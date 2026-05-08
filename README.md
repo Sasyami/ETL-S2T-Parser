@@ -31,10 +31,10 @@ flowchart LR
     CH[/chat/]
   end
  subgraph ai [GigaChat]
-    HDR[Header decision\nagent.py]
-    SUM[Summarizer chain\nsummarizer_agent.py]
-    SCH[Schema matcher\nschema_matcher.py]
-    AG[Chat + tools\nagent.py]
+    HDR[Header decision\nagents/agent.py]
+    SUM[Summarizer chain\nagents/summarizer_agent.py]
+    SCH[Schema matcher\nagents/schema_matcher.py]
+    AG[Chat + tools\nagents/agent.py]
   end
  subgraph data [SQLite excel_data.db]
     T1[files / sheets / columns / data]
@@ -57,16 +57,16 @@ flowchart LR
 | Module | Role |
 |--------|------|
 | `app.py` | Flask app: upload, corrections, preview, summary, schema match, finalize, chat. |
-| `agent.py` | `get_header_decision()` (LLM + heuristics); `agent_chat()` (tool-calling loop). |
-| `summarizer_agent.py` | LCEL chain: fetch DB snapshot → extract schema → structural/domain text → synthesize → validate. |
-| `schema_matcher.py` | LangChain Runnable chains: sheet→table match, column mapping; `compare_with_target()`. |
+| `agents/agent.py` | `get_header_decision()` (LLM + heuristics); `agent_chat()` (tool-calling loop). |
+| `agents/summarizer_agent.py` | LCEL chain: fetch DB snapshot → extract schema → structural/domain text → synthesize → validate. |
+| `agents/schema_matcher.py` | LangChain Runnable chains: sheet→table match, column mapping; `compare_with_target()`. |
 | `db_storage.py` | SQLite schema, migrations, `store_excel_data`, graph helpers, embedding table. |
 | `data_loader.py` | `load_data_from_similarity_report()` → target tables + `MAPS_TO` edges. |
 | `semantic_layer.py` | GigaChat embeddings, `similarity_search`, `store_embedding`. |
 | `load_skills_tools.py` | Loads `skills.md` / `tools.md`; registers SQL/lineage/list/similarity tools for the chat agent. |
 | `templates/index.html` | Upload and per-sheet correction UI. |
 
-**Design note:** Header detection is **not** LangGraph in the current codebase; the README previously mentioned LangGraph generically—`schema_matcher` and other parts use LangChain Runnables. Optional **Langfuse** tracing is wired where `observe` decorators exist.
+**Design note:** Header detection is **not** LangGraph in the current codebase; the README previously mentioned LangGraph generically—`agents/schema_matcher.py` and other parts use LangChain Runnables. Optional **Langfuse** tracing is wired where `observe` decorators exist.
 
 ---
 
@@ -274,9 +274,10 @@ make test-cov
 
 ```
 ├── app.py                 # Flask entrypoint
-├── agent.py               # Header LLM + chat agent
-├── summarizer_agent.py    # Summary LCEL chain
-├── schema_matcher.py      # Target-schema matching
+├── agents/
+│   ├── agent.py           # Header LLM + chat agent
+│   ├── summarizer_agent.py
+│   └── schema_matcher.py
 ├── data_loader.py         # Load from similarity report
 ├── db_storage.py          # SQLite layer
 ├── semantic_layer.py      # Embeddings + similarity

@@ -1,7 +1,7 @@
 import pytest
 import json
 from unittest.mock import patch, MagicMock
-from schema_matcher import (
+from agents.schema_matcher import (
     TARGET_SCHEMA,
     match_sheets_to_tables,
     map_columns_for_table,
@@ -68,7 +68,7 @@ def test_target_schema_structure():
         assert col in col_mappings["columns"]
 
 
-@patch('schema_matcher.giga')
+@patch('agents.schema_matcher.giga')
 def test_match_sheets_to_tables(mock_giga, sample_excel_json):
     """Test sheet matching with mocked GigaChat response."""
     # Mock the API response
@@ -95,7 +95,7 @@ def test_match_sheets_to_tables(mock_giga, sample_excel_json):
     assert source_match["similarity"] == "high"
 
 
-@patch('schema_matcher.giga')
+@patch('agents.schema_matcher.giga')
 def test_map_columns_for_table(mock_giga, sample_excel_json):
     """Test column mapping for a specific table."""
     mock_response = MagicMock()
@@ -113,8 +113,8 @@ def test_map_columns_for_table(mock_giga, sample_excel_json):
     assert result["mapping"]["system_code"] == "system_code"
 
 
-@patch('schema_matcher.match_sheets_to_tables')
-@patch('schema_matcher.map_columns_for_table')
+@patch('agents.schema_matcher.match_sheets_to_tables')
+@patch('agents.schema_matcher.map_columns_for_table')
 def test_compare_with_target(mock_map_columns, mock_match_sheets, sample_excel_json):
     """Test the full comparison workflow."""
     # Mock sheet matching results
@@ -145,7 +145,7 @@ def test_compare_with_target(mock_map_columns, mock_match_sheets, sample_excel_j
 
 def test_compare_with_target_error_handling(sample_excel_json):
     """Test error handling when match_sheets_to_tables fails."""
-    with patch('schema_matcher.match_sheets_to_tables', return_value=[]):
+    with patch('agents.schema_matcher.match_sheets_to_tables', return_value=[]):
         result = compare_with_target(sample_excel_json)
         assert result["similarity_score"] == 0
         assert result["mapping_suggestions"] == []

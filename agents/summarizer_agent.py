@@ -4,7 +4,7 @@ import re
 from typing import Dict, Any
 from langchain_core.runnables import RunnableLambda
 from db_storage import get_db_connection, update_file_summary
-from agent import giga, get_model_name
+from .agent import giga, get_model_name
 from gigachat.models import Chat, Messages, MessagesRole
 from load_skills_tools import load_skills, load_tools
 

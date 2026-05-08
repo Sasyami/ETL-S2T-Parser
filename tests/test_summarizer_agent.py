@@ -1,9 +1,9 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from summarizer_agent import generate_summary, summarize_file
+from agents.summarizer_agent import generate_summary, summarize_file
 
-@patch('summarizer_agent.get_db_connection')
-@patch('summarizer_agent.call_gigachat')
+@patch('agents.summarizer_agent.get_db_connection')
+@patch('agents.summarizer_agent.call_gigachat')
 def test_generate_summary(mock_call_gigachat, mock_get_db_conn):
     # Mock database connection and cursor
     mock_conn = MagicMock()
@@ -53,8 +53,8 @@ def test_generate_summary(mock_call_gigachat, mock_get_db_conn):
     assert isinstance(summary, str)
     assert summary == "Final synthesized summary."
 
-@patch('summarizer_agent.generate_summary')
-@patch('summarizer_agent.update_file_summary')
+@patch('agents.summarizer_agent.generate_summary')
+@patch('agents.summarizer_agent.update_file_summary')
 def test_summarize_file(mock_update, mock_generate):
     mock_generate.return_value = "Generated summary"
     result = summarize_file("hash", save=True)

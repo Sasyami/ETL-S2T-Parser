@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from agent import (
+from agents.agent import (
     get_header_decision,
     get_model_name,
     agent_chat,
@@ -12,7 +12,7 @@ from agent import (
 
 @pytest.fixture
 def mock_llm_success():
-    with patch('agent.call_gigachat_with_retry') as mock_call:
+    with patch('agents.agent.call_gigachat_with_retry') as mock_call:
         mock_call.return_value = '{"header_start_row": 0, "header_rows": 1, "nested": false, "explanation": "Test decision"}'
         yield mock_call
 
@@ -30,7 +30,7 @@ def test_get_header_decision_single_row_header(mock_llm_success):
 
 
 def test_get_header_decision_multi_row_header():
-    with patch('agent.call_gigachat_with_retry') as mock_call:
+    with patch('agents.agent.call_gigachat_with_retry') as mock_call:
         mock_call.return_value = '{"header_start_row": 0, "header_rows": 2, "nested": true, "explanation": "Multi-level header"}'
         preview_rows = [
             ["Name", "Name", "Age", "Age"],
@@ -51,7 +51,7 @@ def test_get_header_decision_fallback_on_llm_failure_default():
         [long_text, long_text],  # both cells long → f1 becomes False
         ["Data 1", "Data 2"]
     ]
-    with patch('agent.call_gigachat_with_retry', side_effect=Exception("API error")):
+    with patch('agents.agent.call_gigachat_with_retry', side_effect=Exception("API error")):
         start_row, header_rows, nested = get_header_decision("Sheet3", preview_rows)
         assert start_row == 0
         assert header_rows == 1
@@ -64,7 +64,7 @@ def test_get_header_decision_fallback_two_short_rows():
         ["Column A", "Column B"],
         ["Data 1", "Data 2"]
     ]
-    with patch('agent.call_gigachat_with_retry', side_effect=Exception("API error")):
+    with patch('agents.agent.call_gigachat_with_retry', side_effect=Exception("API error")):
         start_row, header_rows, nested = get_header_decision("Sheet4", preview_rows)
         assert start_row == 0
         assert header_rows == 2
@@ -101,7 +101,7 @@ def test_safe_extract_json_braces_fallback():
     assert safe_extract_json(raw) == '{"x": true}'
 
 
-@patch("agent.giga")
+@patch("agents.agent.giga")
 def test_agent_chat_nested_action_input_invokes_tool(mock_giga):
     mock_tool = MagicMock(return_value={"result": "ok"})
     r1 = MagicMock()
@@ -114,14 +114,14 @@ def test_agent_chat_nested_action_input_invokes_tool(mock_giga):
     r2.choices[0].message.content = "Final Answer: Done."
     mock_giga.chat.side_effect = [r1, r2]
 
-    with patch.dict("agent.TOOL_FUNCTIONS", {"dummy_tool": mock_tool}, clear=False):
+    with patch.dict("agents.agent.TOOL_FUNCTIONS", {"dummy_tool": mock_tool}, clear=False):
         out = agent_chat("run nested tool", max_steps=5)
 
     assert out == "Done."
     mock_tool.assert_called_once_with(config={"nested": {"x": 1}})
 
 
-@patch("agent.giga")
+@patch("agents.agent.giga")
 def test_agent_chat_malformed_action_input_gets_observation(mock_giga):
     r1 = MagicMock()
     r1.choices[0].message.content = (
@@ -132,7 +132,7 @@ def test_agent_chat_malformed_action_input_gets_observation(mock_giga):
     mock_giga.chat.side_effect = [r1, r2]
 
     mock_sql = MagicMock()
-    with patch.dict("agent.TOOL_FUNCTIONS", {"run_sql": mock_sql}, clear=False):
+    with patch.dict("agents.agent.TOOL_FUNCTIONS", {"run_sql": mock_sql}, clear=False):
         out = agent_chat("q", max_steps=5)
 
     assert out == "Recovered."

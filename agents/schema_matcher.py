@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Dict, Any, List
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from agent import giga
+from .agent import giga
 from gigachat.models import Chat, Messages, MessagesRole
 
 logger = logging.getLogger(__name__)

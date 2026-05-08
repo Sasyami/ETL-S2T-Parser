@@ -6,10 +6,10 @@ import json
 import datetime
 from typing import List, Any, Dict
 from flask import Flask, request, jsonify, render_template
-from agent import get_header_decision, get_model_name, agent_chat
+from agents.agent import get_header_decision, get_model_name, agent_chat
 from db_storage import init_db, store_excel_data, update_file_result_json, get_db_connection
-from summarizer_agent import summarize_file
-from schema_matcher import compare_with_target
+from agents.summarizer_agent import summarize_file
+from agents.schema_matcher import compare_with_target
 from data_loader import load_data_from_similarity_report
 
 app = Flask(__name__)
