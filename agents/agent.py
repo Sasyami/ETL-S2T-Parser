@@ -6,7 +6,15 @@ from typing import List, Any, Tuple, Dict, Optional
 from dotenv import load_dotenv
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
-from load_skills_tools import get_tool_functions, load_tools, load_skills
+from load_skills_tools import (
+    format_stored_files_answer,
+    get_tool_functions,
+    load_skills,
+    load_tools,
+    try_answer_sheets_for_workbook_query,
+    try_answer_target_table_for_mapping_identifier,
+    user_wants_stored_file_inventory,
+)
 
 try:
     from langfuse import observe
@@ -193,30 +201,13 @@ def get_model_name() -> str:
 # ------------------------------------------------------------
 # AI Agent Chat with Tool Calling
 # ------------------------------------------------------------
-def agent_chat(user_query: str, max_steps: int = 5) -> str:
+def react_tool_loop(user_query: str, system_prompt: str, max_steps: int = 5) -> str:
     """
-    Multi‑step reasoning agent that uses tools defined in tools.md.
+    Shared ReAct loop over GigaChat with tools from TOOL_FUNCTIONS.
     """
-    system_prompt = f"""You are a data intelligence assistant. You have access to the following tools:
-
-{TOOLS_DESCRIPTION}
-
-Use the following format:
-
-Thought: what you need to do next
-Action: tool_name
-Action Input: {{"param1": "value1", "param2": "value2"}}
-Observation: result from tool
-... (repeat as needed)
-Final Answer: your concise answer to the user
-
-Always use tools to answer questions about data lineage, similarity, files, sheets, or columns.
-If a tool requires a column ID, first use similarity_search or list_columns to find it.
-If a tool returns an error, try a different approach or explain the issue to the user.
-"""
     messages = [
         Messages(role=MessagesRole.SYSTEM, content=system_prompt),
-        Messages(role=MessagesRole.USER, content=user_query)
+        Messages(role=MessagesRole.USER, content=user_query),
     ]
     step = 0
     while step < max_steps:
@@ -273,3 +264,39 @@ If a tool returns an error, try a different approach or explain the issue to the
             return answer
 
     return "Max steps reached without final answer."
+
+
+def agent_chat(user_query: str, max_steps: int = 5) -> str:
+    """
+    Multi‑step reasoning agent that uses tools defined in tools.md.
+    """
+    stripped = user_query.strip()
+    if user_wants_stored_file_inventory(stripped):
+        return format_stored_files_answer()
+    sheet_ans = try_answer_sheets_for_workbook_query(stripped)
+    if sheet_ans is not None:
+        return sheet_ans
+    tgt_ans = try_answer_target_table_for_mapping_identifier(stripped)
+    if tgt_ans is not None:
+        return tgt_ans
+    system_prompt = f"""You are a data intelligence assistant. You have access to the following tools:
+
+{TOOLS_DESCRIPTION}
+
+Use the following format:
+
+Thought: what you need to do next
+Action: tool_name
+Action Input: {{"param1": "value1", "param2": "value2"}}
+Observation: result from tool
+... (repeat as needed)
+Final Answer: your concise answer to the user
+
+Always use tools to answer questions about data lineage, similarity, files, sheets, columns, or S2T mapping facts.
+SQLite `column_mappings` has `target_column` and `source_column` (there is **no** `target_column_name`). Prefer **`search_column_mappings`** when looking for a substring in mappings.
+Never tell the user to run PRAGMA or SQL manually — call **`run_sql`** yourself (`SELECT`, or **`PRAGMA table_info(tab)`**).
+Never invent filenames or hashes: for any full list of uploads, call `list_files` with `Action Input: {{}}` and report only Observation data.
+If a tool requires a column ID, first use similarity_search or list_columns to find it.
+If a tool returns an error, try a different approach or explain the issue to the user.
+"""
+    return react_tool_loop(user_query, system_prompt, max_steps)

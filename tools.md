@@ -37,9 +37,14 @@
 - **Purpose:** Show user what headers would look like before applying changes.
 
 ## `run_sql(query)`
-- **Input:** `query` (str) – read‑only SQL query (SELECT only)
+- **Input:** `query` (str) – SQL against the app's SQLite (**`SELECT`** and read-only **`PRAGMA`** such as **`PRAGMA table_info(tab)`**, not DDL/DML)
 - **Output:** list of dicts (rows)
-- **Purpose:** Execute a SELECT query on the internal database.
+- **Purpose:** Inspect data or introspect schema (`SELECT`, `PRAGMA table_info`)
+
+## `search_column_mappings(needle, limit)`
+- **Input:** `needle` (str) – substring matched with `LIKE` against **`target_column`**, **`source_column`**, table ids (`target_table_id`, `source_table_id`), `mapping.id`, plus joined **`target_tables.name`** / **`source_tables.name`**. **`limit`** (optional, default 50, max 100)
+- **Output:** list of row dicts (`mapping_id`, `target_table_id`, `target_column`, `source_table_id`, `source_column`, `target_table_name`, `source_table_name`, …); or `{"error": "..."}`
+- **Purpose:** Reliable lookup without guessing SQLite column names (there is **no** `target_column_name` — use **`target_column`**)
 
 ## `get_lineage(column_id)`
 - **Input:** `column_id` (str)
@@ -80,3 +85,8 @@
 - **Input:** `sheet_id` (str) – can be sheet_hash or sheet_name (prefer sheet_hash)
 - **Output:** list of column names (with their hashes if needed)
 - **Purpose:** List columns in a specific sheet.
+
+## `mapping_overview(limit)`
+- **Input:** `limit` (int, default 15) – max sample rows per S2T table (capped at 100)
+- **Output:** dict with counts + row samples for `source_tables`, `target_tables`, `column_mappings`, `additions`; relationship counts grouped by `relation_type` and overall total
+- **Purpose:** Quick read-only snapshot of finalized mapping tables and lineage graph size for agents and dashboards

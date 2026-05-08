@@ -137,3 +137,29 @@ def test_agent_chat_malformed_action_input_gets_observation(mock_giga):
 
     assert out == "Recovered."
     mock_sql.assert_not_called()
+
+
+def test_agent_chat_file_inventory_from_db(tmp_path):
+    import db_storage
+
+    orig = db_storage.DB_PATH
+    db_storage.DB_PATH = str(tmp_path / "fdb.db")
+    try:
+        from db_storage import init_db, get_db_connection
+
+        init_db()
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO files (file_hash, filename, upload_time) VALUES (?, ?, ?)",
+            ("agfh", "agent_file.xlsx", "2026-04-01"),
+        )
+        conn.commit()
+        conn.close()
+
+        from agents.agent import agent_chat
+
+        out = agent_chat("What files are uploaded?")
+        assert "agent_file.xlsx" in out
+        assert "agfh" in out
+    finally:
+        db_storage.DB_PATH = orig

@@ -158,7 +158,7 @@ flowchart TB
 
 `/chat` runs **`agent_chat`**: the model is prompted to emit `Thought` / `Action` / `Action Input: { ... }` lines. The server parses JSON with a balanced decoder (nested objects supported), executes a function from `load_skills_tools.TOOL_FUNCTIONS`, and appends an `Observation` until the model answers or the step limit is reached.
 
-Registered tools include `run_sql`, `list_files`, `list_sheets`, `list_columns`, lineage helpers, and `similarity_search` (requires embedding API credentials and populated `embeddings` table).
+Registered tools include `run_sql`, `mapping_overview` (counts + samples for finalized S2T tables), `list_files`, `list_sheets`, `list_columns`, lineage helpers, and `similarity_search` (requires embedding API credentials and populated `embeddings` table).
 
 ---
 
@@ -184,6 +184,10 @@ uv sync
 ```bash
 uv run python app.py
 # or: make run
+
+# Optional: Streamlit workspace for grounded S2T insights (uses same SQLite + GigaChat)
+uv run streamlit run streamlit_insights.py
+# or: make streamlit-insights
 ```
 
 Open **http://127.0.0.1:5000**.

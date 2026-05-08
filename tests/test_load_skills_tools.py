@@ -70,6 +70,167 @@ def test_list_sheets_and_columns_after_store(sample_excel_bytes):
     assert cols[0]["name"] == "ColA"
 
 
+def test_mapping_overview_empty_db():
+    from load_skills_tools import mapping_overview
+
+    out = mapping_overview(limit=5)
+    for t in ("source_tables", "target_tables", "column_mappings", "additions"):
+        assert t in out
+        assert out[t]["count"] == 0
+        assert out[t]["sample"] == []
+    assert out["relationships_total"] == 0
+    assert out["relationships_by_type"] == []
+
+
+def test_mapping_overview_with_rows():
+    from load_skills_tools import mapping_overview
+
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO source_tables (id, name) VALUES ('s1', 'src')"
+    )
+    conn.execute(
+        "INSERT INTO target_tables (id, name) VALUES ('t1', 'tgt')"
+    )
+    conn.execute(
+        """INSERT INTO column_mappings
+        (id, target_table_id, target_column, source_table_id, source_column)
+        VALUES ('m1', 't1', 'c_tgt', 's1', 'c_src')"""
+    )
+    conn.execute(
+        """INSERT INTO additions
+        (id, table_name, description) VALUES ('a1', 'new_tbl', 'desc')"""
+    )
+    conn.execute(
+        """INSERT INTO relationships (id, from_id, to_id, relation_type, metadata)
+        VALUES ('r1', 'x', 'y', 'semantic', '{}')"""
+    )
+    conn.commit()
+    conn.close()
+
+    out = mapping_overview(limit=10)
+    assert out["source_tables"]["count"] == 1
+    assert out["target_tables"]["count"] == 1
+    assert out["column_mappings"]["count"] == 1
+    assert out["additions"]["count"] == 1
+    assert out["relationships_total"] == 1
+    assert len(out["relationships_by_type"]) >= 1
+
+
+def test_user_wants_stored_file_inventory():
+    from load_skills_tools import user_wants_stored_file_inventory as wants
+
+    assert wants("Give me all files stored")
+    assert wants("list every uploaded file in the db")
+    assert not wants("What files contain customer identifiers")
+    assert not wants("What files map to target columns")
+
+
+def test_format_stored_files_answer():
+    from load_skills_tools import format_stored_files_answer
+
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO files (file_hash, filename, upload_time) VALUES (?, ?, ?)",
+        ("hinv", "inventory.xlsx", "2026-01-02"),
+    )
+    conn.commit()
+    conn.close()
+
+    text = format_stored_files_answer()
+    assert "inventory.xlsx" in text
+    assert "hinv" in text
+    assert "list_files" in text
+
+
+def test_extract_workbook_filenames_from_query():
+    from load_skills_tools import extract_workbook_filenames_from_query as ex
+
+    q = "what sheets in s2t_sbrf_pprb_305000042_dul_b_t_v049.xlsx stored"
+    assert ex(q) == ["s2t_sbrf_pprb_305000042_dul_b_t_v049.xlsx"]
+
+
+def test_user_wants_sheets_for_named_workbook():
+    from load_skills_tools import user_wants_sheets_for_named_workbook as sw
+
+    assert sw("what sheets in book.xlsx stored")
+    assert sw("tabs in data.xls")
+    assert not sw("what columns in book.xlsx")
+    assert not sw("what is in book.xlsx")
+
+
+def test_try_answer_sheets_for_workbook_query():
+    from load_skills_tools import try_answer_sheets_for_workbook_query
+
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO files (file_hash, filename, upload_time) VALUES (?, ?, ?)",
+        ("fhsheet", "Book1.xlsx", "2026-01-01"),
+    )
+    conn.execute(
+        """INSERT INTO sheets
+        (sheet_hash, file_hash, sheet_name, header_start_row, header_rows_count, nested_structure)
+        VALUES (?, ?, ?, 0, 1, 0)""",
+        ("sh1", "fhsheet", "SheetA"),
+    )
+    conn.commit()
+    conn.close()
+
+    out = try_answer_sheets_for_workbook_query(
+        "What sheets in Book1.xlsx are stored?"
+    )
+    assert out is not None
+    assert "SheetA" in out
+    assert "fhsheet" in out
+
+
+def test_search_column_mappings_matches():
+    from load_skills_tools import search_column_mappings
+
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO target_tables (id, name) VALUES ('t_rate', 'RATE_TGT')"
+    )
+    conn.execute(
+        "INSERT INTO source_tables (id, name) VALUES ('s_src', 'SRC')"
+    )
+    conn.execute(
+        """INSERT INTO column_mappings
+        (id, target_table_id, target_column, source_table_id, source_column)
+        VALUES ('m1', 't_rate', 'b3050000420018_ratetariff', 's_src', 'oldcol')"""
+    )
+    conn.commit()
+    conn.close()
+
+    rows = search_column_mappings("b3050000420018_ratetariff")
+    assert isinstance(rows, list)
+    assert len(rows) == 1
+    assert rows[0]["target_table_id"] == "t_rate"
+    assert rows[0]["target_table_name"] == "RATE_TGT"
+    assert rows[0]["target_column"] == "b3050000420018_ratetariff"
+
+
+def test_try_answer_target_table_for_mapping_identifier():
+    from load_skills_tools import try_answer_target_table_for_mapping_identifier
+
+    conn = get_db_connection()
+    conn.execute("INSERT INTO target_tables (id, name) VALUES ('t2', 'NM')")
+    conn.execute(
+        """INSERT INTO column_mappings
+        (id, target_table_id, target_column, source_table_id, source_column)
+        VALUES ('mx', 't2', 'b3050000420018_ratetariff', '', '')"""
+    )
+    conn.commit()
+    conn.close()
+
+    out = try_answer_target_table_for_mapping_identifier(
+        "what target table uses b3050000420018_ratetariff"
+    )
+    assert out is not None
+    assert "t2" in out
+    assert "b3050000420018_ratetariff" in out
+
+
 def test_list_columns_by_sheet_name(sample_excel_bytes):
     from db_storage import store_excel_data
     from load_skills_tools import list_columns

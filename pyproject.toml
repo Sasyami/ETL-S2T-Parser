@@ -26,4 +26,5 @@ dependencies = [
     "pytest-cov>=7.1.0",
     "langfuse>=4.2.0",
     "openinference-instrumentation-langchain>=0.1.62",
+    "streamlit>=1.45.0",
 ]
