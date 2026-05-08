@@ -15,6 +15,9 @@
         .skip-checkbox { margin-right: 1rem; }
         .alert-success { margin-top: 1rem; }
         .similarity-table { font-size: 0.9rem; }
+        .data-preview-table { font-size: 0.85rem; background: #fff; }
+        .data-preview-table td { vertical-align: middle; white-space: nowrap; max-width: 280px;
+            overflow: hidden; text-overflow: ellipsis; }
         .chat-container {
             background: #f8f9fc;
             border: 1px solid #dee2e6;
@@ -246,6 +249,38 @@
         }
     });
 
+    function previewCellText(v) {
+        if (v === null || v === undefined) return '';
+        if (typeof v === 'object') return JSON.stringify(v);
+        return String(v);
+    }
+
+    /** first_data_rows_preview: array of row arrays from the API */
+    function renderDataPreviewTable(rows) {
+        if (!rows || !rows.length) {
+            return '<p class="text-muted small mb-0"><em>No data rows to preview.</em></p>';
+        }
+        let maxCols = 0;
+        for (let i = 0; i < rows.length; i++) {
+            const r = rows[i];
+            if (Array.isArray(r)) maxCols = Math.max(maxCols, r.length);
+        }
+        let html = '<div class="table-responsive"><table class="table table-sm table-bordered mb-0 data-preview-table">';
+        html += '<tbody>';
+        for (let ri = 0; ri < rows.length; ri++) {
+            const r = rows[ri];
+            const cells = Array.isArray(r) ? r : [];
+            html += '<tr>';
+            for (let ci = 0; ci < maxCols; ci++) {
+                html += '<td title="' + escapeAttr(previewCellText(cells[ci])) + '">' +
+                    escapeHtml(previewCellText(cells[ci])) + '</td>';
+            }
+            html += '</tr>';
+        }
+        html += '</tbody></table></div>';
+        return html;
+    }
+
     async function updateHeaderPreview(sheetName, option, previewDivId) {
         try {
             const response = await fetch('/preview_headers', {
@@ -312,8 +347,8 @@
                     </div>
                 </div>
                 <div class="mt-2">
-                    <small>Data preview (first 3 rows):</small>
-                    <pre class="small">${escapeHtml(JSON.stringify(sheet.first_data_rows_preview || [], null, 2))}</pre>
+                    <small class="d-block mb-1">Data preview (first 3 rows):</small>
+                    ${renderDataPreviewTable(sheet.first_data_rows_preview || [])}
                 </div>
             `;
             sheetsContainer.appendChild(card);
@@ -411,7 +446,7 @@
                         <td>${escapeHtml(sugg.explanation)}</td>
                      </tr>`;
         }
-        html += `</tbody></tr>`;
+        html += `</tbody></table>`;
         if (report.unmatched_excel_sheets && report.unmatched_excel_sheets.length) {
             html += `<div class="alert alert-warning">⚠️ Unmatched Excel sheets: ${report.unmatched_excel_sheets.join(', ')}</div>`;
         }
@@ -462,6 +497,15 @@
             if (m === '>') return '&gt;';
             return m;
         });
+    }
+
+    function escapeAttr(str) {
+        if (str == null || str === '') return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
     }
 </script>
 </body>
