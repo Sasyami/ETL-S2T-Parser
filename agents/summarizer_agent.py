@@ -22,12 +22,40 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Columns whose headers suggest human-authored descriptions (S2T / data-dictionary sheets).
+_DESCRIPTION_HEADER_HINTS = (
+    "description",
+    "описание",
+    "опис",
+    "attribute note",
+    "column attribute",
+    "note",
+    "comment",
+    "примечание",
+    "назначение",
+    "definition",
+    "table desc",
+    "memo",
+    "summary",
+)
+
+
+def _column_looks_like_description(flat_name: str) -> bool:
+    if not flat_name:
+        return False
+    n = flat_name.lower()
+    return any(h in n for h in _DESCRIPTION_HEADER_HINTS)
+
+
 SYSTEM_PROMPT = f"""
 {load_skills()}
 
 {load_tools()}
 
-You are a business analyst and technical writer. Use the skills and tools above.
+You analyze **business meaning in source and column metadata** (descriptions, notes, domain-oriented names).
+**Do not** discuss the workbook as an artifact: no Excel, sheets, tabs, file name, upload, “this document”, page counts,
+or S2T/mapping “as a document type”. Speak only about the **subject domain, data objects, and processes** implied by field content.
+Use the skills and tools above where relevant.
 """
 
 def call_gigachat(user_content: str) -> str:
@@ -76,9 +104,72 @@ def fetch_file_data(file_hash: str) -> Dict[str, Any]:
             sheets_dict[sheet_name] = {
                 "sheet_name": sheet_name,
                 "columns": [],
-                "sample_rows": []
+                "sample_rows": [],
+                "description_cells": [],
             }
         sheets_dict[sheet_name]["columns"].append(r["column_name_flat"])
+
+    # Collect description-like cell text per sheet (metadata: table/column descriptions).
+    sheet_hashes_by_name: Dict[str, str] = {}
+    for r in rows:
+        sn = r["sheet_name"]
+        if sn not in sheet_hashes_by_name:
+            cursor.execute(
+                """
+                SELECT sheet_hash FROM sheets
+                WHERE file_hash = ? AND sheet_name = ?
+                """,
+                (file_hash, sn),
+            )
+            sh = cursor.fetchone()
+            if sh:
+                sheet_hashes_by_name[sn] = sh["sheet_hash"]
+
+    description_snippets: list[str] = []
+    for sheet_name, sheet_hash in sheet_hashes_by_name.items():
+        cursor.execute(
+            """
+            SELECT c.column_hash, c.column_name_flat
+            FROM columns c
+            WHERE c.sheet_hash = ?
+            """,
+            (sheet_hash,),
+        )
+        col_rows = cursor.fetchall()
+        texts: list[str] = []
+        for cr in col_rows:
+            if isinstance(cr, dict):
+                cname = (cr.get("column_name_flat") or "").strip()
+                ch = cr.get("column_hash")
+            else:
+                try:
+                    cname = (cr["column_name_flat"] or "").strip()
+                    ch = cr["column_hash"]
+                except (KeyError, TypeError):
+                    continue
+            if not ch:
+                continue
+            if not _column_looks_like_description(cname):
+                continue
+            cursor.execute(
+                """
+                SELECT DISTINCT d.value
+                FROM data d
+                WHERE d.column_hash = ? AND d.value IS NOT NULL
+                  AND TRIM(d.value) != ''
+                """,
+                (ch,),
+            )
+            for vr in cursor.fetchall():
+                v = (vr["value"] or "").strip()
+                if len(v) < 8:
+                    continue
+                cut = v[:1200]
+                texts.append(cut)
+                if len(description_snippets) < 400:
+                    description_snippets.append(f"[{sheet_name} / {cname}] {cut}")
+
+        sheets_dict[sheet_name]["description_cells"] = texts[:80]
 
     for sheet_name in sheets_dict:
         cursor.execute("""
@@ -127,42 +218,60 @@ def fetch_file_data(file_hash: str) -> Dict[str, Any]:
         "filename": filename,
         "raw_sheets": sheets_list,
         "important_values": list(important_values)[:30],
+        "source_description_snippets": description_snippets[:120],
         "schema": {},
         "section_summaries": [],
         "final_summary": "",
-        "validation_errors": []
+        "validation_errors": [],
     }
 
 @observe()
 def extract_schema(state: Dict[str, Any]) -> Dict[str, Any]:
-    filename = state["filename"]
     sheets = state["raw_sheets"]
     important_vals = state["important_values"]
+    snippets = state.get("source_description_snippets") or []
     sheets_columns = []
     sample_data = []
+    description_bullets = []
     for sheet in sheets:
         cols = ", ".join(sheet["columns"][:20])
         sheets_columns.append(f"Лист '{sheet['sheet_name']}': {cols}")
+        desc_cells = sheet.get("description_cells") or []
+        if desc_cells:
+            description_bullets.append(f"Лист '{sheet['sheet_name']}' — фрагменты из полей описания:")
+            for d in desc_cells[:12]:
+                description_bullets.append(f"  • {d[:500]}")
         if sheet["sample_rows"]:
             sample_data.append(f"Лист '{sheet['sheet_name']}':")
             for row in sheet["sample_rows"]:
                 sample_data.append(f"  Строка {row['row_num']}: {row['values']}")
 
+    desc_focus = "\n".join(description_bullets) if description_bullets else ""
+    snippets_joined = "\n".join(snippets[:35]) if snippets else ""
+
     prompt = f"""
-Ты – эксперт по анализу данных. Извлеки структурированную информацию из Excel-файла.
+Ты — эксперт по доменной модели данных. Главный источник — **описания и комментарии в бизнес-полях**
+(поля вроде Description, Описание, Attribute Note и т.п.) и цитаты из ячеек ниже.
 
-Файл: {filename}
+**Не включай в ответ и не выводи в JSON:** имя файла, Excel, листы, вкладки, «документ», количество таблиц в книге,
+тип файла, загрузку, шаблон — это служебный контекст для тебя, не для пользователя.
 
-Листы и колонки:
+1) Тексты из полей описания (приоритет):
+{desc_focus if desc_focus else "(Явные длинные тексты в полях описания не найдены — опирайся осторожно на имена полей и примеры значений.)"}
+
+2) Дополнительные сниппеты метаданных:
+{snippets_joined if snippets_joined else "(нет)"}
+
+3) Имена полей по группам (только чтобы выделить сущности; не описывай это как «структуру документа»):
 {chr(10).join(sheets_columns)}
 
-Примеры данных (первые строки):
+4) Примеры значений (вторично — уточнение домена; не выдумывай организации/проекты без опоры на п.1–2):
 {chr(10).join(sample_data[:10])}
 
-Важные бизнес-термины, найденные в данных:
+5) Эвристические токены (шум возможен):
 {chr(10).join(important_vals[:15])}
 
-Извлеки JSON:
+Извлеки JSON — только бизнес-содержание (домен, сущности, темы таблиц по смыслу полей, не «о файле»):
 {{
     "business_domain": "...",
     "bank_hint": "...",
@@ -171,7 +280,8 @@ def extract_schema(state: Dict[str, Any]) -> Dict[str, Any]:
     "history_types": [],
     "source_tables": [],
     "target_tables": [],
-    "transformation_patterns": []
+    "transformation_patterns": [],
+    "description_highlights": ["ключевые тезисы только из смысла описаний и полей"]
 }}
 """
     answer = call_gigachat(prompt)
@@ -183,22 +293,41 @@ def extract_schema(state: Dict[str, Any]) -> Dict[str, Any]:
                 (e if isinstance(e, str) else e.get("name") or e.get("entity") or str(e))
                 for e in schema["key_entities"]
             ]
+        if "description_highlights" not in schema:
+            schema["description_highlights"] = []
         state["schema"] = schema
         logger.info(f"Schema extracted: {schema}")
     except Exception as e:
         logger.error(f"Schema extraction failed: {e}")
-        state["schema"] = {"business_domain": "не определено", "key_entities": []}
+        state["schema"] = {"business_domain": "не определено", "key_entities": [], "description_highlights": []}
         state["validation_errors"].append(f"Schema error: {e}")
     return state
 
 @observe()
 def structural_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     sheets = state["raw_sheets"]
-    sheets_columns = []
+    lines = []
     for sheet in sheets:
         cols = ", ".join(sheet["columns"][:20])
-        sheets_columns.append(f"Лист '{sheet['sheet_name']}': {cols}")
-    prompt = f"Опиши структуру документа (листы и их назначение). 1-2 абзаца на русском.\n\nЛисты и колонки:\n{chr(10).join(sheets_columns)}"
+        lines.append(f"Группа полей / тема «{sheet['sheet_name']}»: {cols}")
+        desc_cells = sheet.get("description_cells") or []
+        if desc_cells:
+            lines.append("  Тексты из полей описания и примечаний:")
+            for t in desc_cells[:15]:
+                lines.append(f"    — {t[:450]}")
+    prompt = f"""
+Сформируй 1–2 абзаца **только о предметной области и бизнес-объектах** (договоры, клиенты, продукты, события —
+что следует из текстов ниже и из смысла имён полей).
+
+**Категорически запрещено** упоминать или обсуждать: Excel, файл, документ, книгу, листы, вкладки, число листов,
+загрузку, шаблон, «данный файл», «настоящая спецификация», формат xlsx, маппинг как *тип документа*.
+Не описывай артефакт хранения — только домен данных.
+
+Если явных описаний мало, честно скажи об **ограниченности доменных данных**, без перехода к метаописанию книги.
+
+Исходные фрагменты:
+{chr(10).join(lines)}
+"""
     answer = call_gigachat(prompt)
     state["section_summaries"].append(answer)
     return state
@@ -206,17 +335,24 @@ def structural_summary(state: Dict[str, Any]) -> Dict[str, Any]:
 @observe()
 def domain_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     schema = state.get("schema", {})
-    schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
+    highlights = schema.get("description_highlights") or []
+    schema_trim = {k: v for k, v in schema.items() if k != "description_highlights"}
+    schema_str = json.dumps(schema_trim, ensure_ascii=False, indent=2)
+    hl_text = "\n".join(f"• {h}" for h in highlights[:20]) if highlights else "(нет выделенных тезисов)"
+
     prompt = f"""
-На основе извлечённой схемы:
+Используй только **тезисы из описаний полей** и структурированные признаки домена ниже.
+
+Тезисы из полей описания:
+{hl_text}
+
+Признаки домена (JSON; не повторяй как «описание файла»):
 {schema_str}
 
-Опиши бизнес-домен, ключевые сущности, жизненный цикл данных. Обязательно упомяни:
-- Банк или организацию (если есть намёк)
-- Коды проектов (например, КЮЛ)
-- Финансовые стандарты (МСФО, IFRS)
-- Конкретные продукты (кредиты, гарантии, субсидии, продуктовые регистры)
-Напиши 2 абзаца на русском.
+Задача: 2 абзаца на русском о **бизнес-домене, объектах и потоках данных** (что означают данные, какие сущности, какая логика).
+**Не пиши** про Excel, листы, файлы, спецификацию как документ, загрузку, количество таблиц в книге.
+
+Банк, МСФО, коды проектов — **только** если явно следуют из описаний / highlights / key_entities.
 """
     answer = call_gigachat(prompt)
     state["section_summaries"].append(answer)
@@ -226,16 +362,19 @@ def domain_summary(state: Dict[str, Any]) -> Dict[str, Any]:
 def synthesize(state: Dict[str, Any]) -> Dict[str, Any]:
     combined = "\n\n".join(state["section_summaries"])
     prompt = f"""
-На основе следующих резюме создай **ОДИН связный абзац** (5-7 предложений) на русском языке.
-Абзац должен быть максимально похож на пример ниже по стилю и детализации.
+Собери **один связный абзац** (5–8 предложений) на русском — **исключительно про предметную область и данные**:
+сущности, процессы, назначение и смысл полей по **бизнес-описаниям** из материала ниже.
 
-Промежуточные резюме:
+**Запрещено** (не использовать ни в зачине, ни в тексте):
+- «данный файл / документ / книга Excel / xlsx», лист, вкладка, число листов, шаблон, «спецификация» как **оформление материала**;
+- загрузка, хранение **файла**, «в этом файле», «в книге».
+
+Разрешено: предметная область, объекты данных, атрибуты, правила, перенос или соответствие **полей и сущностей по смыслу метаданных** (если это следует из описаний), без акцента на формате носителя.
+
+Разрешено: домен (например кредитование, регистры договоров), объекты, атрибуты, связи, правила — если они следуют из полей и описаний.
+
+Промежуточные фрагменты (игнорируй любые упоминания про файл/Excel, если они случайно попали — не переноси в итог):
 {combined}
-
-Пример желаемого стиля:
-"Данный файл представляет собой спецификацию маппинга «Источник-Приёмник» (Source-to-Target, S2T) для хранилища данных по корпоративному кредитованию (код проекта «КЮЛ» — Кредиты Юридическим Лицам) в рамках крупной российской банковской среды (предположительно Сбербанк). Документ определяет логику ETL-процессов для трансформации данных из исходных систем в единую аналитическую модель, охватывающую полный жизненный цикл кредитных продуктов: кредитные договоры, договоры банковской гарантии и договоры обеспечения, а также связанные с ними атрибуты, такие как контрагенты, валюты, правила расчёта процентных ставок, субсидии, метрики классификации по МСФО (IFRS 9), продуктовые регистры, а также плановые и фактические финансовые операции."
-
-Напиши абзац, следуя этому примеру: укажи тип документа (S2T, маппинг, ETL), проект, банк, перечисли конкретные сущности и финансовые показатели.
 """
     answer = call_gigachat(prompt)
     state["final_summary"] = answer

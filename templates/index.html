@@ -48,6 +48,14 @@
             color: #6c757d;
             padding: 0.5rem;
         }
+        .summary-box {
+            font-size: 0.95rem;
+            line-height: 1.55;
+            max-height: 420px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
     </style>
 </head>
 <body>
@@ -70,6 +78,19 @@
                         <button type="button" id="toggleChatBtn" class="btn btn-info">💬 Show Chat</button>
                         <div id="loading" class="mt-3 text-primary d-none">🤔 AI is analyzing headers... ⏳</div>
                     </form>
+
+                    <!-- Business summary (summarizer agent) -->
+                    <div id="summaryArea" class="mt-4" style="display: none;">
+                        <div class="card border-success shadow-sm">
+                            <div class="card-header bg-success bg-opacity-10 py-2">
+                                <strong>📋 Business summary</strong>
+                                <span class="text-muted small ms-1">(summarizer agent, Russian)</span>
+                            </div>
+                            <div class="card-body py-3">
+                                <div id="summaryContent" class="summary-box text-body"></div>
+                            </div>
+                        </div>
+                    </div>
 
                     <!-- Correction area (unchanged) -->
                     <div id="correctionArea" class="mt-4" style="display: none;">
@@ -131,6 +152,8 @@
     const chatInput = document.getElementById('chatInput');
     const sendChatBtn = document.getElementById('sendChatBtn');
     const chatTyping = document.getElementById('chatTyping');
+    const summaryArea = document.getElementById('summaryArea');
+    const summaryContent = document.getElementById('summaryContent');
 
     // Reset UI but keep the selected file (used before upload)
     function resetUI() {
@@ -145,6 +168,8 @@
         currentSheets = [];
         currentSimilarityReport = null;
         loadDataBtn.disabled = false;
+        summaryArea.style.display = 'none';
+        summaryContent.textContent = '';
         loadDataBtn.innerText = '📥 Load Data into Target Tables';
     }
 
@@ -211,6 +236,16 @@
         if (e.key === 'Enter') sendChatMessage();
     });
 
+    function showSummary(summary) {
+        summaryArea.style.display = 'block';
+        const text = summary === null || summary === undefined ? '' : String(summary).trim();
+        if (!text) {
+            summaryContent.innerHTML = '<p class="text-muted mb-0"><em>No business summary was generated for this file.</em></p>';
+            return;
+        }
+        summaryContent.textContent = summary;
+    }
+
     // Existing upload logic
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
@@ -239,6 +274,7 @@
 
             currentFileHash = data.file_hash;
             currentSheets = data.sheets;
+            showSummary(data.summary);
             renderCorrectionUI(data.sheets);
             correctionArea.style.display = 'block';
         } catch (err) {
@@ -406,6 +442,8 @@
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error);
+
+            showSummary(data.summary);
 
             const matchResponse = await fetch('/match_schema', {
                 method: 'POST',
