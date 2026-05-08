@@ -8,6 +8,7 @@ from data_loader import (
     get_or_create_source_table,
     get_or_create_target_table,
     load_data_from_similarity_report,
+    _row_value_for_excel_header,
 )
 
 
@@ -23,6 +24,12 @@ def _temp_db_path():
 
 def test_get_data_rows_empty_when_unknown_sheet():
     assert get_data_rows("missing", "Sheet1") == []
+
+
+def test_row_value_for_excel_header_case_and_nested():
+    row = {"Target TABLE": "t1", "S > ColName": "c1"}
+    assert _row_value_for_excel_header(row, "target table") == "t1"
+    assert _row_value_for_excel_header(row, "ColName") == "c1"
 
 
 def test_get_data_rows_roundtrip(sample_excel_bytes):
@@ -63,6 +70,93 @@ def test_get_or_create_target_table_idempotent():
     id1 = get_or_create_target_table("DimAcc", "desc")
     id2 = get_or_create_target_table("dimacc", "other")
     assert id1 == id2
+
+
+def test_load_target_catalog_column_mappings_without_source(sample_excel_bytes):
+    """Target-only sheets: LLM often omits source_* in column_mapping."""
+    sheets_info = [
+        {
+            "sheet_name": "Target columns",
+            "skipped": False,
+            "ai_decision": {
+                "header_start_row": 0,
+                "header_rows_count": 1,
+                "nested_structure": False,
+            },
+            "columns": ["ColumnTableName", "ColumnName", "Column Datatype"],
+        }
+    ]
+    data_rows = {
+        "Target columns": [["T1", "c1", "varchar"]],
+    }
+    fh = store_excel_data(
+        sample_excel_bytes, "tc.xlsx", "model", sheets_info, data_rows
+    )
+    report = {
+        "mapping_suggestions": [
+            {
+                "target_table": "column_mappings",
+                "excel_sheet": "Target columns",
+                "similarity": "high",
+                "column_mapping": {
+                    "target_table_name": "ColumnTableName",
+                    "target_column": "ColumnName",
+                },
+            }
+        ]
+    }
+    counts = load_data_from_similarity_report(fh, report)
+    assert counts.get("column_mappings", 0) >= 1
+
+
+def test_lineage_uses_excel_header_not_cell_value(sample_excel_bytes):
+    """MAPS_TO must use the physical column from mapping, not the cell text (e.g. dto)."""
+    from db_storage import get_lineage
+
+    sheets_info = [
+        {
+            "sheet_name": "S2T",
+            "skipped": False,
+            "ai_decision": {
+                "header_start_row": 0,
+                "header_rows_count": 1,
+                "nested_structure": False,
+            },
+            "columns": ["tgt_tbl", "tgt_col", "src_tbl", "src_col_attr"],
+        }
+    ]
+    data_rows = {
+        "S2T": [["dim", "x", "raw", "dto"]],
+    }
+    fh = store_excel_data(sample_excel_bytes, "s2t.xlsx", "m", sheets_info, data_rows)
+    report = {
+        "mapping_suggestions": [
+            {
+                "target_table": "column_mappings",
+                "excel_sheet": "S2T",
+                "similarity": "high",
+                "column_mapping": {
+                    "target_table_name": "tgt_tbl",
+                    "target_column": "tgt_col",
+                    "source_table_name": "src_tbl",
+                    "source_column": "src_col_attr",
+                },
+            }
+        ]
+    }
+    load_data_from_similarity_report(fh, report)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT column_hash FROM columns WHERE sheet_hash = ? AND column_name_flat = ?",
+        (get_sheet_hash(fh, "S2T"), "src_col_attr"),
+    )
+    col_row = cur.fetchone()
+    conn.close()
+    assert col_row
+    lineage = get_lineage(col_row["column_hash"])
+    assert any(r["relation_type"] == "MAPS_TO" for r in lineage)
 
 
 def test_insert_column_mapping_and_load_report(sample_excel_bytes):

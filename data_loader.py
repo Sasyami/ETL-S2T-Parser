@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 from typing import Dict, Any, List, Optional
 from db_storage import (
     get_db_connection, generate_id, add_relationship,
@@ -16,6 +17,78 @@ except ImportError:
         return decorator
 
 logger = logging.getLogger(__name__)
+
+# Sheets that only describe target columns (no source system) still map to column_mappings;
+# we store them with a synthetic source table for referential consistency.
+PLACEHOLDER_SOURCE_TABLE = "(target catalog)"
+
+
+def _normalize_cell(val: Any) -> Any:
+    """Strip strings; treat blank as None (DB often stores text)."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        s = val.strip()
+        return s if s else None
+    return val
+
+
+def _norm_col_key(s: str) -> str:
+    return " ".join((s or "").split()).lower()
+
+
+def _row_value_for_excel_header(row: Dict[str, Any], header: Optional[Any]) -> Any:
+    """
+    Map similarity-report Excel column names to row dict keys.
+    Handles case/whitespace differences and nested headers (leaf segment match).
+    """
+    if header is None:
+        return None
+    if not isinstance(header, str):
+        header = str(header)
+    h = header.strip()
+    if not h:
+        return None
+    hn = _norm_col_key(h)
+
+    if h in row:
+        return _normalize_cell(row[h])
+
+    hl = h.lower()
+    for k, v in row.items():
+        if k is None:
+            continue
+        ks = str(k).strip()
+        if ks.lower() == hl:
+            return _normalize_cell(v)
+
+    for k, v in row.items():
+        if k is None:
+            continue
+        if _norm_col_key(str(k)) == hn:
+            return _normalize_cell(v)
+
+    segment_matches: List[Any] = []
+    for k, v in row.items():
+        if k is None:
+            continue
+        ks = str(k).strip()
+        parts = re.split(r"\s*>\s*", ks)
+        for p in parts:
+            if _norm_col_key(p) == hn:
+                segment_matches.append(v)
+                break
+
+    if len(segment_matches) == 1:
+        return _normalize_cell(segment_matches[0])
+    if len(segment_matches) > 1:
+        logger.debug(
+            "Ambiguous excel header %r on row keys %s",
+            h,
+            list(row.keys()),
+        )
+
+    return None
 
 
 def get_data_rows(file_hash: str, sheet_name: str) -> List[Dict[str, Any]]:
@@ -161,7 +234,8 @@ def load_data_from_similarity_report(file_hash: str, similarity_report: Dict[str
         required_cols = {
             "source_tables": ["name"],
             "target_tables": ["name"],
-            "column_mappings": ["target_table_name", "target_column", "source_table_name", "source_column"],
+            # source_* optional: target-column catalog sheets often have no source side
+            "column_mappings": ["target_table_name", "target_column"],
             "additions": []
         }
         required = required_cols.get(target_table, [])
@@ -185,7 +259,7 @@ def load_data_from_similarity_report(file_hash: str, similarity_report: Dict[str
         for row_idx, row in enumerate(rows):
             record = {}
             for target_col, excel_col in column_mapping.items():
-                record[target_col] = row.get(excel_col)
+                record[target_col] = _row_value_for_excel_header(row, excel_col)
 
             try:
                 if target_table == "source_tables":
@@ -212,37 +286,57 @@ def load_data_from_similarity_report(file_hash: str, similarity_report: Dict[str
                     count += 1
 
                 elif target_table == "column_mappings":
-                    target_table_name_val = record.get("target_table_name")
-                    target_column = record.get("target_column")
-                    source_table_name_val = record.get("source_table_name")
-                    source_column = record.get("source_column")
-                    if not target_table_name_val or not target_column or not source_table_name_val:
-                        logger.warning(f"Sheet '{sheet_name}', row {row_idx}: skipping - missing required mapping fields")
+                    target_table_name_val = _normalize_cell(record.get("target_table_name"))
+                    target_column = _normalize_cell(record.get("target_column"))
+                    source_table_name_val = _normalize_cell(record.get("source_table_name"))
+                    source_column_val = _normalize_cell(record.get("source_column"))
+                    if not target_table_name_val or not target_column:
+                        empty_fields = [
+                            n
+                            for n, v in (
+                                ("target_table_name", target_table_name_val),
+                                ("target_column", target_column),
+                            )
+                            if not v
+                        ]
+                        logger.warning(
+                            "Sheet '%s', row %s: skipping column_mappings — "
+                            "empty fields %s. Mapped excel headers: %s. "
+                            "Sample row keys: %s",
+                            sheet_name,
+                            row_idx,
+                            empty_fields,
+                            {k: column_mapping.get(k) for k in column_mapping},
+                            list(row.keys())[:25],
+                        )
                         continue
 
-                    # Insert the column mapping
+                    st_name = source_table_name_val or PLACEHOLDER_SOURCE_TABLE
                     mapping_id = insert_column_mapping(
                         target_table_name=target_table_name_val,
                         target_column=target_column,
-                        source_table_name=source_table_name_val,
-                        source_column=source_column,
+                        source_table_name=st_name,
+                        source_column=source_column_val,
                         transformation_rule=record.get("transformation_rule"),
                         data_type=record.get("data_type"),
                         is_primary_key=str(record.get("is_primary_key")).lower() in ('yes', 'true', '1', 'y', 'да')
                     )
 
-                    # Create graph edge: source column -> mapping
-                    if source_column:
-                        source_col_hash = get_column_id_by_name(sheet_hash, source_column)
+                    # Lineage: resolve the *Excel column header* from the mapping, not the cell value.
+                    src_excel_header = column_mapping.get("source_column")
+                    if src_excel_header is not None and str(src_excel_header).strip():
+                        hdr = str(src_excel_header).strip()
+                        source_col_hash = get_column_id_by_name(sheet_hash, hdr)
                         if source_col_hash:
                             metadata = {"transformation": record.get("transformation_rule", "direct")}
                             add_relationship(source_col_hash, mapping_id, "MAPS_TO", json.dumps(metadata))
-                            logger.debug(f"Created MAPS_TO relationship: {source_column} -> {target_column}")
+                            logger.debug("MAPS_TO: Excel column %r -> mapping %s", hdr, mapping_id)
                         else:
-                            logger.warning(f"Source column hash not found for '{source_column}' in sheet '{sheet_name}' (sheet_hash={sheet_hash})")
-                    else:
-                        logger.warning(f"No source_column for mapping row {row_idx} in sheet '{sheet_name}'")
-
+                            logger.debug(
+                                "No column hash for excel header %r (sheet %s); lineage skipped",
+                                hdr,
+                                sheet_name,
+                            )
                     count += 1
 
                 elif target_table == "additions":

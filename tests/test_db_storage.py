@@ -130,6 +130,41 @@ def test_add_relationship_and_get_lineage(temp_db):
     assert lines[0]["relation_type"] == "MAPS_TO"
 
 
+def test_get_column_id_by_name_segment_short_token(temp_db):
+    """Schema matcher often emits short Excel aliases (e.g. dto) vs nested headers."""
+    sheets_info = [
+        {
+            "sheet_name": "Meta",
+            "skipped": False,
+            "ai_decision": {
+                "header_start_row": 0,
+                "header_rows_count": 1,
+                "nested_structure": False,
+            },
+            "columns": ["Метаданные > DTO", "Other"],
+        }
+    ]
+    fh = store_excel_data(
+        b"",
+        "meta.xlsx",
+        "model",
+        sheets_info,
+        {"Meta": [["v1", "v2"]]},
+        max_rows_per_sheet=10,
+    )
+    sh = get_sheet_hash(fh, "Meta")
+    cid = get_column_id_by_name(sh, "dto")
+    assert cid is not None
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT column_name_flat FROM columns WHERE column_hash = ?", (cid,)
+    )
+    flat = cur.fetchone()["column_name_flat"]
+    conn.close()
+    assert "DTO" in flat
+
+
 def test_get_column_id_by_name_and_nested_partial(temp_db):
     sheets_info = [
         {

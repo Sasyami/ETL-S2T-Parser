@@ -2,6 +2,7 @@ import sqlite3
 import hashlib
 import json
 import logging
+import re
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -329,50 +330,91 @@ def get_downstream_targets(column_id: str) -> List[str]:
     return [row["to_id"] for row in rows]
 
 
-def get_column_id_by_name(sheet_hash: str, column_name: str) -> str:
+def _norm_header_token(s: str) -> str:
+    """Collapse whitespace; compare case-insensitively in callers."""
+    return " ".join((s or "").split()).lower()
+
+
+def _header_segments(column_name_flat: str) -> List[str]:
+    """Split nested header on '>' (with optional spaces) into normalized tokens."""
+    if not column_name_flat:
+        return []
+    parts = re.split(r"\s*>\s*", column_name_flat.strip())
+    return [_norm_header_token(p) for p in parts if p.strip()]
+
+
+def get_column_id_by_name(sheet_hash: str, column_name: str) -> Optional[str]:
     """
     Find column hash by name, supporting nested headers (e.g., "Parent > Child").
-    Tries exact match, then last part after " > ", then partial match.
+    Matches, in order:
+    1. Whole column_name_flat equals the search string (case-insensitive, spaces normalized)
+    2. Any header level segment equals the search string (so "dto" matches "Meta > DTO")
+    3. Underscore/space-insensitive segment match
+    4. For search strings of length >= 5, substring containment on flat name (weak)
     """
-    if not column_name:
+    if not sheet_hash or not column_name:
         return None
-    column_name = column_name.strip()
+    key = _norm_header_token(column_name)
+    if not key:
+        return None
+    key_loose = key.replace("_", " ")
+
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # 1. Exact match (case‑insensitive)
-    cursor.execute("""
-        SELECT column_hash FROM columns
-        WHERE sheet_hash = ? AND LOWER(column_name_flat) = LOWER(?)
-    """, (sheet_hash, column_name))
-    row = cursor.fetchone()
-    if row:
-        conn.close()
-        return row["column_hash"]
-
-    # 2. Try to match the last part of a nested header (after " > ")
-    last_part = column_name
-    if " > " in column_name:
-        last_part = column_name.split(" > ")[-1]
-    cursor.execute("""
-        SELECT column_hash FROM columns
-        WHERE sheet_hash = ? AND LOWER(column_name_flat) LIKE LOWER(?)
-        AND column_name_flat LIKE '% > %'
-    """, (sheet_hash, '%' + last_part))
-    row = cursor.fetchone()
-    if row:
-        conn.close()
-        return row["column_hash"]
-
-    # 3. Partial match (contains) – last resort
-    cursor.execute("""
-        SELECT column_hash FROM columns
-        WHERE sheet_hash = ? AND LOWER(column_name_flat) LIKE LOWER(?)
-        LIMIT 1
-    """, (sheet_hash, '%' + column_name + '%'))
-    row = cursor.fetchone()
+    cursor.execute(
+        """
+        SELECT column_hash, column_name_flat, column_index
+        FROM columns
+        WHERE sheet_hash = ?
+        ORDER BY column_index
+        """,
+        (sheet_hash,),
+    )
+    rows = cursor.fetchall()
     conn.close()
-    return row["column_hash"] if row else None
+
+    segment_hits: List[tuple] = []
+    loose_segment_hits: List[tuple] = []
+    substr_hits: List[tuple] = []
+
+    for row in rows:
+        flat = row["column_name_flat"] or ""
+        col_hash = row["column_hash"]
+        col_idx = row["column_index"]
+        nf = _norm_header_token(flat)
+
+        if nf == key or nf == key_loose:
+            return col_hash
+
+        segs = _header_segments(flat)
+        if key in segs or key_loose in segs:
+            segment_hits.append((col_idx, col_hash))
+            continue
+        loose_matched = False
+        for seg in segs:
+            s2 = seg.replace("_", " ")
+            if key_loose == s2 or key == s2:
+                loose_segment_hits.append((col_idx, col_hash))
+                loose_matched = True
+                break
+
+        if loose_matched:
+            continue
+
+        if len(key) >= 5 and (key in nf or key_loose in nf.replace("_", " ")):
+            substr_hits.append((col_idx, col_hash))
+
+    if segment_hits:
+        segment_hits.sort(key=lambda t: t[0])
+        return segment_hits[0][1]
+    if loose_segment_hits:
+        loose_segment_hits.sort(key=lambda t: t[0])
+        return loose_segment_hits[0][1]
+    if substr_hits:
+        substr_hits.sort(key=lambda t: t[0])
+        return substr_hits[0][1]
+
+    return None
 
 
 def get_target_column_id(target_table_name: str, target_column: str) -> str:
