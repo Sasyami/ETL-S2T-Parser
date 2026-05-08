@@ -149,6 +149,12 @@ def init_db():
         )
     """)
 
+    # Helpful indexes (no FK constraints — SQLite; consistency enforced in application code)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sheets_file_hash ON sheets(file_hash)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_columns_sheet_hash ON columns(sheet_hash)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_data_sheet_row ON data(sheet_hash, row_num)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_entity ON embeddings(entity_id)")
+
     conn.commit()
     conn.close()
     logger.info("Database initialized with all tables")
@@ -169,10 +175,14 @@ def store_excel_data(file_bytes: bytes, filename: str, model_used: str,
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Insert file record
+    # Upsert file row: do not use REPLACE — it would NULL out summary / result_json on re-upload.
     cursor.execute("""
-        INSERT OR REPLACE INTO files (file_hash, filename, model_used, upload_time)
+        INSERT INTO files (file_hash, filename, model_used, upload_time)
         VALUES (?, ?, ?, ?)
+        ON CONFLICT(file_hash) DO UPDATE SET
+            filename = excluded.filename,
+            model_used = excluded.model_used,
+            upload_time = excluded.upload_time
     """, (file_hash, filename, model_used, upload_time))
 
     for sheet in sheets_info:

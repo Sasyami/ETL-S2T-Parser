@@ -43,6 +43,43 @@ def test_store_excel_data(temp_db, sample_excel_bytes):
     assert row["filename"] == "test.xlsx"
     conn.close()
 
+def test_store_excel_preserves_summary_and_result_json_on_reupload(
+    temp_db, sample_excel_bytes
+):
+    sheets_info = [
+        {
+            "sheet_name": "Sheet1",
+            "skipped": False,
+            "ai_decision": {
+                "header_start_row": 0,
+                "header_rows_count": 1,
+                "nested_structure": False,
+            },
+            "columns": ["A"],
+        }
+    ]
+    data_rows = {"Sheet1": [["1"]]}
+    fh = store_excel_data(
+        sample_excel_bytes, "t.xlsx", "m1", sheets_info, data_rows
+    )
+    update_file_summary(fh, "preserved summary")
+    update_file_result_json(fh, '{"kept": true}')
+
+    store_excel_data(sample_excel_bytes, "t.xlsx", "m2", sheets_info, data_rows)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT summary, result_json, model_used FROM files WHERE file_hash = ?",
+        (fh,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    assert row["summary"] == "preserved summary"
+    assert json.loads(row["result_json"]) == {"kept": True}
+    assert row["model_used"] == "m2"
+
+
 def test_update_file_summary(temp_db):
     # First insert a file manually
     conn = get_db_connection()
