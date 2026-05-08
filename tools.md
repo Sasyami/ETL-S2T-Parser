@@ -35,3 +35,48 @@
 - **Input:** file bytes, sheet name, start row index, number of header rows
 - **Output:** list of column headers (flattened if nested)
 - **Purpose:** Show user what headers would look like before applying changes.
+
+## `run_sql(query)`
+- **Input:** `query` (str) – read‑only SQL query (SELECT only)
+- **Output:** list of dicts (rows)
+- **Purpose:** Execute a SELECT query on the internal database.
+
+## `get_lineage(column_id)`
+- **Input:** `column_id` (str)
+- **Output:** list of relationships (each with from_id, to_id, relation_type, metadata)
+- **Purpose:** Retrieve upstream and downstream lineage for a column.
+
+## `get_upstream_sources(column_id)`
+- **Input:** `column_id` (str)
+- **Output:** list of source column IDs/names
+- **Purpose:** Get all sources that feed into a column.
+
+## `get_downstream_targets(column_id)`
+- **Input:** `column_id` (str)
+- **Output:** list of target column IDs/names
+- **Purpose:** Get all targets that depend on a column.
+
+## `similarity_search(query)`
+- **Input:** `query` (str)
+- **Output:** list of entities (id, type, similarity score)
+- **Purpose:** Find columns or other entities semantically similar to the query.
+
+## `find_similar_columns(name)`
+- **Input:** `name` (str)
+- **Output:** list of similar column names with scores
+- **Purpose:** Convenience wrapper around similarity_search for columns.
+
+## `list_files()`
+- **Input:** none
+- **Output:** list of dicts (file_hash, filename, upload_time)
+- **Purpose:** List all uploaded files.
+
+## `list_sheets(file_hash)`
+- **Input:** `file_hash` (str)
+- **Output:** list of sheet names
+- **Purpose:** List sheets in a given file.
+
+## `list_columns(sheet_id)`
+- **Input:** `sheet_id` (str) – can be sheet_hash or sheet_name (prefer sheet_hash)
+- **Output:** list of column names (with their hashes if needed)
+- **Purpose:** List columns in a specific sheet.

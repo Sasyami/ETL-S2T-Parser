@@ -87,3 +87,54 @@ def test_preview_headers(client, sample_excel_bytes):
     data = response.get_json()
     assert 'headers' in data
     assert isinstance(data['headers'], list)
+
+
+@patch("app.agent_chat")
+def test_chat_success(mock_agent, client):
+    mock_agent.return_value = "Answer text"
+    response = client.post("/chat", json={"query": "List files"})
+    assert response.status_code == 200
+    assert response.get_json() == {"answer": "Answer text"}
+
+
+def test_chat_missing_query(client):
+    response = client.post("/chat", json={})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+@patch("app.compare_with_target")
+def test_match_schema_ok(mock_compare, client, sample_excel_json):
+    mock_compare.return_value = {"similarity_score": 50}
+    response = client.post(
+        "/match_schema",
+        json=sample_excel_json,
+        content_type="application/json",
+    )
+    assert response.status_code == 200
+    assert response.get_json()["similarity_score"] == 50
+
+
+def test_match_schema_no_json(client):
+    # JSON `null` parses to Python None → treated as missing payload
+    response = client.post(
+        "/match_schema",
+        data="null",
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    body = response.get_json(silent=True)
+    assert body and "error" in body
+
+
+def test_finalize_missing_file_hash(client):
+    response = client.post("/finalize_and_load", json={"similarity_report": {}})
+    assert response.status_code == 400
+
+
+def test_finalize_no_stored_json(client):
+    response = client.post(
+        "/finalize_and_load",
+        json={"file_hash": "missing-hash-123", "similarity_report": {"mapping_suggestions": []}},
+    )
+    assert response.status_code == 404

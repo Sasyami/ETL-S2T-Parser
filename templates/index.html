@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>AI Excel Parser – Human Correction & Schema Matching</title>
+    <title>AI Excel Parser – Human Correction & Schema Matching + AI Chat</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; padding-top: 2rem; }
@@ -15,6 +15,36 @@
         .skip-checkbox { margin-right: 1rem; }
         .alert-success { margin-top: 1rem; }
         .similarity-table { font-size: 0.9rem; }
+        .chat-container {
+            background: #f8f9fc;
+            border: 1px solid #dee2e6;
+            border-radius: 0.5rem;
+            padding: 1rem;
+            margin-top: 1rem;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .chat-message {
+            margin-bottom: 0.75rem;
+            padding: 0.5rem;
+            border-radius: 0.5rem;
+        }
+        .chat-user {
+            background: #e9ecef;
+            text-align: right;
+        }
+        .chat-agent {
+            background: #d1e7dd;
+            text-align: left;
+        }
+        .chat-input-group {
+            margin-top: 1rem;
+        }
+        .typing-indicator {
+            font-style: italic;
+            color: #6c757d;
+            padding: 0.5rem;
+        }
     </style>
 </head>
 <body>
@@ -23,9 +53,10 @@
         <div class="col-md-10">
             <div class="card shadow-sm">
                 <div class="card-header bg-primary text-white">
-                    <h4 class="mb-0">🤖 AI Excel Parser – Human Correction & Schema Matching</h4>
+                    <h4 class="mb-0">🤖 AI Excel Parser – Human Correction & Schema Matching + AI Chat</h4>
                 </div>
                 <div class="card-body">
+                    <!-- File upload area (unchanged) -->
                     <form id="uploadForm" enctype="multipart/form-data">
                         <div class="mb-3">
                             <label for="fileInput" class="form-label">Choose Excel file (.xlsx, .xls, .xlsm)</label>
@@ -33,15 +64,18 @@
                         </div>
                         <button type="submit" class="btn btn-primary">Upload & Analyze</button>
                         <button type="button" id="resetBtn" class="btn btn-secondary">🔄 New File</button>
+                        <button type="button" id="toggleChatBtn" class="btn btn-info">💬 Show Chat</button>
                         <div id="loading" class="mt-3 text-primary d-none">🤔 AI is analyzing headers... ⏳</div>
                     </form>
 
+                    <!-- Correction area (unchanged) -->
                     <div id="correctionArea" class="mt-4" style="display: none;">
                         <h5>📝 Review and correct AI decisions</h5>
                         <div id="sheetsContainer"></div>
                         <button id="submitCorrectionsBtn" class="btn btn-success mt-3">✅ Apply Corrections & Check Similarity</button>
                     </div>
 
+                    <!-- Similarity report area (unchanged) -->
                     <div id="similarityArea" class="mt-4" style="display: none;">
                         <h5>📊 Schema Similarity Report</h5>
                         <div id="similarityContent"></div>
@@ -49,8 +83,20 @@
                         <div id="loadResult" class="alert alert-info mt-3" style="display: none;"></div>
                     </div>
 
+                    <!-- Error area (unchanged) -->
                     <div id="errorArea" class="mt-4 text-danger" style="display: none;">
                         <strong>Error:</strong> <span id="errorMessage"></span>
+                    </div>
+
+                    <!-- NEW: Chat area (initially hidden) -->
+                    <div id="chatArea" class="mt-4" style="display: none;">
+                        <h5>💬 Ask the AI Agent about your data</h5>
+                        <div id="chatMessages" class="chat-container"></div>
+                        <div class="chat-input-group input-group">
+                            <input type="text" id="chatInput" class="form-control" placeholder="e.g., Show lineage of customer_email, Find columns similar to revenue, Which files contain customer data?">
+                            <button id="sendChatBtn" class="btn btn-primary">Send</button>
+                        </div>
+                        <div id="chatTyping" class="typing-indicator" style="display: none;">Agent is thinking...</div>
                     </div>
                 </div>
             </div>
@@ -76,6 +122,12 @@
     const errorMessage = document.getElementById('errorMessage');
     const submitBtn = document.getElementById('submitCorrectionsBtn');
     const resetBtn = document.getElementById('resetBtn');
+    const toggleChatBtn = document.getElementById('toggleChatBtn');
+    const chatArea = document.getElementById('chatArea');
+    const chatMessages = document.getElementById('chatMessages');
+    const chatInput = document.getElementById('chatInput');
+    const sendChatBtn = document.getElementById('sendChatBtn');
+    const chatTyping = document.getElementById('chatTyping');
 
     // Reset UI but keep the selected file (used before upload)
     function resetUI() {
@@ -97,10 +149,66 @@
     function fullReset() {
         resetUI();
         fileInput.value = '';
+        // Also clear chat history if open
+        if (chatArea.style.display !== 'none') {
+            chatMessages.innerHTML = '';
+        }
     }
 
     resetBtn.addEventListener('click', fullReset);
 
+    // Toggle chat visibility
+    toggleChatBtn.addEventListener('click', () => {
+        if (chatArea.style.display === 'none') {
+            chatArea.style.display = 'block';
+            toggleChatBtn.textContent = '💬 Hide Chat';
+        } else {
+            chatArea.style.display = 'none';
+            toggleChatBtn.textContent = '💬 Show Chat';
+        }
+    });
+
+    // Chat functionality
+    async function sendChatMessage() {
+        const query = chatInput.value.trim();
+        if (!query) return;
+        // Add user message to chat
+        addChatMessage('user', query);
+        chatInput.value = '';
+        chatTyping.style.display = 'block';
+        sendChatBtn.disabled = true;
+
+        try {
+            const response = await fetch('/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query: query })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Chat failed');
+            addChatMessage('agent', data.answer);
+        } catch (err) {
+            addChatMessage('agent', `❌ Error: ${err.message}`);
+        } finally {
+            chatTyping.style.display = 'none';
+            sendChatBtn.disabled = false;
+        }
+    }
+
+    function addChatMessage(role, text) {
+        const messageDiv = document.createElement('div');
+        messageDiv.className = `chat-message chat-${role}`;
+        messageDiv.innerHTML = `<strong>${role === 'user' ? 'You' : 'Agent'}:</strong><br>${escapeHtml(text)}`;
+        chatMessages.appendChild(messageDiv);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+
+    sendChatBtn.addEventListener('click', sendChatMessage);
+    chatInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') sendChatMessage();
+    });
+
+    // Existing upload logic
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
 
@@ -111,7 +219,6 @@
             return;
         }
 
-        // Reset UI before new upload (but keep the file)
         resetUI();
 
         const formData = new FormData();
@@ -304,7 +411,7 @@
                         <td>${escapeHtml(sugg.explanation)}</td>
                      </tr>`;
         }
-        html += `</tbody></table>`;
+        html += `</tbody></tr>`;
         if (report.unmatched_excel_sheets && report.unmatched_excel_sheets.length) {
             html += `<div class="alert alert-warning">⚠️ Unmatched Excel sheets: ${report.unmatched_excel_sheets.join(', ')}</div>`;
         }

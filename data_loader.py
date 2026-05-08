@@ -1,6 +1,10 @@
 import logging
+import json
 from typing import Dict, Any, List, Optional
-from db_storage import get_db_connection, generate_id
+from db_storage import (
+    get_db_connection, generate_id, add_relationship,
+    get_column_id_by_name, get_sheet_hash
+)
 
 try:
     from langfuse import observe
@@ -13,7 +17,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
 def get_data_rows(file_hash: str, sheet_name: str) -> List[Dict[str, Any]]:
+    """Retrieve data rows for a sheet as list of dicts (column_name -> value)."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT sheet_hash FROM sheets WHERE file_hash = ? AND sheet_name = ?", (file_hash, sheet_name))
@@ -42,6 +48,7 @@ def get_data_rows(file_hash: str, sheet_name: str) -> List[Dict[str, Any]]:
         rows_dict[row_num][col_name] = row["value"]
     return list(rows_dict.values())
 
+
 def get_or_create_source_table(name: str, description: Optional[str] = None, system_code: Optional[str] = None) -> str:
     if not name:
         raise ValueError("Source table name cannot be empty or None")
@@ -61,6 +68,7 @@ def get_or_create_source_table(name: str, description: Optional[str] = None, sys
     conn.close()
     return table_id
 
+
 def get_or_create_target_table(name: str, description: Optional[str] = None) -> str:
     if not name:
         raise ValueError("Target table name cannot be empty or None")
@@ -79,6 +87,7 @@ def get_or_create_target_table(name: str, description: Optional[str] = None) -> 
     conn.commit()
     conn.close()
     return table_id
+
 
 def insert_column_mapping(target_table_name: str, target_column: str,
                           source_table_name: str, source_column: Optional[str],
@@ -103,6 +112,7 @@ def insert_column_mapping(target_table_name: str, target_column: str,
     conn.close()
     return mapping_id
 
+
 def insert_addition(table_name: Optional[str], table_description: Optional[str],
                     source_tables_name: Optional[str], sql: Optional[str],
                     description: Optional[str]) -> str:
@@ -117,10 +127,15 @@ def insert_addition(table_name: Optional[str], table_description: Optional[str],
     conn.close()
     return add_id
 
+
 @observe()
 def load_data_from_similarity_report(file_hash: str, similarity_report: Dict[str, Any],
                                      include_medium: bool = True,
                                      min_similarity: str = "low") -> Dict[str, int]:
+    """
+    Load data into target tables based on the similarity report.
+    Creates graph relationships for every column mapping.
+    """
     similarity_rank = {"high": 3, "medium": 2, "low": 1}
     min_rank = similarity_rank.get(min_similarity, 0)
 
@@ -146,12 +161,10 @@ def load_data_from_similarity_report(file_hash: str, similarity_report: Dict[str
         required_cols = {
             "source_tables": ["name"],
             "target_tables": ["name"],
-            "column_mappings": ["target_table_name", "target_column", "source_table_name"],
+            "column_mappings": ["target_table_name", "target_column", "source_table_name", "source_column"],
             "additions": []
         }
         required = required_cols.get(target_table, [])
-
-        # Check if required columns are present in mapping
         missing = [col for col in required if col not in column_mapping]
         if missing:
             logger.warning(f"Skipping sheet '{sheet_name}' -> {target_table}: missing required columns {missing}. Mapping: {column_mapping}")
@@ -160,6 +173,12 @@ def load_data_from_similarity_report(file_hash: str, similarity_report: Dict[str
         rows = get_data_rows(file_hash, sheet_name)
         if not rows:
             logger.info(f"No data rows for sheet '{sheet_name}'")
+            continue
+
+        # Get sheet_hash for lineage
+        sheet_hash = get_sheet_hash(file_hash, sheet_name)
+        if not sheet_hash:
+            logger.error(f"Cannot find sheet_hash for sheet '{sheet_name}' (file {file_hash})")
             continue
 
         count = 0
@@ -196,18 +215,34 @@ def load_data_from_similarity_report(file_hash: str, similarity_report: Dict[str
                     target_table_name_val = record.get("target_table_name")
                     target_column = record.get("target_column")
                     source_table_name_val = record.get("source_table_name")
+                    source_column = record.get("source_column")
                     if not target_table_name_val or not target_column or not source_table_name_val:
                         logger.warning(f"Sheet '{sheet_name}', row {row_idx}: skipping - missing required mapping fields")
                         continue
-                    insert_column_mapping(
+
+                    # Insert the column mapping
+                    mapping_id = insert_column_mapping(
                         target_table_name=target_table_name_val,
                         target_column=target_column,
                         source_table_name=source_table_name_val,
-                        source_column=record.get("source_column"),
+                        source_column=source_column,
                         transformation_rule=record.get("transformation_rule"),
                         data_type=record.get("data_type"),
                         is_primary_key=str(record.get("is_primary_key")).lower() in ('yes', 'true', '1', 'y', 'да')
                     )
+
+                    # Create graph edge: source column -> mapping
+                    if source_column:
+                        source_col_hash = get_column_id_by_name(sheet_hash, source_column)
+                        if source_col_hash:
+                            metadata = {"transformation": record.get("transformation_rule", "direct")}
+                            add_relationship(source_col_hash, mapping_id, "MAPS_TO", json.dumps(metadata))
+                            logger.debug(f"Created MAPS_TO relationship: {source_column} -> {target_column}")
+                        else:
+                            logger.warning(f"Source column hash not found for '{source_column}' in sheet '{sheet_name}' (sheet_hash={sheet_hash})")
+                    else:
+                        logger.warning(f"No source_column for mapping row {row_idx} in sheet '{sheet_name}'")
+
                     count += 1
 
                 elif target_table == "additions":

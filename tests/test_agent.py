@@ -1,6 +1,13 @@
 import pytest
-from unittest.mock import patch
-from agent import get_header_decision, get_model_name
+from unittest.mock import patch, MagicMock
+from agent import (
+    get_header_decision,
+    get_model_name,
+    agent_chat,
+    _extract_tool_input_dict,
+    _extract_final_answer,
+    safe_extract_json,
+)
 
 
 @pytest.fixture
@@ -68,3 +75,65 @@ def test_get_model_name():
     name = get_model_name()
     assert isinstance(name, str)
     assert len(name) > 0
+
+
+def test_extract_tool_input_dict_nested_json():
+    text = """Thought: call tool
+Action: dummy_tool
+Action Input: {"config": {"a": 1, "b": {"c": 2}}, "flag": true}
+"""
+    parsed = _extract_tool_input_dict(text)
+    assert parsed == {"config": {"a": 1, "b": {"c": 2}}, "flag": True}
+
+
+def test_extract_final_answer():
+    text = "Thought: done\nFinal Answer:  **Hello**  \n"
+    assert _extract_final_answer(text) == "**Hello**"
+
+
+def test_safe_extract_json_from_fence():
+    raw = 'Here:\n```json\n{"a": 1}\n```\n'
+    assert safe_extract_json(raw) == '{"a": 1}'
+
+
+def test_safe_extract_json_braces_fallback():
+    raw = 'prefix {"x": true} trailing'
+    assert safe_extract_json(raw) == '{"x": true}'
+
+
+@patch("agent.giga")
+def test_agent_chat_nested_action_input_invokes_tool(mock_giga):
+    mock_tool = MagicMock(return_value={"result": "ok"})
+    r1 = MagicMock()
+    r1.choices[0].message.content = (
+        "Thought: test\n"
+        "Action: dummy_tool\n"
+        'Action Input: {"config": {"nested": {"x": 1}}}\n'
+    )
+    r2 = MagicMock()
+    r2.choices[0].message.content = "Final Answer: Done."
+    mock_giga.chat.side_effect = [r1, r2]
+
+    with patch.dict("agent.TOOL_FUNCTIONS", {"dummy_tool": mock_tool}, clear=False):
+        out = agent_chat("run nested tool", max_steps=5)
+
+    assert out == "Done."
+    mock_tool.assert_called_once_with(config={"nested": {"x": 1}})
+
+
+@patch("agent.giga")
+def test_agent_chat_malformed_action_input_gets_observation(mock_giga):
+    r1 = MagicMock()
+    r1.choices[0].message.content = (
+        "Action: run_sql\nAction Input: {not valid json}\n"
+    )
+    r2 = MagicMock()
+    r2.choices[0].message.content = "Final Answer: Recovered."
+    mock_giga.chat.side_effect = [r1, r2]
+
+    mock_sql = MagicMock()
+    with patch.dict("agent.TOOL_FUNCTIONS", {"run_sql": mock_sql}, clear=False):
+        out = agent_chat("q", max_steps=5)
+
+    assert out == "Recovered."
+    mock_sql.assert_not_called()

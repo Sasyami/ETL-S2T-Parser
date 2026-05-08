@@ -4,10 +4,9 @@ import pandas as pd
 import numpy as np
 import json
 import datetime
-import hashlib
 from typing import List, Any, Dict
 from flask import Flask, request, jsonify, render_template
-from agent import get_header_decision, get_model_name
+from agent import get_header_decision, get_model_name, agent_chat
 from db_storage import init_db, store_excel_data, update_file_result_json, get_db_connection
 from summarizer_agent import summarize_file
 from schema_matcher import compare_with_target
@@ -521,6 +520,23 @@ def finalize_and_load():
     except Exception as e:
         logger.exception("Data loading failed")
         return jsonify({"error": f"Data loading failed: {str(e)}"}), 500
+
+# ============================================
+# NEW CHAT ENDPOINT FOR AI AGENT
+# ============================================
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Natural language query endpoint."""
+    data = request.get_json()
+    query = data.get("query")
+    if not query:
+        return jsonify({"error": "Missing query"}), 400
+    try:
+        answer = agent_chat(query)
+        return jsonify({"answer": answer}), 200
+    except Exception as e:
+        logger.exception("Chat agent failed")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)

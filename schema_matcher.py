@@ -2,7 +2,6 @@ import json
 import logging
 from typing import Dict, Any, List
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain_core.output_parsers import JsonOutputParser
 from agent import giga
 from gigachat.models import Chat, Messages, MessagesRole
 
@@ -37,6 +36,7 @@ TARGET_SCHEMA = {
     ]
 }
 
+
 def call_gigachat(prompt: str) -> str:
     """Call the authenticated GigaChat client with a plain string prompt."""
     messages = [
@@ -46,8 +46,49 @@ def call_gigachat(prompt: str) -> str:
     response = giga.chat(Chat(messages=messages))
     return response.choices[0].message.content.strip()
 
+
 # Wrap the function as a Runnable
 gigachat_runnable = RunnableLambda(call_gigachat)
+
+
+def _extract_json_payload(raw_text: str) -> str:
+    """Extract JSON payload from raw model response."""
+    if not raw_text:
+        return ""
+
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    first_obj = text.find("{")
+    first_arr = text.find("[")
+    starts = [i for i in (first_obj, first_arr) if i >= 0]
+    if not starts:
+        return text
+
+    start = min(starts)
+    end_obj = text.rfind("}")
+    end_arr = text.rfind("]")
+    end = max(end_obj, end_arr)
+    if end < start:
+        return text[start:]
+    return text[start:end + 1]
+
+
+def _parse_model_json(raw_text: str, expected_type: type):
+    payload = _extract_json_payload(raw_text)
+    parsed = json.loads(payload)
+    if not isinstance(parsed, expected_type):
+        raise ValueError(
+            f"Unexpected JSON type: expected {expected_type.__name__}, got {type(parsed).__name__}"
+        )
+    return parsed
+
 
 # ---------- Sheet Matching Chain ----------
 def build_sheet_matching_prompt(excel_sheets: str, target_tables: str) -> str:
@@ -75,12 +116,13 @@ Target schema tables:
 ]
 """
 
+
 sheet_matching_chain = (
-    RunnablePassthrough()  # passes a dict with keys "excel_sheets" and "target_tables"
-    | (lambda x: build_sheet_matching_prompt(x["excel_sheets"], x["target_tables"]))
-    | gigachat_runnable
-    | JsonOutputParser()
+        RunnablePassthrough()
+        | (lambda x: build_sheet_matching_prompt(x["excel_sheets"], x["target_tables"]))
+        | gigachat_runnable
 )
+
 
 def match_sheets_to_tables(excel_json: Dict[str, Any]) -> List[Dict[str, Any]]:
     try:
@@ -105,15 +147,17 @@ def match_sheets_to_tables(excel_json: Dict[str, Any]) -> List[Dict[str, Any]]:
         excel_sheets_str = json.dumps(sheets_data, ensure_ascii=False, indent=2)
         target_tables_str = json.dumps(target_tables, ensure_ascii=False, indent=2)
 
-        result = sheet_matching_chain.invoke({
+        raw_result = sheet_matching_chain.invoke({
             "excel_sheets": excel_sheets_str,
             "target_tables": target_tables_str
         })
+        result = _parse_model_json(raw_result, list)
         logger.info("Sheet matching completed via LCEL")
         return result
     except Exception as e:
-        logger.error(f"Sheet matching failed: {e}")
+        logger.exception(f"Sheet matching failed: {e}")
         return []
+
 
 # ---------- Column Mapping Chain ----------
 def build_column_mapping_prompt(target_table: str, target_columns: List[str],
@@ -134,17 +178,20 @@ def build_column_mapping_prompt(target_table: str, target_columns: List[str],
 }}
 """
 
+
 column_mapping_chain = (
-    RunnablePassthrough()
-    | (lambda x: build_column_mapping_prompt(
-        x["target_table"], x["target_columns"],
-        x["sheet_name"], x["excel_columns"]
-      ))
-    | gigachat_runnable
-    | JsonOutputParser()
+        RunnablePassthrough()
+        | (lambda x: build_column_mapping_prompt(
+    x["target_table"], x["target_columns"],
+    x["sheet_name"], x["excel_columns"]
+))
+        | gigachat_runnable
 )
 
+
 def map_columns_for_table(excel_json: Dict[str, Any], sheet_name: str, target_table_name: str) -> Dict[str, Any]:
+    target_columns: List[str] = []
+    excel_columns: List[str] = []
     try:
         sheet = None
         for s in excel_json.get("sheets", []):
@@ -159,19 +206,19 @@ def map_columns_for_table(excel_json: Dict[str, Any], sheet_name: str, target_ta
             return {"error": f"Target table '{target_table_name}' not found", "mapping": {}, "similarity": "low"}
 
         target_columns = target_table["columns"]
-        excel_columns = []
         for col in sheet.get("columns", []):
             if isinstance(col, list):
                 excel_columns.append(" > ".join(str(c) for c in col if c))
             else:
                 excel_columns.append(str(col))
 
-        result = column_mapping_chain.invoke({
+        raw_result = column_mapping_chain.invoke({
             "target_table": target_table_name,
             "target_columns": target_columns,
             "sheet_name": sheet_name,
             "excel_columns": excel_columns[:30]
         })
+        result = _parse_model_json(raw_result, dict)
         logger.info(f"Column mapping completed for {sheet_name} -> {target_table_name}")
         if "mapping" not in result:
             result["mapping"] = {}
@@ -179,7 +226,7 @@ def map_columns_for_table(excel_json: Dict[str, Any], sheet_name: str, target_ta
             result["similarity"] = "low"
         return result
     except Exception as e:
-        logger.error(f"Column mapping failed for {target_table_name}: {e}")
+        logger.exception(f"Column mapping failed for {target_table_name}: {e}")
         # Fallback: simple substring match
         mapping = {}
         for tcol in target_columns:
@@ -189,8 +236,51 @@ def map_columns_for_table(excel_json: Dict[str, Any], sheet_name: str, target_ta
                     break
         return {"mapping": mapping, "similarity": "low", "error": str(e)}
 
+
+# ---------- Helper to create graph edges from column mappings ----------
+def create_graph_edges_from_mapping(file_hash: str, sheet_name: str, target_table_name: str,
+                                    column_mapping: Dict[str, str]) -> None:
+    """Create relationships in the graph for each column mapping."""
+    try:
+        from db_storage import get_db_connection, add_relationship
+        from db_storage import get_column_id_by_name, get_target_column_id
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT sheet_hash FROM sheets WHERE file_hash = ? AND sheet_name = ?", (file_hash, sheet_name))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            logger.warning(f"Cannot find sheet_hash for {file_hash}/{sheet_name}")
+            return
+        sheet_hash = row["sheet_hash"]
+
+        for target_col, source_col in column_mapping.items():
+            if not source_col:
+                logger.warning(f"Empty source column for target '{target_col}', skipping")
+                continue
+            source_col_id = get_column_id_by_name(sheet_hash, source_col)
+            if not source_col_id:
+                logger.warning(f"Source column '{source_col}' not found in DB")
+                continue
+            target_col_id = get_target_column_id(target_table_name, target_col)
+            if not target_col_id:
+                logger.warning(f"Cannot build target column id for '{target_table_name}.{target_col}'")
+                continue
+            add_relationship(source_col_id, target_col_id, "MAPS_TO",
+                             metadata=json.dumps({"transformation": "direct"}))
+            add_relationship(target_col_id, source_col_id, "DERIVED_FROM")
+            logger.debug(f"Created edge: {source_col_id} -> {target_col_id} (MAPS_TO)")
+    except Exception as e:
+        logger.error(f"Failed to create graph edges: {e}")
+
+
 # ---------- Main Comparison ----------
-def compare_with_target(excel_json: Dict[str, Any]) -> Dict[str, Any]:
+def compare_with_target(excel_json: Dict[str, Any], file_hash: str = None) -> Dict[str, Any]:
+    """Match Excel sheets to target schema and optionally create graph edges."""
+    if file_hash is None:
+        file_hash = excel_json.get("file_hash")
+
     sheet_matches = match_sheets_to_tables(excel_json)
     mapping_suggestions = []
     for match in sheet_matches:
@@ -205,6 +295,12 @@ def compare_with_target(excel_json: Dict[str, Any]) -> Dict[str, Any]:
                 "column_mapping": column_mapping.get("mapping", {}),
                 "mapping_similarity": column_mapping.get("similarity", "low")
             })
+            # Create graph edges if file_hash is available and mapping is not empty
+            if file_hash and column_mapping.get("mapping"):
+                create_graph_edges_from_mapping(
+                    file_hash, match["sheet_name"], target_table,
+                    column_mapping["mapping"]
+                )
         else:
             mapping_suggestions.append({
                 "excel_sheet": match["sheet_name"],
@@ -215,7 +311,8 @@ def compare_with_target(excel_json: Dict[str, Any]) -> Dict[str, Any]:
             })
 
     score_map = {"high": 3, "medium": 2, "low": 1, "none": 0}
-    total = sum(score_map.get(m["similarity"], 0) for m in mapping_suggestions)
+    # Prefer column-level confidence where available.
+    total = sum(score_map.get(m.get("mapping_similarity", m["similarity"]), 0) for m in mapping_suggestions)
     count = len([m for m in mapping_suggestions if m["target_table"]])
     avg_score = (total / (count * 3) * 100) if count > 0 else 0
 
