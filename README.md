@@ -1,90 +1,202 @@
-
-# ETL S2T Parser – AI‑Powered Excel Metadata Extractor
+# ETL S2T Parser – AI-Powered Excel Metadata Extractor
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Flask](https://img.shields.io/badge/Flask-2.3.3-green.svg)](https://flask.palletsprojects.com/)
+[![Flask](https://img.shields.io/badge/Flask-3.x-green.svg)](https://flask.palletsprojects.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**ETL S2T Parser** is an intelligent tool that extracts structured metadata from Excel files containing Source‑to‑Target (S2T) mappings, ETL rules, data dictionaries, or any tabular specifications. It uses GigaChat (LLM) to automatically detect column headers (even with merged cells, multi‑level headers, or long descriptions) and provides a web interface for human correction. The extracted data is stored in SQLite, and a business‑focused summary (in Russian) is generated.
+**ETL S2T Parser** helps analysts work with messy Excel files that describe Source-to-Target (S2T) mappings, ETL rules, and data dictionaries. It uses **GigaChat** to infer where column headers start (including merged cells and multi-level headers), exposes a **Flask** web UI for corrections, persists structure and sample rows in **SQLite**, and can **match** sheets to a target schema and **load** mappings into graph-friendly tables. A multi-step pipeline also generates a **Russian business summary** of each upload.
 
 ---
 
-## ✨ Key Features
+## What the system does
 
-- **AI‑driven header detection** – Identifies which rows contain column headers, handles merged cells, skips long descriptive rows.
-- **Multi‑sheet support** – Processes all sheets, skips empty/irrelevant ones.
-- **Human correction UI** – Override AI decisions per sheet (first row only, second row only, both concatenated). Real‑time header preview.
-- **Business summary generation** – Multi‑step LLM pipeline produces a concise Russian description of the file’s domain, entities, and transformation logic.
-- **SQLite storage** – Stores file metadata, sheet structures, column headers (flat/nested), and sampled data rows.
-- **Schema matching** – Compares Excel structure to a target database schema (source_tables, target_tables, column_mappings, additions) and suggests mappings.
-- **Hash‑based deduplication** – Uses SHA256 (shortened) for IDs, lower‑cased for consistency.
-- **REST API** – Upload files, apply corrections, preview headers, retrieve summaries.
+1. **Parse** each sheet: preview rows, detect empty sheets, ask the LLM for header row span (or apply user overrides).
+2. **Normalize** headers into flat names (for example `Parent > Child`) and store up to thousands of data cells per sheet.
+3. **Summarize** the file in Russian using several LLM calls (structure, domain, final synthesis).
+4. **Optional:** run **schema matching** against a built-in target model and **finalize** high-confidence rows into `source_tables`, `target_tables`, `column_mappings`, and `additions`.
+5. **Optional:** **semantic search** over stored embeddings (`semantic_layer`) and a **chat** endpoint that runs a small ReAct-style tool loop (`agent_chat`).
 
----
+The diagram below shows the main runtime path from upload to storage.
 
-## 🏗 Architecture
-
+```mermaid
+flowchart LR
+  subgraph ui [Browser]
+    UI[Correction UI]
+  end
+ subgraph api [Flask app.py]
+    UP[/upload/]
+    AC[/apply_corrections/]
+    MS[/match_schema/]
+    FN[/finalize_and_load/]
+    CH[/chat/]
+  end
+ subgraph ai [GigaChat]
+    HDR[Header decision\nagent.py]
+    SUM[Summarizer chain\nsummarizer_agent.py]
+    SCH[Schema matcher\nschema_matcher.py]
+    AG[Chat + tools\nagent.py]
+  end
+ subgraph data [SQLite excel_data.db]
+    T1[files / sheets / columns / data]
+    T2[relationships / embeddings]
+    T3[target schema tables]
+  end
+  UI --> UP & AC
+  UP --> HDR --> T1
+  UP --> SUM --> T1
+  AC --> HDR --> T1
+  MS --> SCH --> UI
+  FN --> T3
+  CH --> AG --> T1 & T2 & T3
 ```
-Excel File → Flask API → Header Detection (GigaChat + LangGraph) → 
-Column & Data Extraction → SQLite Storage → Summary Generation → 
-Human Correction UI → Final JSON → Database Update
-```
-
-Main modules:
-
-| Module | Responsibility |
-|--------|----------------|
-| `app.py` | Flask web server, endpoints `/upload`, `/apply_corrections`, `/preview_headers`, `/summary/<hash>` |
-| `agent.py` | AI header decision using GigaChat and LangGraph |
-| `summarizer_agent.py` | Multi‑step business summary generation |
-| `db_storage.py` | SQLite schema, data persistence |
-| `schema_matcher_agent.py` | Compares Excel JSON with target relational schema |
-| `data_loader.py` | Inserts high/medium similarity data into target tables |
-| `helper.py` | Loads `skills.md` / `tools.md` for system prompts |
-| `templates/index.html` | Human correction interface |
 
 ---
 
-## 🚀 Installation
+## Architecture (modules)
+
+| Module | Role |
+|--------|------|
+| `app.py` | Flask app: upload, corrections, preview, summary, schema match, finalize, chat. |
+| `agent.py` | `get_header_decision()` (LLM + heuristics); `agent_chat()` (tool-calling loop). |
+| `summarizer_agent.py` | LCEL chain: fetch DB snapshot → extract schema → structural/domain text → synthesize → validate. |
+| `schema_matcher.py` | LangChain Runnable chains: sheet→table match, column mapping; `compare_with_target()`. |
+| `db_storage.py` | SQLite schema, migrations, `store_excel_data`, graph helpers, embedding table. |
+| `data_loader.py` | `load_data_from_similarity_report()` → target tables + `MAPS_TO` edges. |
+| `semantic_layer.py` | GigaChat embeddings, `similarity_search`, `store_embedding`. |
+| `load_skills_tools.py` | Loads `skills.md` / `tools.md`; registers SQL/lineage/list/similarity tools for the chat agent. |
+| `templates/index.html` | Upload and per-sheet correction UI. |
+
+**Design note:** Header detection is **not** LangGraph in the current codebase; the README previously mentioned LangGraph generically—`schema_matcher` and other parts use LangChain Runnables. Optional **Langfuse** tracing is wired where `observe` decorators exist.
+
+---
+
+## End-to-end upload sequence
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant F as Flask
+  participant G as GigaChat
+  participant D as SQLite
+  U->>F: POST /upload (xlsx)
+  F->>F: parse_excel_with_decisions
+  loop each sheet
+    F->>G: header structure (preview rows)
+    G-->>F: JSON header_start_row, header_rows, nested
+    F->>F: read headers + data rows
+  end
+  F->>D: store_excel_data
+  F->>G: summarize_file (chain)
+  G-->>F: Russian summary
+  F->>D: update_file_result_json
+  F-->>U: JSON + file_hash
+  opt corrections
+    U->>F: POST /apply_corrections
+    F->>D: re-store + new summary
+  end
+```
+
+---
+
+## Data model (conceptual)
+
+Files are keyed by **`file_hash`** (MD5 of raw file bytes). Each non-skipped sheet gets a deterministic **`sheet_hash`**. Columns and cell values reference `sheet_hash`.
+
+```mermaid
+erDiagram
+  files ||--o{ sheets : contains
+  sheets ||--o{ columns : has
+  sheets ||--o{ data : stores
+  columns ||--o{ relationships : from_id_to_id
+  files {
+    text file_hash PK
+    text filename
+    text upload_time
+    text result_json
+    text summary
+  }
+  sheets {
+    text sheet_hash PK
+    text file_hash FK
+    text sheet_name
+    int header_start_row
+    int header_rows_count
+  }
+  columns {
+    text column_hash PK
+    text sheet_hash FK
+    int column_index
+    text column_name_flat
+  }
+  data {
+    text id PK
+    text sheet_hash FK
+    int row_num
+    text column_hash FK
+    text value
+  }
+```
+
+**Target-side tables** (`source_tables`, `target_tables`, `column_mappings`, `additions`) hold normalized mapping metadata. **`relationships`** stores lineage edges (for example column → mapping).
+
+---
+
+## Summarizer pipeline
+
+```mermaid
+flowchart TB
+  A[fetch_file_data\nfrom SQLite] --> B[extract_schema\nLLM JSON]
+  B --> C[structural_summary\nLLM text]
+  C --> D[domain_summary\nLLM text]
+  D --> E[synthesize\none paragraph]
+  E --> F[validate\nentity mentions]
+```
+
+---
+
+## Chat agent and tools
+
+`/chat` runs **`agent_chat`**: the model is prompted to emit `Thought` / `Action` / `Action Input: { ... }` lines. The server parses JSON with a balanced decoder (nested objects supported), executes a function from `load_skills_tools.TOOL_FUNCTIONS`, and appends an `Observation` until the model answers or the step limit is reached.
+
+Registered tools include `run_sql`, `list_files`, `list_sheets`, `list_columns`, lineage helpers, and `similarity_search` (requires embedding API credentials and populated `embeddings` table).
+
+---
+
+## Installation
 
 ### Prerequisites
 
-- Python 3.12 or higher
-- `uv` (recommended) or `pip`
-- Access to GigaChat API (credentials)
+- Python **3.12+**
+- **uv** (recommended) or **pip**
+- **GigaChat** API access
 
-### Steps
+### Clone and install
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/Xpehutta/ETL-S2T-Parser.git
-   cd ETL-S2T-Parser
-   ```
+```bash
+git clone https://github.com/Xpehutta/ETL-S2T-Parser.git
+cd ETL-S2T-Parser
+uv sync
+# or: pip install -e .
+```
 
-2. **Install dependencies**
-   ```bash
-   uv sync
-   # or
-   pip install -r requirements.txt
-   ```
+### Run
 
-3. **Create a `.env` file** (see [Configuration](#-configuration))
+```bash
+uv run python app.py
+# or: make run
+```
 
-4. **Run the application**
-   ```bash
-   uv run python app.py
-   ```
-
-5. **Open your browser** at `http://127.0.0.1:5000`
+Open **http://127.0.0.1:5000**.
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
-Create a `.env` file in the project root:
+Create a **`.env`** in the project root (never commit secrets):
 
 ```ini
-GIGACHAT_API_KEY=your_api_key_here
+# Required for LLM calls (agent, summarizer, schema matcher, header decision)
+GIGACHAT_API_KEY=your_key
 GIGACHAT_API_URL=https://gigachat.devices.sberbank.ru/api/v1
 GIGACHAT_VERIFY_SSL=false
 GIGACHAT_SCOPE=GIGACHAT_API_PERS
@@ -92,92 +204,94 @@ MODEL=GigaChat-Pro
 GIGACHAT_TIMEOUT=120
 ```
 
-| Variable | Description |
-|----------|-------------|
-| `GIGACHAT_API_KEY` | Your GigaChat API key |
-| `GIGACHAT_API_URL` | GigaChat endpoint URL |
-| `VERIFY_SSL` | Disable SSL verification if behind corporate proxy |
-| `SCOPE` | API scope (default `GIGACHAT_API_PERS`) |
-| `MODEL` | Model name (`GigaChat-Pro` or `GigaChat-Max`) |
-| `TIMEOUT` | Request timeout in seconds |
+**Embeddings** (`semantic_layer.py`, used by similarity tools) also read `GIGACHAT_API_KEY` or `GIGACHAT_EMBEDDINGS_CREDENTIALS`. If embeddings are not used, you still need chat credentials to start imports that load `semantic_layer` indirectly (for example via tool imports in some code paths).
+
+| Variable | Purpose |
+|----------|---------|
+| `GIGACHAT_API_KEY` | Primary credential for GigaChat |
+| `GIGACHAT_EMBEDDINGS_CREDENTIALS` | Alternative credential label for embeddings |
+| `GIGACHAT_API_URL` | API base URL |
+| `GIGACHAT_VERIFY_SSL` | `true` / `false` |
+| `GIGACHAT_SCOPE` | OAuth scope |
+| `MODEL` | Chat model id |
+| `GIGACHAT_TIMEOUT` | HTTP timeout (seconds) |
+
+Optional **Langfuse** tracing: install `langfuse` and configure `langfuse_setup.py` / environment as in your deployment.
 
 ---
 
-## 📖 Usage
+## API reference
 
-### Web Interface
+| Method | Path | Body / params | Description |
+|--------|------|----------------|-------------|
+| `GET` | `/` | — | Web UI |
+| `POST` | `/upload` | `multipart/form-data` file | Parse Excel, store DB rows, return JSON + `file_hash` |
+| `POST` | `/apply_corrections` | JSON: `file_hash`, `corrections[]` | Re-parse with overrides; file bytes must still be in server cache |
+| `POST` | `/preview_headers` | JSON: `file_hash`, `sheet_name`, `option` | Header preview for UI |
+| `GET` | `/summary/<file_hash>` | — | Stored or on-demand summary |
+| `POST` | `/match_schema` | JSON: same shape as `/upload` response | LLM sheet/table + column mapping report |
+| `POST` | `/finalize_and_load` | JSON: `file_hash`, optional `similarity_report` | Load mappings into target tables |
+| `POST` | `/chat` | JSON: `query` | Tool-using agent answer |
 
-1. **Upload an Excel file** – click “Upload & Analyze”.
-2. **Review AI decisions** – for each sheet, see the detected header rows and a data preview.
-3. **Correct if needed** – choose a different header option or skip the sheet. Header preview updates instantly.
-4. **Apply corrections** – click “OK – Apply Corrections”. The final JSON is stored in the database and displayed.
+**Upload response (conceptual):** `filename`, `model_used`, `file_hash`, `summary`, `sheets[]` with `ai_decision`, `columns`, previews, and `skipped` / `skip_reason` where applicable.
 
-### API Endpoints
+---
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/upload` | Upload Excel file, returns JSON with `file_hash`, `summary`, `sheets` |
-| `POST` | `/apply_corrections` | Apply user corrections (JSON body with `file_hash` and `corrections` list) |
-| `POST` | `/preview_headers` | Preview column headers for a given sheet and option (used by UI) |
-| `GET`  | `/summary/<file_hash>` | Retrieve the generated business summary |
+## Web workflow
 
-### Example `/upload` response (abbreviated)
+1. **Upload** an `.xlsx` / `.xls` / `.xlsm` file.
+2. Review per-sheet **AI header** choices and data preview.
+3. Adjust options or skip sheets; **preview headers** updates live.
+4. **Apply corrections** to refresh the DB and summary.
+5. Optionally run **schema match** and **finalize** from the UI/API when integrated.
 
-```json
-{
-  "filename": "S2T-700-КЮЛ_v5.xlsx",
-  "model_used": "GigaChat-Pro",
-  "file_hash": "a1b2c3...",
-  "summary": "Данный файл представляет собой спецификацию маппинга...",
-  "sheets": [
-    {
-      "sheet_name": "S2T",
-      "skipped": false,
-      "ai_decision": {
-        "header_start_row": 0,
-        "header_rows_count": 2,
-        "nested_structure": true
-      },
-      "columns": [["Приемник данных", "Предметная область модели"], ...],
-      "first_data_rows_preview": [...]
-    }
-  ]
-}
+---
+
+## Database files
+
+- Default path: **`excel_data.db`** in the working directory (configurable in code via `db_storage.DB_PATH`).
+- Tables: `files`, `sheets`, `columns`, `data`, `relationships`, `embeddings`, plus target schema tables listed above.
+
+---
+
+## Tests
+
+```bash
+export GIGACHAT_API_KEY=dummy   # required for imports that load GigaChat clients
+pytest tests/ -q
+# or: make test
+```
+
+Coverage:
+
+```bash
+make test-cov
 ```
 
 ---
 
-## 🗄 Database Schema
+## Project layout (short)
 
-SQLite database (`excel_data.db`) is created automatically.
-
-### Core tables
-
-- `files` – `file_hash`, `filename`, `upload_time`, `model_used`, `summary`, `result_json`
-- `sheets` – `sheet_hash`, `file_hash`, `sheet_name`, `header_start_row`, `header_rows_count`, `nested_structure`
-- `columns` – `column_hash`, `sheet_hash`, `column_index`, `column_header` (JSON), `column_name_flat`
-- `data` – `id`, `sheet_hash`, `column_hash`, `row_num`, `value`
-
-### Target tables (for loaded mappings)
-
-- `source_tables`, `target_tables`, `column_mappings`, `additions` – populated by `data_loader.py` based on similarity reports.
-
----
-
-## 🧠 AI Prompts & Skills
-
-The system uses `skills.md` and `tools.md` to provide structured context to GigaChat. These files are loaded by `helper.py` and injected into the system prompt of both `agent.py` and `summarizer_agent.py`. This improves consistency and reduces hallucinations.
-
-- **skills.md** – lists agent capabilities (header detection, schema matching, summarization, etc.)
-- **tools.md** – describes each available function with input/output specs and examples.
-
----
-
-
-## 🙏 Acknowledgements
-
-- [GigaChat](https://developers.sber.ru/portal/products/gigachat) for LLM capabilities
-- [LangGraph](https://langchain-ai.github.io/langgraph/) for agent orchestration
-- [Flask](https://flask.palletsprojects.com/) for the web framework
-- [Bootstrap](https://getbootstrap.com/) for the UI components
 ```
+├── app.py                 # Flask entrypoint
+├── agent.py               # Header LLM + chat agent
+├── summarizer_agent.py    # Summary LCEL chain
+├── schema_matcher.py      # Target-schema matching
+├── data_loader.py         # Load from similarity report
+├── db_storage.py          # SQLite layer
+├── semantic_layer.py      # Embeddings + similarity
+├── load_skills_tools.py   # skills/tools markdown + tool registry
+├── skills.md / tools.md   # Prompt and tool documentation
+├── templates/index.html
+├── tests/
+└── pyproject.toml         # Dependencies
+```
+
+---
+
+## Acknowledgements
+
+- [GigaChat](https://developers.sber.ru/portal/products/gigachat) for LLM APIs  
+- [LangChain](https://www.langchain.com/) / LangGraph ecosystem used in schema and summarizer code paths  
+- [Flask](https://flask.palletsprojects.com/) for the web layer  
+- [pandas](https://pandas.pydata.org/) / [openpyxl](https://openpyxl.readthedocs.io/) for Excel I/O  
