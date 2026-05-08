@@ -6,6 +6,24 @@ from typing import Any, List, Dict, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+SQLITE_MAPPING_SCHEMA_CHEATSHEET = """
+
+---
+
+## SQLite column names — use exactly this (avoid SQL errors)
+
+| Table | Columns (real names) |
+|-------|---------------------|
+| `target_tables` | `id`, `name`, `description` — **`name`**, NOT `table_name` |
+| `source_tables` | `id`, `name`, `description`, `system_code` — **`name`**, NOT `table_name` |
+| `column_mappings` | `id`, `target_table_id`, **`target_column`**, `source_table_id`, **`source_column`**, `transformation_rule`, `data_type`, `is_primary_key` — NOT `target_column_name` |
+| `additions` | `id`, `table_name`, `table_description`, `source_tables_name`, `sql`, `description` |
+
+Join pattern: `column_mappings cm` → `JOIN target_tables tt ON cm.target_table_id = tt.id` and select **`tt.name`** as the logical target table title.
+
+"""
+
+
 # ============================================
 # MARKDOWN LOADERS (unchanged)
 # ============================================
@@ -18,12 +36,13 @@ def load_skills() -> str:
         return ""
 
 def load_tools() -> str:
-    """Load tools.md from the project root."""
+    """Load tools.md plus mandatory SQLite naming hints agents often get wrong."""
     try:
         with open("tools.md", "r", encoding="utf-8") as f:
-            return f.read()
+            body = f.read()
     except FileNotFoundError:
-        return ""
+        body = ""
+    return body + SQLITE_MAPPING_SCHEMA_CHEATSHEET
 
 # ============================================
 # TOOL IMPLEMENTATIONS

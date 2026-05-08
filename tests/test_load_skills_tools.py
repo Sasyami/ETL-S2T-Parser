@@ -5,6 +5,15 @@ import db_storage
 from db_storage import init_db, get_db_connection
 
 
+def test_load_tools_appends_sqlite_mapping_cheatsheet():
+    from load_skills_tools import load_tools
+
+    text = load_tools()
+    assert "target_tables" in text
+    assert "NOT `target_column_name`" in text or "NOT `table_name`" in text
+    assert "`name`" in text
+
+
 @pytest.fixture(autouse=True)
 def _temp_db_path():
     original = db_storage.DB_PATH
