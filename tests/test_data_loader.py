@@ -214,3 +214,65 @@ def test_insert_column_mapping_and_load_report(sample_excel_bytes):
     n = cur.fetchone()["n"]
     conn.close()
     assert n >= 1
+
+
+def test_load_column_mapping_persists_description(sample_excel_bytes):
+    """column_description populated from mapped Excel columns (e.g. description)."""
+    from db_storage import get_db_connection
+
+    sheets_info = [
+        {
+            "sheet_name": "Map",
+            "skipped": False,
+            "ai_decision": {
+                "header_start_row": 0,
+                "header_rows_count": 1,
+                "nested_structure": False,
+            },
+            "columns": [
+                "target_table_name",
+                "target_column",
+                "description",
+                "source_table_name",
+                "source_column",
+            ],
+        }
+    ]
+    data_rows = {
+        "Map": [
+            ["t_cat", "col_a", "Business meaning A", "src1", "excel_col"],
+        ]
+    }
+    fh = store_excel_data(
+        sample_excel_bytes, "desc.xlsx", "model", sheets_info, data_rows
+    )
+    report = {
+        "mapping_suggestions": [
+            {
+                "target_table": "column_mappings",
+                "excel_sheet": "Map",
+                "similarity": "high",
+                "column_mapping": {
+                    "target_table_name": "target_table_name",
+                    "target_column": "target_column",
+                    "description": "description",
+                    "source_table_name": "source_table_name",
+                    "source_column": "source_column",
+                },
+            }
+        ]
+    }
+    counts = load_data_from_similarity_report(
+        fh, report, include_medium=True, min_similarity="low"
+    )
+    assert counts.get("column_mappings", 0) >= 1
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT column_description FROM column_mappings WHERE target_column = ?",
+        ("col_a",),
+    )
+    row = cur.fetchone()
+    conn.close()
+    assert row and row["column_description"] == "Business meaning A"

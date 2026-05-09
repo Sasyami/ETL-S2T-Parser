@@ -12,6 +12,7 @@ from load_skills_tools import (
     load_skills,
     load_tools,
     try_answer_sheets_for_workbook_query,
+    try_answer_target_table_fields_query,
     try_answer_target_table_for_mapping_identifier,
     user_wants_stored_file_inventory,
 )
@@ -279,6 +280,9 @@ def agent_chat(user_query: str, max_steps: int = 5) -> str:
     tgt_ans = try_answer_target_table_for_mapping_identifier(stripped)
     if tgt_ans is not None:
         return tgt_ans
+    fields_ans = try_answer_target_table_fields_query(stripped)
+    if fields_ans is not None:
+        return fields_ans
     system_prompt = f"""You are a data intelligence assistant. You have access to the following tools:
 
 {TOOLS_DESCRIPTION}
@@ -293,8 +297,8 @@ Observation: result from tool
 Final Answer: your concise answer to the user
 
 Always use tools to answer questions about data lineage, similarity, files, sheets, columns, or S2T mapping facts.
-SQLite `column_mappings` has `target_column` and `source_column` (there is **no** `target_column_name`). Prefer **`search_column_mappings`** when looking for a substring in mappings.
-Never tell the user to run PRAGMA or SQL manually — call **`run_sql`** yourself (`SELECT`, or **`PRAGMA table_info(tab)`**).
+Logical target names (`t_*`) do not imply a SQLite physical table: use **`list_target_table_columns`** for field lists.
+Never tell the user to run PRAGMA or SQL manually — call **`run_sql`** yourself for real SQLite tables (`SELECT`, **`PRAGMA table_info(tab)`**). For **`t_*` logical target names**, use **`list_target_table_columns`**, not `PRAGMA` on that identifier.
 Never invent filenames or hashes: for any full list of uploads, call `list_files` with `Action Input: {{}}` and report only Observation data.
 If a tool requires a column ID, first use similarity_search or list_columns to find it.
 If a tool returns an error, try a different approach or explain the issue to the user.

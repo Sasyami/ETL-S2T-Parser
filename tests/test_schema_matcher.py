@@ -61,7 +61,7 @@ def test_target_schema_structure():
     # Check column_mappings has required columns
     col_mappings = next(t for t in TARGET_SCHEMA["tables"] if t["name"] == "column_mappings")
     expected_cols = [
-        "target_table_name", "target_column", "source_table_name",
+        "target_table_name", "target_column", "target_column_description", "source_table_name",
         "source_column", "transformation_rule", "data_type", "is_primary_key"
     ]
     for col in expected_cols:

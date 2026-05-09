@@ -2,7 +2,7 @@ import os
 import re
 import json
 import logging
-from typing import Any, List, Dict, Callable, Optional
+from typing import Any, List, Dict, Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +16,10 @@ SQLITE_MAPPING_SCHEMA_CHEATSHEET = """
 |-------|---------------------|
 | `target_tables` | `id`, `name`, `description` — **`name`**, NOT `table_name` |
 | `source_tables` | `id`, `name`, `description`, `system_code` — **`name`**, NOT `table_name` |
-| `column_mappings` | `id`, `target_table_id`, **`target_column`**, `source_table_id`, **`source_column`**, `transformation_rule`, `data_type`, `is_primary_key` — NOT `target_column_name` |
+| `column_mappings` | `id`, `target_table_id`, **`target_column`**, **`column_description`** (catalog text), `source_table_id`, **`source_column`**, `transformation_rule`, `data_type`, `is_primary_key` — NOT `target_column_name` |
 | `additions` | `id`, `table_name`, `table_description`, `source_tables_name`, `sql`, `description` |
+
+**Logical target models** (names like `t_agr_frame`) are **not** separate SQLite tables: their fields appear as rows in **`column_mappings`** (`target_column`). Use tool **`list_target_table_columns`** instead of `PRAGMA t_agr_frame`.
 
 Join pattern: `column_mappings cm` → `JOIN target_tables tt ON cm.target_table_id = tt.id` and select **`tt.name`** as the logical target table title.
 
@@ -383,6 +385,7 @@ def search_column_mappings(needle: str, limit: int = 50) -> Any:
                 cm.source_column,
                 cm.transformation_rule,
                 cm.data_type,
+                cm.column_description,
                 tt.name AS target_table_name,
                 st.name AS source_table_name
             FROM column_mappings cm
@@ -395,10 +398,11 @@ def search_column_mappings(needle: str, limit: int = 50) -> Any:
                OR cm.id LIKE ?
                OR IFNULL(tt.name, '') LIKE ?
                OR IFNULL(st.name, '') LIKE ?
+               OR IFNULL(cm.column_description, '') LIKE ?
             ORDER BY cm.target_table_id, cm.target_column
             LIMIT ?
             """,
-            (pat, pat, pat, pat, pat, pat, pat, lim),
+            (pat, pat, pat, pat, pat, pat, pat, pat, lim),
         )
         return [dict(row) for row in cursor.fetchall()]
     finally:
@@ -406,6 +410,268 @@ def search_column_mappings(needle: str, limit: int = 50) -> Any:
 
 
 register_tool("search_column_mappings", search_column_mappings)
+
+
+def list_target_table_columns(table_identifier: str) -> Dict[str, Any]:
+    """
+    Logical target catalog: list column_mappings rows for a target table id or name.
+    There is no SQLite table per logical name (e.g. t_agr_frame); fields are target_column values.
+    """
+    from db_storage import get_db_connection
+
+    raw = (table_identifier or "").strip()
+    if not raw:
+        return {"error": "empty table_identifier"}
+    if len(raw) > 200:
+        return {"error": "table_identifier too long"}
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """SELECT id, name, description FROM target_tables
+               WHERE id = ? OR lower(id) = lower(?)
+                  OR lower(name) = lower(?)""",
+            (raw, raw, raw),
+        )
+        tt = [dict(r) for r in cursor.fetchall()]
+        ids: List[str] = []
+        for r in tt:
+            if r["id"] and r["id"] not in ids:
+                ids.append(r["id"])
+        if not ids:
+            cursor.execute(
+                """SELECT DISTINCT target_table_id FROM column_mappings
+                   WHERE target_table_id = ? OR lower(target_table_id) = lower(?)""",
+                (raw, raw),
+            )
+            ids = [
+                row["target_table_id"]
+                for row in cursor.fetchall()
+                if row["target_table_id"]
+            ]
+        if not ids:
+            return {
+                "error": (
+                    f"No row for «{raw}» in target_tables and no column_mappings "
+                    f"with target_table_id matching that id/name."
+                ),
+                "table_identifier": raw,
+                "hint": (
+                    "Names like t_agr_frame are logical target tables: metadata lives in "
+                    "`target_tables` (id, name) and field list in `column_mappings.target_column`. "
+                    "They are not separate SQLite tables — do not use PRAGMA on t_agr_frame."
+                ),
+            }
+
+        if not tt:
+            ph = ",".join("?" * len(ids))
+            cursor.execute(
+                f"SELECT id, name, description FROM target_tables WHERE id IN ({ph})",
+                ids,
+            )
+            tt = [dict(r) for r in cursor.fetchall()]
+
+        ph2 = ",".join("?" * len(ids))
+        cursor.execute(
+            f"""
+            SELECT id AS mapping_id, target_table_id, target_column, data_type,
+                   is_primary_key, source_table_id, source_column, transformation_rule,
+                   column_description
+            FROM column_mappings
+            WHERE target_table_id IN ({ph2})
+            ORDER BY target_column
+            """,
+            ids,
+        )
+        cols = [dict(r) for r in cursor.fetchall()]
+        return {
+            "table_identifier_query": raw,
+            "target_tables": tt,
+            "columns": cols,
+            "column_count": len(cols),
+            "note": (
+                "Logical fields = values in column_mappings.target_column for this target_table_id."
+            ),
+        }
+    finally:
+        conn.close()
+
+
+register_tool("list_target_table_columns", list_target_table_columns)
+
+
+def extract_target_table_identifier_from_fields_query(query: str) -> Optional[str]:
+    q = (query or "").strip()
+    if not q:
+        return None
+    m = re.search(r"`([A-Za-z][A-Za-z0-9_]*)`", q)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?i)\bтаблиц[а-яё]+\s+([A-Za-z][A-Za-z0-9_]*)\b", q)
+    if m:
+        return m.group(1)
+    m = re.search(
+        r"(?i)\b(?:у|для)\s+таблиц[а-яё]+\s+([A-Za-z][A-Za-z0-9_]*)\b",
+        q,
+    )
+    if m:
+        return m.group(1)
+    m = re.search(r"(?i)\btable\s+([A-Za-z][A-Za-z0-9_]*)\b", q)
+    if m:
+        return m.group(1)
+    return None
+
+
+def user_wants_logical_target_table_fields(query: str) -> bool:
+    q = (query or "").strip()
+    if not q:
+        return False
+    ru_list = bool(
+        re.search(r"(?i)\b(поля|полей|колонки|структур[аы]?|атрибуты)\b", q)
+    ) and bool(re.search(r"(?i)\bтаблиц", q))
+    ru_desc = bool(re.search(r"(?i)\bописани", q)) and bool(
+        re.search(r"(?i)\b(полей|поля|колонок|колонки|столбц)\b", q)
+    ) and bool(re.search(r"(?i)\bтаблиц", q))
+    en_list = bool(re.search(r"(?i)\b(columns|fields|attributes)\b", q)) and bool(
+        re.search(r"(?i)\btable\b", q)
+    )
+    en_desc = bool(re.search(r"(?i)\bdescriptions?\b", q)) and bool(
+        re.search(r"(?i)\b(columns|fields)\b", q)
+    ) and bool(re.search(r"(?i)\btable\b", q))
+    if not (ru_list or ru_desc or en_list or en_desc):
+        return False
+    return extract_target_table_identifier_from_fields_query(q) is not None
+
+
+def _markdown_table_cell(value: Any, max_len: int = 400) -> str:
+    if value is None:
+        return ""
+    s = str(value).replace("\n", " ").replace("|", "\\|").strip()
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
+
+
+def _aggregate_catalog_columns(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Merge multiple column_mappings rows that share target_column into one displayed row.
+    Duplicate mapping_ids usually differ by source_* or reload history.
+    """
+    from collections import OrderedDict
+
+    groups: OrderedDict[str, List[Dict[str, Any]]] = OrderedDict()
+    for r in rows:
+        tc = str(r.get("target_column") or "")
+        if tc not in groups:
+            groups[tc] = []
+        groups[tc].append(r)
+
+    merged_note = any(len(gr) > 1 for gr in groups.values())
+
+    agg: List[Dict[str, Any]] = []
+    for tc, grp in groups.items():
+        descriptions = []
+        for g in grp:
+            cd = g.get("column_description")
+            if cd and str(cd).strip() and str(cd).strip() not in descriptions:
+                descriptions.append(str(cd).strip())
+        srcs = []
+        for g in grp:
+            sc = g.get("source_column")
+            if sc and str(sc).strip() and str(sc).strip() not in srcs:
+                srcs.append(str(sc).strip())
+        trans = []
+        for g in grp:
+            tr = g.get("transformation_rule")
+            if tr and str(tr).strip() and str(tr).strip() not in trans:
+                trans.append(str(tr).strip())
+        pkv = [g.get("is_primary_key") for g in grp]
+        pk_show = pkv[0] if len({repr(x) for x in pkv}) == 1 else "…"
+
+        dts_uniq = []
+        for g in grp:
+            dt = str(g.get("data_type") or "").strip()
+            if dt and dt not in dts_uniq:
+                dts_uniq.append(dt)
+        dt_show = dts_uniq[0] if len(dts_uniq) == 1 else ", ".join(dts_uniq)
+
+        mids = ", ".join(f"`{g.get('mapping_id')}`" for g in grp)
+        agg.append(
+            {
+                "target_column": tc,
+                "column_description": " · ".join(descriptions),
+                "source_column": ", ".join(srcs),
+                "transformation_rule": "; ".join(trans),
+                "data_type": dt_show,
+                "is_primary_key": pk_show,
+                "mapping_id": mids,
+            }
+        )
+    return agg, merged_note
+
+
+def format_target_table_fields_answer(data: Dict[str, Any]) -> str:
+    if "error" in data:
+        body = (
+            f"**Нет данных по логической таблице `{data.get('table_identifier', '')}`** "
+            f"(в этой SQLite нет отдельной физической таблицы с таким именем).\n\n"
+            f"{data.get('error', '')}\n\n"
+            f"{data.get('hint', '')}"
+        )
+        return body + "\n\n```json\n" + json.dumps(data, ensure_ascii=False, indent=2) + "\n```"
+
+    cols = data.get("columns") or []
+    tt = data.get("target_tables") or []
+    raw = json.dumps(data, ensure_ascii=False, indent=2)
+    if not cols:
+        head = "**Целевая таблица найдена, но строк в column_mappings для неё нет** (поля каталога не загружены).\n\n"
+        return head + f"```json\n{raw}\n```"
+
+    display_rows, merged_any = _aggregate_catalog_columns(cols)
+
+    lines = []
+    if tt:
+        for r in tt:
+            lines.append(
+                f"- `target_tables`: id=`{r.get('id')}`, name=`{r.get('name')}`"
+            )
+    md = (
+        "**Поля целевой таблицы** (`column_mappings`). "
+        "Если **`column_description`** пуст, смотрите **`source_column`** и **`transformation_rule`**.\n\n"
+        "| target_column | column_description | source_column | transformation_rule | "
+        "data_type | PK | mapping_id |\n"
+        "|---|---|---|---|---|:---:|---|\n"
+    )
+    for r in display_rows:
+        pk = r.get("is_primary_key")
+        md += (
+            f"| `{r.get('target_column')}` | {_markdown_table_cell(r.get('column_description'))} | "
+            f"{_markdown_table_cell(r.get('source_column'))} | "
+            f"{_markdown_table_cell(r.get('transformation_rule'))} | "
+            f"{_markdown_table_cell(r.get('data_type'), 80)} | {pk} | {r.get('mapping_id', '')} |\n"
+        )
+    if merged_any:
+        md += (
+            "\n(*Несколько записей на одно `target_column` сведены в одну строку; несколько **`mapping_id`** — "
+            "разные строки источника или повторная загрузка. Полная детализация — в JSON ниже.)*\n"
+        )
+    md += "\n" + ("\n".join(lines) + "\n\n" if lines else "")
+    md += "```json\n" + raw + "\n```"
+    return md
+
+
+def try_answer_target_table_fields_query(query: str) -> Optional[str]:
+    q = (query or "").strip()
+    if not user_wants_logical_target_table_fields(q):
+        return None
+    tid = extract_target_table_identifier_from_fields_query(q)
+    if not tid:
+        return None
+    data = list_target_table_columns(tid)
+    return format_target_table_fields_answer(data)
 
 
 def extract_target_mapping_search_needle(query: str) -> Optional[str]:
@@ -475,13 +741,14 @@ def format_target_table_mapping_answer(needle: str) -> str:
         f"`target_tables`):\n\n"
         + "\n".join(bullets)
         + "\n\n**Matching rows:**\n\n"
-        "| target_table_name | target_table_id | target_column | source_column | mapping_id |\n"
-        "|---|---|---|---|---|\n"
+        "| target_table_name | target_table_id | target_column | column_description | source_column | mapping_id |\n"
+        "|---|---|---|---|---|---|\n"
     )
     for r in rows:
         md += (
             f"| {r.get('target_table_name') or ''} | `{r.get('target_table_id')}` | "
-            f"`{r.get('target_column')}` | `{r.get('source_column')}` | `{r.get('mapping_id')}` |\n"
+            f"`{r.get('target_column')}` | {_markdown_table_cell(r.get('column_description'))} | "
+            f"`{r.get('source_column')}` | `{r.get('mapping_id')}` |\n"
         )
     md += "\n```json\n" + raw + "\n```"
     return md

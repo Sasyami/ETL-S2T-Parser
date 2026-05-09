@@ -37,6 +37,35 @@ def _norm_col_key(s: str) -> str:
     return " ".join((s or "").split()).lower()
 
 
+def _mapping_column_description(record: Dict[str, Any]) -> Optional[str]:
+    """Business description for a target column (S2T catalog Excel)."""
+    priority = (
+        "target_column_description",
+        "column_description",
+        "description",
+        "comment",
+        "column_comment",
+        "назначение",
+        "описание целевого поля",
+        "описание назначения",
+        "описание целевого атрибута",
+        "Описание",
+        "описание",
+        "Комментарий",
+        "комментарий",
+        "Комментарий к полю назначения",
+        "комментарий к полю назначения",
+    )
+    for key in priority:
+        v = record.get(key)
+        if v is None:
+            continue
+        norm = _normalize_cell(v)
+        if isinstance(norm, str) and norm.strip():
+            return norm.strip()
+    return None
+
+
 def _row_value_for_excel_header(row: Dict[str, Any], header: Optional[Any]) -> Any:
     """
     Map similarity-report Excel column names to row dict keys.
@@ -165,7 +194,8 @@ def get_or_create_target_table(name: str, description: Optional[str] = None) -> 
 def insert_column_mapping(target_table_name: str, target_column: str,
                           source_table_name: str, source_column: Optional[str],
                           transformation_rule: Optional[str], data_type: Optional[str],
-                          is_primary_key: bool) -> str:
+                          is_primary_key: bool,
+                          column_description: Optional[str] = None) -> str:
     if not target_table_name or not target_column or not source_table_name:
         raise ValueError(f"Missing required fields: target_table_name='{target_table_name}', "
                          f"target_column='{target_column}', source_table_name='{source_table_name}'")
@@ -177,10 +207,11 @@ def insert_column_mapping(target_table_name: str, target_column: str,
     cursor.execute("""
         INSERT OR IGNORE INTO column_mappings
         (id, target_table_id, target_column, source_table_id, source_column,
-         transformation_rule, data_type, is_primary_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         transformation_rule, data_type, is_primary_key, column_description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (mapping_id, target_id, target_column, source_id, source_column,
-          transformation_rule, data_type, 1 if is_primary_key else 0))
+          transformation_rule, data_type, 1 if is_primary_key else 0,
+          column_description))
     conn.commit()
     conn.close()
     return mapping_id
@@ -319,7 +350,9 @@ def load_data_from_similarity_report(file_hash: str, similarity_report: Dict[str
                         source_column=source_column_val,
                         transformation_rule=record.get("transformation_rule"),
                         data_type=record.get("data_type"),
-                        is_primary_key=str(record.get("is_primary_key")).lower() in ('yes', 'true', '1', 'y', 'да')
+                        is_primary_key=str(record.get("is_primary_key")).lower()
+                        in ("yes", "true", "1", "y", "да"),
+                        column_description=_mapping_column_description(record),
                     )
 
                     # Lineage: resolve the *Excel column header* from the mapping, not the cell value.

@@ -114,3 +114,32 @@ def test_insights_target_table_identifier_short_cut(tmp_path):
         assert "TName" in out
     finally:
         db_storage.DB_PATH = orig
+
+
+def test_insights_russian_table_fields_short_cut(tmp_path):
+    import db_storage
+
+    orig = db_storage.DB_PATH
+    db_storage.DB_PATH = str(tmp_path / "agr.db")
+    try:
+        from db_storage import init_db, get_db_connection
+
+        init_db()
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO target_tables (id, name) VALUES ('t_agr_frame', 'A')"
+        )
+        conn.execute(
+            """INSERT INTO column_mappings
+            (id, target_table_id, target_column)
+            VALUES ('q1', 't_agr_frame', 'rate_id')"""
+        )
+        conn.commit()
+        conn.close()
+
+        from agents.insights_agent import insights_chat
+
+        out = insights_chat("дай поля таблицы t_agr_frame")
+        assert "rate_id" in out
+    finally:
+        db_storage.DB_PATH = orig

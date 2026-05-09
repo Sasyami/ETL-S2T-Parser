@@ -240,6 +240,112 @@ def test_try_answer_target_table_for_mapping_identifier():
     assert "b3050000420018_ratetariff" in out
 
 
+def test_list_target_table_columns_orphan_mappings():
+    """Logical id only in column_mappings (no target_tables row yet)."""
+    from load_skills_tools import list_target_table_columns
+
+    conn = get_db_connection()
+    conn.execute(
+        """INSERT INTO column_mappings
+        (id, target_table_id, target_column, source_table_id, source_column)
+        VALUES ('mf', 't_agr_frame', 'col_alpha', '', '')"""
+    )
+    conn.commit()
+    conn.close()
+
+    out = list_target_table_columns("t_agr_frame")
+    assert out.get("column_count") == 1
+    assert out["columns"][0]["target_column"] == "col_alpha"
+
+
+def test_try_answer_target_table_fields_query_russian():
+    from load_skills_tools import try_answer_target_table_fields_query
+
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO target_tables (id, name) VALUES ('t_agr_frame', 'Agr')"
+    )
+    conn.execute(
+        """INSERT INTO column_mappings
+        (id, target_table_id, target_column, source_table_id, source_column)
+        VALUES ('m99', 't_agr_frame', 'fld1', '', '')"""
+    )
+    conn.commit()
+    conn.close()
+
+    ans = try_answer_target_table_fields_query("дай поля таблицы t_agr_frame")
+    assert ans is not None
+    assert "fld1" in ans
+
+
+def test_search_column_mappings_by_description():
+    from load_skills_tools import search_column_mappings
+
+    conn = get_db_connection()
+    conn.execute("INSERT INTO target_tables (id, name) VALUES ('txd', 'X')")
+    conn.execute(
+        """INSERT INTO column_mappings
+        (id, target_table_id, target_column, column_description)
+        VALUES ('mxd', 'txd', 'c1', 'Unique phrase XyZ')"""
+    )
+    conn.commit()
+    conn.close()
+
+    rows = search_column_mappings("XyZ")
+    assert isinstance(rows, list)
+    assert len(rows) == 1
+    assert rows[0]["column_description"] == "Unique phrase XyZ"
+
+
+def test_try_answer_target_table_fields_includes_descriptions():
+    from load_skills_tools import try_answer_target_table_fields_query
+
+    conn = get_db_connection()
+    conn.execute("INSERT INTO target_tables (id, name) VALUES ('td', 'D')")
+    conn.execute(
+        """INSERT INTO column_mappings
+        (id, target_table_id, target_column, column_description)
+        VALUES ('md', 'td', 'f1', 'Описание поля')"""
+    )
+    conn.commit()
+    conn.close()
+
+    out = try_answer_target_table_fields_query("описания колонок таблицы td")
+    assert out is not None
+    assert "Описание поля" in out
+
+
+def test_aggregate_catalog_columns_merges_duplicate_target_column():
+    from load_skills_tools import _aggregate_catalog_columns
+
+    rows = [
+        {
+            "target_column": "agr_frame_desc",
+            "column_description": "",
+            "source_column": "a",
+            "data_type": "text",
+            "is_primary_key": 0,
+            "mapping_id": "id1",
+            "transformation_rule": None,
+        },
+        {
+            "target_column": "agr_frame_desc",
+            "column_description": None,
+            "source_column": "b",
+            "data_type": "text",
+            "is_primary_key": 0,
+            "mapping_id": "id2",
+            "transformation_rule": "x",
+        },
+    ]
+    agg, merged = _aggregate_catalog_columns(rows)
+    assert merged is True
+    assert len(agg) == 1
+    assert "`id1`" in agg[0]["mapping_id"]
+    assert "`id2`" in agg[0]["mapping_id"]
+    assert "a" in agg[0]["source_column"] and "b" in agg[0]["source_column"]
+
+
 def test_list_columns_by_sheet_name(sample_excel_bytes):
     from db_storage import store_excel_data
     from load_skills_tools import list_columns

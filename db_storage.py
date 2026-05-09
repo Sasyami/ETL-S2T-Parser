@@ -136,9 +136,14 @@ def init_db():
             source_column TEXT,
             transformation_rule TEXT,
             data_type TEXT,
-            is_primary_key INTEGER
+            is_primary_key INTEGER,
+            column_description TEXT
         )
     """)
+    cursor.execute("PRAGMA table_info(column_mappings)")
+    mapping_cols = [c[1] for c in cursor.fetchall()]
+    if "column_description" not in mapping_cols:
+        cursor.execute("ALTER TABLE column_mappings ADD COLUMN column_description TEXT")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS additions (
             id TEXT PRIMARY KEY,

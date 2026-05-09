@@ -42,9 +42,14 @@
 - **Purpose:** Inspect data or introspect schema (`SELECT`, `PRAGMA table_info`)
 
 ## `search_column_mappings(needle, limit)`
-- **Input:** `needle` (str) – substring matched with `LIKE` against **`target_column`**, **`source_column`**, table ids (`target_table_id`, `source_table_id`), `mapping.id`, plus joined **`target_tables.name`** / **`source_tables.name`**. **`limit`** (optional, default 50, max 100)
-- **Output:** list of row dicts (`mapping_id`, `target_table_id`, `target_column`, `source_table_id`, `source_column`, `target_table_name`, `source_table_name`, …); or `{"error": "..."}`
+- **Input:** `needle` (str) – substring matched with `LIKE` against **`target_column`**, **`source_column`**, **`column_description`**, table ids, `mapping.id`, plus joined **`target_tables.name`** / **`source_tables.name`**. **`limit`** (optional, default 50, max 100)
+- **Output:** list of row dicts (`mapping_id`, `target_table_id`, `target_column`, **`column_description`**, `source_column`, …); or `{"error": "..."}`
 - **Purpose:** Reliable lookup without guessing SQLite column names (there is **no** `target_column_name` — use **`target_column`**)
+
+## `list_target_table_columns(table_identifier)`
+- **Input:** `table_identifier` (`target_tables.id` or `target_tables.name`, e.g. `t_agr_frame`) — **not** a separate physical SQLite table in this app
+- **Output:** dict with `target_tables` matches and all `column_mappings` for those ids (`target_column`, **`column_description`**, `data_type`, PK flag, …); or `error` + `hint`
+- **Purpose:** Tabular catalog field lists (“поля таблицы …”) without `PRAGMA` on logical names
 
 ## `get_lineage(column_id)`
 - **Input:** `column_id` (str)

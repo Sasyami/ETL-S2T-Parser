@@ -6,6 +6,7 @@ from agents.agent import TOOLS_DESCRIPTION, react_tool_loop
 from load_skills_tools import (
     format_stored_files_answer,
     try_answer_sheets_for_workbook_query,
+    try_answer_target_table_fields_query,
     try_answer_target_table_for_mapping_identifier,
     user_wants_stored_file_inventory,
 )
@@ -14,12 +15,13 @@ INSIGHTS_SYSTEM_PROMPT = f"""You are an analyst extracting insights about **sour
 
 Goals:
 - Describe what is mapped, gaps, and notable lineage or naming patterns.
-- Ground every factual claim with tools (`mapping_overview`, `run_sql`, `search_column_mappings`, lineage helpers, file/sheet/column listing, `similarity_search` when embeddings exist).
+- Ground every factual claim with tools (`mapping_overview`, `run_sql`, `search_column_mappings`, **`list_target_table_columns`**, lineage helpers, file/sheet/column listing, `similarity_search` when embeddings exist).
 - Never invent `file_hash`, `filename`, `upload_time`, or sheet tab names. For the file catalog call **`list_files`** with **`Action Input: {{}}`**; for sheet tabs use **`list_sheets(file_hash)`** after resolving the row in `files` by exact `filename`.
 
-SQLite **`column_mappings`** columns: **`id`**, **`target_table_id`**, **`target_column`**, **`source_table_id`**, **`source_column`**, **`transformation_rule`**, **`data_type`**, **`is_primary_key`**. There is **no** **`target_column_name`** — use **`target_column`**. For substring/code lookups prefer **`search_column_mappings`** with `{{"needle": "<text>"}}`.
+SQLite **`column_mappings`** columns: **`id`**, **`target_table_id`**, **`target_column`**, **`column_description`** (описание поля из каталога / Excel), **`source_table_id`**, **`source_column`**, **`transformation_rule`**, **`data_type`**, **`is_primary_key`**. There is **no** **`target_column_name`** — use **`target_column`**. Для поиска подстрок используйте **`search_column_mappings`** с `{{"needle": "<text>"}}`.
 
-Never ask the user to run SQL manually. You **`can`** run **`run_sql`** with **`SELECT`** or **`PRAGMA table_info(...)`** for schema checks.
+Never ask the user to run SQL manually. You **`can`** run **`run_sql`** (`SELECT`, **`PRAGMA table_info(...)`**) for introspection — but **`not`** for logical target names (`t_*`): those are not physical tables here.
+- Use **`list_target_table_columns`** with `{{"table_identifier": "..."}}` instead of **`PRAGMA`** on logical names like `t_agr_frame`.
 
 Workflow:
 - For broad questions (overview of mapping), call `mapping_overview` with `limit` between 10 and 25, then drill down with `run_sql` or lineage tools using concrete column IDs.
@@ -56,6 +58,9 @@ def insights_chat(
     tgt_ans = try_answer_target_table_for_mapping_identifier(q)
     if tgt_ans is not None:
         return tgt_ans
+    fields_ans = try_answer_target_table_fields_query(q)
+    if fields_ans is not None:
+        return fields_ans
     fh = (file_hash or "").strip()
     if fh:
         q = (

@@ -24,7 +24,8 @@ TARGET_SCHEMA = {
         {
             "name": "column_mappings",
             "description": "Правила маппинга исходных колонок в целевые",
-            "columns": ["target_table_name", "target_column", "source_table_name",
+            "columns": ["target_table_name", "target_column", "target_column_description",
+                        "source_table_name",
                         "source_column", "transformation_rule", "data_type", "is_primary_key"]
         },
         {
