@@ -2,10 +2,14 @@ import os
 import json
 import logging
 import re
-from typing import List, Any, Tuple, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 from dotenv import load_dotenv
-from gigachat import GigaChat
-from gigachat.models import Chat, Messages, MessagesRole
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda
+from langchain_core.utils.json import parse_json_markdown
+from langchain_gigachat import GigaChat
 from load_skills_tools import (
     format_stored_files_answer,
     get_tool_functions,
@@ -41,10 +45,38 @@ SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 MODEL = os.getenv("MODEL", "GigaChat-Pro")
 TIMEOUT = int(os.getenv("GIGACHAT_TIMEOUT", "120"))
 
-giga = GigaChat(
-    model=MODEL, credentials=GIGACHAT_CREDENTIALS, base_url=GIGACHAT_BASE_URL,
-    verify_ssl_certs=VERIFY_SSL, scope=SCOPE, timeout=TIMEOUT
+# LangChain chat model (Runnable); use .invoke(...) instead of the raw SDK .chat(...)
+chat_model = GigaChat(
+    model=MODEL,
+    credentials=GIGACHAT_CREDENTIALS,
+    base_url=GIGACHAT_BASE_URL,
+    verify_ssl_certs=VERIFY_SSL,
+    scope=SCOPE,
+    timeout=float(TIMEOUT),
 )
+
+chat_model_with_retry = chat_model.with_retry(stop_after_attempt=3)
+
+# Back-compat for imports / patches (same object as chat_model).
+giga = chat_model
+
+
+def _message_content_text(content: Union[str, list, Any]) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and "text" in block:
+                parts.append(str(block["text"]))
+        return "".join(parts) if parts else str(content)
+    return str(content)
+
+
+def _message_text(message: BaseMessage) -> str:
+    return _message_content_text(message.content).strip()
 
 # Load skills and tools for system prompt
 SKILLS = load_skills()
@@ -96,20 +128,28 @@ def looks_like_data(value: Any) -> bool:
             return True
     return False
 
-def call_gigachat_with_retry(system_content: str, user_content: str, retries: int = 3) -> str:
-    for attempt in range(retries):
-        try:
-            messages = [
-                Messages(role=MessagesRole.SYSTEM, content=system_content),
-                Messages(role=MessagesRole.USER, content=user_content)
-            ]
-            response = giga.chat(Chat(messages=messages))
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.warning(f"GigaChat attempt {attempt+1}/{retries} failed: {e}")
-            if attempt == retries - 1:
-                raise
-    raise RuntimeError("GigaChat call failed after retries")
+def _header_completion_messages(prompt_vars: Dict[str, str]) -> List[BaseMessage]:
+    """LCEL-friendly message list for SYSTEM + USER header analysis."""
+    return [
+        SystemMessage(content=prompt_vars["system_content"]),
+        HumanMessage(content=prompt_vars["user_content"]),
+    ]
+
+
+_header_completion_chain = (
+    RunnableLambda(_header_completion_messages)
+    | chat_model_with_retry
+    | StrOutputParser()
+)
+
+
+def call_gigachat_with_retry(system_content: str, user_content: str) -> str:
+    return (
+        _header_completion_chain.invoke(
+            {"system_content": system_content, "user_content": user_content}
+        ).strip()
+    )
+
 
 def safe_extract_json(text: str) -> str:
     text = text.strip()
@@ -169,8 +209,10 @@ def get_header_decision(sheet_name: str, preview_rows: List[List[Any]]) -> Tuple
     )
     try:
         answer = call_gigachat_with_retry(SYSTEM_PROMPT, user_prompt)
-        cleaned = safe_extract_json(answer)
-        result = json.loads(cleaned)
+        try:
+            result = parse_json_markdown(answer)
+        except json.JSONDecodeError:
+            result = json.loads(safe_extract_json(answer))
         start_row = max(0, result.get("header_start_row", 0))
         header_rows = max(1, min(result.get("header_rows", 1), 5))
         nested = result.get("nested", header_rows >= 2)
@@ -206,15 +248,15 @@ def react_tool_loop(user_query: str, system_prompt: str, max_steps: int = 5) -> 
     """
     Shared ReAct loop over GigaChat with tools from TOOL_FUNCTIONS.
     """
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content=system_prompt),
-        Messages(role=MessagesRole.USER, content=user_query),
+    messages: List[BaseMessage] = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_query),
     ]
     step = 0
     while step < max_steps:
         try:
-            response = giga.chat(Chat(messages=messages))
-            answer = response.choices[0].message.content.strip()
+            reply = chat_model.invoke(messages)
+            answer = _message_text(reply)
         except Exception as e:
             logger.error(f"GigaChat error in agent loop: {e}")
             return f"Error communicating with LLM: {e}"
@@ -242,14 +284,13 @@ def react_tool_loop(user_query: str, system_prompt: str, max_steps: int = 5) -> 
             except Exception as e:
                 observation = f"Error executing tool '{tool_name}': {str(e)}"
 
-            messages.append(Messages(role=MessagesRole.ASSISTANT, content=answer))
-            messages.append(Messages(role=MessagesRole.USER, content=f"Observation: {observation}"))
+            messages.append(AIMessage(content=answer))
+            messages.append(HumanMessage(content=f"Observation: {observation}"))
             step += 1
         elif action_match and tool_input is None:
-            messages.append(Messages(role=MessagesRole.ASSISTANT, content=answer))
+            messages.append(AIMessage(content=answer))
             messages.append(
-                Messages(
-                    role=MessagesRole.USER,
+                HumanMessage(
                     content=(
                         "Observation: Error: could not parse JSON after 'Action Input:'. "
                         "Use a single JSON object with double-quoted keys, "

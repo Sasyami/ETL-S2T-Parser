@@ -15,8 +15,8 @@ if _REPO_ROOT not in sys.path:
 
 import streamlit as st
 
-from db_storage import DB_PATH, init_db
-from load_skills_tools import list_files, mapping_overview
+from db_storage import DB_PATH, get_db_connection, init_db
+from load_skills_tools import get_aggregated_target_table_catalog, list_files, mapping_overview
 
 
 def _strip_json_code_fences(text: str) -> str:
@@ -30,6 +30,26 @@ def _strip_json_code_fences(text: str) -> str:
         flags=re.IGNORECASE,
     )
     return out.strip()
+
+
+_DISPLAY_CATALOG_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("target_column", "Target column"),
+    ("data_type", "Data type"),
+    ("column_description", "Description"),
+    ("transformation_rule", "Transformation rule"),
+    ("source_column", "Source column"),
+    ("is_primary_key", "PK"),
+    ("mapping_id", "Mapping IDs"),
+)
+
+
+def _catalog_summary_table(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Reorder and rename aggregated catalog columns for Streamlit/table export."""
+    import pandas as pd
+
+    out = df[[src for src, _ in _DISPLAY_CATALOG_COLUMNS if src in df.columns]].copy()
+    rename = {src: label for src, label in _DISPLAY_CATALOG_COLUMNS if src in out.columns}
+    return out.rename(columns=rename)
 
 
 def _render_mapping_overview_pretty(snap: dict) -> None:
@@ -108,6 +128,82 @@ with st.sidebar:
 def _cached_overview(limit: int):
     return mapping_overview(limit=limit)
 
+
+@st.cache_data(ttl=5)
+def _target_table_name_options() -> list[str]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM target_tables ORDER BY lower(name)")
+    names = [r[0] for r in cur.fetchall() if r[0]]
+    conn.close()
+    return names
+
+
+with st.expander("Logical target table: columns & rules", expanded=True):
+    import pandas as pd
+
+    opts = _target_table_name_options()
+    if not opts:
+        st.info("No `target_tables` rows yet — upload and parse mappings first.")
+    else:
+        c1, c2 = st.columns((2, 1))
+        with c1:
+            pick = st.selectbox("Pick table", opts, index=0, key="streamlit_target_table_pick")
+        with c2:
+            override = st.text_input(
+                "Or paste id/name",
+                key="streamlit_target_table_override",
+                placeholder="target_tables.id or name",
+            )
+        tid = override.strip() or pick
+        if tid:
+            try:
+                catalog = get_aggregated_target_table_catalog(tid)
+            except Exception as e:
+                st.error(str(e))
+            else:
+                if catalog.get("error"):
+                    st.error(catalog["error"])
+                    hint = catalog.get("hint") or ""
+                    if hint:
+                        st.caption(hint)
+                else:
+                    tinfo = catalog.get("target_tables") or []
+                    for tt in tinfo:
+                        nm = tt.get("name") or ""
+                        tid_show = tt.get("id") or ""
+                        desc = (tt.get("description") or "").strip() or "—"
+                        st.markdown(f"**`{nm}`** · `{tid_show}`  \n{desc}")
+                    if catalog.get("had_duplicate_target_columns"):
+                        st.caption(
+                            "Several `column_mappings` rows map to the same target column "
+                            '(e.g. real source vs "target catalog"). Values are merged in one row.'
+                        )
+                    agg = catalog.get("aggregated") or []
+                    if agg:
+                        df_raw = pd.DataFrame(agg)
+                        tbl = _catalog_summary_table(df_raw)
+                        safe_name = re.sub(r"[^\w\-]+", "_", tid.strip()) or "catalog"
+                        st.subheader("Catalog")
+                        csv_bytes = tbl.to_csv(index=False).encode("utf-8")
+                        dl1, dl2 = st.columns((1, 3))
+                        with dl1:
+                            st.download_button(
+                                "Download CSV table",
+                                data=csv_bytes,
+                                file_name=f"{safe_name}_columns.csv",
+                                mime="text/csv;charset=utf-8",
+                                key="download_target_catalog_csv",
+                            )
+                        st.dataframe(
+                            tbl,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.warning("Target table exists but has no rows in column_mappings.")
+                    if show_raw_json:
+                        st.json(catalog)
 
 with st.expander("DB snapshot (mapping_overview)", expanded=False):
     lim = st.number_input("Sample rows per table", min_value=1, max_value=100, value=15)

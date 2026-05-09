@@ -1,11 +1,12 @@
 import logging
 import json
 import re
-from typing import Dict, Any
+from typing import Dict, Any, List
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_core.runnables import RunnableLambda
 from db_storage import get_db_connection, update_file_summary
-from .agent import giga, get_model_name
-from gigachat.models import Chat, Messages, MessagesRole
+from .agent import chat_model
 from load_skills_tools import load_skills, load_tools
 
 # Langfuse imports
@@ -58,23 +59,27 @@ or S2T/mapping “as a document type”. Speak only about the **subject domain, 
 Use the skills and tools above where relevant.
 """
 
-def call_gigachat(user_content: str) -> str:
-    """Call GigaChat with system prompt and user content."""
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT),
-        Messages(role=MessagesRole.USER, content=user_content)
-    ]
-    response = giga.chat(Chat(messages=messages))
-    return response.choices[0].message.content.strip()
+_schema_json_parser = JsonOutputParser()
 
-def extract_json(text: str) -> str:
-    """Extract JSON from markdown code blocks."""
-    text = text.strip()
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0]
-    elif "```" in text:
-        text = text.split("```")[1].split("```")[0]
-    return text.strip()
+
+def _summarizer_messages(inp: Dict[str, str]) -> List[BaseMessage]:
+    return [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=inp["user_content"]),
+    ]
+
+
+_summarizer_llm_chain = (
+    RunnableLambda(_summarizer_messages)
+    | chat_model
+    | StrOutputParser()
+)
+
+
+def call_gigachat(user_content: str) -> str:
+    """Call GigaChat with system prompt and user content (LCEL)."""
+    return _summarizer_llm_chain.invoke({"user_content": user_content}).strip()
+
 
 def fetch_file_data(file_hash: str) -> Dict[str, Any]:
     """Fetch file metadata, sheets, columns, sample rows, and important values."""
@@ -286,8 +291,7 @@ def extract_schema(state: Dict[str, Any]) -> Dict[str, Any]:
 """
     answer = call_gigachat(prompt)
     try:
-        json_str = extract_json(answer)
-        schema = json.loads(json_str)
+        schema = _schema_json_parser.parse(answer)
         if "key_entities" in schema:
             schema["key_entities"] = [
                 (e if isinstance(e, str) else e.get("name") or e.get("entity") or str(e))

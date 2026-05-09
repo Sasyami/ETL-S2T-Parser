@@ -1,6 +1,5 @@
 import pytest
-import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from agents.schema_matcher import (
     TARGET_SCHEMA,
     match_sheets_to_tables,
@@ -68,17 +67,14 @@ def test_target_schema_structure():
         assert col in col_mappings["columns"]
 
 
-@patch('agents.schema_matcher.giga')
-def test_match_sheets_to_tables(mock_giga, sample_excel_json):
+@patch('agents.schema_matcher.invoke_llm_plain_text')
+def test_match_sheets_to_tables(mock_llm, sample_excel_json):
     """Test sheet matching with mocked GigaChat response."""
-    # Mock the API response
-    mock_response = MagicMock()
-    mock_response.choices = [MagicMock(message=MagicMock(content='''[
+    mock_llm.return_value = '''[
         {"sheet_name": "Sheet1", "target_table": null, "similarity": "low", "reason": "No match"},
         {"sheet_name": "Source tables", "target_table": "source_tables", "similarity": "high", "reason": "Direct match"},
         {"sheet_name": "S2T", "target_table": "column_mappings", "similarity": "high", "reason": "Mapping sheet"}
-    ]'''))]
-    mock_giga.chat.return_value = mock_response
+    ]'''
 
     result = match_sheets_to_tables(sample_excel_json)
     assert len(result) == 3
@@ -95,15 +91,13 @@ def test_match_sheets_to_tables(mock_giga, sample_excel_json):
     assert source_match["similarity"] == "high"
 
 
-@patch('agents.schema_matcher.giga')
-def test_map_columns_for_table(mock_giga, sample_excel_json):
+@patch('agents.schema_matcher.invoke_llm_plain_text')
+def test_map_columns_for_table(mock_llm, sample_excel_json):
     """Test column mapping for a specific table."""
-    mock_response = MagicMock()
-    mock_response.choices = [MagicMock(message=MagicMock(content='''{
+    mock_llm.return_value = '''{
         "mapping": {"name": "name", "system_code": "system_code"},
         "similarity": "high"
-    }'''))]
-    mock_giga.chat.return_value = mock_response
+    }'''
 
     result = map_columns_for_table(sample_excel_json, "Source tables", "source_tables")
     assert "mapping" in result

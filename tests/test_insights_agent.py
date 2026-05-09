@@ -1,13 +1,13 @@
 """Tests for insights_chat (delegates to shared ReAct loop)."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
+
+from langchain_core.messages import AIMessage
 
 
-@patch("agents.agent.giga")
-def test_insights_chat_final_answer(mock_giga):
-    r1 = MagicMock()
-    r1.choices[0].message.content = "Final Answer: Mapping looks consistent."
-    mock_giga.chat.return_value = r1
+@patch("agents.agent.chat_model")
+def test_insights_chat_final_answer(mock_chat):
+    mock_chat.invoke.return_value = AIMessage(content="Final Answer: Mapping looks consistent.")
 
     from agents.insights_agent import insights_chat
 

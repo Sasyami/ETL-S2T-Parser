@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import patch, MagicMock
+from langchain_core.messages import AIMessage
 from agents.agent import (
     get_header_decision,
     get_model_name,
@@ -101,18 +102,21 @@ def test_safe_extract_json_braces_fallback():
     assert safe_extract_json(raw) == '{"x": true}'
 
 
-@patch("agents.agent.giga")
-def test_agent_chat_nested_action_input_invokes_tool(mock_giga):
+from langchain_core.messages import AIMessage
+
+
+@patch("agents.agent.chat_model")
+def test_agent_chat_nested_action_input_invokes_tool(mock_chat):
     mock_tool = MagicMock(return_value={"result": "ok"})
-    r1 = MagicMock()
-    r1.choices[0].message.content = (
+    r1 = AIMessage(
+        content=(
         "Thought: test\n"
         "Action: dummy_tool\n"
         'Action Input: {"config": {"nested": {"x": 1}}}\n'
+        )
     )
-    r2 = MagicMock()
-    r2.choices[0].message.content = "Final Answer: Done."
-    mock_giga.chat.side_effect = [r1, r2]
+    r2 = AIMessage(content="Final Answer: Done.")
+    mock_chat.invoke.side_effect = [r1, r2]
 
     with patch.dict("agents.agent.TOOL_FUNCTIONS", {"dummy_tool": mock_tool}, clear=False):
         out = agent_chat("run nested tool", max_steps=5)
@@ -121,15 +125,15 @@ def test_agent_chat_nested_action_input_invokes_tool(mock_giga):
     mock_tool.assert_called_once_with(config={"nested": {"x": 1}})
 
 
-@patch("agents.agent.giga")
-def test_agent_chat_malformed_action_input_gets_observation(mock_giga):
-    r1 = MagicMock()
-    r1.choices[0].message.content = (
+@patch("agents.agent.chat_model")
+def test_agent_chat_malformed_action_input_gets_observation(mock_chat):
+    r1 = AIMessage(
+        content=(
         "Action: run_sql\nAction Input: {not valid json}\n"
+        )
     )
-    r2 = MagicMock()
-    r2.choices[0].message.content = "Final Answer: Recovered."
-    mock_giga.chat.side_effect = [r1, r2]
+    r2 = AIMessage(content="Final Answer: Recovered.")
+    mock_chat.invoke.side_effect = [r1, r2]
 
     mock_sql = MagicMock()
     with patch.dict("agents.agent.TOOL_FUNCTIONS", {"run_sql": mock_sql}, clear=False):

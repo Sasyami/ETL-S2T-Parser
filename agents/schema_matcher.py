@@ -1,11 +1,27 @@
 import json
 import logging
-from typing import Dict, Any, List
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from .agent import giga
-from gigachat.models import Chat, Messages, MessagesRole
+import sys
+from typing import Any, Dict, List
+
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_core.runnables import RunnableLambda
 
 logger = logging.getLogger(__name__)
+
+_json_parser = JsonOutputParser()
+
+
+def invoke_llm_plain_text(prompt: str) -> str:
+    """Prompt string → assistant text via chat model + StrOutputParser (patchable in tests)."""
+    from . import agent as _agent
+
+    return (_agent.chat_model | StrOutputParser()).invoke(prompt)
+
+
+def _dispatch_invoke_llm_plain_text(prompt: str) -> str:
+    """Resolve ``invoke_llm_plain_text`` at runtime so patched tests see the stub."""
+    return sys.modules[__name__].invoke_llm_plain_text(prompt)
+
 
 TARGET_SCHEMA = {
     "database": "SQLite",
@@ -38,52 +54,8 @@ TARGET_SCHEMA = {
 }
 
 
-def call_gigachat(prompt: str) -> str:
-    """Call the authenticated GigaChat client with a plain string prompt."""
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content="Ты – аналитик данных. Отвечай только JSON."),
-        Messages(role=MessagesRole.USER, content=prompt)
-    ]
-    response = giga.chat(Chat(messages=messages))
-    return response.choices[0].message.content.strip()
-
-
-# Wrap the function as a Runnable
-gigachat_runnable = RunnableLambda(call_gigachat)
-
-
-def _extract_json_payload(raw_text: str) -> str:
-    """Extract JSON payload from raw model response."""
-    if not raw_text:
-        return ""
-
-    text = raw_text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-
-    first_obj = text.find("{")
-    first_arr = text.find("[")
-    starts = [i for i in (first_obj, first_arr) if i >= 0]
-    if not starts:
-        return text
-
-    start = min(starts)
-    end_obj = text.rfind("}")
-    end_arr = text.rfind("]")
-    end = max(end_obj, end_arr)
-    if end < start:
-        return text[start:]
-    return text[start:end + 1]
-
-
 def _parse_model_json(raw_text: str, expected_type: type):
-    payload = _extract_json_payload(raw_text)
-    parsed = json.loads(payload)
+    parsed = _json_parser.parse(raw_text)
     if not isinstance(parsed, expected_type):
         raise ValueError(
             f"Unexpected JSON type: expected {expected_type.__name__}, got {type(parsed).__name__}"
@@ -91,7 +63,7 @@ def _parse_model_json(raw_text: str, expected_type: type):
     return parsed
 
 
-# ---------- Sheet Matching Chain ----------
+# ---------- Sheet matching (prompt + LC chat model)
 def build_sheet_matching_prompt(excel_sheets: str, target_tables: str) -> str:
     return f"""Ты – эксперт по интеграции данных. Сопоставь каждый лист Excel (его название и колонки) с наиболее подходящей таблицей из целевой схемы.
 
@@ -119,9 +91,11 @@ Target schema tables:
 
 
 sheet_matching_chain = (
-        RunnablePassthrough()
-        | (lambda x: build_sheet_matching_prompt(x["excel_sheets"], x["target_tables"]))
-        | gigachat_runnable
+    RunnableLambda(
+        lambda p: build_sheet_matching_prompt(p["excel_sheets"], p["target_tables"])
+    )
+    | RunnableLambda(_dispatch_invoke_llm_plain_text)
+    | RunnableLambda(lambda text: _parse_model_json(text, list))
 )
 
 
@@ -148,19 +122,17 @@ def match_sheets_to_tables(excel_json: Dict[str, Any]) -> List[Dict[str, Any]]:
         excel_sheets_str = json.dumps(sheets_data, ensure_ascii=False, indent=2)
         target_tables_str = json.dumps(target_tables, ensure_ascii=False, indent=2)
 
-        raw_result = sheet_matching_chain.invoke({
-            "excel_sheets": excel_sheets_str,
-            "target_tables": target_tables_str
-        })
-        result = _parse_model_json(raw_result, list)
-        logger.info("Sheet matching completed via LCEL")
-        return result
+        raw_result = sheet_matching_chain.invoke(
+            {"excel_sheets": excel_sheets_str, "target_tables": target_tables_str}
+        )
+        logger.info("Sheet matching completed")
+        return raw_result
     except Exception as e:
         logger.exception(f"Sheet matching failed: {e}")
         return []
 
 
-# ---------- Column Mapping Chain ----------
+# ---------- Column mapping (prompt + LC chat model)
 def build_column_mapping_prompt(target_table: str, target_columns: List[str],
                                 sheet_name: str, excel_columns: List[str]) -> str:
     return f"""Ты – эксперт по маппингу данных. Для таблицы "{target_table}" (колонки: {target_columns}) 
@@ -180,13 +152,27 @@ def build_column_mapping_prompt(target_table: str, target_columns: List[str],
 """
 
 
+def _finalize_column_mapping_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    m = dict(d)
+    if "mapping" not in m or m.get("mapping") is None:
+        m["mapping"] = {}
+    if "similarity" not in m:
+        m["similarity"] = "low"
+    return m
+
+
 column_mapping_chain = (
-        RunnablePassthrough()
-        | (lambda x: build_column_mapping_prompt(
-    x["target_table"], x["target_columns"],
-    x["sheet_name"], x["excel_columns"]
-))
-        | gigachat_runnable
+    RunnableLambda(
+        lambda p: build_column_mapping_prompt(
+            p["target_table"],
+            p["target_columns"],
+            p["sheet_name"],
+            p["excel_columns"],
+        )
+    )
+    | RunnableLambda(_dispatch_invoke_llm_plain_text)
+    | RunnableLambda(lambda text: _parse_model_json(text, dict))
+    | RunnableLambda(_finalize_column_mapping_dict)
 )
 
 
@@ -213,19 +199,16 @@ def map_columns_for_table(excel_json: Dict[str, Any], sheet_name: str, target_ta
             else:
                 excel_columns.append(str(col))
 
-        raw_result = column_mapping_chain.invoke({
-            "target_table": target_table_name,
-            "target_columns": target_columns,
-            "sheet_name": sheet_name,
-            "excel_columns": excel_columns[:30]
-        })
-        result = _parse_model_json(raw_result, dict)
+        raw_result = column_mapping_chain.invoke(
+            {
+                "target_table": target_table_name,
+                "target_columns": target_columns,
+                "sheet_name": sheet_name,
+                "excel_columns": excel_columns[:30],
+            }
+        )
         logger.info(f"Column mapping completed for {sheet_name} -> {target_table_name}")
-        if "mapping" not in result:
-            result["mapping"] = {}
-        if "similarity" not in result:
-            result["similarity"] = "low"
-        return result
+        return raw_result
     except Exception as e:
         logger.exception(f"Column mapping failed for {target_table_name}: {e}")
         # Fallback: simple substring match

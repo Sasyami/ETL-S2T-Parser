@@ -613,6 +613,29 @@ def _aggregate_catalog_columns(
     return agg, merged_note
 
 
+def get_aggregated_target_table_catalog(table_identifier: str) -> Dict[str, Any]:
+    """
+    Full logical-target catalog with one row per target_column when possible.
+    Intended for Streamlit / scripts; merges duplicate mappings like format_target_table_fields_answer.
+    """
+    data = list_target_table_columns(table_identifier)
+    if data.get("error"):
+        return data
+    cols = data.get("columns") or []
+    if not cols:
+        return {
+            **data,
+            "aggregated": [],
+            "had_duplicate_target_columns": False,
+        }
+    agg, merged = _aggregate_catalog_columns(cols)
+    return {
+        **data,
+        "aggregated": agg,
+        "had_duplicate_target_columns": merged,
+    }
+
+
 def format_target_table_fields_answer(data: Dict[str, Any]) -> str:
     if "error" in data:
         body = (
