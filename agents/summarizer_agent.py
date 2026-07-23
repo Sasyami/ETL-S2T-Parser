@@ -291,7 +291,14 @@ def extract_schema(state: Dict[str, Any]) -> Dict[str, Any]:
 """
     answer = call_gigachat(prompt)
     try:
-        schema = _schema_json_parser.parse(answer)
+        try:
+            schema = _schema_json_parser.parse(answer)
+        except Exception:
+            from .agent import extract_json_payload
+
+            schema = json.loads(extract_json_payload(answer))
+        if not isinstance(schema, dict):
+            raise ValueError(f"Expected JSON object, got {type(schema).__name__}")
         if "key_entities" in schema:
             schema["key_entities"] = [
                 (e if isinstance(e, str) else e.get("name") or e.get("entity") or str(e))

@@ -598,7 +598,9 @@ def _aggregate_catalog_columns(
                 dts_uniq.append(dt)
         dt_show = dts_uniq[0] if len(dts_uniq) == 1 else ", ".join(dts_uniq)
 
-        mids = ", ".join(f"`{g.get('mapping_id')}`" for g in grp)
+        mids = ", ".join(
+            str(g.get("mapping_id")) for g in grp if g.get("mapping_id") not in (None, "")
+        )
         agg.append(
             {
                 "target_column": tc,
@@ -611,6 +613,15 @@ def _aggregate_catalog_columns(
             }
         )
     return agg, merged_note
+
+
+def _format_mapping_ids_markdown(mapping_id: Any) -> str:
+    """Wrap plain mapping id list for markdown tables (CSV keeps plain ids)."""
+    s = str(mapping_id or "").strip()
+    if not s:
+        return ""
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    return ", ".join(f"`{p}`" for p in parts)
 
 
 def get_aggregated_target_table_catalog(table_identifier: str) -> Dict[str, Any]:
@@ -674,7 +685,8 @@ def format_target_table_fields_answer(data: Dict[str, Any]) -> str:
             f"| `{r.get('target_column')}` | {_markdown_table_cell(r.get('column_description'))} | "
             f"{_markdown_table_cell(r.get('source_column'))} | "
             f"{_markdown_table_cell(r.get('transformation_rule'))} | "
-            f"{_markdown_table_cell(r.get('data_type'), 80)} | {pk} | {r.get('mapping_id', '')} |\n"
+            f"{_markdown_table_cell(r.get('data_type'), 80)} | {pk} | "
+            f"{_format_mapping_ids_markdown(r.get('mapping_id'))} |\n"
         )
     if merged_any:
         md += (

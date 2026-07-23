@@ -151,17 +151,41 @@ def call_gigachat_with_retry(system_content: str, user_content: str) -> str:
     )
 
 
-def safe_extract_json(text: str) -> str:
-    text = text.strip()
-    match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
+def extract_json_payload(raw_text: str) -> str:
+    """
+    Pull a JSON object/array out of LLM text (fences or leading/trailing prose).
+    Prefers the earliest '{'/'[' and the matching outermost '}'/']'.
+    """
+    if not raw_text:
+        return ""
+    text = raw_text.strip()
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
     if match:
-        return match.group(1).strip()
-    # fallback: find first { or [ and last } or ]
-    start = text.find('{') if '{' in text else text.find('[')
-    end = text.rfind('}') if '}' in text else text.rfind(']')
-    if start != -1 and end != -1:
-        return text[start:end+1]
-    return text
+        text = match.group(1).strip()
+    elif text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    first_obj = text.find("{")
+    first_arr = text.find("[")
+    starts = [i for i in (first_obj, first_arr) if i >= 0]
+    if not starts:
+        return text
+    start = min(starts)
+    end_obj = text.rfind("}")
+    end_arr = text.rfind("]")
+    end = max(end_obj, end_arr)
+    if end < start:
+        return text[start:]
+    return text[start : end + 1]
+
+
+def safe_extract_json(text: str) -> str:
+    return extract_json_payload(text)
 
 
 def _extract_tool_input_dict(text: str) -> Optional[Dict[str, Any]]:

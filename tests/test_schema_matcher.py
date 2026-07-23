@@ -92,6 +92,21 @@ def test_match_sheets_to_tables(mock_llm, sample_excel_json):
 
 
 @patch('agents.schema_matcher.invoke_llm_plain_text')
+def test_match_sheets_to_tables_prose_wrapped_json(mock_llm, sample_excel_json):
+    """Prose before a JSON array must still parse (JsonOutputParser alone fails)."""
+    mock_llm.return_value = (
+        "Sure, here is the mapping:\n"
+        '[{"sheet_name": "Sheet1", "target_table": null, "similarity": "low", "reason": "No match"},'
+        '{"sheet_name": "Source tables", "target_table": "source_tables", "similarity": "high", "reason": "Direct match"},'
+        '{"sheet_name": "S2T", "target_table": "column_mappings", "similarity": "high", "reason": "Mapping sheet"}]'
+    )
+    result = match_sheets_to_tables(sample_excel_json)
+    assert len(result) == 3
+    source_match = next(r for r in result if r["sheet_name"] == "Source tables")
+    assert source_match["target_table"] == "source_tables"
+
+
+@patch('agents.schema_matcher.invoke_llm_plain_text')
 def test_map_columns_for_table(mock_llm, sample_excel_json):
     """Test column mapping for a specific table."""
     mock_llm.return_value = '''{
@@ -105,6 +120,16 @@ def test_map_columns_for_table(mock_llm, sample_excel_json):
     assert result["similarity"] == "high"
     assert result["mapping"]["name"] == "name"
     assert result["mapping"]["system_code"] == "system_code"
+
+
+@patch('agents.schema_matcher.invoke_llm_plain_text')
+def test_map_columns_for_table_prose_wrapped_json(mock_llm, sample_excel_json):
+    mock_llm.return_value = (
+        'Result:\n{"mapping": {"name": "name"}, "similarity": "medium"}'
+    )
+    result = map_columns_for_table(sample_excel_json, "Source tables", "source_tables")
+    assert result["mapping"]["name"] == "name"
+    assert result["similarity"] == "medium"
 
 
 @patch('agents.schema_matcher.match_sheets_to_tables')

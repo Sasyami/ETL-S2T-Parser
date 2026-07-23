@@ -341,9 +341,13 @@ def test_aggregate_catalog_columns_merges_duplicate_target_column():
     agg, merged = _aggregate_catalog_columns(rows)
     assert merged is True
     assert len(agg) == 1
-    assert "`id1`" in agg[0]["mapping_id"]
-    assert "`id2`" in agg[0]["mapping_id"]
+    assert agg[0]["mapping_id"] == "id1, id2"
+    assert "`id1`" not in agg[0]["mapping_id"]
     assert "a" in agg[0]["source_column"] and "b" in agg[0]["source_column"]
+
+    from load_skills_tools import _format_mapping_ids_markdown
+
+    assert _format_mapping_ids_markdown(agg[0]["mapping_id"]) == "`id1`, `id2`"
 
 
 def test_list_columns_by_sheet_name(sample_excel_bytes):

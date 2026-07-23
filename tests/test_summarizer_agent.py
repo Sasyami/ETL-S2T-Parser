@@ -1,6 +1,36 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from agents.summarizer_agent import generate_summary, summarize_file
+from agents.summarizer_agent import extract_schema, generate_summary, summarize_file
+
+
+def test_extract_schema_parses_prose_wrapped_json():
+    state = {
+        "raw_sheets": [
+            {
+                "sheet_name": "S1",
+                "columns": ["Name", "Age"],
+                "sample_rows": [],
+                "description_cells": [],
+            }
+        ],
+        "important_values": [],
+        "source_description_snippets": [],
+        "schema": {},
+        "section_summaries": [],
+        "final_summary": "",
+        "validation_errors": [],
+    }
+    prose = (
+        "Вот JSON:\n"
+        '{"business_domain": "кредитование", "key_entities": ["договор"], '
+        '"description_highlights": ["ставка"]}'
+    )
+    with patch("agents.summarizer_agent.call_gigachat", return_value=prose):
+        out = extract_schema(state)
+    assert out["schema"]["business_domain"] == "кредитование"
+    assert out["schema"]["key_entities"] == ["договор"]
+    assert out["validation_errors"] == []
+
 
 @patch('agents.summarizer_agent.get_db_connection')
 @patch('agents.summarizer_agent.call_gigachat')

@@ -102,6 +102,17 @@ def test_safe_extract_json_braces_fallback():
     assert safe_extract_json(raw) == '{"x": true}'
 
 
+def test_extract_json_payload_prefers_array_over_inner_object():
+    from agents.agent import extract_json_payload
+    import json
+
+    raw = 'Sure! [{"sheet_name": "A", "target_table": null, "nested": {"k": 1}}]'
+    payload = extract_json_payload(raw)
+    parsed = json.loads(payload)
+    assert isinstance(parsed, list)
+    assert parsed[0]["sheet_name"] == "A"
+
+
 from langchain_core.messages import AIMessage
 
 

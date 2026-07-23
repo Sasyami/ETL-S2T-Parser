@@ -3,6 +3,7 @@ import logging
 import sys
 from typing import Any, Dict, List
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_core.runnables import RunnableLambda
 
@@ -10,12 +11,18 @@ logger = logging.getLogger(__name__)
 
 _json_parser = JsonOutputParser()
 
+_SCHEMA_MATCHER_SYSTEM = "Ты – аналитик данных. Отвечай только JSON."
+
 
 def invoke_llm_plain_text(prompt: str) -> str:
-    """Prompt string → assistant text via chat model + StrOutputParser (patchable in tests)."""
+    """SYSTEM (JSON-only) + USER prompt → assistant text (patchable in tests)."""
     from . import agent as _agent
 
-    return (_agent.chat_model | StrOutputParser()).invoke(prompt)
+    messages = [
+        SystemMessage(content=_SCHEMA_MATCHER_SYSTEM),
+        HumanMessage(content=prompt),
+    ]
+    return (_agent.chat_model | StrOutputParser()).invoke(messages)
 
 
 def _dispatch_invoke_llm_plain_text(prompt: str) -> str:
@@ -55,7 +62,16 @@ TARGET_SCHEMA = {
 
 
 def _parse_model_json(raw_text: str, expected_type: type):
-    parsed = _json_parser.parse(raw_text)
+    """Parse model JSON; fall back to brace extraction when the parser rejects prose wrappers."""
+    from .agent import extract_json_payload
+
+    parsed = None
+    try:
+        parsed = _json_parser.parse(raw_text)
+    except Exception:
+        parsed = None
+    if not isinstance(parsed, expected_type):
+        parsed = json.loads(extract_json_payload(raw_text))
     if not isinstance(parsed, expected_type):
         raise ValueError(
             f"Unexpected JSON type: expected {expected_type.__name__}, got {type(parsed).__name__}"
