@@ -1,227 +1,191 @@
-# ETL S2T Parser – AI-Powered Excel Metadata Extractor
+# ETL S2T Parser
 
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
 [![Flask](https://img.shields.io/badge/Flask-3.x-green.svg)](https://flask.palletsprojects.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**ETL S2T Parser** helps analysts work with messy Excel files that describe Source-to-Target (S2T) mappings, ETL rules, and data dictionaries. It uses a configured **LLM provider** (GigaChat, OpenRouter, or Ollama) to infer where column headers start (including merged cells and multi-level headers), exposes a **Flask** web UI for corrections, persists workbook structure and sample rows in **SQLite**, extracts minimal S2T transformations through an internal subagent, and answers questions through a small tool-using chat loop. A one-pass summarizer can also generate a **Russian business summary** of each upload.
+ETL S2T Parser — веб-приложение для разбора Excel-файлов с Source-to-Target-маппингами, описаниями таблиц и правилами преобразований.
 
----
+Приложение:
 
-## What the system does
+- определяет заголовки и читает многоуровневые Excel-листы;
+- сохраняет структуру файла и значения строк в SQLite;
+- классифицирует листы и извлекает S2T-трансформации по настраиваемым схемам;
+- строит краткое бизнес-описание загруженного файла;
+- создаёт локальные эмбеддинги описаний файлов и таблиц;
+- проецирует связи между колонками в Neo4j;
+- отвечает на вопросы через инструментального LangGraph-агента.
 
-1. **Parse** each sheet: preview rows, detect empty sheets, ask the LLM for header row span (or apply user overrides).
-2. **Normalize** headers into flat names (for example `Parent > Child`) and store up to thousands of data cells per sheet.
-3. **Summarize** the file in Russian using several LLM calls (structure, domain, final synthesis).
-4. **Extract table catalogs and S2T transformations** from the configured `source_tables`, `target_tables`, and `s2t` sheet groups.
-5. **Answer questions** through `/chat` using current tools over files, saved sheet headers, row values, and S2T transformations.
-
-The diagram below shows the main runtime path from upload to storage.
+## Как устроена обработка
 
 ```mermaid
 flowchart LR
-  subgraph ui [Browser]
-    UI[Correction UI]
-  end
- subgraph api [Flask app.py]
-    UP[/upload/]
-    AC[/apply_corrections/]
-    TR[/transformations/]
-    CH[/chat/]
-  end
- subgraph ai [Configured LLM]
-    HDR[Header decision\nagents/agent.py]
-    SUM[Summarizer chain\nagents/summarizer_agent.py]
-    S2T[S2T extraction subagent]
-    AG[Chat + tools\nagents/agent.py]
-  end
- subgraph data [SQLite excel_data.db]
-    T1[files / file_sheet_headers / data]
-    T2[source_tables / target_tables / s2t_transformations]
-  end
-  UI --> UP & AC
-  UP --> HDR --> T1
-  UP --> S2T --> T2
-  UP --> SUM --> T1
-  AC --> HDR --> T1
-  TR --> T2
-  CH --> AG --> T1 & T2
+    U["Excel-файл"] --> P["Механический разбор листов"]
+    P --> H["Определение заголовков"]
+    H --> DB[("SQLite")]
+    DB --> C["Классификация групп листов"]
+    C --> S["Sheet skills"]
+    S --> DB
+    DB --> M["Суммаризация и описания"]
+    M --> DB
+    DB --> G[("Neo4j: lineage колонок")]
+    DB --> A["LangGraph-агент"]
+    G --> A
 ```
 
----
+### 1. Разбор Excel
 
-## Architecture (modules)
+`processing/excel.py` один раз читает каждый лист, применяет найденное или исправленное пользователем решение о заголовке, разворачивает объединённые ячейки заголовков и строит плоские имена колонок. Скрытые строки по умолчанию не загружаются; в интерфейсе их можно явно включить.
 
-| Module | Role |
-|--------|------|
-| `app.py` | Thin Flask routes: upload, corrections, preview, summary, S2T extraction, transformations API, chat. |
-| `processing/excel.py` | Mechanical workbook parsing: preview, existing header detection, stored columns, and raw rows. |
-| `agents/agent.py` | `get_header_decision()` (LLM + heuristics); входная точка `agent_chat()`. |
-| `agents/chat_graph.py` | LangGraph planner with native tool calling, `ToolNode`, structured observer, and responder. |
-| `agents/summarizer_agent.py` | One-pass summary from column names and the first five stored rows of every sheet. |
-| `sheet_skills/s2t.py` | S2T sheet skill: inspect, deterministic/LLM column matching, validate rows, build records. |
-| `sheet_skills/table_catalog.py` | Source/target table-catalog sheet skill without business-value deduplication. |
-| `storage/s2t.py` | Transactional persistence, reads, search/aggregation, clear, and verification. |
-| `storage/database.py` | Current SQLite schema, migrations, generic workbook metadata and raw-row storage. |
-| `config/` | JSON configuration and typed loaders for sheet groups and column mappings. |
-| `agents/tools/` | Decorated `@tool` modules split by domain plus explicit read-only/write registries. |
-| `templates/index.html` | Upload and per-sheet correction UI. |
+Определение положения и глубины заголовка находится в `agents/agent.py`. Результат можно проверить и скорректировать до повторной записи файла.
 
-**Design note:** Header detection uses a LangChain-style LLM call. Chat orchestration uses a multi-step LangGraph with application-controlled tool execution; S2T extraction is implemented as an internal subagent. Optional **Langfuse** tracing is wired where `observe` decorators exist.
+### 2. Хранение исходных фактов
 
----
+SQLite — основной источник данных приложения. В неё записываются:
 
-## End-to-end upload sequence
+- метаданные файла;
+- листы и распознанные заголовки;
+- значения ячеек с исходными номерами строк;
+- каталоги source- и target-таблиц;
+- строки S2T-трансформаций.
+
+Одинаковые строки не дедуплицируются: каждая строка исходного Excel остаётся отдельным фактом.
+
+### 3. Классификация листов и sheet skills
+
+Сначала `agents/sheet_group_classifier.py` определяет группу каждого листа:
+
+1. точное или нечёткое совпадение по `config/sheet_groups.json`;
+2. один LLM-вызов только для несопоставленных листов;
+3. сохранение подтверждённых новых алиасов в конфигурацию.
+
+После классификации запускается подходящий обработчик из `sheet_skills/`:
+
+- `sheet_skills/s2t.py` сопоставляет колонки и строит строки `s2t_transformations`;
+- `sheet_skills/table_catalog.py` сохраняет названия и описания source/target-таблиц.
+
+Для S2T сначала используется сопоставление по `config/column_mapping.json`. Если найдены не все настроенные поля, модель получает один компактный запрос для этого листа. Если валидный план не получен, обработка завершается ошибкой без молчаливой записи неполных данных.
+
+Отсутствие `target_table` в любой извлекаемой строке считается ошибкой до начала транзакции. Уже сохранённые трансформации при этом не изменяются.
+
+### 4. Суммаризация и эмбеддинги
+
+`agents/summarizer_agent.py` делает один LLM-вызов: передаёт названия колонок и не более пяти первых строк каждого непропущенного листа.
+
+При сохранении описаний создаются локальные эмбеддинги:
+
+- `files.description`;
+- `source_tables.description`;
+- `target_tables.description`.
+
+Модель задаётся переменной `EMBEDDING_MODEL`. Векторы хранятся в BLOB-полях соответствующих SQLite-таблиц, отдельная таблица эмбеддингов не используется.
+
+### 5. Графовая проекция
+
+После успешной записи S2T-результата `services/graph_sync.py` может пересобрать в Neo4j проекцию lineage выбранного файла:
+
+- узлы `ETLColumn` представляют колонки логических таблиц;
+- связи `TRANSFORMS_TO` представляют переход source-колонки в target-колонку.
+
+Названия файлов, листов, таблиц, описания и сами строки трансформаций остаются в SQLite. Отсутствие узла или связи в Neo4j не доказывает отсутствие факта в SQLite.
+
+### 6. Инструментальный агент
+
+`agents/chat_graph.py` реализует цикл:
 
 ```mermaid
-sequenceDiagram
-  participant U as User
-  participant F as Flask
-  participant G as LLM provider
-  participant D as SQLite
-  U->>F: POST /upload (xlsx)
-  F->>F: parse_excel_with_decisions
-  loop each sheet
-    F->>G: header structure (preview rows)
-    G-->>F: JSON header_start_row, header_rows, nested
-    F->>F: read headers + data rows
-  end
-  F->>D: store_excel_data
-  F->>D: run S2T extraction subagent and write s2t_transformations
-  F->>G: summarize_file (chain)
-  G-->>F: Russian summary
-  F->>D: update_file_result_json
-  F-->>U: JSON + file_id
-  opt corrections
-    U->>F: POST /apply_corrections
-    F->>D: re-store + new summary
-  end
+flowchart LR
+    Q["Вопрос"] --> P["Planner"]
+    P -->|вызов инструмента| T["ToolNode"]
+    T --> O["Observer"]
+    O --> P
+    P -->|инструменты больше не нужны| R["Responder"]
+    R --> A["Ответ"]
 ```
 
----
+Planner выбирает только зарегистрированные инструменты. Observer фиксирует полученные факты и ограничения, а отдельный responder формирует итоговый ответ.
 
-## Data model (conceptual)
+Маршрутизация источников разделена:
 
-Every upload receives a new numeric **`file_id`**. Each parsed sheet receives a numeric **`sheet_id`**, and columns are referenced inside a sheet by a 1-based numeric **`column_id`**. Identical uploaded files and identical extracted rows remain separate records.
+- строки, маппинги, правила и таблица трансформаций читаются из SQLite;
+- lineage, пути, upstream/downstream и impact analysis читаются из Neo4j;
+- отсутствие данных в Neo4j не подменяет проверку SQLite.
 
-```mermaid
-erDiagram
-  files ||--o{ file_sheet_headers : summarizes
-  file_sheet_headers ||--o{ data : stores
-  files ||--o{ s2t_transformations : has
-  files ||--o{ source_tables : has
-  files ||--o{ target_tables : has
-  files {
-    int file_id PK
-    text filename
-    text upload_time
-    text result_json
-    text summary
-  }
-  data {
-    int id PK
-    int sheet_id FK
-    text table_name
-    int row_num
-    int column_id
-    text value
-  }
-  file_sheet_headers {
-    int sheet_id PK
-    int file_id FK
-    text sheet_name
-    int columns_count
-    text headers_json
-    text headers_flat
-  }
-  s2t_transformations {
-    int id PK
-    int file_id FK
-    int sheet_id
-    int row_num
-    text target_table
-    text target_field
-    text source_table
-    text source_field
-    text transformation_rule
-  }
-  source_tables {
-    int id PK
-    int file_id FK
-    int sheet_id
-    int row_num
-    text table_name
-    text description
-  }
-  target_tables {
-    int id PK
-    int file_id FK
-    int sheet_id
-    int row_num
-    text table_name
-    text description
-  }
+Диалог read-only по умолчанию. Инструменты изменения данных находятся в отдельном registry и не выдаются обычному чату.
+
+## Структура проекта
+
+```text
+app.py                         Flask API и запуск приложения
+processing/excel.py            механический разбор Excel
+storage/database.py            схема и базовые операции SQLite
+storage/s2t.py                 запись, чтение и поиск S2T
+graph_storage/                 конфигурация, подключение и чтение Neo4j
+services/analysis.py           запуск анализа после сохранения файла
+services/embeddings.py         локальное эмбеддирование описаний
+services/graph_sync.py         проекция SQLite → Neo4j
+agents/agent.py                определение заголовков и вход в чат
+agents/chat_graph.py           LangGraph planner/tools/observer/responder
+agents/summarizer_agent.py     однопроходная суммаризация
+agents/sheet_group_classifier.py
+agents/tools/                  тематические @tool и registry
+agents/prompts/                системные инструкции агента
+sheet_skills/s2t.py            извлечение S2T
+sheet_skills/table_catalog.py  каталоги source/target-таблиц
+config/                        JSON-схемы и их загрузчики
+templates/                     веб-интерфейс
+tests/                         автоматические проверки
+samples/                       примеры Excel-файлов
 ```
 
-**`file_sheet_headers`** stores one row per uploaded sheet with saved headers. **`data`** is the public row-value table for inspecting workbook contents. **`source_tables`** and **`target_tables`** store table names and descriptions from their configured sheet groups. **`s2t_transformations`** stores row-level transformations from the parsed `s2t` sheet. Equal source rows are retained as separate records in all three extracted tables. The user-facing schema contains `files`, `file_sheet_headers`, `source_tables`, `target_tables`, `s2t_transformations`, and `data`.
+## Быстрый запуск
 
----
+### Требования
 
-## Summarizer pipeline
+- Python 3.12 или новее;
+- [uv](https://docs.astral.sh/uv/);
+- доступ хотя бы к одному LLM-provider: GigaChat, OpenRouter или Ollama;
+- Neo4j — только если нужна графовая проекция и lineage-запросы.
 
-```mermaid
-flowchart TB
-  A[SQLite] --> B[Sheet name + columns + first 5 rows]
-  B --> C[One LLM request]
-  C --> D[Russian summary]
-```
-
----
-
-## Chat agent and tools
-
-`/chat` runs **`agent_chat`** through a LangGraph state graph. The planner uses native model tool calls and invokes one registered read-only `BaseTool` through `ToolNode`. A structured observer extracts facts and limitations from each real `ToolMessage`; the planner then decides whether another tool is needed. A separate responder produces the final user-facing answer when the planner stops calling tools.
-
-The chat page keeps successful `user` / `assistant` turns in browser `sessionStorage`, restores them after a reload in the same tab, and sends only the latest bounded context to `/chat`. Chat history is not persisted in SQLite or a server-side session.
-
-Registered tools include `run_sql`, `list_files`, `list_sheets`, `list_columns`, `list_file_sheet_headers`, `list_s2t_transformations`, `search_s2t_transformations`, and `list_sheet_group_classifications`.
-
----
-
-## Installation
-
-### Prerequisites
-
-- Python **3.12+**
-- **uv** (recommended) or **pip**
-- **GigaChat**, **OpenRouter**, or local **Ollama** access
-
-### Clone and install
+### Установка
 
 ```bash
 git clone https://github.com/Xpehutta/ETL-S2T-Parser.git
 cd ETL-S2T-Parser
 uv sync
-# or: pip install -e .
 ```
 
-### Run
+Создайте `.env` в корне проекта, затем запустите:
 
 ```bash
 uv run python app.py
-# or: make run
-
 ```
 
-Open **http://127.0.0.1:5000**.
+Основной интерфейс откроется по адресу `http://127.0.0.1:5000`, чат — по адресу `http://127.0.0.1:5000/chat_app`.
 
----
+## Настройка LLM
 
-## Configuration
+Выберите один provider через `LLM_PROVIDER`.
 
-Create a **`.env`** in the project root (never commit secrets).
+### Ollama
 
-OpenRouter free-router setup:
+Используемая модель должна поддерживать native tool calling, иначе чат-агент не сможет вызывать инструменты.
+
+```bash
+ollama pull qwen2.5:7b
+```
+
+```ini
+LLM_PROVIDER=ollama
+OLLAMA_MODEL=qwen2.5:7b
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_NUM_CTX=16384
+OLLAMA_TIMEOUT=120
+OLLAMA_TEMPERATURE=0
+OLLAMA_REASONING=false
+```
+
+### OpenRouter
 
 ```ini
 LLM_PROVIDER=openrouter
@@ -232,39 +196,47 @@ OPENROUTER_TIMEOUT=120
 OPENROUTER_TEMPERATURE=0
 ```
 
-Ollama local setup:
-
-```bash
-ollama pull qwen2.5:7b
-```
+### GigaChat
 
 ```ini
-LLM_PROVIDER=ollama
-OLLAMA_MODEL=qwen2.5:7b
-OLLAMA_BASE_URL=http://localhost:11434/v1
-OLLAMA_NUM_CTX=16384
-OLLAMA_TIMEOUT=120
-OLLAMA_TEMPERATURE=0
-OLLAMA_REASONING=false
-```
-
-GigaChat setup:
-
-```ini
-# Required for GigaChat-backed LLM calls (agent, summarizer, header decision)
 LLM_PROVIDER=gigachat
 GIGACHAT_API_KEY=your_key
+GIGACHAT_MODEL=GigaChat
 GIGACHAT_API_URL=https://gigachat.devices.sberbank.ru/api/v1
-GIGACHAT_VERIFY_SSL=false
 GIGACHAT_SCOPE=GIGACHAT_API_PERS
-MODEL=GigaChat
+GIGACHAT_VERIFY_SSL=false
 GIGACHAT_TIMEOUT=120
+
 GIGACHAT_HEADER_TIMEOUT=20
 GIGACHAT_HEADER_RETRY_ATTEMPTS=1
 GIGACHAT_HEADER_PREVIEW_ROWS=4
 ```
 
-Optional isolated Neo4j connection module:
+Вместо `GIGACHAT_API_KEY` также поддерживаются `GIGACHAT_CREDENTIALS` и `GIGACHAT_EMBEDDINGS_CREDENTIALS`.
+
+## Настройка эмбеддингов
+
+Эмбеддинги считаются локально через Sentence Transformers. Например:
+
+```ini
+EMBEDDING_MODEL=intfloat/multilingual-e5-small
+```
+
+При первом использовании библиотека загрузит модель в локальный кеш.
+
+## Настройка Neo4j
+
+Neo4j запускается отдельным процессом и не обязан находиться внутри Flask-приложения. Пример запуска через Docker:
+
+```bash
+docker run --name etl-s2t-neo4j \
+  -p 7474:7474 \
+  -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/change_me \
+  -d neo4j:5
+```
+
+Добавьте подключение в `.env`:
 
 ```ini
 NEO4J_URI=neo4j://localhost:7687
@@ -273,143 +245,105 @@ NEO4J_PASSWORD=change_me
 NEO4J_DATABASE=neo4j
 ```
 
-The `graph_storage` package owns only Neo4j configuration and driver lifecycle.
-After SQLite analysis is committed, `services/graph_sync.py` rebuilds the
-selected file's column-lineage projection. Neo4j stores only `ETLColumn` nodes
-and `TRANSFORMS_TO` relationships; all other facts remain in SQLite.
+Веб-интерфейс Neo4j Browser будет доступен по адресу `http://localhost:7474`.
 
-The current chat tools do not require the removed legacy embeddings table.
+Если Neo4j не настроен или недоступен, SQLite-анализ остаётся сохранённым, а ошибка синхронизации возвращается отдельно.
 
-| Variable | Purpose |
-|----------|---------|
-| `LLM_PROVIDER` | `gigachat`, `openrouter`, or `ollama` |
-| `OPENROUTER_API_KEY` | OpenRouter API key |
-| `OPENROUTER_MODEL` | OpenRouter model id; `openrouter/free` uses the free-model router |
-| `OPENROUTER_BASE_URL` | OpenRouter OpenAI-compatible API base URL |
-| `OPENROUTER_TIMEOUT` | OpenRouter HTTP timeout (seconds) |
-| `OPENROUTER_TEMPERATURE` | OpenRouter sampling temperature |
-| `OLLAMA_MODEL` | Local Ollama model id, for example `qwen2.5:7b` |
-| `OLLAMA_BASE_URL` | Ollama OpenAI-compatible API base URL, usually `http://localhost:11434/v1` |
-| `OLLAMA_NUM_CTX` | Optional Ollama context window size in tokens, for example `16384` |
-| `OLLAMA_TIMEOUT` | Ollama HTTP timeout (seconds) |
-| `OLLAMA_TEMPERATURE` | Ollama sampling temperature |
-| `OLLAMA_REASONING` | Enable or disable Ollama thinking; keep `false` for the chat graph |
-| `OLLAMA_MAX_TOKENS` | Optional max token cap for Ollama responses |
-| `GIGACHAT_API_KEY` | Primary credential for GigaChat |
-| `GIGACHAT_EMBEDDINGS_CREDENTIALS` | Alternative credential label for embeddings |
-| `GIGACHAT_API_URL` | API base URL |
-| `GIGACHAT_VERIFY_SSL` | `true` / `false` |
-| `GIGACHAT_SCOPE` | OAuth scope |
-| `MODEL` | Chat model id; use `GigaChat` by default, switch to `GigaChat-Pro` only when the API key/tariff allows it |
-| `GIGACHAT_TIMEOUT` | HTTP timeout (seconds) |
-| `GIGACHAT_HEADER_TIMEOUT` | Short timeout for header detection calls |
-| `GIGACHAT_HEADER_RETRY_ATTEMPTS` | Retry attempts for header detection |
-| `GIGACHAT_HEADER_PREVIEW_ROWS` | Number of top rows sent to header detection |
+## Конфигурация извлечения
 
-Optional **Langfuse** tracing: install `langfuse` and configure `agents/observability.py` / environment as in your deployment.
+Логика извлечения задаётся данными, а не зашивается в обработчик:
 
----
+| Файл | Назначение |
+|---|---|
+| `config/sheet_groups.json` | группы листов и допустимые имена/алиасы |
+| `config/column_mapping.json` | поля группы и варианты заголовков Excel |
+| `config/usefull_col_extraction.json` | целевые SQLite-таблицы, группа листа и список записываемых полей |
 
-## API reference
+Пример целевого описания:
 
-| Method | Path | Body / params | Description |
-|--------|------|----------------|-------------|
-| `GET` | `/` | — | Web UI |
-| `GET` | `/chat_app` | — | Single-user chat-first UI |
-| `POST` | `/upload` | `multipart/form-data` file | Parse Excel, store DB rows, return JSON + `file_id` |
-| `POST` | `/apply_corrections` | JSON: `file_id`, `corrections[]` | Re-parse with overrides; file bytes must still be in server cache |
-| `POST` | `/preview_headers` | JSON: `file_id`, `sheet_name`, `option` | Header preview for UI |
-| `GET` | `/summary/<file_id>` | — | Stored or on-demand summary |
-| `GET` | `/transformations/<file_id>` | query: `limit`, `q` | Browse extracted `s2t_transformations` rows |
-| `POST` | `/transformations/<file_id>/refresh` | — | Re-run S2T extraction subagent |
-| `DELETE` | `/transformations/<file_id>` | — | Clear S2T transformations for a file |
-| `DELETE` | `/storage` | — | Clear all SQLite data, the Neo4j projection, and runtime upload caches |
-| `GET` | `/sheet_groups/<file_id>/classify` | query: `llm=0/1` | Classify sheet groups |
-| `POST` | `/chat` | JSON: `query` | Tool-using agent answer |
+```json
+{
+  "s2t_transformations": {
+    "sheet_group": "s2t",
+    "fields": [
+      "target_field",
+      "source_field",
+      "target_table",
+      "source_table",
+      "transformation_rule"
+    ]
+  }
+}
+```
 
-**Upload response (conceptual):** `filename`, `model_used`, `file_id`, `summary`, and `sheets[]` with `header`, `columns`, `data_preview`, and an optional `skip_reason`.
+Имена полей в `fields` одновременно определяют ожидаемые роли из `column_mapping.json` и пользовательские колонки целевой SQLite-таблицы.
 
----
+## SQLite-схема
 
-## Web workflow
+По умолчанию база создаётся в `excel_data.db`.
 
-1. **Upload** an `.xlsx` / `.xls` / `.xlsm` file.
-2. Review per-sheet **AI header** choices and data preview.
-3. Adjust options or skip sheets; **preview headers** updates live.
-4. **Apply corrections** to refresh the DB and summary.
-5. Browse or refresh extracted **S2T transformations**.
+| Таблица | Содержимое |
+|---|---|
+| `files` | файл, модель, время загрузки, summary, description и embedding |
+| `file_sheet_headers` | лист, решение о заголовке и плоские имена колонок |
+| `data` | значения ячеек: лист, исходная строка, колонка и значение |
+| `source_tables` | строки каталога таблиц-источников и embeddings описаний |
+| `target_tables` | строки каталога таблиц-приёмников и embeddings описаний |
+| `s2t_transformations` | построчные source-to-target-маппинги и правила |
 
----
+При несовместимой старой схеме приложение выдаёт явную ошибку. Автоматическая миграция пользовательских данных не выполняется.
 
-## Database files
+## Инструменты агента
 
-- Default path: **`excel_data.db`** in the working directory (configurable in code via `storage.database.DB_PATH`).
-- Physical/user-facing tables: `files`, `file_sheet_headers`, `source_tables`, `target_tables`, `s2t_transformations`, `data`.
-- Legacy catalog/lineage tables are dropped by `init_db`: `relationships`, `embeddings`, `column_mappings`, `additions`.
+Основные read-only инструменты:
 
----
+- `run_sql` — свободный read-only SQL по публичной SQLite-схеме;
+- `list_s2t_transformations` и `search_s2t_transformations` — просмотр S2T;
+- `summarize_s2t_tables` — сводка по логическим таблицам;
+- `list_files`, `resolve_file`, `list_sheets`, `list_columns` — навигация по загрузкам;
+- `run_cypher` — свободный read-only Cypher;
+- `trace_neo4j_lineage` — upstream/downstream-пути колонок;
+- `show_plan` — явная фиксация выполненных и следующих действий.
 
-## Tests
+Инструменты объявлены через `@tool(parse_docstring=True)` в `agents/tools/` и явно включаются в `agents/tools/registry.py`.
+
+## HTTP API
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| `GET` | `/` | основной веб-интерфейс |
+| `GET` | `/chat_app` | интерфейс чата |
+| `GET` | `/analysis_progress/<upload_id>` | прогресс фонового анализа |
+| `POST` | `/upload` | загрузка и первичный разбор Excel |
+| `POST` | `/apply_corrections` | повторный разбор с исправлениями заголовков |
+| `POST` | `/preview_headers` | предварительный просмотр выбранного заголовка |
+| `GET` | `/summary/<file_id>` | summary файла |
+| `GET` | `/description/<file_id>` | описание файла |
+| `GET` | `/transformations/<file_id>` | строки S2T |
+| `POST` | `/transformations/<file_id>/refresh` | повторное извлечение S2T |
+| `DELETE` | `/transformations/<file_id>` | удаление S2T указанного файла |
+| `DELETE` | `/storage` | полная очистка SQLite, Neo4j и runtime-кеша |
+| `GET` | `/sheet_groups/<file_id>/classify` | классификация листов |
+| `GET` | `/exports/sql/<filename>` | выгрузка подготовленного SQL-файла |
+| `POST` | `/chat` | запрос к инструментальному агенту |
+
+История чата хранится в `sessionStorage` браузера, поэтому переживает перезагрузку страницы в той же вкладке, но не записывается в SQLite.
+
+## Langfuse
+
+Интеграция вынесена в `agents/observability.py` и остаётся необязательной. При заданных ключах Langfuse получает трассировки поддерживаемых LLM-вызовов; без конфигурации основная обработка продолжает работать.
+
+```ini
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_TRACING_ENVIRONMENT=development
+```
+
+## Разработка
 
 ```bash
-export GIGACHAT_API_KEY=dummy   # required for imports that load GigaChat clients
 pytest tests/ -q
-# or: make test
+pytest tests/ --cov=. --cov-config=.coveragerc
 ```
 
-Coverage:
-
-```bash
-make test-cov
-```
-
----
-
-## Project layout (short)
-
-```
-├── app.py                 # Flask entrypoint
-├── processing/
-│   └── excel.py           # Mechanical Excel parsing
-├── storage/
-│   ├── database.py        # SQLite schema and workbook persistence
-│   └── s2t.py             # S2T repository
-├── graph_storage/
-│   ├── config.py          # Isolated Neo4j environment settings
-│   └── connection.py      # Driver lifecycle without graph queries
-├── services/
-│   └── graph_sync.py      # SQLite-to-Neo4j file projection
-├── config/
-│   ├── column_mapping.py
-│   ├── sheet_groups.py
-│   ├── useful_columns.py
-│   └── *.json
-├── agents/
-│   ├── agent.py           # Header LLM + chat agent
-│   ├── tools/
-│   │   ├── sql.py         # Read-only SQL tool
-│   │   ├── files.py       # File metadata tools
-│   │   ├── s2t.py         # S2T query tools
-│   │   ├── sheets.py      # Sheet/header tools
-│   │   └── registry.py    # Read-only/write registries
-│   ├── observability.py   # Optional Langfuse integration
-│   ├── summarizer_agent.py
-│   ├── sheet_group_classifier.py
-│   └── prompts/
-├── sheet_skills/
-│   ├── s2t.py
-│   └── table_catalog.py
-├── samples/               # Example S2T workbooks
-├── templates/index.html
-├── tests/
-└── pyproject.toml         # Dependencies
-```
-
----
-
-## Acknowledgements
-
-- [GigaChat](https://developers.sber.ru/portal/products/gigachat), [OpenRouter](https://openrouter.ai/docs), and [Ollama](https://ollama.com/) for LLM APIs
-- [LangChain](https://www.langchain.com/) / LangGraph ecosystem used in schema and summarizer code paths  
-- [Flask](https://flask.palletsprojects.com/) for the web layer  
-- [pandas](https://pandas.pydata.org/) / [openpyxl](https://openpyxl.readthedocs.io/) for Excel I/O  
+Перед изменением схемы SQLite, формата конфигураций или набора tools обновляйте соответствующие проверки в `tests/`.
