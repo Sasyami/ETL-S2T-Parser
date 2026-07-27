@@ -13,11 +13,14 @@ build/
 # Virtual environments
 .venv/
 venv/
+venv_test/
+py312ascii/
 ENV/
 env/
 
 # Database
 *.db
+*.db-journal
 *.sqlite
 *.sqlite3
 
@@ -41,10 +44,18 @@ env/
 # Coverage
 .coverage
 htmlcov/
+.pytest_tmp_*/
+.pytest_codex/
+.test_runs/
+tmp_pytest_*/
 
 # OS junk
 .DS_Store
 Thumbs.db
+~$*.xls*
 
 # Uploaded file cache (if any)
 file_bytes_cache.pkl
+
+# Generated SQL exports
+exports/

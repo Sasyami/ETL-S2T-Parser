@@ -1,0 +1,26 @@
+{
+  "s2t_transformations": {
+    "sheet_group": "s2t",
+    "fields": [
+      "target_field",
+      "source_field",
+      "target_table",
+      "source_table",
+      "transformation_rule"
+    ]
+  },
+  "source_tables": {
+    "sheet_group": "source_tables",
+    "fields": [
+      "table_name",
+      "description"
+    ]
+  },
+  "target_tables": {
+    "sheet_group": "target_tables",
+    "fields": [
+      "table_name",
+      "description"
+    ]
+  }
+}

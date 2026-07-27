@@ -1,0 +1,864 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ETL S2T Agent Chat</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --app-bg: #f5f7fb;
+            --line: #d8dee9;
+            --panel: #ffffff;
+            --accent: #1667c2;
+            --accent-soft: #e8f1fd;
+            --text-muted: #667085;
+        }
+        body {
+            min-height: 100vh;
+            margin: 0;
+            background: var(--app-bg);
+            color: #1f2937;
+        }
+        .app-shell {
+            min-height: 100vh;
+            display: grid;
+            grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+        }
+        .side-panel {
+            border-right: 1px solid var(--line);
+            background: var(--panel);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+        .brand-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            margin: 0;
+        }
+        .brand-subtitle {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            margin: 4px 0 0;
+        }
+        .status-panel {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 14px;
+            background: #fbfcfe;
+        }
+        .status-label {
+            color: var(--text-muted);
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0;
+            margin-bottom: 4px;
+        }
+        .status-value {
+            font-size: 0.92rem;
+            word-break: break-word;
+        }
+        .quick-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .quick-actions button {
+            text-align: left;
+            white-space: normal;
+        }
+        .analysis-progress {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 12px;
+            background: #fbfcfe;
+        }
+        .analysis-progress-main {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            align-items: baseline;
+            font-size: 0.9rem;
+            margin-bottom: 8px;
+        }
+        .analysis-progress-message {
+            min-width: 0;
+            word-break: break-word;
+        }
+        .analysis-progress-percent {
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+        .analysis-progress .progress {
+            height: 8px;
+            background: #e6edf7;
+        }
+        .analysis-progress-detail {
+            margin-top: 8px;
+            color: var(--text-muted);
+            font-size: 0.82rem;
+            word-break: break-word;
+        }
+        .analysis-progress-history {
+            margin: 8px 0 0;
+            padding-left: 18px;
+            color: var(--text-muted);
+            font-size: 0.78rem;
+        }
+        .chat-main {
+            display: grid;
+            grid-template-rows: auto minmax(0, 1fr) auto;
+            min-width: 0;
+        }
+        .chat-header {
+            background: var(--panel);
+            border-bottom: 1px solid var(--line);
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        .chat-header h1 {
+            font-size: 1.05rem;
+            margin: 0;
+        }
+        .chat-header a {
+            font-size: 0.9rem;
+            text-decoration: none;
+        }
+        .messages {
+            padding: 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .message {
+            max-width: min(860px, 92%);
+            border-radius: 8px;
+            padding: 12px 14px;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            word-break: break-word;
+            border: 1px solid transparent;
+        }
+        .message-wide {
+            max-width: min(1280px, 96%);
+            width: fit-content;
+        }
+        .message-user {
+            align-self: flex-end;
+            background: var(--accent);
+            color: #fff;
+        }
+        .message-agent {
+            align-self: flex-start;
+            background: var(--panel);
+            border-color: var(--line);
+        }
+        .message-system {
+            align-self: center;
+            max-width: min(760px, 96%);
+            background: var(--accent-soft);
+            border-color: #c8dcf8;
+            color: #25496f;
+            font-size: 0.92rem;
+        }
+        .message table {
+            width: max-content;
+            min-width: 100%;
+            margin: 8px 0;
+            border-collapse: collapse;
+            white-space: normal;
+            font-size: 0.86rem;
+            background: #fff;
+        }
+        .message .table-responsive {
+            max-width: min(1240px, 92vw);
+            overflow-x: auto;
+        }
+        .message th,
+        .message td {
+            border: 1px solid var(--line);
+            padding: 6px 8px;
+            vertical-align: top;
+            min-width: 120px;
+            max-width: 280px;
+            overflow-wrap: anywhere;
+        }
+        .message th {
+            background: #eef4fb;
+            white-space: nowrap;
+        }
+        .message td:last-child {
+            min-width: 280px;
+            max-width: 420px;
+            white-space: pre-wrap;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.78rem;
+        }
+        .message pre {
+            background: #111827;
+            color: #eef2ff;
+            border-radius: 6px;
+            padding: 10px;
+            overflow-x: auto;
+            white-space: pre;
+        }
+        .composer {
+            background: var(--panel);
+            border-top: 1px solid var(--line);
+            padding: 14px 20px;
+        }
+        .composer-inner {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 10px;
+            align-items: end;
+        }
+        textarea {
+            resize: none;
+            min-height: 48px;
+            max-height: 140px;
+        }
+        .busy {
+            color: var(--text-muted);
+            font-size: 0.88rem;
+            min-height: 20px;
+            margin-top: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .loading-inline {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .loading-spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid #c8dcf8;
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            flex: 0 0 auto;
+            animation: spin 0.8s linear infinite;
+        }
+        .message-loading {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+        @media (max-width: 860px) {
+            .app-shell {
+                grid-template-columns: 1fr;
+            }
+            .side-panel {
+                border-right: 0;
+                border-bottom: 1px solid var(--line);
+            }
+            .chat-main {
+                min-height: 68vh;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="app-shell">
+    <aside class="side-panel">
+        <div>
+            <p class="brand-title">ETL S2T Agent</p>
+            <p class="brand-subtitle">История хранится только в текущей вкладке браузера.</p>
+        </div>
+
+        <form id="uploadForm">
+            <label for="fileInput" class="form-label">Excel-файл</label>
+            <input class="form-control" type="file" id="fileInput" name="file" accept=".xlsx,.xls,.xlsm" required>
+            <div class="form-check mt-2">
+                <input class="form-check-input" type="checkbox" id="includeHiddenRows">
+                <label class="form-check-label" for="includeHiddenRows">Учитывать скрытые строки</label>
+            </div>
+            <button class="btn btn-primary w-100 mt-2" type="submit">Загрузить и разобрать</button>
+        </form>
+
+        <div id="analysisProgress" class="analysis-progress d-none" aria-live="polite">
+            <div class="status-label">Прогресс анализа</div>
+            <div class="analysis-progress-main">
+                <div id="analysisProgressMessage" class="analysis-progress-message">Ожидаю файл...</div>
+                <div id="analysisProgressPercent" class="analysis-progress-percent">0%</div>
+            </div>
+            <div class="progress" role="progressbar" aria-label="Прогресс анализа файла" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                <div id="analysisProgressBar" class="progress-bar" style="width: 0%"></div>
+            </div>
+            <div id="analysisProgressDetail" class="analysis-progress-detail"></div>
+            <ol id="analysisProgressHistory" class="analysis-progress-history"></ol>
+        </div>
+
+        <div class="status-panel">
+            <div class="status-label">Текущий файл</div>
+            <div id="currentFileName" class="status-value">Файл не загружен</div>
+            <div class="status-label mt-3">ID файла</div>
+            <div id="currentFileId" class="status-value text-muted">-</div>
+            <div class="status-label mt-3">S2T transformations</div>
+            <div id="currentTransformations" class="status-value text-muted">-</div>
+            <div class="d-grid gap-2 mt-3">
+                <button id="rebuildTransformationsBtn" class="btn btn-outline-secondary btn-sm" type="button">Пересобрать трансформации</button>
+                <button id="clearAllDataBtn" class="btn btn-outline-danger btn-sm" type="button">Очистить все данные</button>
+            </div>
+        </div>
+
+        <div>
+            <div class="status-label">Быстрые команды</div>
+            <div class="quick-actions">
+                <button class="btn btn-outline-secondary btn-sm" type="button" data-prompt="Покажи таблицу трансформаций">Показать трансформации</button>
+                <button class="btn btn-outline-secondary btn-sm" type="button" data-prompt="Какие листы есть в текущем файле?">Листы текущего файла</button>
+                <button class="btn btn-outline-secondary btn-sm" type="button" data-prompt="Какие файлы загружены?">Загруженные файлы</button>
+                <button class="btn btn-outline-secondary btn-sm" type="button" data-prompt="Сделай краткое резюме по данным">Краткое резюме</button>
+            </div>
+        </div>
+    </aside>
+
+    <main class="chat-main">
+        <header class="chat-header">
+            <h1>Чат с данными</h1>
+            <div class="d-flex align-items-center gap-3">
+                <button id="clearChatHistoryBtn" class="btn btn-outline-secondary btn-sm" type="button">Очистить историю</button>
+                <a href="/">Классический интерфейс</a>
+            </div>
+        </header>
+
+        <section id="messages" class="messages" aria-live="polite"></section>
+
+        <footer class="composer">
+            <div class="composer-inner">
+                <textarea id="chatInput" class="form-control" placeholder="Например: покажи таблицу трансформаций" rows="2"></textarea>
+                <button id="sendBtn" class="btn btn-primary" type="button">Отправить</button>
+            </div>
+            <div id="busyText" class="busy" role="status" aria-live="polite"></div>
+        </footer>
+    </main>
+</div>
+
+<script>
+    let currentFileId = null;
+    let currentFileName = null;
+    let currentTransformationsCount = null;
+    let busy = false;
+    let loadingMessageNode = null;
+    let progressPollTimer = null;
+    let activeUploadId = null;
+    const CHAT_HISTORY_STORAGE_KEY = 'etl-s2t-chat-history-v1';
+    const CHAT_SESSION_ID_STORAGE_KEY = 'etl-s2t-chat-session-id-v1';
+    const MAX_STORED_CHAT_MESSAGES = 100;
+    const MAX_CONTEXT_MESSAGES = 12;
+    let chatHistory = loadChatHistory();
+    let currentSessionId = ensureChatSessionId();
+
+    const uploadForm = document.getElementById('uploadForm');
+    const fileInput = document.getElementById('fileInput');
+    const includeHiddenRows = document.getElementById('includeHiddenRows');
+    const uploadSubmitBtn = uploadForm.querySelector('button[type="submit"]');
+    const messages = document.getElementById('messages');
+    const chatInput = document.getElementById('chatInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const clearChatHistoryBtn = document.getElementById('clearChatHistoryBtn');
+    const busyText = document.getElementById('busyText');
+    const currentFileNameEl = document.getElementById('currentFileName');
+    const currentFileIdEl = document.getElementById('currentFileId');
+    const currentTransformationsEl = document.getElementById('currentTransformations');
+    const rebuildTransformationsBtn = document.getElementById('rebuildTransformationsBtn');
+    const clearAllDataBtn = document.getElementById('clearAllDataBtn');
+    const quickActionButtons = document.querySelectorAll('[data-prompt]');
+    const analysisProgress = document.getElementById('analysisProgress');
+    const analysisProgressMessage = document.getElementById('analysisProgressMessage');
+    const analysisProgressPercent = document.getElementById('analysisProgressPercent');
+    const analysisProgressBar = document.getElementById('analysisProgressBar');
+    const analysisProgressDetail = document.getElementById('analysisProgressDetail');
+    const analysisProgressHistory = document.getElementById('analysisProgressHistory');
+
+    restoreChatHistory();
+
+    function setBusy(value, text) {
+        busy = value;
+        sendBtn.disabled = value;
+        chatInput.disabled = value;
+        fileInput.disabled = value;
+        includeHiddenRows.disabled = value;
+        uploadSubmitBtn.disabled = value;
+        rebuildTransformationsBtn.disabled = value || !currentFileId;
+        clearAllDataBtn.disabled = value;
+        quickActionButtons.forEach((button) => {
+            button.disabled = value;
+        });
+        clearChatHistoryBtn.disabled = value;
+        if (value) {
+            const message = text || 'Выполняю действие...';
+            busyText.innerHTML = loadingHtml(message);
+            showLoadingMessage(message);
+        } else {
+            busyText.innerHTML = '';
+            hideLoadingMessage();
+        }
+    }
+
+    function setCurrentFile(data) {
+        currentFileId = data.file_id || null;
+        currentFileName = data.filename || null;
+        currentTransformationsCount = Number(data.s2t_transformations_count || 0);
+        currentFileNameEl.textContent = currentFileName || 'Файл не загружен';
+        currentFileIdEl.textContent = currentFileId || '-';
+        currentTransformationsEl.textContent = currentFileId ? `${currentTransformationsCount} строк` : '-';
+        rebuildTransformationsBtn.disabled = busy || !currentFileId;
+        clearAllDataBtn.disabled = busy;
+    }
+
+    setBusy(false);
+
+    uploadForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (busy || !fileInput.files.length) return;
+
+        const file = fileInput.files[0];
+        addMessage('user', `Загрузить файл: ${file.name}`);
+        setBusy(true, 'Разбираю Excel и сохраняю данные...');
+        activeUploadId = createUploadId();
+        resetAnalysisProgress();
+        updateAnalysisProgress({
+            status: 'running',
+            percent: 0,
+            message: 'Готовлю файл к отправке...',
+            detail: file.name,
+            history: []
+        });
+        startProgressPolling(activeUploadId);
+
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('upload_id', activeUploadId);
+        formData.append('include_hidden_rows', String(includeHiddenRows.checked));
+
+        try {
+            const response = await fetch('/upload', { method: 'POST', body: formData });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Upload failed');
+
+            setCurrentFile(data);
+            const sheets = (data.sheets || []).map((sheet) => sheet.sheet_name).join(', ') || 'нет листов';
+            const summary = data.summary ? `\n\nСаммари:\n${data.summary}` : '';
+            const summaryError = data.summary_error
+                ? (data.summary
+                    ? `\n\nLLM-саммари не создано, показано fallback-summary: ${data.summary_error}`
+                    : `\n\nСаммари не создано: ${data.summary_error}`)
+                : '';
+            const s2tError = data.s2t_transformations_error
+                ? `\n\nS2T extraction не записан: ${data.s2t_transformations_error}`
+                : '';
+            addMessage(
+                'agent',
+                `Файл загружен: ${data.filename}\nID файла: ${data.file_id}\nЛисты: ${sheets}\nS2T transformations: ${currentTransformationsCount}${s2tError}${summary}${summaryError}`
+            );
+            if (currentTransformationsCount > 0) {
+                addMessage('system', 'Можно спросить: "Покажи таблицу трансформаций".');
+            }
+            updateAnalysisProgress({
+                status: 'done',
+                percent: 100,
+                message: 'Анализ файла завершен',
+                detail: `Листов: ${(data.sheets || []).length}, S2T transformations: ${currentTransformationsCount}`
+            });
+        } catch (error) {
+            updateAnalysisProgress({
+                status: 'error',
+                percent: 100,
+                message: 'Ошибка анализа файла',
+                detail: error.message
+            });
+            addMessage('agent', `Ошибка загрузки: ${error.message}`);
+        } finally {
+            stopProgressPolling();
+            setBusy(false);
+        }
+    });
+
+    sendBtn.addEventListener('click', sendChat);
+    clearChatHistoryBtn.addEventListener('click', clearChatHistory);
+    rebuildTransformationsBtn.addEventListener('click', rebuildTransformations);
+    clearAllDataBtn.addEventListener('click', clearAllData);
+    chatInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            sendChat();
+        }
+    });
+
+    document.querySelectorAll('[data-prompt]').forEach((button) => {
+        button.addEventListener('click', () => {
+            chatInput.value = button.getAttribute('data-prompt');
+            sendChat();
+        });
+    });
+
+    async function sendChat() {
+        const query = chatInput.value.trim();
+        if (!query || busy) return;
+
+        const history = chatHistory.slice(-MAX_CONTEXT_MESSAGES);
+        addMessage('user', query);
+        chatInput.value = '';
+        setBusy(true, 'Агент отвечает...');
+
+        try {
+            const response = await fetch('/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query, file_id: currentFileId, history, session_id: currentSessionId })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Chat failed');
+            const answer = data.answer || 'Пустой ответ';
+            addMessage('agent', answer);
+            appendChatHistory('user', query);
+            appendChatHistory('assistant', answer);
+        } catch (error) {
+            addMessage('agent', `Ошибка: ${error.message}`);
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    function loadChatHistory() {
+        try {
+            const value = JSON.parse(window.sessionStorage.getItem(CHAT_HISTORY_STORAGE_KEY) || '[]');
+            if (!Array.isArray(value)) return [];
+            return value.filter((item) => (
+                item
+                && (item.role === 'user' || item.role === 'assistant')
+                && typeof item.content === 'string'
+                && item.content.trim()
+            )).slice(-MAX_STORED_CHAT_MESSAGES);
+        } catch (error) {
+            return [];
+        }
+    }
+
+    function createChatSessionId() {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+            return window.crypto.randomUUID();
+        }
+        return `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
+    function ensureChatSessionId() {
+        try {
+            const existing = window.sessionStorage.getItem(CHAT_SESSION_ID_STORAGE_KEY);
+            if (typeof existing === 'string' && existing.trim()) {
+                return existing.trim();
+            }
+            const created = createChatSessionId();
+            window.sessionStorage.setItem(CHAT_SESSION_ID_STORAGE_KEY, created);
+            return created;
+        } catch (error) {
+            return createChatSessionId();
+        }
+    }
+
+    function resetChatSessionId() {
+        currentSessionId = createChatSessionId();
+        try {
+            window.sessionStorage.setItem(CHAT_SESSION_ID_STORAGE_KEY, currentSessionId);
+        } catch (error) {
+            // The chat remains usable when browser storage is unavailable.
+        }
+    }
+
+    function saveChatHistory() {
+        try {
+            window.sessionStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify(chatHistory));
+        } catch (error) {
+            // The chat remains usable when browser storage is unavailable.
+        }
+    }
+
+    function appendChatHistory(role, content) {
+        chatHistory.push({ role, content: String(content) });
+        chatHistory = chatHistory.slice(-MAX_STORED_CHAT_MESSAGES);
+        saveChatHistory();
+    }
+
+    function restoreChatHistory() {
+        if (!chatHistory.length) {
+            addMessage('system', 'Загрузите Excel-файл слева или задайте вопрос по уже сохраненным данным. История чата хранится только в этой вкладке браузера.');
+            return;
+        }
+        chatHistory.forEach((item) => {
+            addMessage(item.role === 'assistant' ? 'agent' : 'user', item.content);
+        });
+    }
+
+    function clearChatHistory() {
+        chatHistory = [];
+        try {
+            window.sessionStorage.removeItem(CHAT_HISTORY_STORAGE_KEY);
+        } catch (error) {
+            // No action is needed when browser storage is unavailable.
+        }
+        resetChatSessionId();
+        messages.innerHTML = '';
+        addMessage('system', 'История очищена. Новые сообщения сохраняются только в этой вкладке браузера.');
+    }
+
+    async function rebuildTransformations() {
+        if (!currentFileId || busy) return;
+        setBusy(true, 'Пересобираю таблицу трансформаций...');
+        try {
+            const response = await fetch(`/transformations/${encodeURIComponent(currentFileId)}/refresh`, { method: 'POST' });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Failed to rebuild transformations');
+            currentTransformationsCount = Number(data.count || 0);
+            currentTransformationsEl.textContent = `${currentTransformationsCount} строк`;
+            const s2tError = data.s2t_transformations_error ? `\nОшибка S2T extraction: ${data.s2t_transformations_error}` : '';
+            addMessage('agent', `Таблица s2t_transformations пересобрана: ${currentTransformationsCount} строк.${s2tError}\nМожно спросить: "Покажи таблицу трансформаций".`);
+        } catch (error) {
+            addMessage('agent', `Ошибка пересборки: ${error.message}`);
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    async function clearAllData() {
+        if (busy) return;
+        if (!window.confirm(
+            'Полностью очистить все таблицы SQLite и весь граф Neo4j? Действие необратимо.'
+        )) return;
+        setBusy(true, 'Очищаю SQLite и Neo4j...');
+        try {
+            const response = await fetch('/storage', { method: 'DELETE' });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Не удалось очистить хранилища');
+            const sqliteRows = Object.values(data.sqlite_deleted || {}).reduce(
+                (total, value) => total + Number(value || 0),
+                0
+            );
+            const graphNodes = Number((data.neo4j_deleted || {}).nodes || 0);
+            setCurrentFile({});
+            fileInput.value = '';
+            addMessage(
+                'system',
+                `Полная очистка завершена: SQLite — ${sqliteRows} строк, Neo4j — ${graphNodes} узлов.`
+            );
+        } catch (error) {
+            addMessage('agent', `Ошибка очистки: ${error.message}`);
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    function addMessage(role, text) {
+        const node = document.createElement('div');
+        node.className = `message message-${role}`;
+        node.innerHTML = renderMessage(text || '');
+        if (node.querySelector('.table-responsive')) {
+            node.classList.add('message-wide');
+        }
+        messages.appendChild(node);
+        messages.scrollTop = messages.scrollHeight;
+        return node;
+    }
+
+    function showLoadingMessage(text) {
+        hideLoadingMessage();
+        loadingMessageNode = document.createElement('div');
+        loadingMessageNode.className = 'message message-system message-loading';
+        loadingMessageNode.setAttribute('role', 'status');
+        loadingMessageNode.setAttribute('aria-live', 'polite');
+        loadingMessageNode.innerHTML = loadingHtml(text);
+        messages.appendChild(loadingMessageNode);
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    function hideLoadingMessage() {
+        if (loadingMessageNode) {
+            loadingMessageNode.remove();
+            loadingMessageNode = null;
+        }
+    }
+
+    function createUploadId() {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+            return window.crypto.randomUUID();
+        }
+        return `upload-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
+    function startProgressPolling(uploadId) {
+        stopProgressPolling();
+        pollAnalysisProgress(uploadId);
+        progressPollTimer = window.setInterval(() => pollAnalysisProgress(uploadId), 700);
+    }
+
+    function stopProgressPolling() {
+        if (progressPollTimer) {
+            window.clearInterval(progressPollTimer);
+            progressPollTimer = null;
+        }
+    }
+
+    async function pollAnalysisProgress(uploadId) {
+        if (!uploadId || uploadId !== activeUploadId) return;
+        try {
+            const response = await fetch(`/analysis_progress/${encodeURIComponent(uploadId)}`);
+            if (response.status === 404) return;
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Progress polling failed');
+            updateAnalysisProgress(data);
+            if (data.status === 'done' || data.status === 'error') {
+                stopProgressPolling();
+            }
+        } catch (error) {
+            updateAnalysisProgress({
+                status: 'running',
+                message: 'Жду обновления прогресса...',
+                detail: error.message
+            });
+        }
+    }
+
+    function resetAnalysisProgress() {
+        analysisProgress.classList.add('d-none');
+        analysisProgressMessage.textContent = 'Ожидаю файл...';
+        analysisProgressPercent.textContent = '0%';
+        analysisProgressBar.style.width = '0%';
+        analysisProgressBar.classList.remove('bg-danger', 'bg-success');
+        analysisProgressDetail.textContent = '';
+        analysisProgressHistory.innerHTML = '';
+        analysisProgress.querySelector('.progress').setAttribute('aria-valuenow', '0');
+    }
+
+    function updateAnalysisProgress(data) {
+        if (!data) return;
+        const percent = Math.max(0, Math.min(100, Number(data.percent || 0)));
+        const message = data.message || 'Анализирую файл...';
+        const detail = data.detail || sheetProgressDetail(data);
+
+        analysisProgress.classList.remove('d-none');
+        analysisProgressMessage.textContent = message;
+        analysisProgressPercent.textContent = `${percent}%`;
+        analysisProgressBar.style.width = `${percent}%`;
+        analysisProgress.querySelector('.progress').setAttribute('aria-valuenow', String(percent));
+        analysisProgressDetail.textContent = detail || '';
+        analysisProgressBar.classList.toggle('bg-success', data.status === 'done');
+        analysisProgressBar.classList.toggle('bg-danger', data.status === 'error');
+
+        if (busy) {
+            busyText.innerHTML = loadingHtml(message);
+            if (loadingMessageNode) {
+                loadingMessageNode.innerHTML = loadingHtml(message);
+            }
+        }
+        renderProgressHistory(data.history || []);
+    }
+
+    function sheetProgressDetail(data) {
+        if (data.sheet_name && data.sheet_index && data.sheet_count) {
+            return `${data.sheet_name} (${data.sheet_index}/${data.sheet_count})`;
+        }
+        return '';
+    }
+
+    function renderProgressHistory(history) {
+        const compact = history
+            .filter((item) => item && item.message)
+            .slice(-5);
+        analysisProgressHistory.innerHTML = compact.map((item) => {
+            const percent = item.percent === null || item.percent === undefined ? '' : `${item.percent}% `;
+            const detail = item.detail ? ` - ${item.detail}` : '';
+            return `<li>${escapeHtml(percent + item.message + detail)}</li>`;
+        }).join('');
+    }
+
+    function loadingHtml(text) {
+        return `<span class="loading-spinner" aria-hidden="true"></span><span>${escapeHtml(text)}</span>`;
+    }
+
+    function renderMessage(text) {
+        const blocks = String(text).split(/(```[\s\S]*?```)/g);
+        return blocks.map((block) => {
+            if (block.startsWith('```')) {
+                const inner = block.replace(/^```[a-zA-Z0-9_-]*\n?/, '').replace(/```$/, '');
+                return `<pre><code>${escapeHtml(inner)}</code></pre>`;
+            }
+            return renderMarkdownTables(block);
+        }).join('');
+    }
+
+    function renderMarkdownTables(text) {
+        const lines = text.split('\n');
+        const out = [];
+        for (let i = 0; i < lines.length; i += 1) {
+            if (isMarkdownTableAt(lines, i)) {
+                const header = splitTableRow(lines[i]);
+                i += 2;
+                const rows = [];
+                while (i < lines.length && lines[i].trim().startsWith('|')) {
+                    rows.push(splitTableRow(lines[i]));
+                    i += 1;
+                }
+                i -= 1;
+                out.push(tableHtml(header, rows));
+            } else {
+                out.push(renderInline(lines[i]));
+                if (i < lines.length - 1) out.push('<br>');
+            }
+        }
+        return out.join('');
+    }
+
+    function isMarkdownTableAt(lines, index) {
+        if (index + 1 >= lines.length) return false;
+        return lines[index].trim().startsWith('|') && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[index + 1]);
+    }
+
+    function splitTableRow(line) {
+        return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
+    }
+
+    function tableHtml(header, rows) {
+        const head = header.map((cell) => `<th>${renderInline(cell)}</th>`).join('');
+        const body = rows.map((row) => `<tr>${row.map((cell) => `<td>${renderInline(cell)}</td>`).join('')}</tr>`).join('');
+        return `<div class="table-responsive"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+    }
+
+    function renderInline(text) {
+        let html = escapeHtml(text);
+        html = html.replace(
+            /\[([^\]]+)\]\((\/exports\/sql\/[A-Za-z0-9_.%-]+\.csv)\)/g,
+            '<a href="$2" target="_blank" rel="noopener">$1</a>'
+        );
+        html = html.replace(
+            /(^|[\s(])(\/exports\/sql\/[A-Za-z0-9_.%-]+\.csv)/g,
+            '$1<a href="$2" target="_blank" rel="noopener">$2</a>'
+        );
+        html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+        html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        return html;
+    }
+
+    function escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+</script>
+</body>
+</html>

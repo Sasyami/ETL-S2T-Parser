@@ -1,0 +1,149 @@
+{
+  "s2t": {
+    "null_flag": [
+      "NULL?",
+      "not null"
+    ],
+    "foreign_key": [
+      "Внешний ключ?",
+      "Внешний ключ"
+    ],
+    "primary_key": [
+      "Первичный ключ?",
+      "Первичный ключ"
+    ],
+    "source_field": [
+      "Поле источника данных",
+      "Поле-источник"
+    ],
+    "target_field": [
+      "Поле приемника данных",
+      "Поле приемника",
+      "Целевое поле"
+    ],
+    "source_table": [
+      "Название таблицы-источника",
+      "Таблица-источник",
+      "Название таблицы-источника (из В-таблицы)"
+    ],
+    "target_table": [
+      "Таблица-приемник",
+      "Целевая таблица"
+    ],
+    "source_field_data_type": [
+      "Тип данных",
+      "Тип данных поля источника",
+      "Тип данных поля-источника",
+      "Тип данных.1"
+    ],
+    "target_field_data_type": [
+      "Тип данных",
+      "Тип данных поля приемника"
+    ],
+    "n_table_name": [
+      "Название N-таблицы",
+      "N-таблица"
+    ],
+    "transformation_rule": [
+
+      "Трансформации табличного уровня (SQL, пояснения)",
+      "Transformation SQL",
+      "Transformation Rule",
+      "Transformation",
+      "SQL",
+      "transformation_rule",
+      "Трансформация поля источника"
+    ]
+  },
+  "source_tables": {
+    "table_name": [
+      "Название таблицы-источника",
+      "Имя таблицы",
+      "source_table_name",
+      "source table name",
+      "source table",
+      "table",
+      "table_name",
+      "name"
+    ],
+    "description": [
+      "Описание таблицы-источника",
+      "Описание таблицы",
+      "Описание",
+      "description",
+      "table_description",
+      "table description"
+    ],
+    "system_code": [
+      "Код системы-источника",
+      "system_code",
+      "source system code",
+      "system code"
+    ]
+  },
+  "target_tables": {
+    "table_name": [
+      "Table Name",
+      "table",
+      "Имя таблицы",
+      "target_table_name",
+      "target table name",
+      "target table",
+      "table_name",
+      "name",
+      "Целевая таблица",
+      "Название таблицы"
+    ],
+    "description": [
+      "Table Entity Definition",
+      "Table Entity Note",
+      "Описание таблицы",
+      "Описание",
+      "description",
+      "table_description",
+      "table description"
+    ]
+  },
+  "source_columns": {
+    "field_name": [
+      "Название поля",
+      "column"
+    ],
+    "table_name": [
+      "Название таблицы",
+      "Название таблицы-источника",
+      "Название таблицы STAGE",
+      "table"
+    ],
+    "primary_key": [
+      "PK",
+      "Первичный ключ",
+      "pk"
+    ],
+    "not_null_flag": [
+      "NULL?",
+      "notnull",
+      "notnullsource",
+      "notnulltcp"
+    ],
+    "data_type": [
+      "Тип поля",
+      "datatype"
+    ],
+    "description": [
+      "comment",
+      "Описание поля"
+    ]
+  },
+  "change_log": {
+    "date": [
+      "Date",
+      "Дата"
+    ],
+    "change": [
+      "change",
+      "Изменение",
+      "Комментарий"
+    ]
+  }
+}

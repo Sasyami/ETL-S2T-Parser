@@ -1,0 +1,92 @@
+{
+  "change_log": [
+    "Список изменений",
+    "История изменений документа",
+    "change_log"
+  ],
+  "s2t": [
+    "SourceToTarget",
+    "S2T",
+    "s2t"
+  ],
+  "source_tables": [
+    "Source tables",
+    "Source Tables",
+    "source_tables"
+  ],
+  "source_columns": [
+    "Source columns",
+    "Source Columns",
+    "source_columns"
+  ],
+  "target_tables": [
+    "Target tables",
+    "Target Tables",
+    "target_tables"
+  ],
+  "target_columns": [
+    "Target columns",
+    "Target Colums",
+    "target_columns"
+  ],
+  "target_relations": [
+    "Target relations",
+    "target_relations"
+  ],
+  "target_resp": [
+    "Target resp",
+    "target_resp"
+  ],
+  "k_tables": [
+    "К-tables",
+    "K-tables",
+    "k_tables"
+  ],
+  "additional_objects": [
+    "Additional objects",
+    "Additional_Objects",
+    "additional_objects"
+  ],
+  "glossary": [
+    "Глоссарий"
+  ],
+  "json_mapping": [
+    "json кап802->hadoop кап818",
+    "Метаданные для hadoop"
+  ],
+  "faq": [
+    "FAQ"
+  ],
+  "n_layer": [
+    "N Objects",
+    "N DDL"
+  ],
+  "dictionaries": [
+    "Dictionaries"
+  ],
+  "const": [
+    "Const"
+  ],
+  "integrity": [
+    "Integrity"
+  ],
+  "env": [
+    "Env"
+  ],
+  "templates": [
+    "templates"
+  ],
+  "sheet1": [
+    "Sheet1",
+    "Лист1"
+  ],
+  "s305_0999_enums": [
+    "s305_0999_enums"
+  ],
+  "master_inst_load": [
+    "master_inst_load"
+  ],
+  "fake_desc": [
+    "FakeDesc"
+  ]
+}

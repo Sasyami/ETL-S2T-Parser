@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>AI Excel Parser – Human Correction & Schema Matching + AI Chat</title>
+    <title>AI Excel Parser – Human Correction + S2T Chat</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; padding-top: 2rem; }
@@ -14,7 +14,6 @@
         .header-preview { font-family: monospace; background: #e9ecef; padding: 0.5rem; border-radius: 0.25rem; margin-top: 0.5rem; }
         .skip-checkbox { margin-right: 1rem; }
         .alert-success { margin-top: 1rem; }
-        .similarity-table { font-size: 0.9rem; }
         .data-preview-table { font-size: 0.85rem; background: #fff; }
         .data-preview-table td { vertical-align: middle; white-space: nowrap; max-width: 280px;
             overflow: hidden; text-overflow: ellipsis; }
@@ -31,6 +30,8 @@
             margin-bottom: 0.75rem;
             padding: 0.5rem;
             border-radius: 0.5rem;
+            white-space: pre-wrap;
+            word-break: break-word;
         }
         .chat-user {
             background: #e9ecef;
@@ -56,6 +57,28 @@
             white-space: pre-wrap;
             word-break: break-word;
         }
+        .transformations-table {
+            font-size: 0.82rem;
+            background: #fff;
+            min-width: 900px;
+            table-layout: fixed;
+        }
+        .transformations-table th {
+            white-space: nowrap;
+        }
+        .transformations-table td {
+            vertical-align: top;
+            max-width: 260px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .transformations-sql {
+            max-width: 360px;
+            white-space: pre-wrap;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 0.78rem;
+        }
     </style>
 </head>
 <body>
@@ -64,7 +87,7 @@
         <div class="col-md-10">
             <div class="card shadow-sm">
                 <div class="card-header bg-primary text-white">
-                    <h4 class="mb-0">🤖 AI Excel Parser – Human Correction & Schema Matching + AI Chat</h4>
+                    <h4 class="mb-0">🤖 AI Excel Parser – Human Correction + S2T Chat</h4>
                 </div>
                 <div class="card-body">
                     <!-- File upload area (unchanged) -->
@@ -73,9 +96,14 @@
                             <label for="fileInput" class="form-label">Choose Excel file (.xlsx, .xls, .xlsm)</label>
                             <input class="form-control" type="file" id="fileInput" name="file" accept=".xlsx,.xls,.xlsm" required>
                         </div>
+                        <div class="form-check mb-3">
+                            <input class="form-check-input" type="checkbox" id="includeHiddenRows">
+                            <label class="form-check-label" for="includeHiddenRows">Учитывать скрытые строки</label>
+                        </div>
                         <button type="submit" class="btn btn-primary">Upload & Analyze</button>
                         <button type="button" id="resetBtn" class="btn btn-secondary">🔄 New File</button>
                         <button type="button" id="toggleChatBtn" class="btn btn-info">💬 Show Chat</button>
+                        <a href="/chat_app" class="btn btn-outline-dark">Chat-first app</a>
                         <div id="loading" class="mt-3 text-primary d-none">🤔 AI is analyzing headers... ⏳</div>
                     </form>
 
@@ -92,19 +120,37 @@
                         </div>
                     </div>
 
+                    <!-- S2T transformations browser -->
+                    <div id="transformationsArea" class="mt-4" style="display: none;">
+                        <div class="card border-primary shadow-sm">
+                            <div class="card-header bg-primary bg-opacity-10 py-2 d-flex justify-content-between align-items-center">
+                                <div>
+                                    <strong>S2T transformations</strong>
+                                    <span id="transformationsCount" class="text-muted small ms-1"></span>
+                                </div>
+                                <div class="btn-group btn-group-sm" role="group">
+                                    <button type="button" id="loadTransformationsBtn" class="btn btn-outline-primary">Load</button>
+                                    <button type="button" id="rebuildTransformationsBtn" class="btn btn-outline-secondary">Rebuild</button>
+                                    <button type="button" id="clearAllDataBtn" class="btn btn-outline-danger">Clear all data</button>
+                                </div>
+                            </div>
+                            <div class="card-body py-3">
+                                <div class="input-group input-group-sm mb-2">
+                                    <input type="text" id="transformationsSearch" class="form-control" placeholder="Filter by target/source/table/rule">
+                                    <button type="button" id="searchTransformationsBtn" class="btn btn-outline-secondary">Search</button>
+                                </div>
+                                <div id="transformationsContent" class="text-muted small">
+                                    Transformations are loaded from SQLite table <code>s2t_transformations</code>.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Correction area (unchanged) -->
                     <div id="correctionArea" class="mt-4" style="display: none;">
                         <h5>📝 Review and correct AI decisions</h5>
                         <div id="sheetsContainer"></div>
-                        <button id="submitCorrectionsBtn" class="btn btn-success mt-3">✅ Apply Corrections & Check Similarity</button>
-                    </div>
-
-                    <!-- Similarity report area (unchanged) -->
-                    <div id="similarityArea" class="mt-4" style="display: none;">
-                        <h5>📊 Schema Similarity Report</h5>
-                        <div id="similarityContent"></div>
-                        <button id="loadDataBtn" class="btn btn-primary mt-3" style="display: none;">📥 Load Data into Target Tables</button>
-                        <div id="loadResult" class="alert alert-info mt-3" style="display: none;"></div>
+                        <button id="submitCorrectionsBtn" class="btn btn-success mt-3">✅ Apply Corrections</button>
                     </div>
 
                     <!-- Error area (unchanged) -->
@@ -129,19 +175,15 @@
 </div>
 
 <script>
-    let currentFileHash = null;
+    let currentFileId = null;
     let currentSheets = [];
-    let currentSimilarityReport = null;
 
     const form = document.getElementById('uploadForm');
     const fileInput = document.getElementById('fileInput');
+    const includeHiddenRows = document.getElementById('includeHiddenRows');
     const loadingDiv = document.getElementById('loading');
     const correctionArea = document.getElementById('correctionArea');
     const sheetsContainer = document.getElementById('sheetsContainer');
-    const similarityArea = document.getElementById('similarityArea');
-    const similarityContent = document.getElementById('similarityContent');
-    const loadDataBtn = document.getElementById('loadDataBtn');
-    const loadResult = document.getElementById('loadResult');
     const errorArea = document.getElementById('errorArea');
     const errorMessage = document.getElementById('errorMessage');
     const submitBtn = document.getElementById('submitCorrectionsBtn');
@@ -154,23 +196,29 @@
     const chatTyping = document.getElementById('chatTyping');
     const summaryArea = document.getElementById('summaryArea');
     const summaryContent = document.getElementById('summaryContent');
+    const transformationsArea = document.getElementById('transformationsArea');
+    const transformationsCount = document.getElementById('transformationsCount');
+    const transformationsContent = document.getElementById('transformationsContent');
+    const transformationsSearch = document.getElementById('transformationsSearch');
+    const loadTransformationsBtn = document.getElementById('loadTransformationsBtn');
+    const rebuildTransformationsBtn = document.getElementById('rebuildTransformationsBtn');
+    const clearAllDataBtn = document.getElementById('clearAllDataBtn');
+    const searchTransformationsBtn = document.getElementById('searchTransformationsBtn');
 
     // Reset UI but keep the selected file (used before upload)
     function resetUI() {
         correctionArea.style.display = 'none';
-        similarityArea.style.display = 'none';
         errorArea.style.display = 'none';
-        loadResult.style.display = 'none';
-        loadDataBtn.style.display = 'none';
         sheetsContainer.innerHTML = '';
         errorMessage.textContent = '';
-        currentFileHash = null;
+        currentFileId = null;
         currentSheets = [];
-        currentSimilarityReport = null;
-        loadDataBtn.disabled = false;
         summaryArea.style.display = 'none';
         summaryContent.textContent = '';
-        loadDataBtn.innerText = '📥 Load Data into Target Tables';
+        transformationsArea.style.display = 'none';
+        transformationsCount.textContent = '';
+        transformationsContent.innerHTML = 'Transformations are loaded from SQLite table <code>s2t_transformations</code>.';
+        transformationsSearch.value = '';
     }
 
     // Full reset including file input (used by New File button)
@@ -236,15 +284,136 @@
         if (e.key === 'Enter') sendChatMessage();
     });
 
-    function showSummary(summary) {
+    function showSummary(summary, summaryError) {
         summaryArea.style.display = 'block';
         const text = summary === null || summary === undefined ? '' : String(summary).trim();
         if (!text) {
-            summaryContent.innerHTML = '<p class="text-muted mb-0"><em>No business summary was generated for this file.</em></p>';
+            const detail = summaryError ? `<br><span class="text-danger">${escapeHtml(String(summaryError))}</span>` : '';
+            summaryContent.innerHTML = `<p class="text-muted mb-0"><em>No business summary was generated for this file.</em>${detail}</p>`;
             return;
         }
         summaryContent.textContent = summary;
     }
+
+    function showTransformationsPanel(count) {
+        const n = Number(count || 0);
+        transformationsArea.style.display = 'block';
+        transformationsCount.textContent = n ? `(${n} rows)` : '(no rows)';
+        if (!n) {
+            transformationsContent.innerHTML = '<p class="text-muted mb-0"><em>No S2T transformations were extracted for this file.</em></p>';
+            return;
+        }
+        transformationsContent.innerHTML = '<span class="text-muted">Loading transformations...</span>';
+        void loadTransformations();
+    }
+
+    async function loadTransformations() {
+        if (!currentFileId) return;
+        const q = transformationsSearch.value.trim();
+        const params = new URLSearchParams({ limit: '200' });
+        if (q) params.set('q', q);
+        transformationsContent.innerHTML = '<span class="text-muted">Loading transformations...</span>';
+        loadTransformationsBtn.disabled = true;
+        rebuildTransformationsBtn.disabled = true;
+        clearAllDataBtn.disabled = true;
+        searchTransformationsBtn.disabled = true;
+        try {
+            const response = await fetch(`/transformations/${encodeURIComponent(currentFileId)}?${params.toString()}`);
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Failed to load transformations');
+            transformationsCount.textContent = `(${data.total} rows)`;
+            transformationsContent.innerHTML = renderTransformationsTable(data.rows, data.total, data.limit);
+        } catch (err) {
+            transformationsContent.innerHTML = `<div class="alert alert-danger mb-0">Error: ${escapeHtml(err.message)}</div>`;
+        } finally {
+            loadTransformationsBtn.disabled = false;
+            rebuildTransformationsBtn.disabled = false;
+            clearAllDataBtn.disabled = false;
+            searchTransformationsBtn.disabled = false;
+        }
+    }
+
+    async function rebuildTransformations() {
+        if (!currentFileId) return;
+        transformationsContent.innerHTML = '<span class="text-muted">Rebuilding transformations...</span>';
+        rebuildTransformationsBtn.disabled = true;
+        try {
+            const response = await fetch(`/transformations/${encodeURIComponent(currentFileId)}/refresh`, { method: 'POST' });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Failed to rebuild transformations');
+            transformationsCount.textContent = `(${data.count} rows)`;
+            await loadTransformations();
+            if (data.s2t_transformations_error) {
+                transformationsContent.innerHTML = `<div class="alert alert-warning mb-2">S2T extraction error: ${escapeHtml(data.s2t_transformations_error)}</div>` + transformationsContent.innerHTML;
+            }
+        } catch (err) {
+            transformationsContent.innerHTML = `<div class="alert alert-danger mb-0">Error: ${escapeHtml(err.message)}</div>`;
+        } finally {
+            rebuildTransformationsBtn.disabled = false;
+        }
+    }
+
+    async function clearAllData() {
+        if (!window.confirm(
+            'Permanently clear every SQLite table and the entire Neo4j projection?'
+        )) return;
+        transformationsContent.innerHTML = '<span class="text-muted">Clearing SQLite and Neo4j...</span>';
+        clearAllDataBtn.disabled = true;
+        try {
+            const response = await fetch('/storage', { method: 'DELETE' });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Failed to clear application storage');
+            fullReset();
+            window.alert('All SQLite data and the Neo4j projection were cleared.');
+        } catch (err) {
+            transformationsContent.innerHTML = `<div class="alert alert-danger mb-0">Error: ${escapeHtml(err.message)}</div>`;
+        } finally {
+            clearAllDataBtn.disabled = false;
+        }
+    }
+
+    function renderTransformationsTable(rows, total, limit) {
+        if (!rows || !rows.length) {
+            return '<p class="text-muted mb-0"><em>No transformations match the filter.</em></p>';
+        }
+        let html = '';
+        if (total > limit) {
+            html += `<div class="alert alert-info py-2 mb-2">Showing first ${limit} of ${total} rows. Use filter to narrow results.</div>`;
+        }
+        html += `<div class="table-responsive"><table class="table table-sm table-bordered transformations-table mb-0">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Target table</th>
+                    <th>Target field</th>
+                    <th>Source table</th>
+                    <th>Source field</th>
+                    <th>Transformation</th>
+                </tr>
+            </thead>
+            <tbody>`;
+        for (const row of rows) {
+            const rulePreview = previewCellText(row.transformation_rule || '').slice(0, 500);
+            html += `<tr>
+                <td>${escapeHtml(previewCellText(row.row_num))}</td>
+                <td title="${escapeAttr(previewCellText(row.target_table))}">${escapeHtml(previewCellText(row.target_table))}</td>
+                <td title="${escapeAttr(previewCellText(row.target_field))}">${escapeHtml(previewCellText(row.target_field))}</td>
+                <td title="${escapeAttr(previewCellText(row.source_table))}">${escapeHtml(previewCellText(row.source_table))}</td>
+                <td title="${escapeAttr(previewCellText(row.source_field))}">${escapeHtml(previewCellText(row.source_field))}</td>
+                <td class="transformations-sql" title="${escapeAttr(rulePreview)}">${escapeHtml(rulePreview)}</td>
+            </tr>`;
+        }
+        html += '</tbody></table></div>';
+        return html;
+    }
+
+    loadTransformationsBtn.addEventListener('click', loadTransformations);
+    rebuildTransformationsBtn.addEventListener('click', rebuildTransformations);
+    clearAllDataBtn.addEventListener('click', clearAllData);
+    searchTransformationsBtn.addEventListener('click', loadTransformations);
+    transformationsSearch.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') loadTransformations();
+    });
 
     // Existing upload logic
     form.addEventListener('submit', async (e) => {
@@ -261,6 +430,7 @@
 
         const formData = new FormData();
         formData.append('file', file);
+        formData.append('include_hidden_rows', String(includeHiddenRows.checked));
 
         loadingDiv.classList.remove('d-none');
 
@@ -272,9 +442,10 @@
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || 'Unknown error');
 
-            currentFileHash = data.file_hash;
+            currentFileId = data.file_id;
             currentSheets = data.sheets;
-            showSummary(data.summary);
+            showSummary(data.summary, data.summary_error);
+            showTransformationsPanel(data.s2t_transformations_count);
             renderCorrectionUI(data.sheets);
             correctionArea.style.display = 'block';
         } catch (err) {
@@ -291,7 +462,7 @@
         return String(v);
     }
 
-    /** first_data_rows_preview: array of row arrays from the API */
+    /** data_preview: first three data rows from the API */
     function renderDataPreviewTable(rows) {
         if (!rows || !rows.length) {
             return '<p class="text-muted small mb-0"><em>No data rows to preview.</em></p>';
@@ -323,7 +494,7 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    file_hash: currentFileHash,
+                    file_id: currentFileId,
                     sheet_name: sheetName,
                     option: option
                 })
@@ -342,10 +513,10 @@
     function renderCorrectionUI(sheets) {
         sheetsContainer.innerHTML = '';
         for (let sheet of sheets) {
-            if (sheet.skipped) continue;
-            const ai = sheet.ai_decision;
-            const currentStartRow = ai.header_start_row;
-            const currentRows = ai.header_rows_count;
+            if (sheet.skip_reason) continue;
+            const header = sheet.header;
+            const currentStartRow = header.start_row;
+            const currentRows = header.row_count;
 
             let selectedOption = "";
             if (currentStartRow === 0 && currentRows === 1) selectedOption = "1";
@@ -384,7 +555,7 @@
                 </div>
                 <div class="mt-2">
                     <small class="d-block mb-1">Data preview (first 3 rows):</small>
-                    ${renderDataPreviewTable(sheet.first_data_rows_preview || [])}
+                    ${renderDataPreviewTable(sheet.data_preview || [])}
                 </div>
             `;
             sheetsContainer.appendChild(card);
@@ -411,7 +582,7 @@
     submitBtn.addEventListener('click', async () => {
         const corrections = [];
         for (let sheet of currentSheets) {
-            if (sheet.skipped) continue;
+            if (sheet.skip_reason) continue;
             const select = document.getElementById(`select-${sheet.sheet_name.replace(/\s/g, '_')}`);
             const skipCheckbox = document.getElementById(`skip-${sheet.sheet_name.replace(/\s/g, '_')}`);
             const skipped = skipCheckbox ? skipCheckbox.checked : false;
@@ -436,94 +607,22 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    file_hash: currentFileHash,
-                    corrections: corrections
+                    file_id: currentFileId,
+                    corrections: corrections,
+                    include_hidden_rows: includeHiddenRows.checked
                 })
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error);
 
-            showSummary(data.summary);
-
-            const matchResponse = await fetch('/match_schema', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            });
-            const report = await matchResponse.json();
-            if (!matchResponse.ok) throw new Error(report.error);
-
+            showSummary(data.summary, data.summary_error);
+            showTransformationsPanel(data.s2t_transformations_count);
             correctionArea.style.display = 'none';
-            similarityContent.innerHTML = renderSimilarityReport(report);
-            similarityArea.style.display = 'block';
-            loadDataBtn.style.display = 'inline-block';
-            loadResult.style.display = 'none';
-
-            currentSimilarityReport = report;
         } catch (err) {
             errorMessage.textContent = err.message;
             errorArea.style.display = 'block';
         } finally {
             loadingDiv.classList.add('d-none');
-        }
-    });
-
-    function renderSimilarityReport(report) {
-        let html = `<p><strong>Overall similarity score:</strong> ${report.similarity_score}%</p>`;
-        html += `<table class="table table-sm table-bordered similarity-table">
-                    <thead>
-                        <tr><th>Excel Sheet</th><th>Target Table</th><th>Similarity</th><th>Explanation</th>
-                        </tr>
-                    </thead>
-                    <tbody>`;
-        for (let sugg of report.mapping_suggestions) {
-            html += `<tr>
-                        <td>${escapeHtml(sugg.excel_sheet)}</td>
-                        <td>${escapeHtml(sugg.target_table || '—')}</td>
-                        <td>${escapeHtml(sugg.similarity)}</td>
-                        <td>${escapeHtml(sugg.explanation)}</td>
-                     </tr>`;
-        }
-        html += `</tbody></table>`;
-        if (report.unmatched_excel_sheets && report.unmatched_excel_sheets.length) {
-            html += `<div class="alert alert-warning">⚠️ Unmatched Excel sheets: ${report.unmatched_excel_sheets.join(', ')}</div>`;
-        }
-        if (report.unmatched_target_tables && report.unmatched_target_tables.length) {
-            html += `<div class="alert alert-info">ℹ️ Unmatched target tables: ${report.unmatched_target_tables.join(', ')}</div>`;
-        }
-        html += `<pre class="small">${escapeHtml(JSON.stringify(report.recommendations, null, 2))}</pre>`;
-        return html;
-    }
-
-    loadDataBtn.addEventListener('click', async () => {
-        loadDataBtn.disabled = true;
-        loadDataBtn.innerText = 'Loading...';
-        loadResult.style.display = 'block';
-        loadResult.innerHTML = '⏳ Loading data into target tables...';
-        loadResult.className = 'alert alert-info';
-
-        try {
-            const response = await fetch('/finalize_and_load', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    file_hash: currentFileHash,
-                    similarity_report: currentSimilarityReport
-                })
-            });
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error);
-
-            loadResult.className = 'alert alert-success';
-            loadResult.innerHTML = `✅ Data loaded successfully!<br>
-                                    Inserted counts: ${JSON.stringify(data.inserted_counts)}<br>
-                                    Similarity score: ${data.similarity_score}%`;
-            loadDataBtn.style.display = 'none';
-        } catch (err) {
-            loadResult.className = 'alert alert-danger';
-            loadResult.innerHTML = `❌ Error: ${err.message}`;
-            loadDataBtn.disabled = false;
-            loadDataBtn.innerText = '📥 Load Data into Target Tables';
         }
     });
 

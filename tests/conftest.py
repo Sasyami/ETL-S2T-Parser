@@ -5,38 +5,55 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-import tempfile
 import sqlite3
 import json
 import io
 from flask import Flask
 from app import app as flask_app
-from db_storage import init_db, get_db_connection
+from storage.database import init_db, get_db_connection
+
 
 @pytest.fixture
-def app():
+def mock_embeddings(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_MODEL", "test-embedding-model")
+    from services import embeddings
+
+    monkeypatch.setattr(
+        embeddings,
+        "embed_description",
+        lambda text: f"embedding:{text}".encode("utf-8"),
+    )
+    monkeypatch.setattr(
+        embeddings,
+        "embed_descriptions",
+        lambda texts: [
+            f"embedding:{text}".encode("utf-8")
+            for text in texts
+        ],
+    )
+
+
+@pytest.fixture
+def app(tmp_path):
     """Flask test client fixture."""
     flask_app.config['TESTING'] = True
     flask_app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
-    # Use a temporary database for tests
-    with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
-        flask_app.config['DB_PATH'] = tmp.name
-        yield flask_app
+    flask_app.config['DB_PATH'] = str(tmp_path / "flask_test.db")
+    yield flask_app
 
 @pytest.fixture
 def client(app):
     return app.test_client()
 
 @pytest.fixture
-def temp_db():
+def temp_db(tmp_path):
     """Create a temporary SQLite database for testing."""
-    with tempfile.NamedTemporaryFile(suffix='.db') as tmp:
-        import db_storage
-        original_path = db_storage.DB_PATH
-        db_storage.DB_PATH = tmp.name
-        init_db()
-        yield db_storage.get_db_connection()
-        db_storage.DB_PATH = original_path
+    import storage.database as db_storage
+    original_path = db_storage.DB_PATH
+    db_storage.DB_PATH = str(tmp_path / "test.db")
+    init_db()
+    yield db_storage.get_db_connection()
+    db_storage.DB_PATH = original_path
 
 @pytest.fixture
 def sample_excel_bytes():
@@ -58,20 +75,20 @@ def sample_excel_json():
     return {
         "filename": "test.xlsx",
         "model_used": "GigaChat-Pro",
-        "file_hash": "abc123",
+        "file_id": "abc123",
         "summary": "Test summary",
+        "description": "Test description",
         "sheets": [
             {
                 "sheet_name": "Sheet1",
-                "skipped": False,
-                "ai_decision": {
-                    "header_start_row": 0,
-                    "header_rows_count": 1,
-                    "nested_structure": False
+                "skip_reason": None,
+                "header": {
+                    "start_row": 0,
+                    "row_count": 1,
+                    "nested": False
                 },
                 "columns": ["Name", "Age"],
-                "first_data_rows_preview": [["Alice", 30], ["Bob", 25]],
-                "preview_rows": [["Name", "Age"], ["Alice", 30], ["Bob", 25]]
+                "data_preview": [["Alice", 30], ["Bob", 25]],
             }
         ]
     }

@@ -1,6 +1,6 @@
 # Makefile for ETL S2T Parser
 
-.PHONY: help install install-dev test test-cov lint format clean run streamlit-insights
+.PHONY: help install install-dev test test-cov lint format clean run
 
 help:
 	@echo "Available targets:"
@@ -12,7 +12,6 @@ help:
 	@echo "  format       Format code (black)"
 	@echo "  clean        Remove cache and temporary files"
 	@echo "  run          Run the Flask application"
-	@echo "  streamlit-insights  Streamlit UI for S2T mapping insights"
 
 install:
 	uv sync --no-dev
@@ -43,6 +42,3 @@ clean:
 
 run:
 	uv run python app.py
-
-streamlit-insights:
-	uv run streamlit run streamlit_insights.py
