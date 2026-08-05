@@ -1,10 +1,12 @@
+"""Build a semantic catalog and generate summary text for one uploaded file."""
+
+from __future__ import annotations
+
 import json
-import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
 
 from storage.database import (
     get_db_connection,
@@ -16,11 +18,7 @@ from .agent import chat_model
 try:
     from langfuse import observe
     from .observability import get_callback_handler
-
-    LANGFUSE_AVAILABLE = True
 except ImportError:
-    LANGFUSE_AVAILABLE = False
-
     def observe(*args, **kwargs):
         def decorator(func):
             return func
@@ -31,20 +29,27 @@ except ImportError:
         return None
 
 
-logger = logging.getLogger(__name__)
+MAX_SUBJECT_AREAS = 12
+MAX_TABLE_DESCRIPTIONS = 20
+MAX_VIEW_DESCRIPTIONS = 20
+MAX_ATTRIBUTE_DESCRIPTIONS = 25
+MAX_FIELD_DESCRIPTIONS = 20
+MAX_METRIC_DESCRIPTIONS = 10
+SUMMARY_TEXT_CHAR_LIMIT = 300
 
-SUMMARY_ROWS_PER_SHEET = 5
-SUMMARY_CELL_CHAR_LIMIT = 300
-SYSTEM_PROMPT = "Сделай краткое саммари на русском языке по переданным табличным данным."
+SYSTEM_PROMPT = (
+    "Сделай краткое бизнес-саммари и описание на русском языке по каталогу "
+    "описаний таблиц, представлений, атрибутов и полей."
+)
 SUMMARY_OUTPUT_REQUIREMENTS = """
-Сформируй один цельный абзац из 3–5 предложений объёмом не более 1200 символов.
-Опиши назначение данных, основные сущности и только те связи, маппинги или правила,
-которые прямо подтверждаются названиями колонок и примерами строк.
-Не придумывай отсутствующие факты и не перечисляй механически все колонки.
-Сразу начни с предметной области или назначения данных, без фраз «документ описывает»
-и «данные содержат». Не упоминай запрос пользователя, JSON, Excel, файл, документ,
-листы, выборку строк или процесс анализа.
-Не используй Markdown-заголовки, списки, вступления и заключения.
+Саммари: один цельный абзац из 3–5 предложений, не более 1200 символов.
+Описание: один короткий абзац из 2–3 предложений, не более 500 символов.
+Опирайся только на переданные описания таблиц, представлений, атрибутов и полей.
+Сформулируй предметные области, сущности и бизнес-процессы спецификации.
+Не перечисляй типы артефактов (S2T-строки, SQL, внешние ключи, исключённые листы),
+не описывай структуру документа и не придумывай отсутствующие факты.
+Не упоминай JSON, Excel, файл, документ, листы, выборку строк или процесс анализа.
+Верни только JSON с непустыми строками summary и description, без Markdown.
 """.strip()
 SUMMARY_RESPONSE_FORMAT = {
     "type": "json_schema",
@@ -54,56 +59,49 @@ SUMMARY_RESPONSE_FORMAT = {
         "schema": {
             "type": "object",
             "properties": {
-                "summary": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 1200,
-                }
+                "summary": {"type": "string", "minLength": 1, "maxLength": 1200},
+                "description": {"type": "string", "minLength": 1, "maxLength": 500},
             },
-            "required": ["summary"],
+            "required": ["summary", "description"],
             "additionalProperties": False,
         },
     },
 }
 
-
-def _summarizer_messages(inp: Dict[str, str]) -> List[BaseMessage]:
-    return [
-        SystemMessage(content=f"{SYSTEM_PROMPT}\n\n{SUMMARY_OUTPUT_REQUIREMENTS}"),
-        HumanMessage(
-            content=(
-                f"{SUMMARY_OUTPUT_REQUIREMENTS}\n\n"
-                "Верни только итоговое саммари без пояснений.\n\n"
-                f"Данные:\n{inp['user_content']}"
-            )
-        ),
-    ]
-
-
-_summarizer_llm_chain = (
-    RunnableLambda(_summarizer_messages)
-    | chat_model
-    | StrOutputParser()
+SUBJECT_AREA_COLUMNS = ("Предметная область",)
+VIEW_NAME_COLUMNS = ("Таблица", "Представление")
+VIEW_DESCRIPTION_COLUMNS = ("Описание таблицы",)
+TARGET_TABLE_COLUMNS = ("Таблица-приемник",)
+TARGET_TABLE_DESCRIPTION_COLUMNS = ("Описание целевой таблицы",)
+FIELD_NAME_COLUMNS = ("Поле приемника", "Поле", "Атрибут")
+FIELD_DESCRIPTION_COLUMNS = (
+    "Описание поля приемника",
+    "Описание поля источника",
+    "Описание поля",
+    "Описание атрибута",
 )
+ENTITY_COLUMNS = ("Сущность",)
+ATTRIBUTE_NAME_COLUMNS = ("Атрибут",)
+METRIC_CODE_COLUMNS = ("Код выборки данных",)
+METRIC_DESCRIPTION_COLUMNS = ("Описание",)
+
+
+def _invoke(messages: List[BaseMessage], *, structured: bool = False) -> str:
+    model = chat_model
+    handler = get_callback_handler()
+    if handler:
+        model = model.with_config({"callbacks": [handler]})
+    kwargs = (
+        {"response_format": SUMMARY_RESPONSE_FORMAT}
+        if structured and getattr(chat_model, "supports_json_schema", False) is True
+        else {}
+    )
+    return StrOutputParser().invoke(model.invoke(messages, **kwargs)).strip()
 
 
 def call_gigachat(user_content: str) -> str:
-    """Invoke the configured chat model for summary-related text."""
-    if getattr(chat_model, "supports_json_schema", False) is True:
-        reply = chat_model.invoke(
-            _summarizer_messages({"user_content": user_content}),
-            response_format=SUMMARY_RESPONSE_FORMAT,
-        )
-        raw = StrOutputParser().invoke(reply).strip()
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError("LLM returned invalid structured summary JSON") from exc
-        summary = payload.get("summary") if isinstance(payload, dict) else None
-        if not isinstance(summary, str) or not summary.strip():
-            raise ValueError("LLM returned an empty structured summary")
-        return summary.strip()
-    return _summarizer_llm_chain.invoke({"user_content": user_content}).strip()
+    """Invoke the configured chat model for a standalone text rewrite."""
+    return _invoke([HumanMessage(content=user_content)])
 
 
 def _file_text_fields(file_id: int) -> Dict[str, Any]:
@@ -120,179 +118,285 @@ def _file_text_fields(file_id: int) -> Dict[str, Any]:
     return dict(row)
 
 
-def _sheet_columns(sheet_id: int, headers_json: Optional[str]) -> List[Dict[str, Any]]:
+def _sheet_columns(headers_json: Optional[str]) -> List[Dict[str, Any]]:
     try:
-        parsed_headers = json.loads(headers_json or "[]")
+        headers = json.loads(headers_json or "[]")
     except (TypeError, json.JSONDecodeError):
-        parsed_headers = []
-
-    columns: List[Dict[str, Any]] = []
-    for position, item in enumerate(parsed_headers):
+        headers = []
+    columns = []
+    for position, item in enumerate(headers):
         if not isinstance(item, dict):
             continue
-        flat_name = str(item.get("flat") or "").strip()
-        if not flat_name:
-            path = item.get("path")
-            if isinstance(path, list):
-                flat_name = " > ".join(str(part) for part in path if part)
-        if not flat_name:
+        path = item.get("path") if isinstance(item.get("path"), list) else []
+        name = str(item.get("flat") or "").strip() or " > ".join(
+            str(part) for part in path if part is not None and str(part).strip()
+        )
+        if not name:
             continue
         try:
-            column_index = int(item.get("index", position))
+            index = int(item.get("index", position))
         except (TypeError, ValueError):
-            column_index = position
-        columns.append(
-            {
-                "index": column_index,
-                "name": flat_name,
-                "column_id": column_index + 1,
-            }
-        )
+            index = position
+        columns.append({"index": index, "name": name, "column_id": index + 1})
     return sorted(columns, key=lambda column: column["index"])
 
 
-def _first_sheet_rows(cursor: Any, sheet_id: int, columns: List[Dict[str, Any]]) -> List[List[Any]]:
-    cursor.execute(
+def _load_rows(
+    cursor: Any,
+    file_id: int,
+    sheet_name: str,
+) -> List[Dict[int, Any]]:
+    rows: Dict[int, Dict[int, Any]] = {}
+    for item in cursor.execute(
         """
         SELECT row_num, column_id, value
         FROM data
-        WHERE sheet_id = ?
-          AND row_num IN (
-              SELECT row_num
-              FROM data
-              WHERE sheet_id = ?
-              GROUP BY row_num
-              ORDER BY row_num
-              LIMIT ?
-          )
+        WHERE file_id = ? AND table_name = ? COLLATE NOCASE
         ORDER BY row_num, id
         """,
-        (sheet_id, sheet_id, SUMMARY_ROWS_PER_SHEET),
-    )
-    values_by_row: Dict[int, Dict[str, Any]] = {}
-    for cell in cursor.fetchall():
-        values_by_row.setdefault(cell["row_num"], {})[cell["column_id"]] = cell["value"]
-
-    return [
-        [row_values.get(column["column_id"]) for column in columns]
-        for _, row_values in sorted(values_by_row.items())
-    ]
+        (file_id, sheet_name),
+    ).fetchall():
+        rows.setdefault(int(item["row_num"]), {})[int(item["column_id"])] = item["value"]
+    return list(rows.values())
 
 
-def fetch_file_data(file_id: int) -> Dict[str, Any]:
-    """Return sheet names, column names, and at most five aligned rows per sheet."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT 1 FROM files WHERE file_id = ?", (file_id,))
-        if not cursor.fetchone():
-            raise ValueError(f"File {file_id} not found")
-
-        cursor.execute(
-            """
-            SELECT sheet_id, sheet_name, headers_json
-            FROM file_sheet_headers
-            WHERE file_id = ? AND IFNULL(skipped, 0) = 0
-            ORDER BY sheet_name
-            """,
-            (file_id,),
-        )
-        header_rows = cursor.fetchall()
-
-        sheets = []
-        for header_row in header_rows:
-            sheet_id = header_row["sheet_id"]
-            columns = _sheet_columns(sheet_id, header_row["headers_json"])
-            sheets.append(
-                {
-                    "sheet_name": header_row["sheet_name"],
-                    "columns": [column["name"] for column in columns],
-                    "rows": _first_sheet_rows(cursor, sheet_id, columns),
-                }
-            )
-    finally:
-        conn.close()
-
-    return {"sheets": sheets, "final_summary": ""}
+def _pick_column(column_ids: Dict[str, int], candidates: Sequence[str]) -> Optional[int]:
+    return next((column_ids[name] for name in candidates if name in column_ids), None)
 
 
-def _compact_summary_value(value: Any) -> Any:
+def _compact(value: Any) -> Optional[str]:
     if value is None:
         return None
     text = str(value).replace("\r\n", "\n").strip()
-    if len(text) <= SUMMARY_CELL_CHAR_LIMIT:
-        return text
-    return f"{text[:SUMMARY_CELL_CHAR_LIMIT - 1]}…"
+    if not text:
+        return None
+    return text if len(text) <= SUMMARY_TEXT_CHAR_LIMIT else f"{text[:299]}…"
 
 
-def _summary_payload_sheets(sheets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        {
-            "sheet_name": sheet["sheet_name"],
-            "columns": [_compact_summary_value(column) for column in sheet["columns"]],
-            "rows": [
-                [_compact_summary_value(value) for value in row]
-                for row in sheet["rows"][:SUMMARY_ROWS_PER_SHEET]
-            ],
-        }
-        for sheet in sheets
-    ]
+def _value(row: Dict[int, Any], column_id: Optional[int]) -> Optional[str]:
+    return _compact(row.get(column_id)) if column_id is not None else None
 
 
-@observe()
-def summarize_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
-    payload = json.dumps(
-        {"sheets": _summary_payload_sheets(state["sheets"])},
-        ensure_ascii=False,
-        default=str,
-    )
-    state["final_summary"] = call_gigachat(payload)
-    return state
-
-
-summarizer_chain = (
-    RunnableLambda(fetch_file_data)
-    | RunnableLambda(summarize_snapshot)
-)
-
-
-@observe()
-def generate_summary(file_id: int) -> str:
-    handler = get_callback_handler()
-    if handler:
-        chain_with_config = summarizer_chain.with_config(
-            {
-                "callbacks": [handler],
-                "run_name": f"summarize_{file_id}",
-            }
+def _dedupe(records: List[Any], key_fields: Sequence[str] = ()) -> List[Any]:
+    seen, result = set(), []
+    for record in records:
+        key = (
+            tuple(str(record.get(field) or "") for field in key_fields)
+            if isinstance(record, dict)
+            else str(record or "")
         )
-        result = chain_with_config.invoke(file_id)
-    else:
-        result = summarizer_chain.invoke(file_id)
-    return result["final_summary"]
+        empty = not any(key) if isinstance(key, tuple) else not key
+        if empty:
+            continue
+        if key not in seen:
+            seen.add(key)
+            result.append(record)
+    return result
+
+
+def _evenly_spaced_items(items: List[Any], limit: int) -> List[Any]:
+    if len(items) <= limit:
+        return items
+    if limit <= 1:
+        return items[:1]
+    last = len(items) - 1
+    indexes = {round(index * last / (limit - 1)) for index in range(limit)}
+    return [item for index, item in enumerate(items) if index in indexes]
+
+
+def _extract_sheet_semantics(
+    columns: List[Dict[str, Any]], rows: List[Dict[int, Any]]
+) -> Dict[str, List[Any]]:
+    ids = {column["name"]: column["column_id"] for column in columns}
+    area_id = _pick_column(ids, SUBJECT_AREA_COLUMNS)
+    view_id = _pick_column(ids, VIEW_NAME_COLUMNS)
+    view_description_id = _pick_column(ids, VIEW_DESCRIPTION_COLUMNS)
+    table_id = _pick_column(ids, TARGET_TABLE_COLUMNS)
+    table_description_id = _pick_column(ids, TARGET_TABLE_DESCRIPTION_COLUMNS)
+    field_id = _pick_column(ids, FIELD_NAME_COLUMNS)
+    field_description_id = _pick_column(ids, FIELD_DESCRIPTION_COLUMNS)
+    entity_id = _pick_column(ids, ENTITY_COLUMNS)
+    attribute_id = _pick_column(ids, ATTRIBUTE_NAME_COLUMNS)
+    metric_id = _pick_column(ids, METRIC_CODE_COLUMNS)
+    metric_description_id = _pick_column(ids, METRIC_DESCRIPTION_COLUMNS)
+    result: Dict[str, List[Any]] = {
+        "subject_areas": [], "views": [], "tables": [],
+        "attributes": [], "fields": [], "metrics": [],
+    }
+    for row in rows:
+        area = _value(row, area_id)
+        if area:
+            result["subject_areas"].append(area)
+
+        view, view_description = _value(row, view_id), _value(row, view_description_id)
+        if view and view_description and table_id is None:
+            result["views"].append({"name": view, "description": view_description})
+
+        table, table_description = _value(row, table_id), _value(row, table_description_id)
+        if table and table_description:
+            record = {"name": table, "description": table_description}
+            if area:
+                record["subject_area"] = area
+            result["tables"].append(record)
+
+        field, field_description = _value(row, field_id), _value(row, field_description_id)
+        if table_description_id is not None and field and field_description:
+            record = {"field": field, "description": field_description}
+            if table:
+                record["table"] = table
+            result["fields"].append(record)
+
+        entity, attribute = _value(row, entity_id), _value(row, attribute_id)
+        if entity and attribute and field_description:
+            result["attributes"].append(
+                {"entity": entity, "attribute": attribute, "description": field_description}
+            )
+
+        metric, metric_description = _value(row, metric_id), _value(row, metric_description_id)
+        if metric and metric_description:
+            result["metrics"].append(
+                {"code": metric, "description": metric_description}
+            )
+    return result
+
+
+def _limit_catalog(catalog: Dict[str, List[Any]]) -> None:
+    catalog["subject_areas"] = _dedupe(catalog["subject_areas"])[:MAX_SUBJECT_AREAS]
+    catalog["views"] = _dedupe(catalog["views"], ("name", "description"))[:MAX_VIEW_DESCRIPTIONS]
+    catalog["tables"] = _evenly_spaced_items(
+        _dedupe(catalog["tables"], ("name", "description")), MAX_TABLE_DESCRIPTIONS
+    )
+    catalog["attributes"] = _evenly_spaced_items(
+        _dedupe(catalog["attributes"], ("entity", "attribute", "description")),
+        MAX_ATTRIBUTE_DESCRIPTIONS,
+    )
+    catalog["fields"] = _evenly_spaced_items(
+        _dedupe(catalog["fields"], ("table", "field", "description")),
+        MAX_FIELD_DESCRIPTIONS,
+    )
+    catalog["metrics"] = _dedupe(catalog["metrics"], ("code", "description"))[:MAX_METRIC_DESCRIPTIONS]
+
+
+def fetch_file_data(file_id: int) -> Dict[str, Any]:
+    """Return the semantic catalog used by the summary model."""
+    catalog: Dict[str, List[Any]] = {
+        "subject_areas": [], "views": [], "tables": [], "attributes": [],
+        "fields": [], "metrics": [], "catalog_tables": [],
+    }
+    conn = get_db_connection()
+    try:
+        file_row = conn.execute(
+            "SELECT filename FROM files WHERE file_id = ?", (file_id,)
+        ).fetchone()
+        if not file_row:
+            raise ValueError(f"File {file_id} not found")
+        sheets = conn.execute(
+            """
+            SELECT sheet_name, headers_json
+            FROM file_sheet_headers AS headers
+            WHERE file_id = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM data
+                  WHERE data.file_id = headers.file_id
+                    AND data.table_name = headers.sheet_name COLLATE NOCASE
+              )
+            ORDER BY sheet_name
+            """,
+            (file_id,),
+        ).fetchall()
+        for sheet in sheets:
+            extracted = _extract_sheet_semantics(
+                _sheet_columns(sheet["headers_json"]),
+                _load_rows(conn, file_id, str(sheet["sheet_name"])),
+            )
+            for key, values in extracted.items():
+                catalog[key].extend(values)
+
+        persisted = conn.execute(
+            """
+            SELECT 'target_tables' AS catalog, table_name, description, row_num
+            FROM target_tables WHERE file_id = ?
+            UNION ALL
+            SELECT 'source_tables', table_name, description, row_num
+            FROM source_tables WHERE file_id = ?
+            ORDER BY row_num
+            """,
+            (file_id, file_id),
+        ).fetchall()
+        catalog["catalog_tables"] = _dedupe(
+            [
+                {
+                    "name": _compact(row["table_name"]) or "",
+                    "description": _compact(row["description"]) or "",
+                    "catalog": row["catalog"],
+                }
+                for row in persisted
+                if _compact(row["table_name"]) and _compact(row["description"])
+            ],
+            ("name", "description"),
+        )
+    finally:
+        conn.close()
+    _limit_catalog(catalog)
+    return {"filename": file_row["filename"], "semantic_catalog": catalog}
+
+
+def build_summary_payload(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the compact JSON payload sent to the summarizer LLM."""
+    catalog = snapshot.get("semantic_catalog") or {}
+    return {
+        "focus": "table_and_attribute_descriptions",
+        "filename": snapshot.get("filename"),
+        **{
+            key: catalog.get(key) or []
+            for key in (
+                "subject_areas", "views", "tables", "attributes",
+                "fields", "metrics", "catalog_tables",
+            )
+        },
+    }
+
+
+@observe()
+def generate_analysis_texts(file_id: int) -> Tuple[str, str]:
+    payload = json.dumps(build_summary_payload(fetch_file_data(file_id)), ensure_ascii=False)
+    messages = [
+        SystemMessage(content=f"{SYSTEM_PROMPT}\n\n{SUMMARY_OUTPUT_REQUIREMENTS}"),
+        HumanMessage(content=payload),
+    ]
+    try:
+        result = json.loads(_invoke(messages, structured=True))
+    except json.JSONDecodeError as exc:
+        raise ValueError("LLM returned invalid summary JSON") from exc
+    if not isinstance(result, dict):
+        raise ValueError("LLM summary response must be a JSON object")
+    summary = str(result.get("summary") or "").strip()
+    description = str(result.get("description") or "").strip()
+    if not summary or not description:
+        raise ValueError("LLM returned empty summary or description")
+    return summary, description
+
+
+def generate_summary(file_id: int) -> str:
+    return generate_analysis_texts(file_id)[0]
 
 
 def summarize_file(file_id: int, save: bool = True) -> str:
-    summary = generate_summary(file_id)
+    summary, description = generate_analysis_texts(file_id)
     if save:
         update_file_summary(file_id, summary)
+        update_file_description(file_id, description)
     return summary
 
 
 def generate_description_from_summary(summary: str) -> str:
-    prompt = f"""
-Сформируй краткое описание данных на русском языке по готовому бизнес-саммари ниже.
-
-Требования:
-- 2–3 предложения, один короткий абзац;
-- пиши только о предметной области, ключевых сущностях, видимых правилах и назначении данных;
-- не упоминай Excel, файл, листы, загрузку, документ или рабочую книгу;
-- не добавляй вводных фраз вида «данный файл содержит».
-
-Готовое бизнес-саммари:
-{summary}
-"""
-    return call_gigachat(prompt).strip()
+    return call_gigachat(
+        "Сформируй по бизнес-саммари краткое описание на русском языке: 2–3 "
+        "предложения об областях, сущностях и процессах из описаний таблиц и "
+        "атрибутов. Не упоминай структуру документа, S2T-артефакты, SQL, Excel "
+        f"или файл. Верни только описание.\n\nБизнес-саммари:\n{summary}"
+    ).strip()
 
 
 def ensure_file_description(
@@ -302,14 +406,16 @@ def ensure_file_description(
     summary_override: Optional[str] = None,
 ) -> str:
     fields = _file_text_fields(file_id)
-    cached_description = str(fields.get("description") or "").strip()
-    if cached_description and not refresh:
-        return cached_description
-
-    summary = str(summary_override or "").strip() or str(fields.get("summary") or "").strip()
+    cached = str(fields.get("description") or "").strip()
+    if cached and not refresh:
+        return cached
+    summary = str(summary_override or fields.get("summary") or "").strip()
     if not summary:
-        summary = summarize_file(file_id, save=save)
-
+        summary, description = generate_analysis_texts(file_id)
+        if save:
+            update_file_summary(file_id, summary)
+            update_file_description(file_id, description)
+        return description
     description = generate_description_from_summary(summary)
     if save:
         update_file_description(file_id, description)
@@ -321,27 +427,14 @@ def generate_description_update_from_user_query(
     summary: str,
     user_query: str,
 ) -> str:
-    prompt = f"""
-Обнови краткое описание данных по уточнению пользователя.
-
-Текущее краткое описание:
-{current_description}
-
-Текущее бизнес-саммари:
-{summary}
-
-Запрос пользователя:
-{user_query}
-
-Требования:
-- верни только обновлённое краткое описание на русском языке;
-- 2–4 предложения, один короткий абзац;
-- опирайся на сохранённое описание, бизнес-саммари и факты из запроса пользователя;
-- если пользователь уточняет или исправляет акцент описания, учти это;
-- не упоминай Excel, файл, листы, загрузку, документ или рабочую книгу;
-- не придумывай факты, которых нет в саммари или запросе пользователя.
-"""
-    return call_gigachat(prompt).strip()
+    return call_gigachat(
+        "Обнови краткое описание по уточнению пользователя. Верни только один "
+        "абзац на русском языке из 2–4 предложений. Опирайся на описание, саммари "
+        "и запрос; не упоминай структуру документа, S2T-артефакты, SQL, Excel "
+        "или файл и не придумывай факты.\n\n"
+        f"Описание:\n{current_description}\n\nСаммари:\n{summary}\n\n"
+        f"Запрос пользователя:\n{user_query}"
+    ).strip()
 
 
 def update_file_description_from_user_query(
@@ -352,15 +445,13 @@ def update_file_description_from_user_query(
     request_text = str(user_query or "").strip()
     if not request_text:
         raise ValueError("user_query must be non-empty")
-
-    base_description = ensure_file_description(file_id, refresh=False, save=save)
-    fields = _file_text_fields(file_id)
-    summary = str(fields.get("summary") or "").strip()
-    updated_description = generate_description_update_from_user_query(
-        current_description=base_description,
+    current = ensure_file_description(file_id, refresh=False, save=save)
+    summary = str(_file_text_fields(file_id).get("summary") or "").strip()
+    updated = generate_description_update_from_user_query(
+        current_description=current,
         summary=summary,
         user_query=request_text,
     )
     if save:
-        update_file_description(file_id, updated_description)
-    return updated_description
+        update_file_description(file_id, updated)
+    return updated

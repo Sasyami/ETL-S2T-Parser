@@ -1,16 +1,62 @@
 import sys
 import os
+import tempfile
+import logging
 
 # Add project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# Disable Langfuse/OTEL export noise before project modules load dotenv.
+os.environ["LANGFUSE_PUBLIC_KEY"] = ""
+os.environ["LANGFUSE_SECRET_KEY"] = ""
+os.environ["OTEL_SDK_DISABLED"] = "true"
+
+# app.py configures file logging at import time. Keep test-only tool calls such
+# as ping/echo out of the runtime logs/agent.log.
+_pytest_import_log = tempfile.NamedTemporaryFile(suffix=".log", delete=False)
+_pytest_import_log.close()
+os.environ["LOG_FILE"] = _pytest_import_log.name
+
+# app.py calls init_db() at import time; use an isolated DB so a legacy local
+# excel_data.db does not break test collection.
+import storage.database as db_storage
+
+_pytest_import_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_pytest_import_db.close()
+db_storage.DB_PATH = _pytest_import_db.name
+
 import pytest
-import sqlite3
-import json
-import io
-from flask import Flask
 from app import app as flask_app
-from storage.database import init_db, get_db_connection
+from storage.database import init_db
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_pytest_import_db():
+    yield
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        if getattr(handler, "_etls2t_log_path", None) == _pytest_import_log.name:
+            root_logger.removeHandler(handler)
+            handler.close()
+    try:
+        os.unlink(_pytest_import_db.name)
+    except OSError:
+        pass
+    try:
+        os.unlink(_pytest_import_log.name)
+    except OSError:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _disable_langfuse_in_tests(monkeypatch):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "")
+    from agents import observability
+
+    monkeypatch.setattr(observability, "is_langfuse_configured", lambda: False)
+    monkeypatch.setattr(observability, "get_langfuse_client", lambda: None)
+    monkeypatch.setattr(observability, "get_callback_handler", lambda: None)
 
 
 @pytest.fixture
@@ -69,26 +115,3 @@ def sample_excel_bytes():
         df.to_excel(writer, sheet_name='Sheet1', index=False)
     return output.getvalue()
 
-@pytest.fixture
-def sample_excel_json():
-    """Sample JSON structure as returned by /upload (mock)."""
-    return {
-        "filename": "test.xlsx",
-        "model_used": "GigaChat-Pro",
-        "file_id": "abc123",
-        "summary": "Test summary",
-        "description": "Test description",
-        "sheets": [
-            {
-                "sheet_name": "Sheet1",
-                "skip_reason": None,
-                "header": {
-                    "start_row": 0,
-                    "row_count": 1,
-                    "nested": False
-                },
-                "columns": ["Name", "Age"],
-                "data_preview": [["Alice", 30], ["Bob", 25]],
-            }
-        ]
-    }

@@ -10,6 +10,12 @@ from .common import file_meta
 def list_files() -> List[Dict[str, Any]]:
     """Получить пользовательский каталог всех загруженных Excel-файлов.
 
+    Используй для общих вопросов «какие файлы загружены», «покажи список
+    загрузок» и выбора файла по имени. Не используй для поиска логических
+    ETL-таблиц, S2T-строк, листов или значений ячеек: для них есть отдельные
+    инструменты. Пустой список означает, что в таблице files сейчас нет
+    сохранённых загрузок.
+
     Возвращает имя файла, сохранённое краткое описание и время загрузки. Внутренний
     file_id намеренно не показывается в общем каталоге; для последующего обращения
     к конкретному файлу по точному имени предназначен resolve_file.
@@ -32,9 +38,15 @@ def list_files() -> List[Dict[str, Any]]:
 def resolve_file(filename: str) -> Dict[str, Any]:
     """Разрешить точное имя загруженного файла в его числовой file_id.
 
+    Используй перед файловыми tools, когда пользователь назвал файл, но не дал
+    его числовой идентификатор. Не вызывай для глобальных запросов по
+    s2t_transformations: активный или разрешённый file_id не должен ограничивать
+    просмотр, поиск и агрегацию глобальной таблицы трансформаций.
+
     Поиск выполняется без учёта регистра. При отсутствии файла возвращает явную
     ошибку, а при нескольких загрузках с одинаковым именем — список совпадений,
-    не выбирая одну запись самовольно.
+    не выбирая одну запись самовольно. Инструмент не ищет по частичному имени и
+    не подставляет «последний файл» как fallback.
 
     Args:
         filename: Полное имя загруженного файла с расширением.
@@ -67,50 +79,84 @@ def resolve_file(filename: str) -> Dict[str, Any]:
 
 
 @tool(parse_docstring=True)
-def get_file_description(file_id: int, regenerate: bool = False) -> Dict[str, Any]:
+def get_file_description(file_id: int) -> Dict[str, Any]:
     """
     Получить сохранённое краткое описание конкретного загруженного файла.
 
-    Читает files.description по реальному числовому file_id. Если описание ещё не
-    создано либо явно запрошена регенерация, строит его из сохранённого summary и
-    данных файла и записывает обратно. Логические имена ETL-таблиц не являются
-    идентификаторами файлов.
+    Read-only: читает files.description и files.summary по реальному числовому
+    file_id без LLM-вызовов и без записи в БД. Если описание ещё не создано,
+    сообщи об этом явно; для генерации или обновления используй мутирующие
+    инструменты после явного запроса пользователя. Логические имена ETL-таблиц
+    не являются идентификаторами файлов.
+
+    Используй только для вопроса об одном конкретном загруженном файле. Для
+    описания известной логической таблицы используй summarize_table_descriptions,
+    а для смыслового поиска неизвестного объекта — semantic_search_descriptions.
+    Отсутствующее description не означает отсутствие самого файла или его
+    Excel-данных: поля description_present и summary_present показываются
+    отдельно.
 
     Args:
         file_id: Числовой идентификатор загрузки из UI или resolve_file.
-        regenerate: Принудительно сформировать описание заново и сохранить его.
     """
-    from agents.summarizer_agent import ensure_file_description
     from storage.database import get_db_connection
 
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT file_id, filename, upload_time, description FROM files WHERE file_id = ?",
-        (file_id,),
-    )
-    row = cursor.fetchone()
-    conn.close()
+    try:
+        row = conn.execute(
+            """
+            SELECT file_id, filename, upload_time, summary, description
+            FROM files
+            WHERE file_id = ?
+            """,
+            (file_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
     if not row:
         return {"error": f"File not found: {file_id}", "file_id": file_id}
 
     meta = dict(row)
-    had_cached_description = bool(str(meta.get("description") or "").strip())
-    description = ensure_file_description(file_id, refresh=bool(regenerate), save=True)
-    meta["description"] = description
-    return {
+    description = str(meta.get("description") or "").strip()
+    summary = str(meta.get("summary") or "").strip()
+    meta["description"] = description or None
+    meta["summary"] = summary or None
+
+    result: Dict[str, Any] = {
         "file": meta,
         "file_id": file_id,
-        "description": description,
-        "generated": bool(regenerate) or not had_cached_description,
+        "description": description or None,
+        "summary": summary or None,
+        "description_present": bool(description),
+        "summary_present": bool(summary),
     }
+
+    if not description:
+        result["missing_description"] = True
+        if summary:
+            result["hint"] = (
+                "Краткое описание ещё не сохранено. Для генерации нужен "
+                "явный запрос пользователя на обновление описания."
+            )
+        else:
+            result["hint"] = (
+                "Краткое описание и бизнес-саммари ещё не сохранены. "
+                "Сообщи пользователю, что данные появятся после завершения "
+                "анализа файла или после явного запроса на обновление."
+            )
+
+    return result
 
 @tool(parse_docstring=True)
 def update_file_description(file_id: int, description: str) -> Dict[str, Any]:
     """Перезаписать сохранённое описание файла по явному запросу пользователя.
 
     Это мутирующий инструмент: обновляет files.description и не должен вызываться
-    для обычного чтения или автоматического уточнения ответа.
+    для обычного чтения, автоматического уточнения ответа или сохранения текста,
+    который пользователь не просил записывать. Используй только когда уже
+    известны реальный file_id и готовый утверждённый текст. Слой хранения вместе
+    с описанием пересчитает description_embedding настроенной моделью.
 
     Args:
         file_id: Числовой идентификатор существующей загрузки.
@@ -138,7 +184,12 @@ def update_table_info_from_user_query(file_id: int, user_query: str) -> Dict[str
 
     Это мутирующий инструмент. Сначала проверяет существование строки files,
     использует уже сохранённое базовое описание, затем просит LLM переработать его
-    с учётом текста пользователя и сохраняет результат.
+    с учётом текста пользователя и сохраняет результат. Используй только если
+    пользователь явно исправляет или дополняет смысл уже загруженного файла.
+    Не используй для вопроса, временного предположения, описания отдельной
+    логической таблицы или простого чтения текущего description. В отличие от
+    update_file_description, этот tool принимает пользовательское уточнение, а
+    не готовый итоговый текст, и поэтому выполняет LLM-вызов.
 
     Args:
         file_id: Числовой идентификатор существующей загрузки.
