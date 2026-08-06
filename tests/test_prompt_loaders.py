@@ -46,6 +46,9 @@ def test_load_skills_includes_transformation_path_analysis_skill():
     assert "Путь S2T-преобразования" in text
     assert "прямую трансформацию" in text
     assert "Отсутствие подтверждения Neo4j не отменяет факты SQLite" in text
+    assert "source_table.source_field → target_table.target_field" in text
+    assert "перенеси её дословно" in text
+    assert "не отсутствие" in text
 
 
 def test_load_skills_can_select_one_section():

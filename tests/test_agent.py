@@ -307,6 +307,20 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     )
     assert "уникальные имена S2T-таблиц" in table_names_description
     assert "детерминированный инструмент" in table_names_description
+    sql_graph_description = next(
+        item["description"]
+        for item in payload["available_tools"]
+        if item["name"] == "visualize_sql_lineage"
+    )
+    assert "конкретного SQL-текста" in sql_graph_description
+    assert "никогда не подменяй" in sql_graph_description
+    global_graph_description = next(
+        item["description"]
+        for item in payload["available_tools"]
+        if item["name"] == "visualize_s2t_table_graph"
+    )
+    assert "глобальный" in global_graph_description
+    assert "Не используй для конкретного" in global_graph_description
     assert sum(
         len(item["description"]) for item in payload["available_tools"]
     ) < 7000
@@ -476,15 +490,12 @@ class _ScriptedNativeModel:
         self,
         responses,
         audit_responses=None,
-        argument_audit_responses=None,
     ):
         self.responses = list(responses)
         self.audit_responses = list(audit_responses or [])
-        self.argument_audit_responses = list(argument_audit_responses or [])
         self.bound_tools = []
         self.messages = []
         self.audit_messages = []
-        self.argument_audit_messages = []
         self.observer = _ObserverModel()
 
     def bind_tools(self, tools):
@@ -499,17 +510,6 @@ class _ScriptedNativeModel:
             and "Ты observer многошагового агента" in str(messages[0].content)
         ):
             return self.observer.invoke(messages)
-        if (
-            messages
-            and "Аудит аргументов tool call" in str(messages[-1].content)
-        ):
-            self.argument_audit_messages.append(messages)
-            if self.argument_audit_responses:
-                return self.argument_audit_responses.pop(0)
-            for message in reversed(messages[:-1]):
-                if isinstance(message, AIMessage) and message.tool_calls:
-                    return message
-            return AIMessage(content="")
         if (
             messages
             and (
@@ -609,7 +609,7 @@ def test_run_agent_graph_executes_native_tool_call_and_uses_observer():
     )
 
 
-def test_responder_uses_exact_single_tabular_tool_result():
+def test_responder_keeps_model_table_output_without_backend_rewrite():
     from agents.chat_graph import run_agent_graph
 
     def table_lookup(limit: int):
@@ -661,72 +661,16 @@ def test_responder_uses_exact_single_tabular_tool_result():
 
     assert out == (
         "Вот две строки:\n\n"
+        "```text\n"
+        '[["first_table"],["second_table"]]\n'
+        "```\n\n"
         "```table\n"
-        '[["table_name"],["first_table"],["second_table"]]\n'
+        '[["table_name","count"],["first_table",1]]\n'
         "```"
     )
 
 
-def test_planner_argument_audit_corrects_explicit_limit_before_tool_execution():
-    from agents.chat_graph import run_agent_graph
-
-    calls = []
-
-    def bounded_lookup(limit: int):
-        calls.append(limit)
-        return {
-            "columns": ["value"],
-            "rows": [{"value": index} for index in range(limit)],
-        }
-
-    corrected_call = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "bounded_lookup",
-                "args": {"limit": 3},
-                "id": "bounded-audited",
-                "type": "tool_call",
-            }
-        ],
-    )
-    model = _ScriptedNativeModel(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "bounded_lookup",
-                        "args": {"limit": 100},
-                        "id": "bounded-proposed",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(content="Три строки подтверждены."),
-            AIMessage(content="Готово."),
-        ],
-        argument_audit_responses=[corrected_call],
-    )
-
-    out = run_agent_graph(
-        "Покажи 3 значения",
-        "Системный контекст",
-        model,
-        (_as_tool(bounded_lookup),),
-        max_steps=2,
-    )
-
-    assert calls == [3]
-    assert len(model.argument_audit_messages) == 1
-    audit_prompt = str(model.argument_audit_messages[0][-1].content)
-    assert "Покажи 3 значения" in audit_prompt
-    assert '"limit": 100' in audit_prompt
-    assert "значению по умолчанию" in audit_prompt
-    assert '[["value"],[0],[1],[2]]' in out
-
-
-def test_numeric_contract_corrects_limit_when_llm_audit_repeats_default():
+def test_numeric_contract_corrects_single_explicit_limit():
     from agents.chat_graph import run_agent_graph
 
     calls = []
@@ -754,8 +698,7 @@ def test_numeric_contract_corrects_limit_when_llm_audit_repeats_default():
             default_call,
             AIMessage(content="Три строки подтверждены."),
             AIMessage(content="Готово."),
-        ],
-        argument_audit_responses=[default_call],
+        ]
     )
 
     out = run_agent_graph(
@@ -767,7 +710,7 @@ def test_numeric_contract_corrects_limit_when_llm_audit_repeats_default():
     )
 
     assert calls == [3]
-    assert '[["value"],[0],[1],[2]]' in out
+    assert out == "Готово."
 
 
 def test_completion_audit_calls_tool_for_unfinished_second_step():
@@ -1042,6 +985,47 @@ def test_run_agent_graph_appends_sql_lineage_visualization_url():
         "[Открыть интерактивный SQL lineage-граф]"
         "(/exports/sql-lineage/sql_lineage_0123456789abcdef.html)"
     ) in out
+
+
+def test_run_agent_graph_does_not_duplicate_existing_visualization_url():
+    from agents.chat_graph import run_agent_graph
+
+    url = "/exports/sql-lineage/sql_lineage_0123456789abcdef.html"
+
+    def make_graph():
+        return {
+            "visualization_type": "sqlglot_graph_html",
+            "visualization_url": url,
+        }
+
+    model = _ScriptedNativeModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "make_graph",
+                        "args": {},
+                        "id": "graph-existing-url",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Граф построен."),
+            AIMessage(content=f"[Посмотреть граф]({url})"),
+        ]
+    )
+
+    out = run_agent_graph(
+        "Покажи граф",
+        "Системный контекст",
+        model,
+        (_as_tool(make_graph),),
+        max_steps=2,
+    )
+
+    assert out == f"[Посмотреть граф]({url})"
+    assert out.count(url) == 1
 
 
 def test_run_agent_graph_appends_s2t_table_graph_visualization_url():
@@ -1345,9 +1329,12 @@ def test_run_agent_graph_passes_history_and_active_file_context():
     assert "глобальная таблица сейчас пуста" in responder_system_text
 
     assert "валидный JSON-список списков" in responder_system_text
-    assert "Не создавай Markdown-таблицу" in responder_system_text
+    assert "Markdown-таблица" in responder_system_text
+    assert "запрещена" in responder_system_text
     assert "браузер сам отрисует блок" in responder_system_text
     assert "сохраняй все запрошенные" in responder_system_text
+    assert "text_diagram без изменений" in responder_system_text
+    assert "не пересказывай" in responder_system_text
 
     for prompt in [*model.messages, *model.observer.messages]:
         system_positions = [

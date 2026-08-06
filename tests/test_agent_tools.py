@@ -227,7 +227,7 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
 
 
 def test_trace_transformation_path_combines_s2t_sql_and_additional_objects():
-    from agents.tools import trace_transformation_path, visualize_transformation_path
+    from agents.tools import trace_transformation_path
 
     conn = get_db_connection()
     conn.execute(
@@ -286,6 +286,14 @@ def test_trace_transformation_path_combines_s2t_sql_and_additional_objects():
     ]
     assert path["steps"][1]["additional_objects"][0]["name"] == "view_orders"
     assert result["neo4j_evidence"] == {"included": False, "rows": []}
+    assert "[raw.orders.id] --direct--> [view_orders.id]" in result[
+        "text_diagram"
+    ]
+    assert "[view_orders.id] --sql--> [dwh.orders.id]" in result[
+        "text_diagram"
+    ]
+    assert result["mermaid"].startswith("flowchart LR\n")
+    assert [edge["transformation_id"] for edge in result["edges"]] == [23, 25]
 
     qualified = trace_transformation_path.invoke(
         {
@@ -298,18 +306,23 @@ def test_trace_transformation_path_combines_s2t_sql_and_additional_objects():
     assert qualified["column_name"] == "id"
     assert qualified["returned_paths"] == 1
 
-    visual = visualize_transformation_path.invoke(
+    qualified_table = trace_transformation_path.invoke(
         {
-            "table_name": "raw.orders",
-            "column_name": "raw.orders.id",
-            "direction": "downstream",
+            "table_name": "dwh.orders.id",
+            "column_name": "id",
+            "direction": "upstream",
+            "include_neo4j": False,
         }
     )
-    assert visual["returned_paths"] == 1
-    assert "[raw.orders.id] --direct--> [view_orders.id]" in visual["text_diagram"]
-    assert "[view_orders.id] --sql--> [dwh.orders.id]" in visual["text_diagram"]
-    assert visual["mermaid"].startswith("flowchart LR\n")
-    assert [edge["transformation_id"] for edge in visual["edges"]] == [23, 25]
+    assert qualified_table["table_name"] == "dwh.orders"
+    assert qualified_table["column_name"] == "id"
+    assert qualified_table["returned_paths"] == 1
+    assert "[raw.orders.id] --direct--> [view_orders.id]" in qualified_table[
+        "text_diagram"
+    ]
+    assert "[view_orders.id] --sql--> [dwh.orders.id]" in qualified_table[
+        "text_diagram"
+    ]
 
     combined = trace_transformation_path.invoke(
         {
@@ -444,11 +457,11 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     assert "source_table + source_field" in path_description
     assert "target_table + target_field" in path_description
     assert "search_s2t_transformations" in path_description
+    assert "всегда возвращает готовые text_diagram" in path_description
+    assert "полную ссылку в table_name" in path_description
     s2t_list_description = tools["list_s2t_transformations"].description
     assert "являются синонимами поля transformation_rule" in s2t_list_description
-    assert tools[
-        "visualize_transformation_path"
-    ].args_schema.model_json_schema()["required"] == ["table_name"]
+    assert "visualize_transformation_path" not in tools
     assert tools[
         "visualize_s2t_table_graph"
     ].args_schema.model_json_schema()["properties"] == {}
@@ -668,7 +681,10 @@ def test_parse_sql_column_lineage_restores_double_escaped_layout():
     ]
 
 
-def test_visualize_sql_lineage_writes_native_sqlglot_html(tmp_path, monkeypatch):
+def test_visualize_sql_lineage_preserves_exact_column_edges_in_html(
+    tmp_path,
+    monkeypatch,
+):
     import agents.tools.sql_lineage as sql_lineage_module
     from agents.tools import visualize_sql_lineage
 
@@ -676,9 +692,12 @@ def test_visualize_sql_lineage_writes_native_sqlglot_html(tmp_path, monkeypatch)
     result = visualize_sql_lineage.invoke(
         {
             "query": (
-                r"SELECT orders.id, orders.amount * 2 AS doubled_amount\n"
-                r"FROM raw.orders AS orders"
-            )
+                "CREATE VIEW mart.order_customer AS "
+                "SELECT o.id, c.name "
+                "FROM raw.orders AS o "
+                "JOIN raw.customers AS c ON c.id = o.customer_id"
+            ),
+            "dialect": "greenplum",
         }
     )
 
@@ -687,12 +706,29 @@ def test_visualize_sql_lineage_writes_native_sqlglot_html(tmp_path, monkeypatch)
     assert result["visualization_url"].startswith("/exports/sql-lineage/")
     assert "text_diagram" not in result
     assert "mermaid" not in result
+    assert result["target_table"] == "mart.order_customer"
+    assert result["source_tables"] == ["raw.orders", "raw.customers"]
+    lineage_by_target = {
+        item["target_column"]: item
+        for item in result["column_lineage"]
+    }
+    assert lineage_by_target["id"]["source_columns"] == [
+        {"table": "raw.orders", "column": "id"}
+    ]
+    assert lineage_by_target["name"]["source_columns"] == [
+        {"table": "raw.customers", "column": "name"}
+    ]
+    assert lineage_by_target["id"]["unresolved_source_columns"] == []
+    assert lineage_by_target["name"]["unresolved_source_columns"] == []
 
     filename = result["visualization_url"].rsplit("/", 1)[-1]
     html = (tmp_path / filename).read_text(encoding="utf-8")
     assert "<!doctype html>" in html
     assert "vis-network" in html
     assert "raw.orders" in html
+    assert "raw.customers" in html
+    assert "o.id AS id" in html
+    assert "c.name AS name" in html
 
 
 def test_visualize_s2t_table_graph_aggregates_edges_and_writes_artifacts(
@@ -920,7 +956,8 @@ def test_trace_neo4j_lineage_uses_exact_names_and_scope(mock_read):
             "target_table": "b_target",
             "target_layer": "T",
             "target_field": "client_id",
-            "wildcard_passthrough": False,
+            "matched_source_field": "client_id",
+            "matched_target_field": "client_id",
             "match_direction": "downstream",
         }
     ]
@@ -942,7 +979,12 @@ def test_trace_neo4j_lineage_uses_exact_names_and_scope(mock_read):
     assert "source.name = state.column_name" in query
     assert "target.table_name = state.table_name" in query
     assert "target.name = state.column_name" in query
-    assert "coalesce(mapping.wildcard_passthrough, false) = true" in query
+    assert "MATCH (source:ETLProjection:ETLTable)" not in query
+    assert "[mapping:TABLE_TRANSFORMS_TO]" not in query
+    assert "[:COVERED_BY]" in query
+    assert "[:EXPANDS_TO]" in query
+    assert query.count("{name: '*'}") == 2
+    assert "source.name = target.name" in query
     assert "transformation_rule" not in query
     assert "sheet_name" not in query
     assert parameters == {
@@ -961,6 +1003,9 @@ def test_trace_neo4j_lineage_uses_exact_names_and_scope(mock_read):
     assert result["returned_paths"] == 1
     assert result["paths"][0]["depth"] == 1
     assert result["direction"] == "downstream"
+    assert "wildcard_passthrough" not in result["rows"][0]
+    assert "matched_source_field" not in result["rows"][0]
+    assert "matched_target_field" not in result["rows"][0]
 
 
 @patch("agents.tools.neo4j.execute_neo4j_read")
@@ -1021,7 +1066,8 @@ def test_trace_neo4j_lineage_resolves_multilevel_wildcard(mock_read):
                     "target_table": "view_table",
                     "target_layer": "B",
                     "target_field": "object_id",
-                    "wildcard_passthrough": False,
+                    "matched_source_field": "object_id",
+                    "matched_target_field": "object_id",
                     "match_direction": "downstream",
                 }
             ]
@@ -1038,7 +1084,8 @@ def test_trace_neo4j_lineage_resolves_multilevel_wildcard(mock_read):
                     "target_table": "target_table",
                     "target_layer": "B",
                     "target_field": "object_id",
-                    "wildcard_passthrough": True,
+                    "matched_source_field": "*",
+                    "matched_target_field": "*",
                     "match_direction": "downstream",
                 }
             ]
@@ -1060,7 +1107,13 @@ def test_trace_neo4j_lineage_resolves_multilevel_wildcard(mock_read):
         "table_name": "target_table",
         "column_name": "object_id",
     }
-    assert result["paths"][1]["steps"][1]["wildcard_passthrough"] is True
+    wildcard_step = result["paths"][1]["steps"][1]
+    assert wildcard_step["source_field"] == "*"
+    assert wildcard_step["target_field"] == "*"
+    assert "wildcard_passthrough" not in wildcard_step
+    assert all(
+        "wildcard_passthrough" not in row for row in result["rows"]
+    )
     assert result["returned_rows"] == 2
     assert result["returned_paths"] == 2
     assert mock_read.call_count == 3
@@ -1126,7 +1179,7 @@ def test_trace_neo4j_table_lineage_returns_sql_queries(mock_read):
     assert "MATCH (source:ETLProjection:ETLTable)" in query
     assert "[mapping:TABLE_TRANSFORMS_TO]" in query
     assert "mapping.sql_query AS sql_query" in query
-    assert "mapping.wildcard_passthrough" in query
+    assert "mapping.wildcard_passthrough" not in query
     assert parameters == {
         "table_name": "a_source",
         "file_id": 7,
@@ -1145,7 +1198,6 @@ def test_trace_neo4j_table_lineage_returns_sql_queries(mock_read):
             "target_layer": None,
             "transformation_count": 1,
             "transformation_ids": [91],
-            "wildcard_passthrough": False,
         }
     ]
 
@@ -1185,9 +1237,19 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "ETLTable хранится в свойстве name" in tools["run_cypher"].description
     assert "ETLColumn имя таблицы" in tools["run_cypher"].description
     assert "узлы ETLColumn" in tools["trace_neo4j_lineage"].description
+    assert "trace_neo4j_table_lineage" in tools[
+        "trace_neo4j_lineage"
+    ].description
+    assert "additional objects" in tools["trace_neo4j_lineage"].description
+    assert "trace_transformation_path" in tools[
+        "trace_neo4j_lineage"
+    ].description
     assert "без префикса таблицы" in tools["trace_neo4j_lineage"].description
     assert "без префикса" in tools["trace_transformation_path"].description
-    assert "без префикса" in tools["visualize_transformation_path"].description
+    assert "additional objects" in tools[
+        "trace_transformation_path"
+    ].description
+    assert "готовую схему" in tools["trace_neo4j_lineage"].description
     assert "не передавай символы" in tools["run_sql"].description
     run_sql_schema = tools["run_sql"].args_schema.model_json_schema()
     assert "JSON-последовательностей" in (
@@ -1232,12 +1294,7 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "не доказательство отсутствия факта в SQLite" in tools[
         "run_cypher"
     ].description
-    assert "Вызывай этот tool сразу" in tools[
-        "visualize_transformation_path"
-    ].description
-    assert "не создаёт PNG/SVG" in tools[
-        "visualize_transformation_path"
-    ].description
+    assert "Mermaid-код" in tools["trace_transformation_path"].description
 
 
 def test_read_only_data_tool_contracts_describe_every_argument():

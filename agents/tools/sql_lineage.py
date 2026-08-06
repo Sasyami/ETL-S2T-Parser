@@ -311,15 +311,19 @@ def visualize_sql_lineage(
     query: str,
     dialect: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Построить готовую визуализацию lineage колонок для SQL-запроса.
+    """Построить интерактивный HTML-граф колонкового lineage переданного SQL.
 
-    Используй вместо parse_sql_column_lineage, когда пользователь просит
+    Это единственный tool для интерактивной визуализации конкретного SQL-текста:
+    выбирай его сразу вместо parse_sql_column_lineage и никогда не подменяй
+    глобальным visualize_s2t_table_graph. Используй, когда пользователь просит
     нарисовать, визуализировать, вывести граф или схему для переданного либо
     ранее показанного SQL. Инструмент возвращает фактический column_lineage и
     URL интерактивного HTML-графа, созданного нативным SQLGlot GraphHTML/vis.js.
-    Не печатай HTML или Mermaid в ответ: передай пользователю visualization_url.
+    Не печатай HTML, Mermaid или visualization_url в ответ: приложение само
+    добавит и встроит ссылку на готовый граф.
     Инструмент не читает SQLite/Neo4j и не предназначен для сохранённых
-    S2T-путей: для них используй visualize_transformation_path.
+    S2T-путей: для них используй trace_transformation_path, который также
+    возвращает готовую text_diagram.
 
     Args:
         query: Текст одного SQL-запроса для построения графа зависимостей.

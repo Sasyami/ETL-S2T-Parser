@@ -1,166 +1,255 @@
 # Демонстрация ETL-агента
 
+## Итог повторного прогона
+
+Строгая оценка учитывает не только успешное выполнение инструмента, но и точность
+финального ответа responder.
+
+| № | Статус | Ошибка |
+|---|---|---|
+| 1 | Частично | Данные верны, но responder вернул Markdown-таблицу вместо компактного блока `table`. |
+| 2 | Частично | Путь верен, но wildcard ошибочно объяснён как возможное отсутствие явного маппинга. |
+| 3 | Частично | Цепочка верна, но responder придумал таблицу `table/count` и не показал запрошенное правило как точный шаг `* → *`. |
+| 4 | Частично | Данные верны, но блок `table` не является валидным JSON-массивом массивов. |
+| 5 | Частично | Данные и двухшаговая цепочка верны, но снова использована Markdown-таблица. |
+| 6 | Частично | Аргументы нормализованы, путь найден; responder ошибочно написал «без фильтрации», хотя SQL содержит `WHERE rn=1`. |
+| 7 | Пройден | Единый `trace_transformation_path` вернул готовую `text_diagram`, отдельный visualizer больше не требуется. |
+| 8 | Пройден | SQLGlot корректно разрешил CTE, JOIN, выражения и транзитивную зависимость. |
+| 9 | Пройден | Построен интерактивный граф конкретного SQL. |
+| 10 | Пройден | Построен глобальный интерактивный S2T-граф с корректными счётчиками. |
+
+Итого: **4 пройдено, 6 пройдено частично, 0 провалено**.
+
 ## 1. Непосредственный upstream колонки
 
 ### Запрос
 
 > Покажи непосредственный upstream для колонки `t_bus_srv.bus_srv_id`. Нужны
-> исходные таблицы, исходные колонки и слои переходов.
+> исходные таблицы, исходные колонки и слои связей.
 
-### Результат
+### Дословный результат
 
 ````text
-Для колонки `t_bus_srv.bus_srv_id` найден непосредственный upstream (4 источника):
+Для колонки `t_bus_srv.bus_srv_id` найдено четыре непосредственных источника (слой B):
 
-```table
-[["Исходная таблица","source_layer","Колонка-источник","ID трансформации","Целевая таблица","Цель. слой","Cтeль. колонка"],["b3050000420001_agreementservice","B","object_id_uid",585,"t_bus_srv","T","bus_srv_id"],["b3050000420010_productservice","B","object_id_uid",679,"t_bus_srv","T","bus_srv_id"],["b3050000420015_technicalservice","B","object_id_uid",696,"t_bus_srv","T","bus_srv_id"],["b3050000420029_planservice","B","object_id_uid",785,"t_bus_srv","T","bus_srv_id"]]
-```
+| Исходная таблица | Слои связи | Колонка-источник | ID трансформации |
+|---|---|---|---|
+| b3050000420001_agreementservice | B → T | object_id_uid | 585 |
+| b3050000420010_productservice | B → T | object_id_uid | 679 |
+| b3050000420015_technicalservice | B → T | object_id_uid | 696 |
+| b3050000420029_planservice | B → T | object_id_uid | 785 |
 
-Все переходы — прямые маппинги без дедупликации (`wildcard_passthrough = false`).
+Все источники используют одну и ту же исходную колонку `object_id_uid` из слоя `B`.
 ````
 
-## 2. Топ целевых ETL-таблиц
+## 2. Два уровня downstream через wildcard
 
 ### Запрос
 
-> Назови пять целевых ETL-таблиц с наибольшим количеством уникальных
-> таблиц-источников. Верни название целевой таблицы и количество источников.
-
-### Результат
-
-````text
-```table
-["target_table","count_sources"],["B7000000250071_I_AGR_COND_VAL",10],["t_rate_rule_param",5],["t_bus_srv",5],["b7000000250004_loansagreement",5],["b7000000250039_loans_productregister::subquery::b_2",5]
-```
-````
-
-## 3. Колонковый lineage Greenplum SQL
-
-### Запрос
-
-> Разбери колонковое происхождение данных в этом Greenplum SQL, но не выполняй
-> его:
->
-> ```sql
-> WITH src AS (
->   SELECT o.id, UPPER(o.name) AS normalized_name
->   FROM raw.orders o -- исходные заказы
-> )
-> SELECT id, normalized_name, 1::BIGINT AS version
-> FROM src
-> ```
-
-### Результат
-
-````text
-Вот разбор колонкового происхождения данных для вашего Greenplum SQL-запроса:
-
-```table
-[["target_column","source_table","source_column"],["id","raw.orders","id"],["normalized_name","raw.orders","name"],["version",null,null]]
-```
-
-**Объяснение:**
-*   **`id`**: берётся напрямую из таблицы `raw.orders`, колонка `id`.
-*   **`normalized_name`**: формируется на основе колонки `name` из той же таблицы `raw.orders` с применением функции преобразования в верхний регистр (`UPPER`).
-*   **`version`**: является константой (литералом) и не зависит от данных исходных таблиц.
-````
-
-## 4. Таблицы, выступающие в обеих ролях
-
-### Запрос
-
-> Какие ETL-таблицы одновременно являются источниками и приёмниками данных?
-> Покажи не более пяти.
-
-### Результат
-
-````text
-```table
-[["table_name"],["b7000000250002_loansdictstatus::subquery::cr"],["b7000000250006_preferences::subquery::cr"],["b7000000250016_loansmsfoinfo::branch::1"],["b7000000250016_loansmsfoinfo::branch::2"],["b7000000250016_loansmsfoinfo::subquery::msfo1"]]
-```
-````
-
-## 5. Зависимая цепочка SQLite → Neo4j
-
-### Запрос
-
-> Найди одну ETL-таблицу, которая одновременно выступает источником и
-> приёмником данных. Затем покажи её непосредственные входящие и исходящие
-> связи.
-
-### Результат
-
-````text
-Найдена ETL-таблица `b7000000250002_loansdictstatus::subquery::cr`, которая одновременно выступает источником и приёмником данных.
-
-**Непосредственные связи:**
-
-| direction | source_table | target_table | transformation_ids |
-|-----------|--------------|--------------|--------------------|
-| upstream  | loansdictstatus | b7000000250002_loansdictstatus::subquery::cr | [14326, 14327, 14328, 14329, 14330] |
-| downstream | b7000000250002_loansdictstatus::subquery::cr | b7000000250002_loansdictstatus | [14331, 14332, 14333, 14334] |
-
-**Входящие связи (upstream):**
-- Из таблицы `loansdictstatus` поступают данные через 5 трансформаций с ID: 14326, 14327, 14328, 14329, 14330.
-
-**Исходящие связи (downstream):**
-- В таблицу `b7000000250002_loansdictstatus` передаются данные через 4 трансформации с ID: 14331, 14332, 14333, 14334.
-````
-
-## 6. Два уровня колонкового lineage
-
-### Запрос
-
-> Покажи происхождение данных вниз до двух переходов для колонки
+> Покажи downstream до глубины 2 для колонки
 > `s_grnplm_as_t_didsd_305_db_stg.b3050000420007_product.object_id`.
-> Перечисли все шаги и отметь переходы через звёздочку.
+> Перечисли шаги по порядку и явно обозначь переход `* → *`.
 
-### Результат
+### Дословный результат
 
 ````text
-Для колонки `s_grnplm_as_t_didsd_305_db_stg.b3050000420007_product.object_id` найдено два downstream-перехода:
+Для колонки `s_grnplm_as_t_didsd_305_db_stg.b3050000420007_product.object_id` downstream-линейность до глубины 2 выглядит следующим образом:
 
-```table
-[["step","transformation_id","source_table","target_table","wildcard_passthrough"],["1",17627,"s_grnplm_as_t_didsd_305_db_stg.b3050000420007_product","v_b3050000420007_product_productrate",false],["2",17675,"v_b3050000420007_product_productrate","s305_0007_product_productrate",true]]
-```
+**Шаг 1:**
+*   **Исходная таблица:** `s_grnplm_as_t_didsd_305_db_stg.b3050000420007_product` (поле `object_id`)
+*   **Целевая таблица:** `v_b3050000420007_product_productrate` (поле `object_id`, слой B)
 
-**Шаги:**  
-1. `object_id` из таблицы `s_grnplm_as_t_didsd_305_db_stg.b3050000420007_product` → через трансформацию ID 17627 → в таблицу `v_b3050000420007_product_productrate`.  
-2. `object_id` из таблицы `v_b3050000420007_product_productrate` → через трансформацию ID 17675 (wildcard-пропуск) → в таблицу `s305_0007_product_productrate`.
+**Шаг 2:**
+*   **Исходная таблица:** `v_b3050000420007_product_productrate` (поле `*`)
+*   **Целевая таблица:** `s305_0007_product_productrate` (поле `object_id`, слой B)
+
+**Переход между шагами:**
+Второй шаг использует правило трансформации с источником и целью, обозначенными как «*» (`source_field: * → target_field: *`). Это указывает на автоматическое наследование или отсутствие явного сопоставления конкретной колонки при переходе от виртуальной таблицы к физической.
 ````
 
-## 7. Табличный lineage Greenplum SQL
+## 3. Обратный двухуровневый upstream
 
 ### Запрос
 
-> Какие физические таблицы участвуют в этом Greenplum SQL и какой объект он
-> создаёт? SQL не выполняй:
+> Покажи upstream до глубины 2 для колонки
+> `s305_0007_product_productrate.object_id`. Верни одну полную цепочку в
+> физическом направлении потока данных, от исходной колонки к запрошенной:
+> upstream означает поиск предков, но стрелки не разворачивай. Явно обозначь
+> переход `* → *`.
+
+### Дословный результат
+
+````text
+```text
+[["table","count"],["s_grnplm_as_t_didsd_305_db_stg.b3050000420007_product",1]]
+```
+
+**Цепочка данных (физическое направление потока):** `s_grnplm_as_t_didsd_305_db_stg.b3050000420007_product` → `v_b3050000420007_product_productrate` → `s305_0007_product_productrate`.
+
+**Переход:** На глубине 1 имя поля в целевой таблице (`s305_...`) было `*`, а на глубине 2 оно явно указано как `object_id` во всех этапах пути, что подтверждает непрерывность потока данных для этой конкретной колонки.
+````
+
+## 4. Обе стороны промежуточной колонки
+
+### Запрос
+
+> Покажи непосредственный upstream и downstream для промежуточной колонки
+> `v_b3050000420007_product_productrate.object_id`. Нужны обе связи, слои и
+> отметка wildcard-перехода.
+
+### Дословный результат
+
+````text
+```table
+["Направление","Таблица источника (source_table)","Поле источника (source_field)","Слои (layers)","ID трансформации"]
+["Upstream","s_grnplm_as_t_didsd_305_db_stg.b3050000420007_product","object_id",null,"17627 (точечная связь)"]
+["Downstream","v_b3050000420007_product_productrate","*","B","17675 (wildcard-переход: поле \"*\" в источнике и цели)"]
+```
+
+**Отметка wildcard-перехода:** Для downstream связи используется правило `"*"`, что соответствует переносу одноимённой колонки через таблицу.
+````
+
+## 5. Зависимая цепочка из двух инструментов
+
+### Запрос
+
+> Найди одну ETL-таблицу, которая одновременно является источником и
+> приёмником. Затем покажи её непосредственные входящие и исходящие табличные
+> связи и количество колонковых трансформаций в каждой связи.
+
+### Дословный результат
+
+````text
+Найдена ETL-таблица `b7000000250002_loansdictstatus::subquery::cr`, которая одновременно является источником и приёмником данных. Её непосредственные связи:
+
+| Направление | Исходящая таблица (source_table) | Входящая таблица (target_table) | Количество трансформаций |
+|-------------|----------------------------------|-------------------------------|---------------------------|
+| upstream    | loansdictstatus                  | b7000000250002_loansdictstatus::subquery::cr | 5                         |
+| downstream  | b7000000250002_loansdictstatus::subquery::cr | b7000000250002_loansdictstatus (слой B)      | 4
+````
+
+## 6. Объяснимый путь через additional object
+
+### Запрос
+
+> Объясни upstream-путь до глубины 3 для колонки
+> `b7000000250002_loansdictstatus.c_id`: покажи все промежуточные узлы, правила
+> преобразования, участие additional object и подтверждение Neo4j.
+
+### Дословный результат
+
+````text
+Найдено один upstream-путь глубины 2 (запрошенная глубина 3 не достигнута). Путь начинается с таблицы `loansdictstatus` и заканчивается в таблице `b7000000250002_loansdictstatus`. Промежуточным узлом является подтаблица `b7000000250002_loansdictstatus::subquery::cr`, созданная дополнительным объектом.
+
+**Структура пути:**
+1.  **Шаг 1 (loansdictstatus → subquery):** Преобразование выражения (`expression`) с правилом `ls.c_id`. Дополнительный объект отсутствует.
+    *   SQL-логика: выборка поля `C_ID` из исходной таблицы `LOANSDICTSTATUS`.
+2.  **Шаг 2 (subquery → b7000000250002_loansdictstatus):** Преобразование выражения (`expression`) с правилом `cr.c_id`. Используется дополнительный объект:
+    *   ID объекта: 2, имя таблицы: `b7000000250002_loansdictstatus`, SQL-запрос сортирует записи по дате валидности и выбирает уникальные записи.
+
+**Подтверждение Neo4j:**
+Связи подтверждены отношениями типа `TABLE_TRANSFORMS_TO` (между таблицами) и `TRANSFORMS_TO` (между колонками). Оба преобразования являются выражениями без фильтрации данных, просто перенося поле через промежуточную подтаблицу.
+
+```text_diagram
+Путь 1:
+  [loansdictstatus.c_id] --expression--> [b7000000250002_loansdictstatus::subquery::cr.c_id]
+    [b7000000250002_loansdictstatus::subquery::cr.c_id] --expression--> [b7000000250002_loansdictstatus.c_id]
+```
+
+**Дополнительный объект:**
+*   **ID объекта:** 2
+*   **Имя таблицы:** `b7000000250002_loansdictstatus`
+*   **SQL-запрос:**
+    ```sql
+    select * from (select C_ID, C_code, C_name, row_number() over (partition by C_ID order by ctl_validfrom desc) as rn from LOANSDICTSTATUS ls) cr where rn=1
+    ```
+````
+
+## 7. Текстовая схема сохранённого пути
+
+### Запрос
+
+> Покажи схемой upstream-путь до глубины 3 для колонки
+> `b7000000250002_loansdictstatus.c_id`. Нужна готовая текстовая схема, без
+> Mermaid-кода.
+
+### Дословный результат
+
+````text
+```text_diagram
+Путь 1:
+  [loansdictstatus.c_id] --expression--> [b7000000250002_loansdictstatus::subquery::cr.c_id]
+    [b7000000250002_loansdictstatus::subquery::cr.c_id] --expression--> [b7000000250002_loansdictstatus.c_id]
+```
+````
+
+## 8. Сложный колонковый lineage Greenplum SQL
+
+### Запрос
+
+> Разбери колонковый lineage этого Greenplum SQL, но не выполняй его:
 >
 > ```sql
-> CREATE VIEW mart.order_customer AS
-> SELECT o.id, c.name
-> FROM raw.orders o
-> JOIN raw.customers c ON c.id = o.customer_id
+> WITH paid AS (
+>   SELECT o.customer_id, SUM(o.amount) AS total_amount
+>   FROM raw.orders o
+>   WHERE o.status = 'paid'
+>   GROUP BY o.customer_id
+> )
+> SELECT
+>   c.id AS customer_id,
+>   UPPER(c.name) AS customer_name,
+>   COALESCE(p.total_amount, 0)::numeric(18,2) AS revenue,
+>   CASE WHEN p.total_amount > 100000 THEN 'vip' ELSE 'regular' END AS segment
+> FROM raw.customers c
+> LEFT JOIN paid p ON p.customer_id = c.id;
 > ```
 
-### Результат
+### Дословный результат
 
 ````text
-SQL-запрос создаёт виртуальную таблицу (представление) **`mart.order_customer`**. Физические таблицы, участвующие в запросе: `raw.orders`, `raw.customers`.
+Анализ колонкового lineage для указанного Greenplum SQL:
+
+- **Целевая таблица**: отсутствует (результат — виртуальная таблица).
+- **Исходные таблицы**: `raw.customers`, `raw.orders`.
+- **Линейность колонок**:
+  - `customer_id` → из колонки `id` в таблице `raw.customers`.
+  - `customer_name` (UPPER(c.name)) → из колонки `name` в таблице `raw.customers`.
+  - `revenue` (CAST(COALESCE(p.total_amount, 0) AS DECIMAL(18,2))) → вычисляется на основе суммы колонок `amount` из таблицы `raw.orders`.
+  - `segment` (CASE WHEN p.total_amount > 100000 THEN 'vip' ELSE 'regular') → зависит от значения колонки `total_amount`, которая агрегирована из `amount` в таблице `raw.orders`; прямая связь с сырой колонокой `amount` верна только транзитивно через CTE.
 ````
 
-## 8. Последний файл и его листы
+## 9. Интерактивный граф конкретного SQL
 
 ### Запрос
 
-> Какой файл был загружен последним? Перечисли листы этого файла.
+> Построй интерактивный граф колонкового lineage для Greenplum SQL, не выполняя
+> его: `CREATE VIEW mart.order_customer AS SELECT o.id, c.name FROM raw.orders o
+> JOIN raw.customers c ON c.id = o.customer_id;`
 
-### Результат
+### Дословный результат
 
 ````text
-Последним загруженным файлом является `s2t_sbrf_pprb_305000042_dul_b_t_v049.xlsx`. Он содержит следующие листы:
+Интерактивный граф наследования для запроса `CREATE VIEW mart.order_customer` построен. Он показывает связь между целевым представлением и источниками:
 
-```table
-["a2b_columns","additional_objects","change_log","pxf2a","s2t","s305_0999_enums","source_columns","source_tables","target_columns","target_tables"]
-```
+- **Целевая таблица**: `mart.order_customer`
+  - Столбец `id` берётся из таблицы `raw.orders`.
+  - Столбец `name` берётся из таблицы `raw.customers`.
+
+Интерактивная визуализация доступна по ссылке: `/exports/sql-lineage/sql_lineage_4c12500d997341ec702b1654.html`
+````
+
+## 10. Интерактивный граф всех S2T-связей
+
+### Запрос
+
+> Построй интерактивный граф всех сохранённых табличных S2T-связей. Кратко
+> сообщи количество узлов и связей и дай ссылку на граф.
+
+### Дословный результат
+
+````text
+Интерактивный граф всех табличных S2T-связей готов. В нём 343 узла и 400 связей (проанализировано 3880 строк, исключено 235). Ссылка на визуализацию: `/exports/s2t-graphs/s2t_table_graph_7288068c55eb0dba929a6767.html`. JSON-данные доступны по ссылке `/exports/s2t-graphs/s2t_table_graph_7288068c55eb0dba929a6767.json`.
+
+[Открыть данные графа в JSON](/exports/s2t-graphs/s2t_table_graph_7288068c55eb0dba929a6767.json)
 ````

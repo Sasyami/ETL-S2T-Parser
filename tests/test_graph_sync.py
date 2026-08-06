@@ -133,20 +133,18 @@ def test_file_graph_projection_preserves_exact_names_and_duplicate_rows(temp_db)
         (
             row["transformation_id"],
             row["sql_query"],
-            row["wildcard_passthrough"],
         )
         for row in projection["table_lineage"]
     ] == [
-        (901, "SELECT source_id FROM exact_source", False),
+        (901, "SELECT source_id FROM exact_source"),
         (
             902,
             "SELECT source_id FROM exact_source WHERE source_id IS NOT NULL",
-            False,
         ),
     ]
 
 
-def test_file_graph_projection_keeps_wildcard_as_table_rule(temp_db):
+def test_file_graph_projection_adds_table_scoped_wildcard_columns(temp_db):
     from services.graph_sync import _build_file_graph_projection
 
     _insert_graph_source_rows()
@@ -180,14 +178,51 @@ def test_file_graph_projection_keeps_wildcard_as_table_rule(temp_db):
 
     projection = _build_file_graph_projection(501)
 
-    assert "*" not in {column["name"] for column in projection["columns"]}
+    wildcard_columns = {
+        (column["table_name"], column["name"], tuple(column["roles"]))
+        for column in projection["columns"]
+        if column["name"] == "*"
+    }
+    assert wildcard_columns == {
+        ("Exact Target", "*", ("source",)),
+        ("Wildcard Target", "*", ("target",)),
+    }
+    wildcard_keys = {
+        column["key"]
+        for column in projection["columns"]
+        if column["name"] == "*"
+    }
+    assert len(wildcard_keys) == 2
     assert [row["transformation_id"] for row in projection["lineage"]] == [
         901,
         902,
+        903,
     ]
+    wildcard_lineage = projection["lineage"][-1]
+    assert wildcard_lineage["source_column_key"] != wildcard_lineage[
+        "target_column_key"
+    ]
+    assert {
+        wildcard_lineage["source_column_key"],
+        wildcard_lineage["target_column_key"],
+    } == wildcard_keys
+    columns_by_key = {
+        column["key"]: (column["table_name"], column["name"])
+        for column in projection["columns"]
+    }
+    assert {
+        (
+            columns_by_key[membership["column_key"]],
+            columns_by_key[membership["wildcard_key"]],
+        )
+        for membership in projection["wildcard_memberships"]
+    } == {
+        (("Exact Target", "target_id"), ("Exact Target", "*")),
+        (("Wildcard Target", "target_id"), ("Wildcard Target", "*")),
+    }
     wildcard_edge = projection["table_lineage"][-1]
     assert wildcard_edge["transformation_id"] == 903
-    assert wildcard_edge["wildcard_passthrough"] is True
+    assert "wildcard_passthrough" not in wildcard_edge
 
 
 def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_db):
@@ -221,6 +256,7 @@ def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_d
         "file_id": 501,
         "columns": 2,
         "lineage_relationships": 2,
+        "wildcard_membership_relationships": 0,
         "tables": 2,
         "table_lineage_relationships": 2,
     }
@@ -230,7 +266,7 @@ def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_d
 
     delete_query = tx.run.call_args_list[0].args[0]
     assert "MATCH (node:ETLProjection {file_id: $file_id})" in delete_query
-    assert len(tx.run.call_args_list) == 5
+    assert len(tx.run.call_args_list) == 6
     columns_call = tx.run.call_args_list[1]
     assert "CREATE (:ETLProjection:ETLColumn" in columns_call.args[0]
     assert len(columns_call.kwargs["rows"]) == 2
@@ -248,28 +284,29 @@ def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_d
         for row in lineage_call.kwargs["rows"]
     ] == [(901, "B", "T"), (902, "B", "T")]
 
-    table_lineage_call = tx.run.call_args_list[4]
+    wildcard_membership_call = tx.run.call_args_list[4]
+    assert "[:COVERED_BY" in wildcard_membership_call.args[0]
+    assert "[:EXPANDS_TO" in wildcard_membership_call.args[0]
+    assert wildcard_membership_call.kwargs["rows"] == []
+
+    table_lineage_call = tx.run.call_args_list[5]
     assert "CREATE (source)-[:TABLE_TRANSFORMS_TO" in table_lineage_call.args[0]
-    assert "wildcard_passthrough: row.wildcard_passthrough" in (
-        table_lineage_call.args[0]
-    )
+    assert "wildcard_passthrough" not in table_lineage_call.args[0]
     assert [
         (
             row["transformation_id"],
             row["source_layer"],
             row["target_layer"],
             row["sql_query"],
-            row["wildcard_passthrough"],
         )
         for row in table_lineage_call.kwargs["rows"]
     ] == [
-        (901, "B", "T", "SELECT source_id FROM exact_source", False),
+        (901, "B", "T", "SELECT source_id FROM exact_source"),
         (
             902,
             "B",
             "T",
             "SELECT source_id FROM exact_source WHERE source_id IS NOT NULL",
-            False,
         ),
     ]
 

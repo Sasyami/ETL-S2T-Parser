@@ -67,7 +67,6 @@ def _table_lineage_connections(rows: list[Dict[str, Any]]) -> list[Dict[str, Any
                 "target_layer": row.get("target_layer"),
                 "transformation_count": 0,
                 "transformation_ids": [],
-                "wildcard_passthrough": False,
             },
         )
         connection["transformation_count"] += 1
@@ -77,8 +76,6 @@ def _table_lineage_connections(rows: list[Dict[str, Any]]) -> list[Dict[str, Any
             and transformation_id not in connection["transformation_ids"]
         ):
             connection["transformation_ids"].append(transformation_id)
-        if row.get("wildcard_passthrough"):
-            connection["wildcard_passthrough"] = True
     return list(grouped.values())
 
 
@@ -190,6 +187,9 @@ def run_cypher(
     цепочек зависимостей, обходов
     соседних таблиц/колонок и impact analysis. В графе есть узлы ETLTable с
     рёбрами TABLE_TRANSFORMS_TO и узлы ETLColumn с рёбрами TRANSFORMS_TO.
+    Wildcard моделируется отдельной колонкой name="*" внутри каждой таблицы;
+    её уникальный key включает file_id и table_name. Конкретные колонки таблицы
+    связаны с ней рёбрами COVERED_BY и EXPANDS_TO.
     Табличное ребро содержит sql_query из transformation_rule. Сведения о
     файлах, листах и точных строках S2T получай из SQLite. Для обычной таблицы S2T-трансформаций,
     фильтрации строк и маппингов используй SQLite-tools, а не этот инструмент.
@@ -259,6 +259,8 @@ MATCH (source:ETLProjection:ETLColumn)
       (target:ETLProjection:ETLColumn)
 WHERE
     (state.file_id IS NULL OR mapping.file_id = state.file_id)
+    AND source.name <> '*'
+    AND target.name <> '*'
     AND (
         (
             $direction = 'downstream'
@@ -281,31 +283,45 @@ RETURN
     target.table_name AS target_table,
     mapping.target_layer AS target_layer,
     target.name AS target_field,
-    false AS wildcard_passthrough,
+    source.name AS matched_source_field,
+    target.name AS matched_target_field,
     $direction AS match_direction
 UNION ALL
 UNWIND $states AS state
-MATCH (source:ETLProjection:ETLTable)
-      -[mapping:TABLE_TRANSFORMS_TO]->
-      (target:ETLProjection:ETLTable)
+MATCH (source:ETLProjection:ETLColumn)
+      -[:COVERED_BY]->
+      (source_wildcard:ETLProjection:ETLColumn {name: '*'})
+      -[mapping:TRANSFORMS_TO]->
+      (target_wildcard:ETLProjection:ETLColumn {name: '*'})
+      -[:EXPANDS_TO]->
+      (target:ETLProjection:ETLColumn)
 WHERE
-    coalesce(mapping.wildcard_passthrough, false) = true
+    source.name = target.name
     AND (state.file_id IS NULL OR mapping.file_id = state.file_id)
     AND (
-        ($direction = 'downstream' AND source.name = state.table_name)
-        OR ($direction = 'upstream' AND target.name = state.table_name)
+        (
+            $direction = 'downstream'
+            AND source.table_name = state.table_name
+            AND source.name = state.column_name
+        )
+        OR (
+            $direction = 'upstream'
+            AND target.table_name = state.table_name
+            AND target.name = state.column_name
+        )
     )
 RETURN
     state.state_index AS state_index,
     mapping.file_id AS file_id,
     mapping.transformation_id AS transformation_id,
-    source.name AS source_table,
+    source.table_name AS source_table,
     mapping.source_layer AS source_layer,
-    state.column_name AS source_field,
-    target.name AS target_table,
+    source.name AS source_field,
+    target.table_name AS target_table,
     mapping.target_layer AS target_layer,
-    state.column_name AS target_field,
-    true AS wildcard_passthrough,
+    target.name AS target_field,
+    source_wildcard.name AS matched_source_field,
+    target_wildcard.name AS matched_target_field,
     $direction AS match_direction
 """
 
@@ -394,7 +410,8 @@ def _resolve_column_lineage(
                     int(row.get("state_index") or 0),
                     int(row.get("file_id") or 0),
                     int(row.get("transformation_id") or 0),
-                    bool(row.get("wildcard_passthrough")),
+                    row.get("matched_source_field") == "*"
+                    and row.get("matched_target_field") == "*",
                 )
             )
 
@@ -424,15 +441,24 @@ def _resolve_column_lineage(
                 if next_key in state["visited"]:
                     continue
 
+                is_wildcard = (
+                    row.get("matched_source_field") == "*"
+                    and row.get("matched_target_field") == "*"
+                )
                 step = {
                     key: value
                     for key, value in row.items()
-                    if key != "state_index"
+                    if key
+                    not in {
+                        "state_index",
+                        "matched_source_field",
+                        "matched_target_field",
+                    }
                 }
                 step["file_id"] = edge_file_id
-                step["wildcard_passthrough"] = bool(
-                    step.get("wildcard_passthrough")
-                )
+                if is_wildcard:
+                    step["source_field"] = "*"
+                    step["target_field"] = "*"
                 steps = [*state["steps"], step]
                 paths.append(
                     _path_result(
@@ -471,7 +497,6 @@ def _resolve_column_lineage(
                 step.get("source_field"),
                 step.get("target_table"),
                 step.get("target_field"),
-                step.get("wildcard_passthrough"),
             )
             if signature in seen_steps:
                 continue
@@ -496,7 +521,14 @@ def trace_neo4j_lineage(
     max_depth: int = 1,
     limit: int = 50,
 ) -> Dict[str, Any]:
-    """Найти одно- или многоуровневый upstream/downstream lineage колонок.
+    """Найти upstream/downstream lineage конкретной именованной колонки.
+
+    Не используй для lineage всей таблицы без колонки: там нужен
+    trace_neo4j_table_lineage. Используй для структуры графа и именованных
+    зависимостей колонок; если
+    пользователь просит правила преобразования, SQL, additional objects,
+    объяснимый сохранённый S2T-путь или его готовую схему, выбирай
+    trace_transformation_path: он также возвращает text_diagram.
 
     Перед вызовом обязательно нормализуй ссылку на именованную колонку. Раздели
     ссылку ``table_name.column_name`` по последней точке: всю левую часть
@@ -512,8 +544,14 @@ def trace_neo4j_lineage(
     TRANSFORMS_TO; имена сравниваются точно.
 
     Для именованной колонки tool проходит до max_depth связей сам: обычные
-    TRANSFORMS_TO и правила ``* -> *`` объединяются в один путь. Wildcard означает
-    passthrough любой конкретной колонки и не является колонкой с именем ``*``.
+    TRANSFORMS_TO и правила ``* -> *`` объединяются в один путь. Wildcard
+    представлен отдельным ETLColumn с name="*" для каждой таблицы; его key
+    включает file_id и table_name, поэтому wildcard разных таблиц не смешивается.
+    Каждая известная конкретная колонка соединена с wildcard своей таблицы
+    рёбрами COVERED_BY и EXPANDS_TO; между таблицами сопоставляются только
+    одноимённые колонки.
+    В публичных шагах такое ребро возвращается как source_field="*" и
+    target_field="*" без отдельного boolean-признака.
     Для произвольного графового запроса используй run_cypher, для объяснения
     S2T-правил — trace_transformation_path. file_id допустим только при явном
     файловом scope.
@@ -746,7 +784,6 @@ def trace_neo4j_table_lineage(
             target.name AS target_table,
             mapping.target_layer AS target_layer,
             mapping.sql_query AS sql_query,
-            coalesce(mapping.wildcard_passthrough, false) AS wildcard_passthrough,
             CASE
                 WHEN source.name = $table_name
                 THEN 'downstream'

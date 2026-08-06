@@ -998,16 +998,29 @@ def test_additional_objects_parse_greenplum_comments_and_keep_valid_objects(s2t_
     )
 
     analysis = classify_file_sheet_groups(file_id, use_llm=False)
-    report = extract_structured_metadata(file_id, analysis)
+    with patch(
+        "sheet_skills.additional_objects._repair_sql_with_llm",
+        return_value="SELECT (",
+    ) as repair_sql:
+        report = extract_structured_metadata(file_id, analysis)
     etl_report = report["targets"]["additional_objects"]["etl_transformations"]
 
     assert etl_report["status"] == "partial"
     assert etl_report["object_count"] == 2
     assert etl_report["parsed_object_count"] == 1
     assert etl_report["error_count"] == 1
+    assert etl_report["repair_attempt_count"] == 1
+    assert etl_report["repaired_object_count"] == 0
+    assert etl_report["repair_error_count"] == 1
     assert etl_report["written"] == 3
     assert etl_report["objects"][0]["select_count"] == 1
     assert etl_report["objects"][0]["statement_count"] == 2
+    broken_report = etl_report["objects"][1]
+    assert broken_report["llm_repair_attempted"] is True
+    assert broken_report["llm_repair_status"] == "retry_parse_error"
+    assert broken_report["initial_parse_error"]
+    assert broken_report["retry_parse_error"]
+    repair_sql.assert_called_once()
 
     conn = get_db_connection()
     try:
@@ -1056,6 +1069,87 @@ def test_additional_objects_parse_greenplum_comments_and_keep_valid_objects(s2t_
             "target_layer": "B",
         },
     ]
+
+
+def test_additional_objects_repair_invalid_sql_and_retry_sqlglot(s2t_db):
+    original_sql = "SELECT ( -- незавершённое выражение"
+    repaired_sql = "SELECT o.id FROM raw.orders AS o -- исходные заказы"
+    file_id = store_excel_data(
+        "additional_repair.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "Additional objects",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": ["name", "SQL"],
+                "data_rows": [["mart.repaired", original_sql]],
+            }
+        ],
+    )
+
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    with patch(
+        "sheet_skills.additional_objects._repair_sql_with_llm",
+        return_value=repaired_sql,
+    ) as repair_sql:
+        report = extract_structured_metadata(file_id, analysis)
+
+    etl_report = report["targets"]["additional_objects"]["etl_transformations"]
+    object_report = etl_report["objects"][0]
+    assert etl_report["status"] == "ok"
+    assert etl_report["repair_attempt_count"] == 1
+    assert etl_report["repaired_object_count"] == 1
+    assert etl_report["repair_error_count"] == 0
+    assert etl_report["written"] == 1
+    assert object_report["status"] == "ok"
+    assert object_report["llm_repair_attempted"] is True
+    assert object_report["llm_repair_status"] == "success"
+    assert object_report["initial_parse_error"]
+    assert object_report["retry_parse_error"] is None
+    repair_sql.assert_called_once()
+    assert repair_sql.call_args.args[0] == original_sql
+    assert repair_sql.call_args.args[1] == object_report["initial_parse_error"]
+
+    conn = get_db_connection()
+    try:
+        stored_sql = conn.execute(
+            "SELECT sql FROM additional_objects WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()["sql"]
+        raw_sql = conn.execute(
+            """
+            SELECT value
+            FROM data
+            WHERE file_id = ? AND table_name = ? AND value = ?
+            """,
+            (file_id, "Additional objects", original_sql),
+        ).fetchone()
+        lineage_row = dict(
+            conn.execute(
+                """
+                SELECT target_table, target_field, source_table, source_field,
+                       transformation_rule, source_layer, target_layer
+                FROM s2t_transformations
+                WHERE file_id = ?
+                """,
+                (file_id,),
+            ).fetchone()
+        )
+    finally:
+        conn.close()
+
+    assert stored_sql == original_sql
+    assert raw_sql["value"] == original_sql
+    assert lineage_row == {
+        "target_table": "mart.repaired",
+        "target_field": "id",
+        "source_table": "raw.orders",
+        "source_field": "id",
+        "transformation_rule": "o.id",
+        "source_layer": None,
+        "target_layer": "B",
+    }
 
 
 def test_additional_objects_preserve_cte_scope_lineage(s2t_db):

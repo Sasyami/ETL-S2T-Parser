@@ -43,11 +43,6 @@ _VISUALIZATION_URL = re.compile(
 _S2T_GRAPH_DATA_URL = re.compile(
     r"^/exports/s2t-graphs/[A-Za-z0-9_.-]+\.json$"
 )
-_TABLE_BLOCK = re.compile(r"```table\s*[\s\S]*?```", re.IGNORECASE)
-_FENCED_JSON_LIST_BLOCK = re.compile(
-    r"```(?:text|json)?\s*(\[[\s\S]*?\])\s*```",
-    re.IGNORECASE,
-)
 _OBSERVATION_SUMMARY_MAX_CHARS = 1200
 _OBSERVATION_FACT_MAX_CHARS = 300
 _OBSERVATION_FACTS_MAX_COUNT = 8
@@ -78,21 +73,6 @@ _COMPLETION_AUDIT_RETRY_PROMPT = """
 каждая часть запроса уже подтверждена фактическими ToolMessage.
 """.strip()
 _BOUNDED_ARGUMENT_NAMES = frozenset({"limit", "preview_limit", "max_depth"})
-_TOOL_CALL_ARGUMENT_AUDIT_PROMPT = """
-Аудит аргументов tool call перед выполнением. Сопоставь исходный запрос
-пользователя с каждым предложенным вызовом и схемой его аргументов. Особое
-внимание удели явным числовым ограничениям: максимуму строк, количеству,
-preview_limit и глубине. Не доверяй предложенному значению по умолчанию: если
-пользователь указал N и соответствующий аргумент существует, он должен быть
-равен N. Также проверь, что выбранная операция прямо соответствует запросу.
-
-Верни нативные tool_calls, которые действительно следует выполнить сейчас.
-Если предложенные вызовы корректны, повтори их без изменения. Если аргументы или
-операция неверны, верни исправленные вызовы. Не объясняй решение обычным текстом.
-
-Исходный запрос: {user_query}
-Предложенные tool_calls: {tool_calls}
-""".strip()
 
 
 def _completed_tool_names(messages: Sequence[BaseMessage]) -> List[str]:
@@ -101,14 +81,6 @@ def _completed_tool_names(messages: Sequence[BaseMessage]) -> List[str]:
         for message in messages
         if isinstance(message, ToolMessage)
     ]
-
-
-def _tool_calls_need_argument_audit(tool_calls: Sequence[Mapping[str, Any]]) -> bool:
-    return any(
-        bool(_BOUNDED_ARGUMENT_NAMES.intersection((call.get("args") or {}).keys()))
-        for call in tool_calls
-        if isinstance(call.get("args"), Mapping)
-    )
 
 
 def _enforce_single_numeric_constraint(
@@ -417,78 +389,6 @@ def _tool_message_payload(message: ToolMessage) -> Dict[str, Any]:
     }
 
 
-def _decoded_tool_message_payload(message: ToolMessage) -> Optional[Dict[str, Any]]:
-    content = message.content
-    if isinstance(content, dict):
-        payload = content
-    else:
-        try:
-            payload = json.loads(_message_content_text(content))
-        except (json.JSONDecodeError, TypeError):
-            return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _single_authoritative_table_block(
-    messages: Sequence[BaseMessage],
-) -> Optional[str]:
-    """Build an exact display block when one successful tool returned a table."""
-    tool_messages = [
-        message for message in messages if isinstance(message, ToolMessage)
-    ]
-    if len(tool_messages) != 1 or _tool_message_has_error(tool_messages[0]):
-        return None
-
-    payload = _decoded_tool_message_payload(tool_messages[0])
-    if payload is None:
-        return None
-    columns = payload.get("columns")
-    rows = payload.get("rows")
-    if (
-        not isinstance(columns, list)
-        or not columns
-        or not all(isinstance(column, str) for column in columns)
-        or not isinstance(rows, list)
-        or not all(isinstance(row, Mapping) for row in rows)
-    ):
-        return None
-
-    table = [columns]
-    table.extend(
-        [[row.get(column) for column in columns] for row in rows]
-    )
-    return (
-        "```table\n"
-        + json.dumps(table, ensure_ascii=False, separators=(",", ":"), default=str)
-        + "\n```"
-    )
-
-
-def _apply_authoritative_table_block(text: str, table_block: str) -> str:
-    """Replace model-rendered table data with the exact tool representation."""
-    clean_text = str(text or "").strip()
-
-    def remove_duplicate_json_list(match: re.Match[str]) -> str:
-        try:
-            value = json.loads(match.group(1))
-        except (json.JSONDecodeError, TypeError):
-            return match.group(0)
-        return "" if isinstance(value, list) else match.group(0)
-
-    clean_text = _FENCED_JSON_LIST_BLOCK.sub(
-        remove_duplicate_json_list,
-        clean_text,
-    ).strip()
-    match = _TABLE_BLOCK.search(clean_text)
-    if match is None:
-        return f"{clean_text}\n\n{table_block}".strip()
-
-    before = clean_text[: match.start()].rstrip()
-    after = _TABLE_BLOCK.sub("", clean_text[match.end() :]).strip()
-    parts = [part for part in (before, table_block, after) if part]
-    return "\n\n".join(parts)
-
-
 def _tool_message_has_error(message: ToolMessage) -> bool:
     if getattr(message, "status", None) == "error":
         return True
@@ -599,58 +499,6 @@ def build_agent_graph(
 
         if not isinstance(reply, AIMessage):
             reply = AIMessage(content=_message_content_text(reply))
-
-        if (
-            not limit_reached
-            and reply.tool_calls
-            and _tool_calls_need_argument_audit(reply.tool_calls)
-        ):
-            try:
-                argument_audit_messages: List[BaseMessage] = [
-                    *planner_messages,
-                    reply,
-                    HumanMessage(
-                        content=_TOOL_CALL_ARGUMENT_AUDIT_PROMPT.format(
-                            user_query=json.dumps(
-                                _last_user_query(state["messages"]),
-                                ensure_ascii=False,
-                            ),
-                            tool_calls=json.dumps(
-                                reply.tool_calls,
-                                ensure_ascii=False,
-                                default=str,
-                            ),
-                        )
-                    ),
-                ]
-                audited_tool_calls = planner_model.invoke(argument_audit_messages)
-                if not isinstance(audited_tool_calls, AIMessage):
-                    audited_tool_calls = AIMessage(
-                        content=_message_content_text(audited_tool_calls)
-                    )
-                logger.info(
-                    "Planner argument audit: proposed=%s audited=%s content=%s",
-                    [
-                        {"name": call.get("name"), "args": call.get("args", {})}
-                        for call in reply.tool_calls
-                    ],
-                    [
-                        {"name": call.get("name"), "args": call.get("args", {})}
-                        for call in audited_tool_calls.tool_calls
-                    ],
-                    _message_text(audited_tool_calls)[:1000],
-                )
-                if audited_tool_calls.tool_calls:
-                    reply = audited_tool_calls
-                else:
-                    logger.warning(
-                        "Planner argument audit returned no native tool_calls; "
-                        "keeping the schema-valid proposed call"
-                    )
-            except Exception:
-                logger.exception(
-                    "LLM error in planner argument audit; using proposed call"
-                )
 
         if not limit_reached and reply.tool_calls:
             reply = _enforce_single_numeric_constraint(
@@ -866,16 +714,18 @@ def build_agent_graph(
 Для ответа о s2t_transformations не связывай глобальный результат с активным
 файлом и не упоминай его file_id или имя. Пустой результат означает только то,
 что глобальная таблица сейчас пуста.
-Табличные данные возвращай компактным текстовым блоком `table`: внутри должен быть
-валидный JSON-список списков, где первая строка содержит названия колонок, а остальные
-строки — значения. Пример: ```table
+Табличные данные возвращай только компактным текстовым блоком `table`: внутри должен
+быть валидный JSON-список списков, где первая строка содержит названия колонок, а
+остальные строки — значения. Пример: ```table
 [["target_table","count"],["t_bus_srv",5],["t_agr_dep",2]]
-```. Не создавай Markdown-таблицу с `|` и строкой `---`: браузер сам отрисует блок
-`table` как таблицу. Не добавляй вводную фразу «Полученные результаты», если она не
-нужна по смыслу. Компактный блок не является сокращением: сохраняй все запрошенные
+```. Markdown-таблица с `|` и строкой `---` запрещена: браузер сам отрисует блок
+`table` как таблицу. Не добавляй вводную фразу «Полученные результаты», если она
+не нужна по смыслу. Компактный блок не является сокращением: сохраняй все запрошенные
 строки, порядок колонок и точные значения из ToolMessage.
-Если фактический ToolMessage содержит text_diagram, перенеси эту схему в ответ
-без изменений внутри блока ```text```. Если ToolMessage содержит
+Если фактический ToolMessage содержит text_diagram, обязательно перенеси ровно
+готовый text_diagram без изменений внутри блока ```text```. Не заменяй его
+списком, не пересказывай и не добавляй собственную классификацию структуры пути.
+Если ToolMessage содержит
 visualization_url, не печатай HTML, DOT или Mermaid; кратко опиши результат —
 приложение само добавит интерактивный граф. Mermaid-код
 показывай только по прямой просьбе пользователя получить Mermaid.
@@ -926,18 +776,6 @@ Planner решил, что дополнительных инструментов
             reply = AIMessage(
                 content=f"Не удалось сформировать ответ из-за ошибки связи с LLM: {exc}"
             )
-
-        exact_table_block = _single_authoritative_table_block(state["messages"])
-        if exact_table_block is not None:
-            exact_content = _apply_authoritative_table_block(
-                _message_text(reply),
-                exact_table_block,
-            )
-            if exact_content != _message_text(reply):
-                logger.info(
-                    "Responder table normalized from the authoritative ToolMessage"
-                )
-                reply = reply.model_copy(update={"content": exact_content})
 
         return {
             "messages": [reply],
@@ -1047,7 +885,7 @@ def run_agent_graph(
                     else "Открыть интерактивный SQL lineage-граф"
                 )
                 link = f"[{label}]({url})"
-                if link not in answer:
+                if url not in answer:
                     answer += f"\n\n{link}"
             for url in _s2t_graph_data_urls(messages):
                 link = f"[Открыть данные графа в JSON]({url})"

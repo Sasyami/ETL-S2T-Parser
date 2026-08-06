@@ -34,10 +34,7 @@ from .sql_lineage import (
     parse_sql_table_lineage,
     visualize_sql_lineage,
 )
-from .transformation_paths import (
-    trace_transformation_path,
-    visualize_transformation_path,
-)
+from .transformation_paths import trace_transformation_path
 
 READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     show_plan,
@@ -45,7 +42,6 @@ READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     get_excel_row,
     semantic_search_descriptions,
     visualize_s2t_table_graph,
-    visualize_transformation_path,
     trace_transformation_path,
     parse_sql_column_lineage,
     parse_sql_table_lineage,

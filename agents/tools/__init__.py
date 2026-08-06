@@ -56,10 +56,7 @@ from .sql_lineage import (
     parse_sql_table_lineage,
     visualize_sql_lineage,
 )
-from .transformation_paths import (
-    trace_transformation_path,
-    visualize_transformation_path,
-)
+from .transformation_paths import trace_transformation_path
 
 __all__ = [
     "ALL_TOOLS",
@@ -108,7 +105,6 @@ __all__ = [
     "trace_neo4j_lineage",
     "trace_neo4j_table_lineage",
     "trace_transformation_path",
-    "visualize_transformation_path",
     "update_file_description",
     "update_table_info_from_user_query",
 ]

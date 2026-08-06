@@ -25,6 +25,33 @@ def _text(value: Any) -> Optional[str]:
     return text or None
 
 
+def _normalize_path_reference(
+    table_name: Any,
+    column_name: Optional[str],
+) -> Tuple[str, Optional[str]]:
+    """Normalize both supported forms of an exact table/column reference."""
+    clean_table = str(table_name or "").strip()
+    if column_name is None:
+        return clean_table, None
+
+    raw_column = str(column_name).strip()
+    if not raw_column:
+        return clean_table, None
+
+    if raw_column.casefold() == clean_table.casefold() and "." in clean_table:
+        clean_table, raw_column = clean_table.rsplit(".", 1)
+        return clean_table.strip(), raw_column.strip() or None
+
+    clean_column = normalize_column_reference(clean_table, raw_column)
+    if clean_column:
+        suffix = f".{clean_column}"
+        if clean_table.casefold().endswith(suffix.casefold()):
+            normalized_table = clean_table[: -len(suffix)].strip()
+            if normalized_table:
+                clean_table = normalized_table
+    return clean_table, clean_column
+
+
 def _node_key(
     file_id: int,
     table_name: Any,
@@ -331,9 +358,11 @@ def trace_transformation_path(
 ) -> Dict[str, Any]:
     """Построить многоуровневый объяснимый путь из сохранённых S2T-фактов.
 
-    Используй для вопросов «как значение приходит», «покажи путь
-    трансформации», «какие правила применяются по цепочке» и end-to-end
-    source → target. Инструмент строит многошаговые пути по глобальной
+    Используй для вопросов о правилах цепочки, исходном SQL, additional objects,
+    подтверждении Neo4j, «как значение приходит», end-to-end source → target и
+    для явной просьбы показать сохранённый путь схемой: tool сразу возвращает
+    готовую text_diagram; обычный trace_neo4j_lineage этих фактов не возвращает.
+    Инструмент строит многошаговые пути по глобальной
     s2t_transformations без фильтра file_id, но никогда не склеивает одинаковые
     имена из разных файлов. Для каждого шага отличает прямую трансформацию
     (NULL, пусто или ровно "-"), выражение и полный SQL; полный SQL разбирает
@@ -344,17 +373,19 @@ def trace_transformation_path(
     Используй, когда важны не только соседние source/target, но и порядок
     нескольких шагов, текст каждого правила и участие additional_objects. Для
     простой выдачи строк предпочитай list/search_s2t_transformations, для одного
-    прямого графового соседа — Neo4j trace tools, а по прямой просьбе нарисовать
-    путь — visualize_transformation_path. table_name и column_name сравниваются
+    прямого графового соседа — Neo4j trace tools. Этот же tool используется при
+    просьбе показать путь схемой: он всегда возвращает готовые text_diagram,
+    Mermaid-код и edges без второго анализа. table_name и column_name сравниваются
     как точные имена без смысловой подстановки. include_neo4j не превращает
     Neo4j в fallback и не удаляет SQLite-пути, которых нет в проекции. Пустой
     paths означает, что из указанной стартовой точки в выбранном направлении не
     собран путь по сохранённым S2T-рёбрам.
 
-    Если пользователь указал колонку в форме table_name.column_name, раздели
-    ссылку: имя таблицы передай в table_name, а в column_name — только имя
-    колонки без префикса. Составная форма принимается только для совместимости
-    и детерминированно нормализуется инструментом.
+    Если пользователь указал колонку в форме table_name.column_name, желательно
+    разделить ссылку: имя таблицы передать в table_name, а в column_name — только
+    имя колонки без префикса. Инструмент также детерминированно исправляет обе
+    совместимые формы: полную ссылку в column_name и полную ссылку в table_name,
+    когда column_name уже содержит совпадающий последний сегмент.
 
     Для downstream table_name и column_name означают пару source_table + source_field,
     для upstream — target_table + target_field. Режим both сначала
@@ -366,7 +397,9 @@ def trace_transformation_path(
     сначала разреши фактические роли через search_s2t_transformations.
 
     Args:
-        table_name: Точное имя исходной или целевой логической ETL-таблицы.
+        table_name: Точное имя исходной или целевой логической ETL-таблицы;
+            совместимая полная ссылка table_name.column_name нормализуется,
+            если column_name передан отдельно и совпадает с последним сегментом.
         column_name: Опциональное точное имя колонки без префикса таблицы;
             null строит путь таблиц.
         direction: upstream, downstream или оба направления both.
@@ -374,18 +407,33 @@ def trace_transformation_path(
         limit: Максимальное число возвращаемых путей, от 1 до 50.
         include_neo4j: Добавить подтверждающие рёбра текущей Neo4j-проекции.
     """
-    clean_table = str(table_name or "").strip()
+    clean_table, clean_column = _normalize_path_reference(
+        table_name,
+        column_name,
+    )
     if not clean_table:
-        return {"error": "table_name must be non-empty", "paths": []}
-    clean_column = normalize_column_reference(clean_table, column_name)
+        empty_edges: List[Dict[str, Any]] = []
+        return {
+            "error": "table_name must be non-empty",
+            "paths": [],
+            "returned_paths": 0,
+            "text_diagram": _text_path_diagram([]),
+            "mermaid": _mermaid_path_diagram(empty_edges),
+            "edges": empty_edges,
+        }
     if (
         column_name is not None
         and str(column_name).strip()
         and not clean_column
     ):
+        empty_edges = []
         return {
             "error": "column_name must contain a column after table_name",
             "paths": [],
+            "returned_paths": 0,
+            "text_diagram": _text_path_diagram([]),
+            "mermaid": _mermaid_path_diagram(empty_edges),
+            "edges": empty_edges,
         }
     clean_depth = clamped_int(max_depth, 5, 1, 10)
     clean_limit = clamped_int(limit, 20, 1, 50)
@@ -435,6 +483,7 @@ def trace_transformation_path(
             for step in path.get("steps", [])
         }
     )
+    display_edges = _visual_edges(paths)
     return {
         "table_name": clean_table,
         "column_name": clean_column,
@@ -447,6 +496,9 @@ def trace_transformation_path(
             if include_neo4j
             else {"included": False, "rows": []}
         ),
+        "text_diagram": _text_path_diagram(paths),
+        "mermaid": _mermaid_path_diagram(display_edges),
+        "edges": display_edges,
     }
 
 
@@ -538,75 +590,6 @@ def _mermaid_path_diagram(edges: Sequence[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-@tool(parse_docstring=True)
-def visualize_transformation_path(
-    table_name: str,
-    column_name: Optional[str] = None,
-    direction: Literal["upstream", "downstream", "both"] = "both",
-    max_depth: int = 5,
-    limit: int = 10,
-) -> Dict[str, Any]:
-    """Визуализировать сохранённый путь S2T-преобразований таблицы или колонки.
-
-    Используй, когда пользователь прямо просит нарисовать, визуализировать или
-    показать схемой путь трансформации. Инструмент использует тот же поиск по
-    глобальной s2t_transformations, что и trace_transformation_path, и не
-    выполняет отдельный SQL/Cypher-обход. Возвращает готовую текстовую схему для
-    текущего чата, Mermaid-код и фактические рёбра с типами правил.
-
-    Вызывай этот tool сразу вместо предварительного trace_transformation_path:
-    повторный анализ не добавит фактов и только потратит tool step. text_diagram
-    предназначен для текущего интерфейса и должен переноситься в ответ без
-    переписывания; mermaid возвращается для клиента, который умеет рендерить
-    Mermaid, либо по прямой просьбе пользователя получить код диаграммы. Tool не создаёт PNG/SVG,
-    не записывает файл и намеренно не запрашивает подтверждение
-    Neo4j. Имена узлов из разных file_id внутренне не склеиваются, даже если их
-    подписи совпадают. Пустой результат содержит явную схему «Пути не найдены».
-    Если пользователь указал table_name.column_name, передай таблицу и колонку
-    раздельно: в column_name передай имя колонки без префикса таблицы. Составная
-    форма column_name принимается только для совместимости.
-
-    Args:
-        table_name: Точное имя исходной или целевой логической ETL-таблицы.
-        column_name: Опциональное точное имя колонки без префикса таблицы;
-            null строит путь таблицы.
-        direction: upstream, downstream или оба направления both.
-        max_depth: Максимальная длина пути, от 1 до 10.
-        limit: Максимальное число визуализируемых путей, от 1 до 50.
-    """
-    traced = trace_transformation_path.invoke(
-        {
-            "table_name": table_name,
-            "column_name": column_name,
-            "direction": direction,
-            "max_depth": max_depth,
-            "limit": limit,
-            "include_neo4j": False,
-        }
-    )
-    if traced.get("error"):
-        return {
-            "error": traced["error"],
-            "returned_paths": 0,
-            "text_diagram": "Пути не найдены.",
-            "mermaid": _mermaid_path_diagram([]),
-            "edges": [],
-        }
-
-    paths = traced.get("paths") or []
-    edges = _visual_edges(paths)
-    return {
-        "table_name": traced["table_name"],
-        "column_name": traced["column_name"],
-        "direction": traced["direction"],
-        "returned_paths": traced["returned_paths"],
-        "text_diagram": _text_path_diagram(paths),
-        "mermaid": _mermaid_path_diagram(edges),
-        "edges": edges,
-    }
-
-
 __all__ = [
     "trace_transformation_path",
-    "visualize_transformation_path",
 ]

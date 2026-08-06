@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from graph_storage import (
     close_neo4j_driver,
@@ -120,32 +120,37 @@ def _build_file_graph_projection(file_id: int) -> Dict[str, Any]:
 
     lineage: List[Dict[str, Any]] = []
     table_lineage: List[Dict[str, Any]] = []
+    wildcard_table_pairs: List[Tuple[str, str]] = []
     for row in transformations:
         source_field = _text(row.get("source_field"))
         target_field = _text(row.get("target_field"))
-        wildcard_passthrough = source_field == "*" and target_field == "*"
+        source_table = _text(row.get("source_table"))
+        target_table = _text(row.get("target_table"))
         source_table_key = register_table(
-            row.get("source_table"), "source", row.get("source_layer")
+            source_table, "source", row.get("source_layer")
         )
         target_table_key = register_table(
-            row.get("target_table"), "target", row.get("target_layer")
+            target_table, "target", row.get("target_layer")
         )
-        # A wildcard is a passthrough rule for any concrete column, not a
-        # physical column called "*". Keep it on the table edge and resolve
-        # the concrete column dynamically while reading lineage.
-        source_key = None
-        target_key = None
-        if source_field != "*" and target_field != "*":
-            source_key = register_column(
-                row.get("source_table"),
-                source_field,
-                "source",
-            )
-            target_key = register_column(
-                row.get("target_table"),
-                target_field,
-                "target",
-            )
+        # Wildcard is a logical column rule. Materialize it as ETLColumn("*")
+        # so the complete column graph is represented by TRANSFORMS_TO edges.
+        source_key = register_column(
+            source_table,
+            source_field,
+            "source",
+        )
+        target_key = register_column(
+            target_table,
+            target_field,
+            "target",
+        )
+        if (
+            source_field == "*"
+            and target_field == "*"
+            and source_table is not None
+            and target_table is not None
+        ):
+            wildcard_table_pairs.append((source_table, target_table))
         if source_key is not None and target_key is not None:
             lineage.append(
                 {
@@ -172,9 +177,64 @@ def _build_file_graph_projection(file_id: int) -> Dict[str, Any]:
                     "source_layer": _text(row.get("source_layer")),
                     "target_layer": _text(row.get("target_layer")),
                     "sql_query": sql_query,
-                    "wildcard_passthrough": wildcard_passthrough,
                 }
             )
+
+    # Propagate all currently known concrete column names through wildcard
+    # table components. This materializes the same-name columns on both sides
+    # without producing false cross-column paths such as id -> name.
+    concrete_names_by_table: Dict[str, set[str]] = {}
+    for column in columns_by_key.values():
+        if column["name"] == "*":
+            continue
+        concrete_names_by_table.setdefault(column["table_name"], set()).add(
+            column["name"]
+        )
+    changed = True
+    while changed:
+        changed = False
+        for source_table, target_table in wildcard_table_pairs:
+            shared_names = (
+                concrete_names_by_table.get(source_table, set())
+                | concrete_names_by_table.get(target_table, set())
+            )
+            for table_name in (source_table, target_table):
+                table_names = concrete_names_by_table.setdefault(
+                    table_name,
+                    set(),
+                )
+                before = len(table_names)
+                table_names.update(shared_names)
+                changed = changed or len(table_names) != before
+
+    for source_table, target_table in wildcard_table_pairs:
+        shared_names = (
+            concrete_names_by_table.get(source_table, set())
+            | concrete_names_by_table.get(target_table, set())
+        )
+        for column_name in shared_names:
+            register_column(source_table, column_name, "source")
+            register_column(target_table, column_name, "target")
+
+    wildcard_memberships_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    wildcard_tables = {
+        table_name
+        for pair in wildcard_table_pairs
+        for table_name in pair
+    }
+    for table_name in wildcard_tables:
+        wildcard_key = _column_key(clean_file_id, table_name, "*")
+        if wildcard_key not in columns_by_key:
+            continue
+        for column_name in sorted(concrete_names_by_table.get(table_name, set())):
+            column_key = _column_key(clean_file_id, table_name, column_name)
+            if column_key not in columns_by_key:
+                continue
+            wildcard_memberships_by_key[(column_key, wildcard_key)] = {
+                "file_id": clean_file_id,
+                "column_key": column_key,
+                "wildcard_key": wildcard_key,
+            }
 
     columns = [
         {**column, "roles": sorted(column["roles"])}
@@ -192,6 +252,7 @@ def _build_file_graph_projection(file_id: int) -> Dict[str, Any]:
         "file_id": clean_file_id,
         "columns": columns,
         "lineage": lineage,
+        "wildcard_memberships": list(wildcard_memberships_by_key.values()),
         "tables": tables,
         "table_lineage": table_lineage,
     }
@@ -256,6 +317,23 @@ def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
     tx.run(
         """
         UNWIND $rows AS row
+        MATCH (column:ETLProjection:ETLColumn {
+            file_id: $file_id,
+            key: row.column_key
+        })
+        MATCH (wildcard:ETLProjection:ETLColumn {
+            file_id: $file_id,
+            key: row.wildcard_key
+        })
+        CREATE (column)-[:COVERED_BY {file_id: $file_id}]->(wildcard)
+        CREATE (wildcard)-[:EXPANDS_TO {file_id: $file_id}]->(column)
+        """,
+        file_id=file_id,
+        rows=projection["wildcard_memberships"],
+    ).consume()
+    tx.run(
+        """
+        UNWIND $rows AS row
         MATCH (source:ETLProjection:ETLTable {
             file_id: $file_id,
             key: row.source_table_key
@@ -269,8 +347,7 @@ def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
             transformation_id: row.transformation_id,
             source_layer: row.source_layer,
             target_layer: row.target_layer,
-            sql_query: row.sql_query,
-            wildcard_passthrough: row.wildcard_passthrough
+            sql_query: row.sql_query
         }]->(target)
         """,
         file_id=file_id,
@@ -293,6 +370,9 @@ def sync_file_graph(file_id: int) -> Dict[str, Any]:
         "file_id": int(file_id),
         "columns": len(projection["columns"]),
         "lineage_relationships": len(projection["lineage"]),
+        "wildcard_membership_relationships": (
+            2 * len(projection["wildcard_memberships"])
+        ),
         "tables": len(projection["tables"]),
         "table_lineage_relationships": len(projection["table_lineage"]),
     }

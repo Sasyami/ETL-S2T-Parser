@@ -392,8 +392,7 @@ uv run python -c "from storage.database import migrate_s2t_layer_columns; from s
 - `run_sql` — свободный read-only SQL по публичной SQLite-схеме;
 - `parse_sql_column_lineage` — колонковый lineage переданного SQL через SQLGlot;
 - `parse_sql_table_lineage` — табличный lineage переданного SQL через SQLGlot;
-- `trace_transformation_path` — составной путь по S2T, SQLGlot, additional objects и Neo4j;
-- `visualize_transformation_path` — текстовая и Mermaid-визуализация найденного S2T-пути;
+- `trace_transformation_path` — составной путь по S2T, SQLGlot, additional objects и Neo4j вместе с готовыми текстовой и Mermaid-схемами;
 - `search_excel_values` и `get_excel_row` — поиск исходных значений и восстановление строки листа;
 - `semantic_search_descriptions` — смысловой поиск по embeddings описаний;
 - `list_s2t_transformations` и `search_s2t_transformations` — просмотр S2T;
