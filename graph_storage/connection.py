@@ -6,6 +6,10 @@ from neo4j import Driver, GraphDatabase
 
 from .config import Neo4jSettings, load_neo4j_settings
 
+NEO4J_CONNECTION_TIMEOUT_SECONDS = 3.0
+NEO4J_CONNECTION_ACQUISITION_TIMEOUT_SECONDS = 3.0
+NEO4J_MAX_TRANSACTION_RETRY_TIME_SECONDS = 0.0
+
 
 def create_neo4j_driver(
     settings: Optional[Neo4jSettings] = None,
@@ -18,6 +22,11 @@ def create_neo4j_driver(
             resolved_settings.username,
             resolved_settings.password,
         ),
+        connection_timeout=NEO4J_CONNECTION_TIMEOUT_SECONDS,
+        connection_acquisition_timeout=(
+            NEO4J_CONNECTION_ACQUISITION_TIMEOUT_SECONDS
+        ),
+        max_transaction_retry_time=NEO4J_MAX_TRANSACTION_RETRY_TIME_SECONDS,
     )
 
 

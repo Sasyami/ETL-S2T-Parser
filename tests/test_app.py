@@ -142,7 +142,9 @@ def test_chat_app_has_loading_indicators(client):
     assert 'aria-label="Полная таблица трансформаций с прокруткой"' in body
     assert 'aria-label="Таблица с прокруткой"' in body
     assert "sessionStorage.getItem(CHAT_SESSION_ID_STORAGE_KEY)" in body
-    assert "JSON.stringify({ query, file_id: currentFileId, history, session_id: currentSessionId })" in body
+    assert "JSON.stringify({ query, history, session_id: currentSessionId })" in body
+    assert "currentFileId" not in body
+    assert "Листы текущего файла" not in body
     assert 'id="clearAllDataBtn"' in body
     assert "Очистить все данные" in body
     assert "fetch('/storage', { method: 'DELETE' })" in body
@@ -151,6 +153,17 @@ def test_chat_app_has_loading_indicators(client):
     assert "Учитывать скрытые строки" in body
     assert "includeHiddenRows.disabled = value" in body
     assert "formData.append('include_hidden_rows', String(includeHiddenRows.checked))" in body
+
+
+def test_chat_app_renders_worker_results_in_scrollable_elements(client):
+    response = client.get("/chat_app")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "addDisplayItems(data.display_items)" in body
+    assert "tool-result-scroll" in body
+    assert "Полный результат:" in body
+    assert "toolResultTable" in body
 
 
 def test_sql_lineage_export_route(client, tmp_path, monkeypatch):
@@ -306,18 +319,21 @@ def test_upload_returns_summary_error(mock_generate_description, mock_summarize,
     assert json_data['s2t_transformations_count'] == 0
     assert json_data['s2t_transformations_error'] is None
 
-@patch("app.agent_chat")
+@patch("app.supervisor_chat")
 def test_chat_success(mock_agent, client):
     mock_agent.return_value = "Answer text"
     response = client.post("/chat", json={"query": "List files"})
     assert response.status_code == 200
-    assert response.get_json() == {"answer": "Answer text"}
+    assert response.get_json() == {
+        "answer": "Answer text",
+        "display_items": [],
+    }
     mock_agent.assert_called_once_with("List files")
 
 
-@patch("app.agent_chat")
-def test_chat_passes_active_file_id_to_agent(mock_agent, client):
-    mock_agent.return_value = "Scoped answer"
+@patch("app.supervisor_chat")
+def test_chat_does_not_pass_legacy_file_id_to_supervisor(mock_agent, client):
+    mock_agent.return_value = "Global answer"
 
     response = client.post(
         "/chat",
@@ -325,15 +341,17 @@ def test_chat_passes_active_file_id_to_agent(mock_agent, client):
     )
 
     assert response.status_code == 200
-    assert response.get_json() == {"answer": "Scoped answer"}
+    assert response.get_json() == {
+        "answer": "Global answer",
+        "display_items": [],
+    }
     mock_agent.assert_called_once_with(
         "Покажи таблицу трансформаций",
-        file_id=106,
     )
 
 
-@patch("app.agent_chat")
-def test_chat_passes_browser_session_history_to_agent(mock_agent, client):
+@patch("app.supervisor_chat")
+def test_chat_passes_browser_history_to_supervisor(mock_agent, client):
     mock_agent.return_value = "Follow-up answer"
     history = [
         {"role": "user", "content": "Какие файлы загружены?"},
@@ -352,8 +370,8 @@ def test_chat_passes_browser_session_history_to_agent(mock_agent, client):
     )
 
 
-@patch("app.agent_chat")
-def test_chat_passes_session_id_to_agent(mock_agent, client):
+@patch("app.supervisor_chat")
+def test_chat_passes_session_id_to_supervisor(mock_agent, client):
     mock_agent.return_value = "Scoped answer"
 
     response = client.post(
@@ -362,14 +380,35 @@ def test_chat_passes_session_id_to_agent(mock_agent, client):
     )
 
     assert response.status_code == 200
-    assert response.get_json() == {"answer": "Scoped answer"}
+    assert response.get_json() == {
+        "answer": "Scoped answer",
+        "display_items": [],
+    }
     mock_agent.assert_called_once_with(
         "List files",
         session_id="chat-session-1",
     )
 
 
-@patch("app.agent_chat")
+@patch("app.supervisor_chat")
+def test_chat_returns_worker_display_items(mock_agent, client):
+    mock_agent.return_value = {
+        "answer": "Найдены строки.",
+        "display_items": [
+            {
+                "name": "run_sql",
+                "content": '{"rows":[{"value":1}]}',
+            }
+        ],
+    }
+
+    response = client.post("/chat", json={"query": "Покажи строки"})
+
+    assert response.status_code == 200
+    assert response.get_json() == mock_agent.return_value
+
+
+@patch("app.supervisor_chat")
 def test_chat_rejects_invalid_history(mock_agent, client):
     response = client.post(
         "/chat",

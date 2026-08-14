@@ -3,14 +3,15 @@
 Architecture:
 
     planner (native tool calling)
-        ├─ tool_calls -> ToolNode -> observer (plain text) -> planner
-        └─ no tool_calls -> responder -> END
+        ├─ tool_calls -> ToolNode -> observer (structured output) -> planner
+        ├─ worker finish_worker call -> END
+        └─ legacy no tool_calls -> responder -> END
 
-Raw ToolMessage content is visible to the observer, subsequent planner calls
-and responder, so a later tool can use exact values returned by an earlier one.
-The planner also receives compact plain-text observations and produces a
-bounded handoff when no more tools are needed. The responder uses that handoff
-together with exact tool outputs, without duplicate observer messages.
+The legacy chat mode keeps raw ToolMessage content in the graph. The isolated
+worker mode instead stores full tool results outside message history and puts a
+single bounded text preview into each ToolMessage. The same planner completes a
+worker with finish_worker(answer), without a separate responder call. A higher
+level coordinator decides which complete results should be displayed.
 """
 
 from __future__ import annotations
@@ -31,7 +32,14 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .observability import get_callback_handler, langfuse_trace_context
 
@@ -46,82 +54,166 @@ _S2T_GRAPH_DATA_URL = re.compile(
 _OBSERVATION_SUMMARY_MAX_CHARS = 1200
 _OBSERVATION_FACT_MAX_CHARS = 300
 _OBSERVATION_FACTS_MAX_COUNT = 8
+_OBSERVATION_MISMATCHES_MAX_COUNT = 8
 _OBSERVATION_LIMITATIONS_MAX_COUNT = 4
 _PLANNER_HANDOFF_MAX_CHARS = 12000
-_COMPLETION_AUDIT_PROMPT = """
-Аудит завершения planner. Ещё раз сопоставь исходный запрос пользователя со всеми
-фактически завершёнными ToolMessage. Проверь каждую запрошенную часть отдельно.
-Считай часть подтверждённой только завершённым ToolMessage инструмента, description
-которого непосредственно покрывает эту операцию. Результат предварительного tool,
-включая найденное имя, агрегированные счётчики или данные для аргументов следующего
-шага, не доказывает, что следующий шаг уже выполнен. Выжимка observer также не
-является отдельным инструментальным результатом.
-Отдельно сравни явные числовые ограничения исходного запроса с фактическими
-аргументами и результатом tool. Если пользователь указал N, а tool получил другой
-limit, количество или глубину, задача не завершена: повтори подходящий tool с N.
-Если хотя бы одна часть требует доступного инструмента и ещё не подтверждена его
-результатом, вызови этот tool сейчас: ответ без tool_calls завершит весь граф.
-Если все части уже подтверждены, верни компактную самодостаточную выжимку для
-responder без обещаний будущих действий. Не повторяй успешный одинаковый вызов без
-новой причины и не выдумывай отсутствующие значения.
+DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS = 6000
+_FINISH_WORKER_TOOL_NAME = "finish_worker"
+_WORKER_PLANNER_PROMPT = """
+Ты planner изолированного read-only worker. Решай переданную task только по
+подтверждённым результатам доступных data tools: {{AVAILABLE_TOOLS}}.
+
+До первого успешного результата обязательно вызови подходящий data tool. На
+каждом следующем шаге оцени task, последний tool exchange и накопленную выжимку
+observer, затем либо вызови следующий tool, либо заверши работу через
+finish_worker. Читай description и схему выбранного tool, сохраняй смысл,
+ограничения и точные значения task. Не придумывай факты и не повторяй успешный
+вызов без новой причины. Не считай производный результат готовым входным фактом
+и не переименовывай заданную операцию. После ошибки исправь действие по
+фактическому результату либо честно укажи ограничение. Полные результаты не
+копируй в answer: внешний coordinator сам решит, что показывать отдельно.
+Если task требует вернуть «только» конкретные поля, значения или элементы,
+answer должен содержать ровно их: без вступления, заключения, подтверждения,
+интерпретации и дополнительных пояснений.
+
+Если structured observation содержит `goal_satisfied=false`, task ещё не
+выполнена: не вызывай finish_worker и не возвращай обычный финальный текст.
+Прочитай отдельный блок «Что выполнено неправильно», исправь каждый указанный
+пункт и вызови подходящий data tool. Завершай работу только когда observer
+вернул `goal_satisfied=true` либо лимит data-tool шагов уже исчерпан.
 """.strip()
-_COMPLETION_AUDIT_RETRY_PROMPT = """
-Повтори аудит в последний раз. Предыдущий ответ был обычным текстом и поэтому не
-выполнил ни одного нового действия. Если ты установил, что часть исходного запроса
-ещё не подтверждена и для неё есть доступный tool, не описывай намерение и не пиши
-«вызываю»: верни нативный tool_call прямо сейчас. Обычный текст допустим только если
-каждая часть запроса уже подтверждена фактическими ToolMessage.
+
+_LEGACY_PLANNER_PROMPT = """
+Ты planner read-only агента. Используй только доступные tools:
+{{AVAILABLE_TOOLS}}. Читай description и схему выбранного tool. На каждом шаге
+либо верни нужный native tool call, либо компактную выжимку подтверждённых
+фактов для responder, если данных уже достаточно. Сохраняй смысл, ограничения
+и точные значения запроса, не придумывай факты и не повторяй успешный вызов без
+новой причины. После ошибки скорректируй действие по фактическому ToolMessage.
 """.strip()
-_BOUNDED_ARGUMENT_NAMES = frozenset({"limit", "preview_limit", "max_depth"})
 
+_OBSERVER_PROMPT = """
+Ты observer многошагового агента. Сопоставь исходную `user_request`, фактические
+аргументы последнего tool call и его результат. Проверь, выполнена ли именно
+запрошенная операция над теми же сущностями, ролями, полями, условиями и
+ограничениями. Успешное выполнение tool само по себе не подтверждает task.
 
-def _completed_tool_names(messages: Sequence[BaseMessage]) -> List[str]:
-    return [
-        str(message.name or "unknown_tool")
-        for message in messages
-        if isinstance(message, ToolMessage)
-    ]
+Верни structured output по переданной схеме Observation. Поле `goal_satisfied`
+равно true только когда результат подтверждает выполнение всей task. Если
+результат ошибочен, частичен, неоднозначен или относится к другой сущности,
+роли, колонке, условию либо операции, верни false и отдельно перечисли в
+`mismatches` все конкретные отличия фактического действия от task. Не прячь эти
+отличия только в `summary`, `limitations` или `important_facts`. При
+`goal_satisfied=false` список `mismatches` не может быть пустым; при true он
+должен быть пустым.
 
+В `summary` дай компактную фактическую выжимку результата. Например, если task
+просит `target_table`, а запрос группирует или возвращает `source_table`,
+`goal_satisfied` обязан быть false, даже если tool успешно вернул строки. Не
+выбирай следующий инструмент и не формулируй ответ пользователю. Не придумывай
+отсутствующие данные.
 
-def _enforce_single_numeric_constraint(
-    reply: AIMessage,
-    user_query: str,
-) -> AIMessage:
-    """Copy one unambiguous numeric request into one bounded tool argument."""
-    requested_numbers = re.findall(
-        r"(?<![\w.])([1-9]\d{0,3})(?![\w.])",
-        str(user_query or ""),
-    )
-    if len(requested_numbers) != 1:
-        return reply
+Поле `available_tools` содержит только текущую палитру worker. Установи
+`reroute_required=true` только если task нельзя исправить следующим вызовом ни
+одного из этих tools и требуется другая инструментальная возможность. В
+`reroute_reason` кратко опиши недостающую возможность, но не выбирай конкретный
+tool: новый выбор выполнит отдельный router. Если достаточно исправить аргументы
+или запрос уже доступного tool, оставь `reroute_required=false`. При
+`goal_satisfied=true` reroute запрещён. Ошибка предыдущего вызова сама по себе
+не требует reroute: если тот же tool можно вызвать с исправленными аргументами,
+схемой или запросом, текущая палитра достаточна.
 
-    bounded_arguments: List[tuple[int, str]] = []
-    for call_index, call in enumerate(reply.tool_calls):
-        args = call.get("args") or {}
-        if not isinstance(args, Mapping):
-            continue
-        for argument_name in _BOUNDED_ARGUMENT_NAMES.intersection(args.keys()):
-            bounded_arguments.append((call_index, argument_name))
-    if len(bounded_arguments) != 1:
-        return reply
+Проверяй все точные имена из task посимвольно. Отдельно сопоставь:
+- источник данных из task с фактическим источником tool call;
+- требуемые сущности и роли с выбранными, группируемыми и фильтруемыми полями;
+- каждое точное значение из task с фактическим условием, в котором оно должно
+  использоваться; отсутствие значения или фильтра назови отдельным mismatch;
+- требуемую операцию с фактической операцией;
+- ограничения и форму новых фактов, которые должен получить этот worker.
+Используй переданный runtime-контекст и схему, чтобы отличать физический источник
+данных от логического имени или значения колонки. Не переопределяй их смысл по
+одной разговорной формулировке task. Для каждого ошибочного или лишнего условия
+назови фактическое условие и требуемое условие отдельно.
+`source_table`, `source_field`, `target_table` и `target_field` — разные роли и
+никогда не подтверждают друг друга. Если task просит считать `source_table`, а
+tool call считает `source_field`, обязательно назови это главным
+несоответствием, добавь его в `mismatches` и верни `goal_satisfied=false`.
+Перечисли все обнаруженные несоответствия, чтобы planner мог исправить их одним
+следующим вызовом.
 
-    requested_value = int(requested_numbers[0])
-    call_index, argument_name = bounded_arguments[0]
-    current_value = reply.tool_calls[call_index].get("args", {}).get(argument_name)
-    if current_value == requested_value:
-        return reply
+Если task передаёт уже подтверждённый факт как условие или контекст для нового
+вычисления, не требуй повторно получать этот факт. Проверяй, что tool использует
+его как заданное условие, а статус нового шага определяй по запрошенному новому
+результату.
 
-    corrected_calls = [dict(call) for call in reply.tool_calls]
-    corrected_args = dict(corrected_calls[call_index].get("args") or {})
-    corrected_args[argument_name] = requested_value
-    corrected_calls[call_index]["args"] = corrected_args
-    logger.info(
-        "Planner numeric contract corrected %s from %r to %s",
-        argument_name,
-        current_value,
-        requested_value,
-    )
-    return reply.model_copy(update={"tool_calls": corrected_calls})
+Если task просит полный направленный путь между двумя узлами, промежуточные узлы
+в корректном пути являются обязательной частью результата, а не лишними
+сущностями только потому, что пользователь не перечислил их заранее. Наличие
+нескольких одинаковых строк пути и ограничение числа возвращённых строк не
+делают один найденный полный путь неполным, если task просит сам путь, а не все
+уникальные пути. Считай такой результат выполненным, когда хотя бы одна строка
+содержит оба заданных конца, все узлы между ними по порядку и глубину пути.
+{{PRIOR_STATE_RULE}}
+
+Перед возвратом structured output выполни финальную посимвольную сверку всех
+названных в task источников, полей, значений, фильтров и операций с фактическими
+аргументами tool call. Идентификаторы с разным написанием не являются
+синонимами. Если task требует `source_table`, а SELECT, COUNT, GROUP BY или
+фильтр использует вместо него `source_field`, обязательно верни
+`goal_satisfied=false` и отдельный mismatch вида «требовалось ...; фактически
+выполнено ...». Одного такого отличия достаточно для false независимо от
+успешного статуса tool и правдоподобия результата.
+Не вызывай tools. Верни только structured output Observation.
+""".strip()
+
+_LEGACY_RESPONDER_PROMPT = """
+Сформируй окончательный ответ пользователю по выжимке planner и фактическим
+результатам tools.
+
+Не вызывай инструменты. Используй исходный запрос, пользовательскую историю
+диалога, реальные ToolMessage и planner_handoff ниже. Внутренние observations
+намеренно не передаются, чтобы не дублировать и не искажать результаты tools.
+Сохраняй требуемую полноту, структуру и точные значения результата. Если данных
+недостаточно либо инструмент завершился ошибкой, явно укажи ограничение. Не
+придумывай отсутствующие факты и не упоминай внутреннее устройство графа.
+""".strip()
+
+_PLANNER_HANDOFF_PROMPT = """
+Planner решил, что дополнительных инструментов больше не требуется, и
+сформировал следующую выжимку проверенных фактов:
+
+<planner_handoff>
+{{PLANNER_TEXT}}
+</planner_handoff>
+
+Используй выжимку как навигацию по результатам, но точные значения и полный
+запрошенный вывод бери из реальных ToolMessage. Верни полноценный окончательный
+ответ, а не комментарий к выжимке.
+""".strip()
+
+_FIRST_TOOL_REPAIR_PROMPT = """
+Ты ещё не получил ни одного результата data tool. Предыдущий обычный текст не выполняет task.
+Верни сейчас ровно один native call одного из доступных data
+tools, сохрани смысл и точные значения task. Не пиши ответ или намерение
+словами.
+""".strip()
+
+_FINISH_ONLY_REPAIR_PROMPT = """
+Лимит шагов исчерпан. Больше не вызывай data tools. По уже подтверждённым
+результатам верни один native call finish_worker. Если задача завершена не
+полностью, честно отрази это в answer.
+""".strip()
+
+_UNSATISFIED_REPAIR_PROMPT = """
+Последний structured observer вернул `goal_satisfied=false`. Предыдущая попытка
+завершить worker запрещена: фактический tool call не подтвердил task. Исправь
+каждый пункт из отдельного блока «Что выполнено неправильно» и верни сейчас
+native call одного из доступных data tools. Используй точный источник,
+сущности, роли, поля, условия и операцию из исходной task. Не заменяй
+одноимённые роли близкими, не проверяй заново уже подтверждённые входные факты
+и не повторяй тот же семантически неверный вызов. Не вызывай finish_worker и не
+отвечай обычным текстом.
+""".strip()
 
 
 class ChatHistoryMessage(TypedDict):
@@ -140,6 +232,19 @@ class Observation(BaseModel):
             "Не добавляй факты, которых нет в результате."
         )
     )
+    goal_satisfied: bool = Field(
+        description=(
+            "Подтверждает ли фактический результат выполнение всей исходной "
+            "task без смысловых подмен."
+        ),
+    )
+    mismatches: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Все конкретные отличия фактического tool call и результата от "
+            "исходной task. Пусто только при goal_satisfied=true."
+        ),
+    )
     has_error: bool = Field(
         default=False,
         description="Есть ли в результате ошибка выполнения или некорректные данные.",
@@ -155,6 +260,58 @@ class Observation(BaseModel):
             "Не выбирай следующий инструмент."
         ),
     )
+    reroute_required: bool = Field(
+        default=False,
+        description=(
+            "Нужна ли новая палитра tools, потому что текущими tools исправить "
+            "несоответствие невозможно."
+        ),
+    )
+    reroute_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "Какая инструментальная возможность отсутствует в текущей палитре. "
+            "Не выбирай конкретный tool."
+        ),
+    )
+
+    @field_validator(
+        "mismatches",
+        "important_facts",
+        "limitations",
+        mode="before",
+    )
+    @classmethod
+    def _remove_blank_list_items(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("observation list fields must be arrays")
+        return [
+            clean_item
+            for item in value
+            if (clean_item := str(item or "").strip())
+        ]
+
+    @model_validator(mode="after")
+    def _mismatches_match_goal_status(self) -> "Observation":
+        if self.goal_satisfied and self.mismatches:
+            raise ValueError(
+                "mismatches must be empty when goal_satisfied is true"
+            )
+        if not self.goal_satisfied and not self.mismatches:
+            raise ValueError(
+                "mismatches must describe why goal_satisfied is false"
+            )
+        if self.goal_satisfied and self.reroute_required:
+            raise ValueError(
+                "reroute_required must be false when goal_satisfied is true"
+            )
+        if self.reroute_required and not str(self.reroute_reason or "").strip():
+            raise ValueError(
+                "reroute_reason is required when reroute_required is true"
+            )
+        return self
 
 
 class AgentGraphState(TypedDict):
@@ -164,7 +321,6 @@ class AgentGraphState(TypedDict):
     observations: List[Observation]
     tool_steps: int
     max_steps: int
-    active_file_id: Optional[int]
 
 
 def _message_content_text(content: Any) -> str:
@@ -187,6 +343,27 @@ def _message_content_text(content: Any) -> str:
 
 def _message_text(message: BaseMessage) -> str:
     return _message_content_text(message.content).strip()
+
+
+def _tool_content_text(content: Any) -> str:
+    """Serialize one tool result to the single textual worker-message field."""
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _tool_message_preview(content: Any, max_chars: int) -> str:
+    text = _tool_content_text(content).strip()
+    limit = max(1, int(max_chars))
+    if len(text) <= limit:
+        return text
+    marker = f"… [preview обрезан: полный результат {len(text)} символов]"
+    if len(marker) >= limit:
+        return marker[:limit]
+    return text[: limit - len(marker)].rstrip() + marker
 
 
 def _normalize_tools(
@@ -233,6 +410,13 @@ def _compact_observation(observation: Observation) -> Observation:
             observation.summary,
             _OBSERVATION_SUMMARY_MAX_CHARS,
         ),
+        goal_satisfied=observation.goal_satisfied,
+        mismatches=[
+            _clip_text(item, _OBSERVATION_FACT_MAX_CHARS)
+            for item in observation.mismatches[
+                :_OBSERVATION_MISMATCHES_MAX_COUNT
+            ]
+        ],
         has_error=observation.has_error,
         important_facts=[
             _clip_text(item, _OBSERVATION_FACT_MAX_CHARS)
@@ -246,7 +430,91 @@ def _compact_observation(observation: Observation) -> Observation:
                 :_OBSERVATION_LIMITATIONS_MAX_COUNT
             ]
         ],
+        reroute_required=observation.reroute_required,
+        reroute_reason=(
+            _clip_text(observation.reroute_reason, _OBSERVATION_FACT_MAX_CHARS)
+            if observation.reroute_reason
+            else None
+        ),
     )
+
+
+class WorkerFinishPayload(BaseModel):
+    """Strict arguments of the worker's native finish call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str = Field(min_length=1)
+
+    @field_validator("answer")
+    @classmethod
+    def _answer_must_not_be_blank(cls, value: str) -> str:
+        clean_value = value.strip()
+        if not clean_value:
+            raise ValueError("answer must not be blank")
+        return clean_value
+
+class WorkerDisplayItem(BaseModel):
+    """Full successful tool output retained outside the worker LLM context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    content: str
+
+
+class WorkerRunResult(BaseModel):
+    """Internal graph result or top-level chat result with UI display data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str
+    display_items: List[WorkerDisplayItem] = Field(default_factory=list)
+    goal_satisfied: bool = Field(default=True, exclude=True)
+    mismatches: List[str] = Field(default_factory=list, exclude=True)
+    reroute_required: bool = Field(default=False, exclude=True)
+    reroute_reason: Optional[str] = Field(default=None, exclude=True)
+
+
+class WorkerResponseError(RuntimeError):
+    """Raised when the worker violates its finish contract."""
+
+
+def _finish_worker_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": _FINISH_WORKER_TOOL_NAME,
+            "description": (
+                "Завершить подзадачу worker и вернуть краткий точный ответ. "
+                "Результаты tools для UI выбирает внешний coordinator."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": {
+                        "type": "string",
+                        "description": "Краткий итог по подтверждённым данным.",
+                    },
+                },
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _worker_finish_payload(
+    call: Mapping[str, Any],
+) -> WorkerFinishPayload:
+    try:
+        payload = WorkerFinishPayload.model_validate(call.get("args") or {})
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise WorkerResponseError(
+            "finish_worker вернул невалидные аргументы"
+        ) from exc
+
+    return payload
 
 
 def _runtime_context(
@@ -256,15 +524,6 @@ def _runtime_context(
 ) -> Optional[str]:
     parts: List[str] = []
 
-    active_file_id = state.get("active_file_id")
-    if active_file_id is not None:
-        parts.append(
-            f"Контекст UI: активный файл имеет file_id={active_file_id}. "
-            "Используй это значение в аргументах инструментов, работающих "
-            "с текущим файлом. Не применяй его к глобальной таблице "
-            "s2t_transformations и её list/search/summarize tools."
-        )
-
     if include_observations:
         for index, observation in enumerate(
             state.get("observations") or [],
@@ -273,6 +532,21 @@ def _runtime_context(
             observation_parts = [
                 f"Выжимка observer для шага {index}:\n{observation.summary}"
             ]
+            if observation.goal_satisfied is False:
+                observation_parts.append(
+                    "Статус выполнения: goal_satisfied=false. Исходная task "
+                    "ещё не подтверждена; не завершай worker."
+                )
+                observation_parts.append(
+                    "Что выполнено неправильно:\n- "
+                    + "\n- ".join(observation.mismatches)
+                    + "\nИсправь каждый пункт следующим data-tool вызовом."
+                )
+            else:
+                observation_parts.append(
+                    "Статус выполнения: goal_satisfied=true. Результат "
+                    "подтверждает исходную task."
+                )
             if observation.important_facts:
                 observation_parts.append(
                     "Важные факты:\n- "
@@ -297,46 +571,45 @@ def _runtime_context(
     return "\n\n".join(parts)
 
 
-def _planner_instruction(available_tool_names: Sequence[str]) -> str:
+def _planner_instruction(
+    available_tool_names: Sequence[str],
+    *,
+    worker_finish: bool = False,
+) -> str:
     available = ", ".join(available_tool_names) or "нет"
-    return (
-        "Ты planner read-only агента. Выбери tool call либо не вызывай tool, "
-        "если проверенных фактов уже достаточно. Не пиши окончательный ответ "
-        "и не повторяй уже успешный одинаковый вызов без новой причины. "
-        f"Используй только доступные tools: {available}. Перед вызовом читай "
-        "description и схему аргументов выбранного tool: они являются его "
-        "контрактом. Не переноси правила и аргументы одного tool на другой, не "
-        "выдумывай значения. Сохраняй явные числовые ограничения пользователя: "
-        "если запрос содержит максимум, глубину или количество N и tool имеет "
-        "соответствующий аргумент, передай ровно N, не заменяя его значением по "
-        "умолчанию или границей диапазона. Не описывай будущий вызов словами: если для "
-        "незавершённой части запроса нужен доступный tool, верни его tool_call "
-        "в этом же сообщении. Текст о намерении вызвать tool без tool_call не "
-        "считается выполнением шага. Если следующий tool не нужен, верни не "
-        "пользовательский ответ, а компактную самодостаточную выжимку для "
-        "responder: сохрани точные имена, числа, результаты, ссылки и ограничения "
-        "из всех выжимок observer, убрав повторы и служебные детали. В истории "
-        "находятся реальные завершённые ToolMessage: используй их точные значения "
-        "для аргументов следующего шага. Если предыдущий ToolMessage или observer "
-        "сообщает об ошибке, не считай задачу выполненной: выясни причину, исправь "
-        "аргументы и снова вызови подходящий доступный tool. Повтор того же tool "
-        "после ошибки разрешён; те же args повторяй только при явно временном сбое."
+    template = (
+        _WORKER_PLANNER_PROMPT
+        if worker_finish
+        else _LEGACY_PLANNER_PROMPT
     )
+    return template.replace("{{AVAILABLE_TOOLS}}", available)
 
 
 def _planner_messages(
     state: AgentGraphState,
     available_tool_names: Sequence[str] = (),
+    *,
+    worker_finish: bool = False,
 ) -> List[BaseMessage]:
     limit_reached = state["tool_steps"] >= state["max_steps"]
-    planner_instruction = _planner_instruction(available_tool_names)
+    planner_instruction = _planner_instruction(
+        available_tool_names,
+        worker_finish=worker_finish,
+    )
 
     if limit_reached:
-        planner_instruction += (
-            "\n\nЛимит инструментальных шагов исчерпан. "
-            "Не вызывай инструменты; верни обычное сообщение без tool_calls, "
-            "чтобы граф перешёл к responder."
-        )
+        if worker_finish:
+            planner_instruction += (
+                "\n\nЛимит data-tool шагов исчерпан. Сейчас разрешён только "
+                "finish_worker. Заверши задачу с подтверждёнными фактами и честно "
+                "укажи недостающие данные."
+            )
+        else:
+            planner_instruction += (
+                "\n\nЛимит инструментальных шагов исчерпан. "
+                "Не вызывай инструменты; верни обычное сообщение без tool_calls, "
+                "чтобы граф перешёл к responder."
+            )
 
     system_parts = [state["system_prompt"].strip(), planner_instruction]
     runtime_context = _runtime_context(state)
@@ -347,7 +620,29 @@ def _planner_messages(
         SystemMessage(content="\n\n".join(system_parts))
     ]
 
-    messages.extend(state["messages"])
+    if worker_finish:
+        task_message = next(
+            (
+                message
+                for message in state["messages"]
+                if isinstance(message, HumanMessage)
+            ),
+            None,
+        )
+        if task_message is not None:
+            messages.append(task_message)
+        try:
+            latest_call, latest_results = _latest_tool_exchange(
+                state["messages"]
+            )
+        except RuntimeError:
+            latest_call = None
+            latest_results = []
+        if latest_call is not None:
+            messages.append(latest_call)
+            messages.extend(latest_results)
+    else:
+        messages.extend(state["messages"])
     return messages
 
 
@@ -454,7 +749,15 @@ def _fallback_observation(
 ) -> Observation:
     raw_output = getattr(error, "llm_output", None)
     if raw_output:
-        return Observation(summary=str(raw_output))
+        return Observation(
+            summary=str(raw_output),
+            goal_satisfied=False,
+            mismatches=[
+                "Observer не вернул валидный structured output, поэтому "
+                "соответствие результата исходной task не подтверждено."
+            ],
+            limitations=[f"Ошибка observer: {type(error).__name__}"],
+        )
 
     names = [call.get("name", "unknown_tool") for call in tool_call_message.tool_calls]
     result_preview = "\n".join(
@@ -469,97 +772,395 @@ def _fallback_observation(
             f"Сырой результат:\n{result_preview}"
         ),
         has_error=True,
+        goal_satisfied=False,
+        mismatches=[
+            "Observer не смог проверить соответствие tool-вызова исходной "
+            "task; результат нельзя считать подтверждённым."
+        ],
         important_facts=[],
         limitations=[f"Ошибка observer: {type(error).__name__}"],
+    )
+
+
+def _enforce_required_sql_roles(
+    observation: Observation,
+    user_request: str,
+    tool_call_message: AIMessage,
+    tool_results: Sequence[ToolMessage],
+) -> Observation:
+    """Reject a positive audit when run_sql omitted an explicitly named role."""
+    if not observation.goal_satisfied:
+        return observation
+    sql_calls = [
+        call
+        for call in tool_call_message.tool_calls
+        if call.get("name") == "run_sql"
+    ]
+    if not sql_calls:
+        return observation
+
+    request_text = str(user_request or "").lower()
+    evidence_text = "\n".join(
+        [
+            *(
+                json.dumps(
+                    call.get("args") or {},
+                    ensure_ascii=False,
+                    default=str,
+                )
+                for call in sql_calls
+            ),
+            *(
+                _message_content_text(message.content)
+                for message in tool_results
+            ),
+        ]
+    ).lower()
+    role_names = (
+        "source_table",
+        "source_field",
+        "target_table",
+        "target_field",
+    )
+    missing_roles = [
+        role
+        for role in role_names
+        if re.search(rf"(?<!\w){re.escape(role)}(?!\w)", request_text)
+        and not re.search(
+            rf"(?<!\w){re.escape(role)}(?!\w)",
+            evidence_text,
+        )
+    ]
+    missing_sources = [
+        source_name
+        for source_name in ("s2t_transformations",)
+        if re.search(
+            rf"(?<!\w){re.escape(source_name)}(?!\w)",
+            request_text,
+        )
+        and not re.search(
+            rf"(?<!\w){re.escape(source_name)}(?!\w)",
+            evidence_text,
+        )
+    ]
+    named_role_values = [
+        (match.group(1).lower(), match.group(2).strip("`'\".()"))
+        for match in re.finditer(
+            r"(?<!\w)(source_table|target_table)\s*=\s*"
+            r"[`'\"]?([^\s,;`'\"]+)",
+            request_text,
+        )
+    ]
+    missing_role_values = [
+        (role, value)
+        for role, value in named_role_values
+        if value and value not in evidence_text
+    ]
+    if not missing_roles and not missing_sources and not missing_role_values:
+        return observation
+
+    return Observation(
+        summary=observation.summary,
+        goal_satisfied=False,
+        mismatches=[
+            *observation.mismatches,
+            *(
+                f"Требовалось поле `{role}`, но оно отсутствует и в "
+                "аргументах run_sql, и в его результате."
+                for role in missing_roles
+            ),
+            *(
+                f"Требовался источник `{source_name}`, но run_sql не "
+                "использовал его и не вернул из него результат."
+                for source_name in missing_sources
+            ),
+            *(
+                f"Требовалось условие `{role} = {value}`, но точное значение "
+                "отсутствует и в аргументах run_sql, и в его результате."
+                for role, value in missing_role_values
+            ),
+        ],
+        has_error=observation.has_error,
+        important_facts=observation.important_facts,
+        limitations=observation.limitations,
+        reroute_required=False,
+        reroute_reason=None,
     )
 
 
 def build_agent_graph(
     model: Any,
     tools: Mapping[str, BaseTool] | Sequence[BaseTool],
+    *,
+    raw_tool_results: Optional[Dict[str, ToolMessage]] = None,
+    tool_message_preview_chars: Optional[int] = None,
+    worker_finish: bool = False,
 ):
     """Build the planner -> tools -> observer -> planner graph."""
     tool_list = _normalize_tools(tools)
     tool_names = tuple(tool.name for tool in tool_list)
-    planner_model = model.bind_tools(tool_list)
+    finish_schema = _finish_worker_tool_schema()
+    planner_model = model.bind_tools(
+        [*tool_list, finish_schema] if worker_finish else tool_list
+    )
+    first_data_model = model.bind_tools(tool_list) if worker_finish else None
+    first_tool_model = first_data_model
+    if worker_finish and len(tool_list) == 1:
+        try:
+            first_tool_model = model.bind_tools(
+                tool_list,
+                tool_choice=tool_names[0],
+            )
+        except TypeError:
+            first_tool_model = first_data_model
+    finish_model = None
+    if worker_finish:
+        try:
+            finish_model = model.bind_tools(
+                [finish_schema],
+                tool_choice=_FINISH_WORKER_TOOL_NAME,
+            )
+        except TypeError:
+            finish_model = model.bind_tools([finish_schema])
+    observer_model = model.with_structured_output(Observation)
     tool_node = ToolNode(tool_list, handle_tool_errors=True)
+
+    def invoke_with_fallback(
+        primary_model: Any,
+        messages: Sequence[BaseMessage],
+        *,
+        fallback_model: Optional[Any] = None,
+    ) -> Any:
+        try:
+            return primary_model.invoke(messages)
+        except Exception:
+            if fallback_model is None or fallback_model is primary_model:
+                raise
+            logger.warning(
+                "Forced tool-choice LLM call failed; retrying with the regular "
+                "planner tool palette",
+                exc_info=True,
+            )
+            return fallback_model.invoke(messages)
 
     def planner(state: AgentGraphState) -> Dict[str, Any]:
         limit_reached = state["tool_steps"] >= state["max_steps"]
-        selected_model = model if limit_reached else planner_model
-        planner_messages = _planner_messages(state, tool_names)
+        finish_only = limit_reached
+        if finish_only and worker_finish:
+            selected_model = finish_model
+        elif finish_only:
+            selected_model = model
+        elif state["tool_steps"] == 0 and first_tool_model is not None:
+            selected_model = first_tool_model
+        else:
+            selected_model = planner_model
+        planner_messages = _planner_messages(
+            state,
+            tool_names,
+            worker_finish=worker_finish,
+        )
 
+        selected_fallback = (
+            first_data_model
+            if selected_model is first_tool_model
+            and first_tool_model is not first_data_model
+            else (
+                planner_model
+                if worker_finish and selected_model is finish_model
+                else None
+            )
+        )
         try:
-            reply = selected_model.invoke(planner_messages)
+            reply = invoke_with_fallback(
+                selected_model,
+                planner_messages,
+                fallback_model=selected_fallback,
+            )
         except Exception as exc:
             logger.exception("LLM error in planner")
-            # A plain message routes to responder, which will produce the user
-            # facing error rather than exposing an internal graph exception.
+            # A plain message routes to the legacy responder or becomes the
+            # worker's honest final text without another LLM call.
             reply = AIMessage(content=f"Planner error: {type(exc).__name__}")
 
         if not isinstance(reply, AIMessage):
             reply = AIMessage(content=_message_content_text(reply))
 
-        if not limit_reached and reply.tool_calls:
-            reply = _enforce_single_numeric_constraint(
-                reply,
-                _last_user_query(state["messages"]),
-            )
-
         if (
-            not limit_reached
-            and state["tool_steps"] > 0
-            and not reply.tool_calls
+            worker_finish
+            and state["tool_steps"] == 0
+            and not any(
+                call.get("name") in tool_names
+                for call in reply.tool_calls
+            )
         ):
-            try:
-                audit_messages: List[BaseMessage] = [
-                    *planner_messages,
-                    AIMessage(content=_message_text(reply)),
-                    HumanMessage(
-                        content=(
-                            f"{_COMPLETION_AUDIT_PROMPT}\n\n"
-                            "Исходный пользовательский запрос: "
-                            f"{_last_user_query(state['messages'])!r}.\n"
-                            "Фактически завершённые tools: "
-                            f"{_completed_tool_names(state['messages']) or ['нет']}.\n"
-                            f"Доступные tools: {list(tool_names) or ['нет']}."
-                        )
-                    ),
-                ]
-                last_audited_reply: Optional[AIMessage] = None
-                for attempt in range(2):
-                    audited_reply = planner_model.invoke(audit_messages)
-                    if not isinstance(audited_reply, AIMessage):
-                        audited_reply = AIMessage(
-                            content=_message_content_text(audited_reply)
-                        )
-                    last_audited_reply = audited_reply
-                    logger.info(
-                        "Planner completion audit %s after %s tool step(s): "
-                        "tool_calls=%s content=%s",
-                        attempt + 1,
-                        state["tool_steps"],
-                        [call.get("name") for call in audited_reply.tool_calls],
-                        _message_text(audited_reply)[:1000],
-                    )
-                    if audited_reply.tool_calls:
-                        reply = audited_reply
-                        break
-                    if attempt == 0:
-                        audit_messages.extend(
-                            [
-                                audited_reply,
-                                HumanMessage(
-                                    content=_COMPLETION_AUDIT_RETRY_PROMPT
-                                ),
-                            ]
-                        )
-                if not reply.tool_calls and last_audited_reply is not None:
-                    reply = last_audited_reply
-            except Exception:
-                logger.exception(
-                    "LLM error in planner completion audit; using initial decision"
+            logger.warning(
+                "Worker planner omitted the required first data tool call; repairing"
+            )
+            repair_messages = [
+                *planner_messages,
+                HumanMessage(
+                    content=_FIRST_TOOL_REPAIR_PROMPT
+                ),
+            ]
+            repaired_reply = invoke_with_fallback(
+                selected_model,
+                repair_messages,
+                fallback_model=(
+                    first_data_model
+                    if selected_model is first_tool_model
+                    and first_tool_model is not first_data_model
+                    else None
+                ),
+            )
+            if not isinstance(repaired_reply, AIMessage):
+                repaired_reply = AIMessage(
+                    content=_message_content_text(repaired_reply)
                 )
+            if not any(
+                call.get("name") in tool_names
+                for call in repaired_reply.tool_calls
+            ):
+                reroute_reason = (
+                    "Planner дважды не сформировал обязательный первый "
+                    "data-tool вызов для текущей task."
+                )
+                reroute_observation = Observation(
+                    summary=reroute_reason,
+                    goal_satisfied=False,
+                    mismatches=[
+                        "До получения данных planner не вызвал ни один "
+                        "доступный data tool даже после repair-вызова."
+                    ],
+                    has_error=True,
+                    limitations=[
+                        "Текущий запуск worker завершён до выполнения data tool."
+                    ],
+                    reroute_required=True,
+                    reroute_reason=reroute_reason,
+                )
+                logger.warning(
+                    "Worker requests reroute after missing the first data "
+                    "tool twice: tools=%s",
+                    list(tool_names),
+                )
+                return {
+                    "planner_message": AIMessage(content=""),
+                    "observations": [reroute_observation],
+                }
+            reply = repaired_reply
+
+        latest_observation = (
+            (state.get("observations") or [])[-1]
+            if state.get("observations")
+            else None
+        )
+        semantic_retry_required = (
+            worker_finish
+            and not finish_only
+            and latest_observation is not None
+            and latest_observation.goal_satisfied is False
+            and (
+                not any(
+                    call.get("name") in tool_names
+                    for call in reply.tool_calls
+                )
+                or any(
+                    call.get("name") == _FINISH_WORKER_TOOL_NAME
+                    for call in reply.tool_calls
+                )
+            )
+        )
+        if semantic_retry_required:
+            logger.warning(
+                "Worker tried to finish after observer marked task "
+                "goal_satisfied=false; requesting a corrected data tool call"
+            )
+            retry_model = (
+                first_tool_model
+                if len(tool_list) == 1 and first_tool_model is not None
+                else first_data_model
+            )
+            repaired_reply = invoke_with_fallback(
+                retry_model,
+                [
+                    *planner_messages,
+                    HumanMessage(content=_UNSATISFIED_REPAIR_PROMPT),
+                ],
+                fallback_model=(
+                    first_data_model
+                    if retry_model is first_tool_model
+                    and first_tool_model is not first_data_model
+                    else None
+                ),
+            )
+            if not isinstance(repaired_reply, AIMessage):
+                repaired_reply = AIMessage(
+                    content=_message_content_text(repaired_reply)
+                )
+            if (
+                not any(
+                    call.get("name") in tool_names
+                    for call in repaired_reply.tool_calls
+                )
+                or any(
+                    call.get("name") == _FINISH_WORKER_TOOL_NAME
+                    for call in repaired_reply.tool_calls
+                )
+            ):
+                reroute_reason = str(
+                    latest_observation.reroute_reason
+                    or (
+                        "Текущая палитра tools не позволила planner "
+                        "сформировать исправленный data-tool вызов после "
+                        "замечаний observer."
+                    )
+                ).strip()
+                reroute_observation = latest_observation.model_copy(
+                    update={
+                        "reroute_required": True,
+                        "reroute_reason": reroute_reason,
+                    }
+                )
+                logger.warning(
+                    "Worker requests reroute after failed semantic repair: "
+                    "tools=%s mismatches=%s",
+                    list(tool_names),
+                    latest_observation.mismatches,
+                )
+                return {
+                    "planner_message": AIMessage(content=""),
+                    "observations": [reroute_observation],
+                }
+            reply = repaired_reply
+
+        if finish_only and worker_finish and reply.tool_calls and not any(
+            call.get("name") == _FINISH_WORKER_TOOL_NAME
+            for call in reply.tool_calls
+        ):
+            logger.warning(
+                "Worker requested another data tool after the step limit; "
+                "asking the LLM to finish"
+            )
+            repaired_reply = invoke_with_fallback(
+                finish_model,
+                [
+                    *planner_messages,
+                    HumanMessage(content=_FINISH_ONLY_REPAIR_PROMPT),
+                ],
+                fallback_model=planner_model,
+            )
+            if not isinstance(repaired_reply, AIMessage):
+                repaired_reply = AIMessage(
+                    content=_message_content_text(repaired_reply)
+                )
+            if repaired_reply.tool_calls and not any(
+                call.get("name") == _FINISH_WORKER_TOOL_NAME
+                for call in repaired_reply.tool_calls
+            ):
+                raise WorkerResponseError(
+                    "Worker после повторного LLM-вызова не завершил задачу."
+                )
+            reply = repaired_reply
 
         logger.info(
             "Agent planner after %s tool step(s): tool_calls=%s content=%s",
@@ -598,7 +1199,7 @@ def build_agent_graph(
         )
 
         result = tool_node.invoke(state)
-        tool_messages = [
+        raw_messages = [
             message.model_copy(update={"status": "error"})
             if isinstance(message, ToolMessage)
             and _tool_message_has_error(message)
@@ -606,6 +1207,28 @@ def build_agent_graph(
             else message
             for message in result.get("messages", [])
         ]
+        tool_messages: List[BaseMessage] = []
+        for message in raw_messages:
+            if not isinstance(message, ToolMessage):
+                tool_messages.append(message)
+                continue
+
+            if raw_tool_results is not None:
+                raw_tool_results[message.tool_call_id] = message
+
+            if tool_message_preview_chars is None:
+                tool_messages.append(message)
+            else:
+                tool_messages.append(
+                    message.model_copy(
+                        update={
+                            "content": _tool_message_preview(
+                                message.content,
+                                tool_message_preview_chars,
+                            )
+                        }
+                    )
+                )
         logger.info(
             "Tool step result: %s",
             json.dumps(
@@ -630,22 +1253,46 @@ def build_agent_graph(
 
         payload = {
             "user_request": _last_user_query(state["messages"]),
+            "available_tools": [
+                {
+                    "name": tool.name,
+                    "description": _clip_text(tool.description, 600),
+                }
+                for tool in tool_list
+            ],
+            "prior_state": (
+                [
+                    observation.model_dump()
+                    for observation in (state.get("observations") or [])
+                ]
+                if worker_finish
+                else []
+            ),
             "tool_calls": tool_call_message.tool_calls,
             "tool_results": [
                 _tool_message_payload(message) for message in tool_results
             ],
         }
 
+        prior_state_rule = (
+            "Поле prior_state содержит прошлую компактную выжимку: верни "
+            "обновлённую самодостаточную выжимку, сохранив из неё только "
+            "факты, ещё нужные для исходной task."
+            if worker_finish
+            else ""
+        )
         observer_messages: List[BaseMessage] = [
             SystemMessage(
-                content=(
-                    "Ты observer многошагового агента. Проанализируй только "
-                    "фактический результат последнего инструмента. Выдели важные "
-                    "факты, ошибки, ограничения и неоднозначности. Не выбирай "
-                    "следующий инструмент, не решай завершать ли работу и не "
-                    "формулируй ответ пользователю. Не придумывай отсутствующие "
-                    "данные. Ответь обычным компактным текстом, не JSON и без "
-                    "tool call."
+                content="\n\n".join(
+                    part
+                    for part in (
+                        state["system_prompt"].strip(),
+                        _OBSERVER_PROMPT.replace(
+                            "{{PRIOR_STATE_RULE}}",
+                            prior_state_rule,
+                        ),
+                    )
+                    if part
                 )
             ),
             HumanMessage(
@@ -654,33 +1301,28 @@ def build_agent_graph(
         ]
 
         try:
-            result = model.invoke(observer_messages)
-            if isinstance(result, Observation):
-                observation = result
-            else:
-                raw_summary = (
-                    _message_text(result)
-                    if isinstance(result, BaseMessage)
-                    else _message_content_text(result).strip()
-                )
-                has_error = any(
-                    _tool_message_has_error(message)
-                    for message in tool_results
-                )
-                observation = Observation(
-                    summary=(
-                        raw_summary
-                        or "Observer не вернул текстовую выжимку результата."
-                    ),
-                    has_error=has_error,
-                    limitations=(
-                        ["Один или несколько tools завершились с ошибкой."]
-                        if has_error
-                        else []
-                    ),
-                )
+            result = observer_model.invoke(observer_messages)
+            observation = (
+                result
+                if isinstance(result, Observation)
+                else Observation.model_validate(result)
+            )
+            tool_has_error = any(
+                _tool_message_has_error(message)
+                for message in tool_results
+            )
+            if tool_has_error:
+                observation_payload = observation.model_dump()
+                observation_payload["has_error"] = True
+                observation = Observation.model_validate(observation_payload)
+            observation = _enforce_required_sql_roles(
+                observation,
+                payload["user_request"],
+                tool_call_message,
+                tool_results,
+            )
         except Exception as exc:
-            logger.exception("Plain-text observer failed")
+            logger.exception("Structured observer failed")
             observation = _fallback_observation(
                 tool_call_message,
                 tool_results,
@@ -693,43 +1335,18 @@ def build_agent_graph(
             observation.model_dump_json()[:2000],
         )
         return {
-            "observations": [
-                *(state.get("observations") or []),
-                observation,
-            ]
+            "observations": (
+                [observation]
+                if worker_finish
+                else [
+                    *(state.get("observations") or []),
+                    observation,
+                ]
+            )
         }
 
     def responder(state: AgentGraphState) -> Dict[str, Any]:
-        response_instruction = """
-Сформируй окончательный ответ пользователю по выжимке planner и фактическим
-результатам tools.
-
-Не вызывай инструменты. Используй исходный запрос, пользовательскую историю диалога,
-реальные ToolMessage и planner_handoff ниже. Внутренние observations намеренно не
-передаются, чтобы не дублировать и не искажать результаты tools. Если пользователь
-просит список, таблицу, строки или полный результат, перенеси соответствующие данные
-из ToolMessage без сокращения. Не упоминай внутренние узлы или устройство графа. Если
-в handoff или ToolMessage указано, что данных недостаточно либо инструмент завершился
-ошибкой, явно укажи ограничение и не придумывай отсутствующие факты.
-Для ответа о s2t_transformations не связывай глобальный результат с активным
-файлом и не упоминай его file_id или имя. Пустой результат означает только то,
-что глобальная таблица сейчас пуста.
-Табличные данные возвращай только компактным текстовым блоком `table`: внутри должен
-быть валидный JSON-список списков, где первая строка содержит названия колонок, а
-остальные строки — значения. Пример: ```table
-[["target_table","count"],["t_bus_srv",5],["t_agr_dep",2]]
-```. Markdown-таблица с `|` и строкой `---` запрещена: браузер сам отрисует блок
-`table` как таблицу. Не добавляй вводную фразу «Полученные результаты», если она
-не нужна по смыслу. Компактный блок не является сокращением: сохраняй все запрошенные
-строки, порядок колонок и точные значения из ToolMessage.
-Если фактический ToolMessage содержит text_diagram, обязательно перенеси ровно
-готовый text_diagram без изменений внутри блока ```text```. Не заменяй его
-списком, не пересказывай и не добавляй собственную классификацию структуры пути.
-Если ToolMessage содержит
-visualization_url, не печатай HTML, DOT или Mermaid; кратко опиши результат —
-приложение само добавит интерактивный граф. Mermaid-код
-показывай только по прямой просьбе пользователя получить Mermaid.
-""".strip()
+        response_instruction = _LEGACY_RESPONDER_PROMPT
 
         planner_message = state.get("planner_message")
         planner_text = _clip_text(
@@ -739,19 +1356,10 @@ visualization_url, не печатай HTML, DOT или Mermaid; кратко о
             planner_message is not None and not planner_message.tool_calls
         ) else ""
         if planner_text:
-            response_instruction += f"""
-
-Planner решил, что дополнительных инструментов больше не требуется, и сформировал
-следующую выжимку проверенных фактов:
-
-<planner_handoff>
-{planner_text}
-</planner_handoff>
-
-Используй выжимку как навигацию по результатам, но точные значения и полный
-запрошенный вывод бери из реальных ToolMessage. Верни полноценный окончательный
-ответ, а не комментарий к выжимке.
-""".rstrip()
+            response_instruction += "\n\n" + _PLANNER_HANDOFF_PROMPT.replace(
+                "{{PLANNER_TEXT}}",
+                planner_text,
+            )
 
         system_parts = [state["system_prompt"].strip(), response_instruction]
         runtime_context = _runtime_context(
@@ -784,10 +1392,19 @@ Planner решил, что дополнительных инструментов
 
     def route_after_planner(
         state: AgentGraphState,
-    ) -> Literal["prepare_tool", "responder"]:
+    ) -> Literal["prepare_tool", "responder", "finish"]:
+        planner_message = state.get("planner_message")
+        if worker_finish:
+            if planner_message is not None and any(
+                call.get("name") == _FINISH_WORKER_TOOL_NAME
+                for call in planner_message.tool_calls
+            ):
+                return "finish"
+            if planner_message is None or not planner_message.tool_calls:
+                return "finish"
+            return "prepare_tool"
         if state["tool_steps"] >= state["max_steps"]:
             return "responder"
-        planner_message = state.get("planner_message")
         if planner_message is not None and planner_message.tool_calls:
             return "prepare_tool"
         return "responder"
@@ -806,6 +1423,7 @@ Planner решил, что дополнительных инструментов
         {
             "prepare_tool": "prepare_tool",
             "responder": "responder",
+            "finish": END,
         },
     )
     graph.add_edge("prepare_tool", "tools")
@@ -827,7 +1445,6 @@ def run_agent_graph(
     user_id: Optional[str] = None,
     trace_tags: Optional[List[str]] = None,
     trace_metadata: Optional[Dict[str, Any]] = None,
-    file_id: Optional[int] = None,
     callbacks: Optional[List[Any]] = None,
 ) -> str:
     """Run the graph and return the final responder message."""
@@ -850,7 +1467,6 @@ def run_agent_graph(
         "observations": [],
         "tool_steps": 0,
         "max_steps": bounded_steps,
-        "active_file_id": int(file_id) if file_id is not None else None,
     }
 
     config: Dict[str, Any] = {
@@ -900,3 +1516,143 @@ def run_agent_graph(
 
     logger.warning("Agent finished without a final AIMessage response")
     return "Модель не вернула финальный ответ."
+
+
+def run_worker_graph(
+    task: str,
+    system_prompt: str,
+    model: Any,
+    tools: Mapping[str, BaseTool] | Sequence[BaseTool],
+    max_steps: int = 5,
+    *,
+    tool_message_preview_chars: int = DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS,
+    callbacks: Optional[List[Any]] = None,
+) -> WorkerRunResult:
+    """Run the internal worker graph and retain its selected UI results locally."""
+    clean_task = str(task or "").strip()
+    if not clean_task:
+        return WorkerRunResult(
+            answer="Подзадача воркера не должна быть пустой.",
+            display_items=[],
+            goal_satisfied=False,
+            mismatches=["Worker получил пустую task."],
+        )
+
+    bounded_steps = max(1, int(max_steps))
+    preview_chars = max(1, int(tool_message_preview_chars))
+    raw_tool_results: Dict[str, ToolMessage] = {}
+    graph = build_agent_graph(
+        model,
+        tools,
+        raw_tool_results=raw_tool_results,
+        tool_message_preview_chars=preview_chars,
+        worker_finish=True,
+    )
+
+    initial_state: AgentGraphState = {
+        "messages": [HumanMessage(content=clean_task)],
+        "system_prompt": system_prompt,
+        "planner_message": None,
+        "observations": [],
+        "tool_steps": 0,
+        "max_steps": bounded_steps,
+    }
+    config: Dict[str, Any] = {
+        "recursion_limit": bounded_steps * 4 + 8,
+        "run_name": "isolated_worker",
+    }
+
+    callback_list = list(callbacks or [])
+    handler = get_callback_handler()
+    if handler is not None and handler not in callback_list:
+        callback_list.append(handler)
+    if callback_list:
+        config["callbacks"] = callback_list
+
+    with langfuse_trace_context(
+        trace_name="isolated_worker",
+        metadata={"tool_message_preview_chars": preview_chars},
+        tags=["worker", "experiment"],
+    ):
+        final_state = graph.invoke(initial_state, config=config)
+
+    latest_observation = (
+        (final_state.get("observations") or [])[-1]
+        if final_state.get("observations")
+        else None
+    )
+    if latest_observation is not None and latest_observation.reroute_required:
+        reroute_reason = str(
+            latest_observation.reroute_reason
+            or "Текущей палитры tools недостаточно для выполнения task."
+        ).strip()
+        logger.info(
+            "Worker graph finished with reroute request: reason=%s",
+            reroute_reason,
+        )
+        return WorkerRunResult(
+            answer=reroute_reason,
+            display_items=[],
+            goal_satisfied=False,
+            mismatches=list(latest_observation.mismatches),
+            reroute_required=True,
+            reroute_reason=reroute_reason,
+        )
+
+    planner_message = final_state.get("planner_message")
+    if planner_message is None:
+        raise WorkerResponseError(
+            "Воркер завершился без finish_worker"
+        )
+    finish_calls = [
+        call
+        for call in planner_message.tool_calls
+        if call.get("name") == _FINISH_WORKER_TOOL_NAME
+    ]
+    if len(finish_calls) == 1 and len(planner_message.tool_calls) == 1:
+        payload = _worker_finish_payload(finish_calls[0])
+    elif not planner_message.tool_calls and _message_text(planner_message):
+        payload = WorkerFinishPayload(
+            answer=_message_text(planner_message),
+        )
+        logger.info(
+            "Worker planner returned plain final text without another LLM call"
+        )
+    else:
+        raise WorkerResponseError(
+            "Воркер должен завершиться ровно одним вызовом finish_worker"
+        )
+    successful_messages = [
+        message
+        for message in raw_tool_results.values()
+        if not _tool_message_has_error(message)
+    ]
+    goal_satisfied = bool(
+        latest_observation is not None
+        and latest_observation.goal_satisfied
+    )
+    mismatches = (
+        list(latest_observation.mismatches)
+        if latest_observation is not None
+        else ["Worker завершился без structured observation результата."]
+    )
+    answer = payload.answer
+
+    display_items = [
+        WorkerDisplayItem(
+            name=str(message.name or "unknown_tool"),
+            content=_tool_content_text(message.content),
+        )
+        for message in successful_messages
+    ]
+    logger.info(
+        "Worker final response (%d chars), display tools=%s",
+        len(answer),
+        [item.name for item in display_items],
+    )
+    return WorkerRunResult(
+        answer=answer,
+        display_items=display_items,
+        goal_satisfied=goal_satisfied,
+        mismatches=mismatches,
+    )

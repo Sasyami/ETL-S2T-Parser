@@ -442,4 +442,26 @@ pytest tests/ -q
 pytest tests/ --cov=. --cov-config=.coveragerc
 ```
 
+Реальные end-to-end сценарии LLM отключены по умолчанию. Они используют рабочую
+`excel_data.db`, настроенного provider и, для графового сценария, запущенный
+Neo4j. Запускайте их по одному, чтобы запросы к модели не выполнялись пакетом:
+
+Каждый live-сценарий поднимает приложение на локальном HTTP-порту и отправляет
+тот же `POST /chat` с `history` и `session_id`, который выполняет браузер. Внутри
+графа supervisor, coordinator, workers, router, tools и observer не подменяются.
+Scrollable CSV создаётся штатно и скачивается через `/exports/sql/...`; после
+проверки удаляется только созданный данным тестом файл. Прямые read-only
+SQL/Cypher используются после ответа исключительно как независимый oracle.
+
+Набор включает обычный диалог, точные SQLite-count, ссылку на историю,
+scrollable SQL-результат, два и три зависимых workers, сохранение точных S2T-пар,
+Neo4j-пути из двух и трёх рёбер и зависимый переход SQLite → Neo4j. Длинный
+path-сценарий проверяет все четыре узла, каждый из трёх `steps` и полный результат
+отдельно от краткого ответа.
+
+```powershell
+$env:RUN_LIVE_AGENT_SCENARIOS = "1"
+pytest tests/test_live_agent_scenarios.py::test_live_agent_returns_exact_global_sqlite_count -q
+```
+
 Перед изменением схемы SQLite, формата конфигураций или набора tools обновляйте соответствующие проверки в `tests/`.

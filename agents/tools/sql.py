@@ -118,10 +118,11 @@ def run_sql(
 ) -> Dict[str, Any]:
     """Выполнить составленный агентом или переданный read-only SQL по SQLite.
 
-    Для стандартных списков source/target, их пересечения, объединения и разности
-    выбирай list_s2t_table_names, а не этот tool. Используй для произвольных
-    табличных срезов, фильтрации, подсчётов, нестандартных агрегаций, строк
+    Используй для произвольных табличных срезов, фильтрации, точных подсчётов,
+    DISTINCT, GROUP BY, SUM, MIN, MAX, нестандартных агрегаций, строк
     S2T-маппинга и обычных связей source → target.
+    Для стандартных списков source/target, их пересечения, объединения и разности
+    выбирай list_s2t_table_names, а не этот tool.
     Если нестандартная аналитика всё же требует пересечения двух множеств, SQL
     должен явно доказать присутствие значения с обеих сторон через INNER JOIN,
     EXISTS, INTERSECT или GROUP BY с HAVING. UNION ALL с сортировкой по COUNT без
@@ -134,7 +135,12 @@ def run_sql(
     ищи их имена в source_table/target_table и связанных строках.
 
     Таблица s2t_transformations глобальная: запросы к ней не должны содержать
-    фильтр по file_id, активному UI-файлу или последней загрузке.
+    неявный фильтр по file_id или последней загрузке.
+    Непустой source_table означает непустое значение этой колонки, а не наличие
+    физических строк в логической source-таблице. При подсчёте distinct
+    source_table для target_table = X фильтруй s2t_transformations напрямую по
+    target_table = X, source_table IS NOT NULL и TRIM(source_table) <> ''; не
+    добавляй JOIN с source_tables, target_tables или data.
     Не используй для lineage, путей, цепочек зависимостей и impact analysis:
     это сценарий Neo4j. Не используй также для разбора переданного пользователем
     SQL-текста без выполнения: для этого предназначены parse_sql_column_lineage
@@ -183,6 +189,13 @@ def run_sql(
             "returned_rows": len(visible_rows),
             "truncated": truncated,
             "max_inline_rows": MAX_INLINE_SQL_ROWS,
+        }
+    except sqlite3.Error as exc:
+        logger.exception("SQL execution failed")
+        return {
+            "error": "SQL query failed",
+            "error_message": str(exc),
+            "query": text,
         }
     except Exception:
         logger.exception("SQL execution failed")

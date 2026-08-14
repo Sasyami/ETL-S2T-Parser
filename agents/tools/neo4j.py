@@ -5,8 +5,9 @@ import re
 from typing import Any, Dict, Literal, Optional
 
 from langchain_core.tools import tool
+from neo4j.exceptions import ServiceUnavailable
 
-from graph_storage import execute_neo4j_read
+from graph_storage import Neo4jConfigurationError, execute_neo4j_read
 
 from .common import clamped_int, normalize_column_reference
 
@@ -27,17 +28,27 @@ _MUTATING_CYPHER_CLAUSE = re.compile(
 )
 
 
+def _neo4j_unavailable_result(exc: Exception) -> Dict[str, Any]:
+    logger.warning("Neo4j is unavailable: %s", exc)
+    return {
+        "error": (
+            "Neo4j недоступен: проверьте, что сервис запущен и настройки "
+            "подключения верны. SQLite-данные при этом остаются доступны."
+        ),
+        "backend": "neo4j",
+        "unavailable": True,
+        "error_type": type(exc).__name__,
+    }
+
+
 def _read_rows(
     query: str,
     parameters: Dict[str, Any],
 ) -> Dict[str, Any]:
     try:
         return {"rows": execute_neo4j_read(query, parameters)}
-    except KeyError as exc:
-        return {
-            "error": f"Neo4j setting is missing: {exc.args[0]}",
-            "rows": [],
-        }
+    except (Neo4jConfigurationError, ServiceUnavailable) as exc:
+        return {**_neo4j_unavailable_result(exc), "rows": []}
     except Exception:
         logger.exception("Neo4j read failed")
         return {
@@ -174,6 +185,51 @@ def _validate_readonly_cypher(query: str) -> Optional[str]:
     return None
 
 
+def _normalize_cypher_transport_whitespace(query: str) -> str:
+    """Decode accidental JSON-style whitespace escapes outside Cypher literals."""
+    source = str(query or "").strip()
+    output: list[str] = []
+    state = "text"
+    index = 0
+    while index < len(source):
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+
+        if state == "text":
+            if char == "'":
+                state = "single"
+            elif char == '"':
+                state = "double"
+            elif char == "`":
+                state = "backtick"
+            elif char == "\\" and following in {"n", "r", "t"}:
+                output.append({"n": "\n", "r": "\r", "t": "\t"}[following])
+                index += 2
+                continue
+        elif state == "single" and char == "'":
+            if following == "'":
+                output.extend((char, following))
+                index += 2
+                continue
+            state = "text"
+        elif state == "double" and char == '"':
+            if following == '"':
+                output.extend((char, following))
+                index += 2
+                continue
+            state = "text"
+        elif state == "backtick" and char == "`":
+            if following == "`":
+                output.extend((char, following))
+                index += 2
+                continue
+            state = "text"
+
+        output.append(char)
+        index += 1
+    return "".join(output).strip()
+
+
 @tool(parse_docstring=True)
 def run_cypher(
     query: str,
@@ -199,6 +255,15 @@ def run_cypher(
     когда требуется произвольный табличный обход, несколько условий,
     группировка или нестандартная форма графового ответа.
 
+    Для точного пути длины N между известными таблицами используй форму
+    `MATCH path=(source:ETLProjection:ETLTable {name: $source})-
+    [:TABLE_TRANSFORMS_TO*N]->
+    (target:ETLProjection:ETLTable {name: $target}) RETURN
+    [node IN nodes(path) | node.name] AS table_path, length(path) AS depth`,
+    где N — безопасный числовой литерал из задачи, а имена передаются только
+    через parameters. Передавай настоящий многострочный query, а не текст с
+    буквальными последовательностями `\\n`.
+
     Поддерживаются MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN,
     SHOW, EXPLAIN и PROFILE. Изменяющие конструкции, несколько выражений и
     процедурный CALL отклоняются до обращения к Neo4j. Всегда передавай
@@ -211,7 +276,7 @@ def run_cypher(
         parameters: Именованные параметры Cypher без символа $ в ключах.
         limit: Максимальное число строк в ответе, от 1 до 100.
     """
-    text = (query or "").strip()
+    text = _normalize_cypher_transport_whitespace(query)
     validation_error = _validate_readonly_cypher(text)
     if validation_error:
         return {
@@ -227,11 +292,8 @@ def run_cypher(
             clean_parameters,
             row_limit=clean_limit + 1,
         )
-    except KeyError as exc:
-        return {
-            "error": f"Neo4j setting is missing: {exc.args[0]}",
-            "query": text,
-        }
+    except (Neo4jConfigurationError, ServiceUnavailable) as exc:
+        return {**_neo4j_unavailable_result(exc), "query": text}
     except Exception:
         logger.exception("Cypher execution failed")
         return {
@@ -602,9 +664,9 @@ def trace_neo4j_lineage(
                 max_depth=clean_max_depth,
                 limit=clean_limit,
             )
-        except KeyError as exc:
+        except (Neo4jConfigurationError, ServiceUnavailable) as exc:
             result = {
-                "error": f"Neo4j setting is missing: {exc.args[0]}",
+                **_neo4j_unavailable_result(exc),
                 "rows": [],
                 "paths": [],
                 "returned_rows": 0,
@@ -725,6 +787,135 @@ def trace_neo4j_lineage(
 
 
 @tool(parse_docstring=True)
+def trace_neo4j_table_path(
+    source_table: str,
+    target_table: str,
+    file_id: Optional[int] = None,
+    depth: Optional[int] = None,
+    max_depth: int = 10,
+    limit: int = 20,
+) -> Dict[str, Any]:
+    """Найти точные направленные пути между двумя известными ETL-таблицами.
+
+    Используй для запроса пути или цепочки `source -> ... -> target`, когда
+    пользователь явно назвал обе конечные таблицы. Для точной длины передай
+    depth; иначе tool вернёт пути глубиной до max_depth. Имена сравниваются
+    точно, направление всегда следует рёбрам TABLE_TRANSFORMS_TO. Имена с
+    сегментами `::subquery::`, `::branch::` или `::union::` являются валидными
+    точными именами внутренних ETLTable в Neo4j: не отклоняй и не заменяй их.
+
+    Tool сам выполняет фиксированный параметризованный Cypher и возвращает
+    table_path с именами всех таблиц по порядку, depth и метаданные каждого
+    ребра в steps. Для непосредственных соседей одной таблицы используй
+    trace_neo4j_table_lineage, для колонок — trace_neo4j_lineage. Пустой paths
+    означает только отсутствие совпадения в текущей Neo4j-проекции.
+
+    Args:
+        source_table: Точное имя начальной логической ETL-таблицы.
+        target_table: Точное имя конечной логической ETL-таблицы.
+        file_id: Опциональный идентификатор файла при явном файловом scope.
+        depth: Точная длина пути в рёбрах, от 1 до 50; null означает любую.
+        max_depth: Максимальная глубина при depth=null, от 1 до 50.
+        limit: Максимальное число найденных путей, от 1 до 100.
+    """
+    clean_source = str(source_table or "").strip()
+    clean_target = str(target_table or "").strip()
+    if not clean_source or not clean_target:
+        return {
+            "error": "source_table and target_table must be non-empty",
+            "paths": [],
+        }
+    clean_file_id = int(file_id) if file_id is not None else None
+    clean_depth = (
+        clamped_int(depth, 1, 1, MAX_LINEAGE_DEPTH)
+        if depth is not None
+        else None
+    )
+    clean_max_depth = clamped_int(max_depth, 10, 1, MAX_LINEAGE_DEPTH)
+    if clean_depth is not None:
+        clean_max_depth = clean_depth
+    clean_limit = clamped_int(limit, 20, 1, MAX_CYPHER_ROWS)
+    result = _read_rows(
+        """
+        MATCH path=(source:ETLProjection:ETLTable {name: $source_table})
+              -[:TABLE_TRANSFORMS_TO*1..50]->
+              (target:ETLProjection:ETLTable {name: $target_table})
+        WHERE
+            length(path) <= $max_depth
+            AND ($depth IS NULL OR length(path) = $depth)
+            AND ALL(
+                mapping IN relationships(path)
+                WHERE $file_id IS NULL OR mapping.file_id = $file_id
+            )
+        WITH
+            [node IN nodes(path) | node.name] AS table_path,
+            relationships(path) AS path_mappings,
+            length(path) AS depth
+        UNWIND range(0, size(path_mappings) - 1) AS step_index
+        WITH
+            table_path,
+            depth,
+            step_index,
+            collect(DISTINCT {
+                file_id: path_mappings[step_index].file_id,
+                transformation_id: path_mappings[step_index].transformation_id,
+                source_layer: path_mappings[step_index].source_layer,
+                target_layer: path_mappings[step_index].target_layer,
+                sql_query: path_mappings[step_index].sql_query
+            }) AS mappings
+        ORDER BY step_index
+        WITH
+            table_path,
+            depth,
+            collect({
+                step_index: step_index,
+                source_table: table_path[step_index],
+                target_table: table_path[step_index + 1],
+                mappings: mappings
+            }) AS steps
+        RETURN
+            table_path,
+            depth,
+            steps
+        ORDER BY depth, table_path
+        LIMIT $limit
+        """,
+        {
+            "source_table": clean_source,
+            "target_table": clean_target,
+            "file_id": clean_file_id,
+            "depth": clean_depth,
+            "max_depth": clean_max_depth,
+            "limit": clean_limit,
+        },
+    )
+    paths = result.get("rows") or []
+    chains = [
+        {
+            "depth": path.get("depth"),
+            "source": (path.get("table_path") or [None])[0],
+            "middle": (path.get("table_path") or [])[1:-1],
+            "target": (path.get("table_path") or [None])[-1],
+            "table_path": path.get("table_path") or [],
+        }
+        for path in paths
+        if path.get("table_path")
+    ]
+    return {
+        **{key: value for key, value in result.items() if key != "rows"},
+        "source_table": clean_source,
+        "target_table": clean_target,
+        "depth": clean_depth,
+        "max_depth": clean_max_depth,
+        "path_count": len(paths),
+        "chains": chains,
+        "file_id": clean_file_id,
+        "limit": clean_limit,
+        "paths": paths,
+    }
+
+
+@tool(parse_docstring=True)
 def trace_neo4j_table_lineage(
     table_name: str,
     file_id: Optional[int] = None,
@@ -739,11 +930,13 @@ def trace_neo4j_table_lineage(
     parse_sql_table_lineage. Граф содержит узлы ETLTable и прямые рёбра
     TABLE_TRANSFORMS_TO с sql_query; имена сравниваются точно.
 
-    Возвращает связи глубины 1. Поле connections группирует точные пары таблиц и
+    Возвращает связи глубины 1. Поле table_exists отдельно показывает наличие
+    самого узла ETLTable в текущей Neo4j-проекции, даже если у него нет подходящих
+    рёбер. Поле connections группирует точные пары таблиц и
     содержит transformation_count/transformation_ids; rows сохраняет исходные
     рёбра с sql_query. Для длинного пути используй run_cypher, для объяснения
-    правил — trace_transformation_path. file_id не бери из UI без явного
-    ограничения. Пустой rows не доказывает отсутствие факта в SQLite.
+    правил — trace_transformation_path. file_id используй только при явном
+    ограничении пользователя. Пустой rows не доказывает отсутствие факта в SQLite.
 
     Args:
         table_name: Точное имя исходной или целевой логической ETL-таблицы.
@@ -799,16 +992,36 @@ def trace_neo4j_table_lineage(
             "limit": clean_limit,
         },
     )
-    connections = _table_lineage_connections(result["rows"])
-    result.update(
-        {
-            "table_name": clean_table_name,
-            "file_id": clean_file_id,
-            "direction": direction,
-            "limit": clean_limit,
-            "returned_rows": len(result["rows"]),
-            "connections": connections,
-            "connection_count": len(connections),
-        }
-    )
-    return result
+    rows = result.get("rows") or []
+    table_exists: Optional[bool] = None
+    if "error" not in result:
+        if rows:
+            table_exists = True
+        else:
+            existence_result = _read_rows(
+                """
+                MATCH (table:ETLProjection:ETLTable {name: $table_name})
+                WHERE $file_id IS NULL OR table.file_id = $file_id
+                RETURN count(table) > 0 AS table_exists
+                """,
+                {
+                    "table_name": clean_table_name,
+                    "file_id": clean_file_id,
+                },
+            )
+            existence_rows = existence_result.get("rows") or []
+            if "error" not in existence_result and existence_rows:
+                table_exists = bool(existence_rows[0].get("table_exists"))
+    connections = _table_lineage_connections(rows)
+    return {
+        **{key: value for key, value in result.items() if key != "rows"},
+        "table_name": clean_table_name,
+        "table_exists": table_exists,
+        "file_id": clean_file_id,
+        "direction": direction,
+        "limit": clean_limit,
+        "returned_rows": len(rows),
+        "connection_count": len(connections),
+        "connections": connections,
+        "rows": rows,
+    }

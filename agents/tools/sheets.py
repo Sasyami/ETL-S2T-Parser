@@ -6,21 +6,23 @@ from typing import Any, Dict, List
 from langchain_core.tools import tool
 
 @tool(parse_docstring=True)
-def list_sheets(file_id: int) -> List[str]:
-    """Получить полный список имён Excel-листов одной сохранённой загрузки.
+def list_sheets(file_id: int) -> Dict[str, Any]:
+    """Получить полный список и точное количество Excel-листов одной загрузки.
 
     Используй для прямого вопроса «какие листы есть в этом файле» после того,
-    как file_id получен из UI или resolve_file. Не используй для поиска колонок,
+    как file_id явно назван пользователем или получен через resolve_file. Не используй для поиска колонок,
     групп листов, строк Excel или S2T-трансформаций. Инструмент не выбирает
     последний файл и не принимает логическое имя ETL-таблицы вместо file_id.
 
-    Читает file_sheet_headers и возвращает только реальные имена листов, включая
-    пропущенные при анализе листы, если они были сохранены в метаданных. Пустой
-    список означает отсутствие сохранённых строк file_sheet_headers для этого
-    file_id; сам по себе он не различает отсутствующий файл и файл без листов.
+    Читает file_sheet_headers и возвращает file_id, машинно рассчитанный
+    sheet_count и реальные имена в sheets, включая пропущенные при анализе листы,
+    если они были сохранены в метаданных. Нулевой sheet_count означает отсутствие
+    сохранённых строк file_sheet_headers для этого file_id; сам по себе он не
+    различает отсутствующий файл и файл без листов. Для ответа о количестве
+    используй sheet_count и не пересчитывай элементы списка самостоятельно.
 
     Args:
-        file_id: Числовой идентификатор загрузки из UI или resolve_file.
+        file_id: Явный числовой идентификатор загрузки или результат resolve_file.
     """
     from storage.database import get_db_connection
     conn = get_db_connection()
@@ -28,7 +30,12 @@ def list_sheets(file_id: int) -> List[str]:
     cursor.execute("SELECT sheet_name FROM file_sheet_headers WHERE file_id = ? ORDER BY sheet_name", (file_id,))
     rows = cursor.fetchall()
     conn.close()
-    return [row["sheet_name"] for row in rows]
+    sheets = [row["sheet_name"] for row in rows]
+    return {
+        "file_id": file_id,
+        "sheet_count": len(sheets),
+        "sheets": sheets,
+    }
 
 @tool(parse_docstring=True)
 def list_file_sheet_headers(file_id: int) -> List[Dict[str, Any]]:
@@ -46,7 +53,7 @@ def list_file_sheet_headers(file_id: int) -> List[Dict[str, Any]]:
     переданного file_id метаданные листов не найдены.
 
     Args:
-        file_id: Числовой идентификатор загрузки из UI или resolve_file.
+        file_id: Явный числовой идентификатор загрузки или результат resolve_file.
     """
     from storage.database import get_db_connection
 
@@ -116,7 +123,7 @@ def list_columns(file_id: int, sheet_name: str) -> Dict[str, Any]:
     что у найденного листа нет сохранённых заголовков.
 
     Args:
-        file_id: Числовой идентификатор загрузки из UI или resolve_file.
+        file_id: Явный числовой идентификатор загрузки или результат resolve_file.
         sheet_name: Фактическое имя листа либо группа/алиас из sheet_groups.json.
     """
     from config.sheet_groups import find_sheet_group_alias

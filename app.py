@@ -6,7 +6,8 @@ from threading import Lock
 from typing import List, Any, Dict, Optional
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from services.logging_setup import configure_logging
-from agents.agent import get_model_name, agent_chat
+from agents.agent import get_model_name
+from agents.supervisor import supervisor_chat
 from agents.sheet_group_classifier import classify_file_sheet_groups
 from services.analysis import (
     finish_analysis,
@@ -407,34 +408,30 @@ def chat():
     if not isinstance(query, str) or not query.strip():
         return jsonify({"error": "Missing query"}), 400
     try:
-        raw_file_id = data.get("file_id")
-        if raw_file_id is None:
-            file_id = None
-        else:
-            try:
-                file_id = int(raw_file_id)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("file_id must be an integer") from exc
-            if file_id <= 0:
-                raise ValueError("file_id must be a positive integer")
         session_id = _normalize_chat_session_id(data.get("session_id"))
         history = _normalize_chat_history(data.get("history"))
         logger.info(
-            "Chat request session_id=%s file_id=%s history_messages=%s query=%s",
+            "Chat request session_id=%s history_messages=%s query=%s",
             session_id,
-            file_id,
             len(history),
             query.strip()[:1000],
         )
-        agent_kwargs: Dict[str, Any] = {}
-        if file_id:
-            agent_kwargs["file_id"] = file_id
+        supervisor_kwargs: Dict[str, Any] = {}
         if history:
-            agent_kwargs["history"] = history
+            supervisor_kwargs["history"] = history
         if session_id:
-            agent_kwargs["session_id"] = session_id
-        answer = agent_chat(query.strip(), **agent_kwargs)
-        return jsonify({"answer": answer}), 200
+            supervisor_kwargs["session_id"] = session_id
+        chat_result = supervisor_chat(query.strip(), **supervisor_kwargs)
+        if hasattr(chat_result, "model_dump"):
+            payload = chat_result.model_dump()
+        elif isinstance(chat_result, dict):
+            payload = chat_result
+        else:
+            payload = {
+                "answer": str(chat_result),
+                "display_items": [],
+            }
+        return jsonify(payload), 200
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
