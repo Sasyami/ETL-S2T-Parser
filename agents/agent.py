@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -98,6 +98,20 @@ SQLITE_SCHEMA_CONTEXT = get_sqlite_schema_cheatsheet()
 
 # Стандартный ToolNode работает со списком BaseTool.
 TOOLS = get_tools()
+
+
+def build_chat_system_prompt(
+    selected_skills: str,
+    selected_tool_names: Sequence[str],
+) -> str:
+    """Compose only the runtime context required by the selected tools."""
+    parts = [CHAT_AGENT_CONTEXT.strip()]
+    clean_skills = str(selected_skills or "").strip()
+    if clean_skills:
+        parts.append(f"Навыки:\n{clean_skills}")
+    if "run_sql" in set(selected_tool_names):
+        parts.append(SQLITE_SCHEMA_CONTEXT.strip())
+    return "\n\n".join(part for part in parts if part)
 
 
 SYSTEM_PROMPT = """
@@ -294,7 +308,6 @@ def _get_langfuse_callbacks() -> List[Any]:
 def agent_chat(
     user_query: str,
     max_steps: int = 5,
-    file_id: Optional[int] = None,
     history: Optional[List[Dict[str, str]]] = None,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
@@ -306,12 +319,6 @@ def agent_chat(
 
     if not clean_query:
         return "Запрос не должен быть пустым."
-
-    active_file_id = (
-        int(file_id)
-        if file_id is not None
-        else None
-    )
 
     callbacks = _get_langfuse_callbacks()
     available_tools = get_tools()
@@ -331,19 +338,10 @@ def agent_chat(
         route.skills,
     )
 
-    system_prompt = f"""
-{CHAT_AGENT_CONTEXT}
-
-Навыки:
-{selected_skills}
-
-{SQLITE_SCHEMA_CONTEXT}
-""".strip()
-
-    trace_metadata: Dict[str, Any] = {}
-
-    if active_file_id is not None:
-        trace_metadata["file_id"] = active_file_id
+    system_prompt = build_chat_system_prompt(
+        selected_skills,
+        [tool.name for tool in selected_tools],
+    )
 
     return run_agent_graph(
         user_query=clean_query,
@@ -352,10 +350,9 @@ def agent_chat(
         tools=selected_tools,
         max_steps=max_steps,
         history=history,
-        file_id=active_file_id,
         session_id=session_id,
         user_id=user_id,
         callbacks=callbacks,
         trace_tags=["chat"],
-        trace_metadata=trace_metadata,
+        trace_metadata={},
     )

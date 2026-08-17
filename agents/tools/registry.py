@@ -13,7 +13,12 @@ from .files import (
 )
 from .planning import show_plan
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
-from .neo4j import run_cypher, trace_neo4j_lineage, trace_neo4j_table_lineage
+from .neo4j import (
+    run_cypher,
+    trace_neo4j_lineage,
+    trace_neo4j_table_lineage,
+    trace_neo4j_table_path,
+)
 from .s2t import (
     list_s2t_table_names,
     list_s2t_transformations,
@@ -50,6 +55,7 @@ READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     run_cypher,
     trace_neo4j_lineage,
     trace_neo4j_table_lineage,
+    trace_neo4j_table_path,
     list_files,
     resolve_file,
     get_file_description,

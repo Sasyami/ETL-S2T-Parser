@@ -187,6 +187,39 @@
             border-radius: 6px;
             background: #fff;
         }
+        .tool-result-title {
+            margin-bottom: 8px;
+            color: var(--text-muted);
+            font-size: 0.82rem;
+            white-space: normal;
+        }
+        .tool-result-scroll {
+            max-width: min(1240px, 92vw);
+            max-height: min(520px, 58vh);
+            overflow: auto;
+            overscroll-behavior: contain;
+            scrollbar-gutter: stable;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: #fff;
+        }
+        .tool-result-scroll pre {
+            min-width: max-content;
+            margin: 0;
+            border-radius: 0;
+        }
+        .tool-result-metadata {
+            margin: 0 0 8px;
+            padding: 8px;
+            max-height: 180px;
+            overflow: auto;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: #f8fafc;
+            color: var(--text-muted);
+            font-size: 0.78rem;
+            white-space: pre-wrap;
+        }
         .message th,
         .message td {
             border: 1px solid var(--line);
@@ -335,10 +368,10 @@
         </div>
 
         <div class="status-panel">
-            <div class="status-label">Текущий файл</div>
-            <div id="currentFileName" class="status-value">Файл не загружен</div>
+            <div class="status-label">Последняя загрузка</div>
+            <div id="lastUploadedFileName" class="status-value">Файлы ещё не загружались</div>
             <div class="status-label mt-3">ID файла</div>
-            <div id="currentFileId" class="status-value text-muted">-</div>
+            <div id="lastUploadedFileId" class="status-value text-muted">-</div>
             <div class="status-label mt-3">S2T transformations</div>
             <div id="currentTransformations" class="status-value text-muted">-</div>
             <div class="d-grid gap-2 mt-3">
@@ -351,7 +384,7 @@
             <div class="status-label">Быстрые команды</div>
             <div class="quick-actions">
                 <button class="btn btn-outline-secondary btn-sm" type="button" data-prompt="Покажи таблицу трансформаций">Показать трансформации</button>
-                <button class="btn btn-outline-secondary btn-sm" type="button" data-prompt="Какие листы есть в текущем файле?">Листы текущего файла</button>
+                <button class="btn btn-outline-secondary btn-sm" type="button" data-prompt="Какие файлы загружены и какие листы есть в каждом?">Листы загруженных файлов</button>
                 <button class="btn btn-outline-secondary btn-sm" type="button" data-prompt="Какие файлы загружены?">Загруженные файлы</button>
                 <button class="btn btn-outline-secondary btn-sm" type="button" data-prompt="Сделай краткое резюме по данным">Краткое резюме</button>
             </div>
@@ -380,9 +413,7 @@
 </div>
 
 <script>
-    let currentFileId = null;
-    let currentFileName = null;
-    let currentTransformationsCount = null;
+    let lastUploadTransformationsCount = 0;
     let busy = false;
     let loadingMessageNode = null;
     let progressPollTimer = null;
@@ -403,8 +434,8 @@
     const sendBtn = document.getElementById('sendBtn');
     const clearChatHistoryBtn = document.getElementById('clearChatHistoryBtn');
     const busyText = document.getElementById('busyText');
-    const currentFileNameEl = document.getElementById('currentFileName');
-    const currentFileIdEl = document.getElementById('currentFileId');
+    const lastUploadedFileNameEl = document.getElementById('lastUploadedFileName');
+    const lastUploadedFileIdEl = document.getElementById('lastUploadedFileId');
     const currentTransformationsEl = document.getElementById('currentTransformations');
     const viewAllTransformationsBtn = document.getElementById('viewAllTransformationsBtn');
     const clearAllDataBtn = document.getElementById('clearAllDataBtn');
@@ -441,13 +472,11 @@
         }
     }
 
-    function setCurrentFile(data) {
-        currentFileId = data.file_id || null;
-        currentFileName = data.filename || null;
-        currentTransformationsCount = Number(data.s2t_transformations_count || 0);
-        currentFileNameEl.textContent = currentFileName || 'Файл не загружен';
-        currentFileIdEl.textContent = currentFileId || '-';
-        currentTransformationsEl.textContent = currentFileId ? `${currentTransformationsCount} строк` : '-';
+    function showLastUpload(data) {
+        lastUploadTransformationsCount = Number(data.s2t_transformations_count || 0);
+        lastUploadedFileNameEl.textContent = data.filename || 'Файл загружен';
+        lastUploadedFileIdEl.textContent = data.file_id || '-';
+        currentTransformationsEl.textContent = `${lastUploadTransformationsCount} строк`;
         clearAllDataBtn.disabled = busy;
     }
 
@@ -481,7 +510,7 @@
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || 'Upload failed');
 
-            setCurrentFile(data);
+            showLastUpload(data);
             const sheets = (data.sheets || []).map((sheet) => sheet.sheet_name).join(', ') || 'нет листов';
             const summary = data.summary ? `\n\nСаммари:\n${data.summary}` : '';
             const summaryError = data.summary_error
@@ -494,16 +523,16 @@
                 : '';
             addMessage(
                 'agent',
-                `Файл загружен: ${data.filename}\nID файла: ${data.file_id}\nЛисты: ${sheets}\nS2T transformations: ${currentTransformationsCount}${s2tError}${summary}${summaryError}`
+                `Файл загружен: ${data.filename}\nID файла: ${data.file_id}\nЛисты: ${sheets}\nS2T transformations: ${lastUploadTransformationsCount}${s2tError}${summary}${summaryError}`
             );
-            if (currentTransformationsCount > 0) {
+            if (lastUploadTransformationsCount > 0) {
                 addMessage('system', 'Можно спросить: "Покажи таблицу трансформаций".');
             }
             updateAnalysisProgress({
                 status: 'done',
                 percent: 100,
                 message: 'Анализ файла завершен',
-                detail: `Листов: ${(data.sheets || []).length}, S2T transformations: ${currentTransformationsCount}`
+                detail: `Листов: ${(data.sheets || []).length}, S2T transformations: ${lastUploadTransformationsCount}`
             });
         } catch (error) {
             updateAnalysisProgress({
@@ -550,12 +579,13 @@
             const response = await fetch('/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query, file_id: currentFileId, history, session_id: currentSessionId })
+                body: JSON.stringify({ query, history, session_id: currentSessionId })
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || 'Chat failed');
             const answer = data.answer || 'Пустой ответ';
             addMessage('agent', answer);
+            addDisplayItems(data.display_items);
             appendChatHistory('user', query);
             appendChatHistory('assistant', answer);
         } catch (error) {
@@ -704,6 +734,82 @@
         messages.appendChild(node);
         messages.scrollTop = messages.scrollHeight;
         return node;
+    }
+
+    function addDisplayItems(items) {
+        if (!Array.isArray(items)) return;
+        items.forEach((item) => {
+            if (!item || typeof item.content !== 'string') return;
+            const node = document.createElement('div');
+            node.className = 'message message-agent message-wide';
+            const title = item.name ? `Полный результат: ${item.name}` : 'Полный результат инструмента';
+            node.innerHTML = (
+                `<div class="tool-result-title">${escapeHtml(title)}</div>`
+                + renderToolResult(item.content)
+            );
+            messages.appendChild(node);
+        });
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    function renderToolResult(content) {
+        try {
+            const parsed = JSON.parse(content);
+            const table = toolResultTable(parsed);
+            if (table) return table;
+        } catch (error) {
+            // Non-JSON tool results are displayed as their original text.
+        }
+        return `<div class="tool-result-scroll" tabindex="0" role="region" aria-label="Полный результат инструмента с прокруткой"><pre><code>${escapeHtml(content)}</code></pre></div>`;
+    }
+
+    function toolResultTable(payload) {
+        const rows = Array.isArray(payload)
+            ? payload
+            : (payload && typeof payload === 'object' && Array.isArray(payload.rows)
+                ? payload.rows
+                : null);
+        if (!rows || !rows.length) return '';
+
+        let columns = [];
+        if (!Array.isArray(payload) && Array.isArray(payload.columns)) {
+            columns = payload.columns.filter((column) => typeof column === 'string');
+        }
+        if (rows.every((row) => row && typeof row === 'object' && !Array.isArray(row))) {
+            rows.forEach((row) => {
+                Object.keys(row).forEach((column) => {
+                    if (!columns.includes(column)) columns.push(column);
+                });
+            });
+        } else if (rows.every((row) => Array.isArray(row))) {
+            const width = Math.max(...rows.map((row) => row.length));
+            while (columns.length < width) columns.push(`column_${columns.length + 1}`);
+        } else {
+            return '';
+        }
+        if (!columns.length) return '';
+
+        const tableRows = rows.map((row) => (
+            Array.isArray(row)
+                ? columns.map((_, index) => toolResultValue(row[index]))
+                : columns.map((column) => toolResultValue(row[column]))
+        ));
+        let metadataHtml = '';
+        if (!Array.isArray(payload)) {
+            const metadata = { ...payload };
+            delete metadata.rows;
+            delete metadata.columns;
+            if (Object.keys(metadata).length) {
+                metadataHtml = `<div class="tool-result-metadata">${escapeHtml(JSON.stringify(metadata, null, 2))}</div>`;
+            }
+        }
+        return metadataHtml + tableHtml(columns, tableRows);
+    }
+
+    function toolResultValue(value) {
+        if (value === null || value === undefined) return '';
+        if (typeof value === 'object') return JSON.stringify(value);
+        return String(value);
     }
 
     function addTransformationsTableMessage(data) {

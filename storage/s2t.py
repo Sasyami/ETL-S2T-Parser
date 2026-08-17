@@ -78,6 +78,8 @@ def list_s2t_transformations(
     limit: Optional[int] = 200,
     q: Optional[str] = None,
     columns: Optional[List[str]] = None,
+    target_table: Optional[str] = None,
+    source_table: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return minimal stored S2T transformations for UI/API browsing."""
     clean_limit = None if limit is None else max(1, min(int(limit or 200), 1000))
@@ -108,6 +110,14 @@ def list_s2t_transformations(
             "(" + " OR ".join(f"{_sql_identifier(field)} LIKE ?" for field in S2T_RECORD_FIELDS) + ")"
         )
         params.extend([pattern] * len(S2T_RECORD_FIELDS))
+    exact_filters = {
+        "target_table": str(target_table or "").strip(),
+        "source_table": str(source_table or "").strip(),
+    }
+    for field_name, field_value in exact_filters.items():
+        if field_value:
+            where.append(f"TRIM({_sql_identifier(field_name)}) = ? COLLATE NOCASE")
+            params.append(field_value)
     where_sql = " AND ".join(where)
     selected_columns_sql = ", ".join(
         _sql_identifier(column) for column in selected_columns
@@ -139,6 +149,13 @@ def list_s2t_transformations(
     }
     if file_id is not None:
         result["file_id"] = int(file_id)
+    applied_filters = {
+        field_name: field_value
+        for field_name, field_value in exact_filters.items()
+        if field_value
+    }
+    if applied_filters:
+        result["filters"] = applied_filters
     return result
 
 

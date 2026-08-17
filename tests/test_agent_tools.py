@@ -92,6 +92,19 @@ def test_run_sql_invalid_returns_error_dict():
     assert "error" in out
 
 
+def test_run_sql_returns_sqlite_error_message():
+    from agents.tools import run_sql
+
+    query = "SELECT missing_column FROM files"
+    out = run_sql.invoke({"query": query})
+
+    assert out == {
+        "error": "SQL query failed",
+        "error_message": "no such column: missing_column",
+        "query": query,
+    }
+
+
 def test_run_sql_rejects_write_queries():
     from agents.tools import run_sql
 
@@ -349,7 +362,7 @@ def test_list_files_empty():
     assert list_files.invoke({}) == []
 
 
-def test_list_files_returns_catalog_only():
+def test_list_files_returns_catalog_with_real_file_id():
     from agents.tools import list_files
 
     conn = get_db_connection()
@@ -370,12 +383,12 @@ def test_list_files_returns_catalog_only():
     result = list_files.invoke({})
     assert result == [
         {
+            "file_id": 21,
             "filename": "summary.xlsx",
             "description": "Short description",
             "upload_time": "2026-01-01",
         }
     ]
-    assert "21" not in str(result)
     assert "Лист, который не должен попасть в каталог" not in str(result)
 
 
@@ -490,7 +503,13 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     list_s2t_schema = tools[
         "list_s2t_transformations"
     ].args_schema.model_json_schema()
-    assert set(list_s2t_schema["properties"]) == {"limit", "q", "columns"}
+    assert set(list_s2t_schema["properties"]) == {
+        "limit",
+        "q",
+        "columns",
+        "target_table",
+        "source_table",
+    }
     columns_schema = list_s2t_schema["properties"]["columns"]
     assert columns_schema["default"] is None
     assert columns_schema["anyOf"][0] == {
@@ -505,7 +524,7 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     assert description_schema["required"] == ["table_name"]
     assert set(description_schema["properties"]) == {"table_name", "file_id", "limit"}
     file_description_schema = tools["get_file_description"].args_schema.model_json_schema()
-    assert "Числовой идентификатор загрузки" in file_description_schema[
+    assert "Явный числовой идентификатор загрузки" in file_description_schema[
         "properties"
     ]["file_id"]["description"]
 
@@ -556,6 +575,18 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
         "downstream",
         "both",
     ]
+    table_path_schema = tools[
+        "trace_neo4j_table_path"
+    ].args_schema.model_json_schema()
+    assert table_path_schema["required"] == ["source_table", "target_table"]
+    assert set(table_path_schema["properties"]) == {
+        "source_table",
+        "target_table",
+        "file_id",
+        "depth",
+        "max_depth",
+        "limit",
+    }
 
 
 @patch("agents.tools.neo4j.execute_neo4j_read")
@@ -595,6 +626,46 @@ def test_run_cypher_returns_limited_rows(mock_read):
     assert result["returned_rows"] == 2
     assert result["truncated"] is True
     assert result["limit"] == 2
+
+
+@patch("agents.tools.neo4j.execute_neo4j_read")
+def test_run_cypher_decodes_transport_newlines_outside_literals(mock_read):
+    from agents.tools import run_cypher
+
+    mock_read.return_value = [{"value": "kept\\ninside"}]
+
+    result = run_cypher.invoke(
+        {
+            "query": "MATCH (n)\\nWHERE n.name = 'kept\\ninside'\\nRETURN n",
+            "parameters": {},
+        }
+    )
+
+    mock_read.assert_called_once_with(
+        "MATCH (n)\nWHERE n.name = 'kept\\ninside'\nRETURN n",
+        {},
+        row_limit=21,
+    )
+    assert result["rows"] == [{"value": "kept\\ninside"}]
+
+
+@patch("agents.tools.neo4j.execute_neo4j_read")
+def test_run_cypher_marks_neo4j_service_unavailable(mock_read):
+    from neo4j.exceptions import ServiceUnavailable
+
+    from agents.tools import run_cypher
+
+    mock_read.side_effect = ServiceUnavailable(
+        "Unable to retrieve routing information"
+    )
+    result = run_cypher.invoke(
+        {"query": "MATCH (n) RETURN n", "limit": 2}
+    )
+
+    assert result["backend"] == "neo4j"
+    assert result["unavailable"] is True
+    assert "Neo4j недоступен" in result["error"]
+    assert result["error_type"] == "ServiceUnavailable"
 
 
 def test_parse_sql_column_lineage_resolves_columns_through_cte_and_join():
@@ -1187,6 +1258,7 @@ def test_trace_neo4j_table_lineage_returns_sql_queries(mock_read):
         "limit": 100,
     }
     assert result["returned_rows"] == 1
+    assert result["table_exists"] is True
     assert result["rows"][0]["sql_query"] == "SELECT * FROM a_source"
     assert result["connection_count"] == 1
     assert result["connections"] == [
@@ -1200,6 +1272,91 @@ def test_trace_neo4j_table_lineage_returns_sql_queries(mock_read):
             "transformation_ids": [91],
         }
     ]
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert serialized.index('"connections"') < serialized.index('"rows"')
+
+
+@patch("agents.tools.neo4j.execute_neo4j_read")
+def test_trace_neo4j_table_lineage_distinguishes_existing_node_without_edges(
+    mock_read,
+):
+    from agents.tools import trace_neo4j_table_lineage
+
+    mock_read.side_effect = [[], [{"table_exists": True}]]
+
+    result = trace_neo4j_table_lineage.invoke(
+        {"table_name": "isolated_table", "direction": "upstream"}
+    )
+
+    assert mock_read.call_count == 2
+    existence_query, existence_parameters = mock_read.call_args_list[1].args
+    assert "table.file_id = $file_id" in existence_query
+    assert existence_parameters == {
+        "table_name": "isolated_table",
+        "file_id": None,
+    }
+    assert result["table_exists"] is True
+    assert result["returned_rows"] == 0
+    assert result["connections"] == []
+
+
+@patch("agents.tools.neo4j.execute_neo4j_read")
+def test_trace_neo4j_table_path_returns_exact_ordered_chain(mock_read):
+    from agents.tools import trace_neo4j_table_path
+
+    mock_read.return_value = [
+        {
+            "table_path": ["a_source", "b_middle", "c_target"],
+            "depth": 2,
+            "steps": [
+                {"transformation_id": 10},
+                {"transformation_id": 11},
+            ],
+        }
+    ]
+
+    result = trace_neo4j_table_path.invoke(
+        {
+            "source_table": "a_source",
+            "target_table": "c_target",
+            "file_id": 7,
+            "depth": 2,
+            "max_depth": 40,
+            "limit": 250,
+        }
+    )
+
+    query, parameters = mock_read.call_args.args
+    assert "[:TABLE_TRANSFORMS_TO*1..50]" in query
+    assert "[node IN nodes(path) | node.name] AS table_path" in query
+    assert "length(path) = $depth" in query
+    assert "collect(DISTINCT" in query
+    assert "mappings: mappings" in query
+    assert parameters == {
+        "source_table": "a_source",
+        "target_table": "c_target",
+        "file_id": 7,
+        "depth": 2,
+        "max_depth": 2,
+        "limit": 100,
+    }
+    assert result["path_count"] == 1
+    assert result["chains"] == [
+        {
+            "depth": 2,
+            "source": "a_source",
+            "middle": ["b_middle"],
+            "target": "c_target",
+            "table_path": ["a_source", "b_middle", "c_target"],
+        }
+    ]
+    assert result["paths"][0]["table_path"] == [
+        "a_source",
+        "b_middle",
+        "c_target",
+    ]
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert serialized.index('"chains"') < serialized.index('"paths"')
 
 
 def test_show_plan_returns_explicit_progress_without_side_effects():
@@ -1227,6 +1384,11 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "это сценарий Neo4j" in tools["run_sql"].description
     assert "не должны содержать" in tools["run_sql"].description
     assert "фильтр по file_id" in tools["run_sql"].description
+    assert "Непустой source_table" in tools["run_sql"].description
+    assert "TRIM(source_table) <> ''" in tools["run_sql"].description
+    assert "не добавляй JOIN" in " ".join(
+        tools["run_sql"].description.split()
+    )
 
     assert "только для сложных графовых путей" in tools["run_cypher"].description
     assert "Для обычной таблицы S2T-трансформаций" in tools["run_cypher"].description
@@ -1258,6 +1420,9 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "sql_query" in tools["trace_neo4j_table_lineage"].description
     assert "не ищет неизвестные таблицы" in tools[
         "trace_neo4j_table_lineage"
+    ].description
+    assert "двумя известными ETL-таблицами" in tools[
+        "trace_neo4j_table_path"
     ].description
     assert "Для компактных списков" in tools[
         "summarize_s2t_tables"
@@ -1440,7 +1605,11 @@ def test_list_sheets_and_columns_after_store():
         }
     ]
     fh = store_excel_data("x.xlsx", "m", sheets)
-    assert list_sheets.invoke({"file_id": fh}) == ["Sheet1"]
+    assert list_sheets.invoke({"file_id": fh}) == {
+        "file_id": fh,
+        "sheet_count": 1,
+        "sheets": ["Sheet1"],
+    }
     headers = list_file_sheet_headers.invoke({"file_id": fh})
     columns_result = list_columns.invoke(
         {"file_id": fh, "sheet_name": "sheet1"}
@@ -1794,6 +1963,31 @@ def test_list_s2t_transformations_selects_requested_columns():
 
     assert result["columns"] == ["transformation_rule"]
     assert result["rows"] == [{"transformation_rule": "source.value"}]
+
+
+def test_list_s2t_transformations_filters_exact_target_table():
+    from agents.tools import list_s2t_transformations
+
+    conn = get_db_connection()
+    conn.executemany(
+        """INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, target_table, target_field)
+        VALUES (?, 61, 'S2T', ?, ?, ?)""",
+        [
+            (211, 1, "t_target", "wanted"),
+            (212, 2, "t_target_archive", "other"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = list_s2t_transformations.invoke(
+        {"limit": 3, "target_table": "t_target"}
+    )
+
+    assert result["total"] == 1
+    assert result["filters"] == {"target_table": "t_target"}
+    assert result["rows"][0]["target_field"] == "wanted"
 
 
 def test_list_s2t_transformations_empty_result_is_global_not_file_error():

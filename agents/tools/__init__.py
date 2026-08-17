@@ -15,7 +15,12 @@ from .files import (
 )
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
 from .planning import show_plan
-from .neo4j import run_cypher, trace_neo4j_lineage, trace_neo4j_table_lineage
+from .neo4j import (
+    run_cypher,
+    trace_neo4j_lineage,
+    trace_neo4j_table_lineage,
+    trace_neo4j_table_path,
+)
 from .registry import (
     ALL_TOOLS,
     ALL_TOOLS_BY_NAME,
@@ -104,6 +109,7 @@ __all__ = [
     "summarize_table_descriptions",
     "trace_neo4j_lineage",
     "trace_neo4j_table_lineage",
+    "trace_neo4j_table_path",
     "trace_transformation_path",
     "update_file_description",
     "update_table_info_from_user_query",

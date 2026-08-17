@@ -141,7 +141,6 @@ def test_agent_chat_delegates_to_native_tool_graph():
     ):
         out = agent_chat(
             "Покажи листы",
-            file_id=42,
             history=history,
             session_id="chat-session-1",
             user_id="user-1",
@@ -152,18 +151,19 @@ def test_agent_chat_delegates_to_native_tool_graph():
     assert kwargs["user_query"] == "Покажи листы"
     assert kwargs["model"] is not None
     assert kwargs["tools"]
-    assert kwargs["file_id"] == 42
+    assert "file_id" not in kwargs
     assert kwargs["history"] == [{"role": "user", "content": "Контекст"}]
     assert kwargs["session_id"] == "chat-session-1"
     assert kwargs["user_id"] == "user-1"
     assert kwargs["callbacks"] == ["callback"]
     assert [tool.name for tool in kwargs["tools"]] == ["list_sheets"]
     assert kwargs["trace_tags"] == ["chat"]
-    assert kwargs["trace_metadata"] == {"file_id": 42}
+    assert kwargs["trace_metadata"] == {}
     assert "read-only" in kwargs["system_prompt"]
     assert "# Навыки агента" not in kwargs["system_prompt"]
     assert "## Excel и описания" in kwargs["system_prompt"]
     assert "## Neo4j" not in kwargs["system_prompt"]
+    assert "## Актуальная схема SQLite" not in kwargs["system_prompt"]
     assert len(kwargs["system_prompt"]) < 7000
     route_args = route_agent.call_args
     assert route_args.args == ("Покажи листы", history)
@@ -171,6 +171,16 @@ def test_agent_chat_delegates_to_native_tool_graph():
     assert route_args.kwargs["available_tools"] == get_tools()
     assert route_args.kwargs["callbacks"] == ["callback"]
     load_runtime_skills.assert_called_once_with(("Excel и описания",))
+
+
+def test_chat_system_prompt_includes_sqlite_schema_only_for_run_sql():
+    from agents.agent import build_chat_system_prompt
+
+    without_sql = build_chat_system_prompt("## Neo4j\nGraph rules", ["run_cypher"])
+    with_sql = build_chat_system_prompt("## SQLite SQL\nSQL rules", ["run_sql"])
+
+    assert "## Актуальная схема SQLite" not in without_sql
+    assert "## Актуальная схема SQLite" in with_sql
 
 
 class _ToolRouterModel:
@@ -275,7 +285,6 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
             )
         )
     )
-
     route = _select_chat_route(
         "Выполни этот запрос",
         history,
@@ -298,8 +307,8 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
         if item["name"] == "run_sql"
     )
     assert "составленный агентом" in run_sql_description
-    assert "выбирай list_s2t_table_names" in run_sql_description
-    assert "а не этот tool" in run_sql_description
+    assert "точных подсчётов" in run_sql_description
+    assert "DISTINCT, GROUP BY" in run_sql_description
     table_names_description = next(
         item["description"]
         for item in payload["available_tools"]
@@ -325,18 +334,46 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
         len(item["description"]) for item in payload["available_tools"]
     ) < 7000
     assert payload["available_skills"] == SKILL_CATALOG
-    assert "description: это контракт" in model.messages[0].content
-    assert "компактную палитру" in model.messages[0].content
-    assert "обычно от одного до четырёх" in model.messages[0].content
-    assert "проверенные" in model.messages[0].content
-    assert "результаты предыдущих шагов" in model.messages[0].content
-    assert "Не наследуй прошлый tool" in model.messages[0].content
-    assert "planner сам выберет порядок" in model.messages[0].content
-    assert "универсальный read-only tool" in model.messages[0].content
-    assert "не добавляй универсальный tool" in model.messages[0].content
+    router_prompt = " ".join(model.messages[0].content.split())
+    assert "минимально достаточную палитру tools" in router_prompt
+    assert "descriptions из каталогов" in router_prompt
+    assert "Tools дают planner доступные действия" in router_prompt
+    assert "Skills выбирай независимо" in router_prompt
+    assert "COUNT, DISTINCT, GROUP BY" not in router_prompt
+    assert "обязательно включай `run_sql`" not in router_prompt
     assert "самостоятельно составить и выполнить SQL" not in model.messages[0].content
     assert "parse_sql_column_lineage" not in model.messages[0].content
-    assert "Skills выбирай независимо" in model.messages[0].content
+
+
+def test_chat_tool_router_receives_explicit_reroute_context():
+    model = _ToolRouterModel(
+        AIMessage(
+            content='{"tools":["run_sql"],"skills":["SQLite SQL"]}'
+        )
+    )
+    reroute_context = {
+        "reason": "Нужна произвольная SQL-агрегация.",
+        "mismatches": ["Предыдущий tool вернул только имена."],
+        "previous_tool_palettes": [["list_s2t_table_names"]],
+        "attempt": 1,
+    }
+
+    route = _select_chat_route(
+        "Найди target_table с максимальным числом строк.",
+        model=model,
+        available_tools=get_tools(),
+        reroute_context=reroute_context,
+    )
+
+    assert route.tools == ["run_sql"]
+    payload = json.loads(model.messages[1].content)
+    assert payload["current_query"] == (
+        "Найди target_table с максимальным числом строк."
+    )
+    assert payload["reroute_context"] == reroute_context
+    router_prompt = " ".join(model.messages[0].content.split())
+    assert "разрешено повторить любую палитру" in router_prompt.lower()
+    assert "меняй палитру только когда" in router_prompt.lower()
 
 
 def test_planner_requires_tool_call_for_an_unfinished_tool_step():
@@ -344,8 +381,24 @@ def test_planner_requires_tool_call_for_an_unfinished_tool_step():
 
     instruction = _planner_instruction(["first_tool", "second_tool"])
 
-    assert "Не описывай будущий вызов словами" in instruction
-    assert "без tool_call не считается выполнением шага" in instruction
+    assert "верни нужный native tool call" in instruction
+    assert "если данных уже достаточно" in instruction
+
+
+def test_worker_planner_finishes_natively_without_domain_specific_rules():
+    from agents.chat_graph import _planner_instruction
+
+    instruction = _planner_instruction(
+        ["run_sql", "search_s2t_transformations"],
+        worker_finish=True,
+    )
+
+    assert "заверши работу через\nfinish_worker" in instruction
+    assert "сохраняй смысл" in instruction.lower()
+    assert "точные значения task" in instruction
+    assert "COUNT, DISTINCT, GROUP BY" not in instruction
+    assert "target_table" not in instruction
+    assert "source_table" not in instruction
 
 
 def test_chat_tool_router_accepts_raw_json_markdown_fence():
@@ -411,6 +464,29 @@ def test_chat_tool_router_repairs_invalid_raw_json_with_one_more_llm_call():
     assert "лишнее пояснение" in str(repair_messages[-2].content)
     assert "двумя и только двумя ключами" in str(repair_messages[-1].content)
     assert "Не добавляй description" in str(repair_messages[-1].content)
+
+
+def test_chat_tool_router_does_not_override_valid_llm_selection():
+    model = _SequenceToolRouterModel(
+        [
+            AIMessage(
+                content=(
+                    '{"tools":["list_s2t_transformations"],'
+                    '"skills":["S2T-строки"]}'
+                )
+            ),
+        ]
+    )
+
+    route = _select_chat_route(
+        "Через SQLite посчитай точное число строк в s2t_transformations.",
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["list_s2t_transformations"]
+    assert route.skills == ["S2T-строки"]
+    assert len(model.calls) == 1
 
 
 def test_chat_tool_router_rejects_invalid_llm_repair():
@@ -481,26 +557,31 @@ class _ObserverModel:
         self.messages = []
 
     def invoke(self, messages):
+        from agents.chat_graph import Observation
+
         self.messages.append(messages)
-        return AIMessage(content="Инструмент вернул ok=true.")
+        return Observation(
+            summary="Инструмент вернул ok=true.",
+            goal_satisfied=True,
+        )
 
 
 class _ScriptedNativeModel:
-    def __init__(
-        self,
-        responses,
-        audit_responses=None,
-    ):
+    def __init__(self, responses):
         self.responses = list(responses)
-        self.audit_responses = list(audit_responses or [])
         self.bound_tools = []
         self.messages = []
-        self.audit_messages = []
         self.observer = _ObserverModel()
 
     def bind_tools(self, tools):
         self.bound_tools = list(tools)
         return self
+
+    def with_structured_output(self, schema):
+        from agents.chat_graph import Observation
+
+        assert schema is Observation
+        return self.observer
 
     def invoke(self, messages, **kwargs):
         del kwargs
@@ -510,24 +591,6 @@ class _ScriptedNativeModel:
             and "Ты observer многошагового агента" in str(messages[0].content)
         ):
             return self.observer.invoke(messages)
-        if (
-            messages
-            and (
-                "Аудит завершения planner" in str(messages[-1].content)
-                or "Повтори аудит в последний раз" in str(messages[-1].content)
-            )
-        ):
-            self.audit_messages.append(messages)
-            if self.audit_responses:
-                return self.audit_responses.pop(0)
-            for message in reversed(messages[:-1]):
-                if (
-                    isinstance(message, AIMessage)
-                    and not message.tool_calls
-                    and str(message.content).strip()
-                ):
-                    return AIMessage(content=message.content)
-            return AIMessage(content="Все части запроса подтверждены.")
         self.messages.append(messages)
         return self.responses.pop(0)
 
@@ -555,9 +618,67 @@ def test_fallback_observation_uses_raw_model_output_as_summary():
     )
 
     assert observation.summary == "Сырой вывод observer"
+    assert observation.goal_satisfied is False
     assert observation.has_error is False
     assert observation.important_facts == []
-    assert observation.limitations == []
+    assert observation.mismatches
+    assert observation.limitations == ["Ошибка observer: OutputParserException"]
+
+
+def test_observation_requires_separate_mismatch_for_failed_goal():
+    from agents.chat_graph import Observation
+
+    with pytest.raises(ValueError, match="mismatches must describe"):
+        Observation(
+            summary="Tool вернул source_table.",
+            goal_satisfied=False,
+        )
+    with pytest.raises(ValueError, match="mismatches must describe"):
+        Observation(
+            summary="Tool вернул source_table.",
+            goal_satisfied=False,
+            mismatches=["  "],
+        )
+
+    observation = Observation(
+        summary="Tool вернул source_table.",
+        goal_satisfied=False,
+        mismatches=[
+            "Task просит target_table, а tool вернул source_table."
+        ],
+    )
+
+    assert observation.mismatches == [
+        "Task просит target_table, а tool вернул source_table."
+    ]
+
+
+def test_observer_prompt_requires_semantic_task_comparison():
+    from agents.chat_graph import _OBSERVER_PROMPT, _WORKER_PLANNER_PROMPT
+
+    normalized_observer_prompt = " ".join(_OBSERVER_PROMPT.split())
+    assert "structured output" in _OBSERVER_PROMPT
+    assert "goal_satisfied=false" in _OBSERVER_PROMPT
+    assert "`mismatches`" in _OBSERVER_PROMPT
+    assert "target_table" in _OBSERVER_PROMPT
+    assert "source_table" in _OBSERVER_PROMPT
+    assert "не подтверждает task" in _OBSERVER_PROMPT
+    assert "выбранными, группируемыми и фильтруемыми полями" in _OBSERVER_PROMPT
+    assert "source_field" in _OBSERVER_PROMPT
+    assert "перечисли все обнаруженные" in _OBSERVER_PROMPT.lower()
+    assert "каждое точное значение из task" in _OBSERVER_PROMPT
+    assert "runtime-контекст и схему" in _OBSERVER_PROMPT
+    assert "финальную посимвольную сверку" in _OBSERVER_PROMPT
+    assert "требовалось ...; фактически" in _OBSERVER_PROMPT
+    assert "не требуй повторно получать этот факт" in _OBSERVER_PROMPT
+    assert "промежуточные узлы" in _OBSERVER_PROMPT
+    assert (
+        "не делают один найденный полный путь неполным"
+        in normalized_observer_prompt
+    )
+    assert "хотя бы одна строка" in _OBSERVER_PROMPT
+    assert "не вызывай finish_worker" in _WORKER_PLANNER_PROMPT
+    assert "Что выполнено неправильно" in _WORKER_PLANNER_PROMPT
 
 
 def test_run_agent_graph_executes_native_tool_call_and_uses_observer():
@@ -601,6 +722,9 @@ def test_run_agent_graph_executes_native_tool_call_and_uses_observer():
     assert calls == [True]
     assert [tool.name for tool in model.bound_tools] == ["ping"]
     assert len(model.observer.messages) == 1
+    observer_system_prompt = str(model.observer.messages[0][0].content)
+    assert observer_system_prompt.startswith("Системный контекст")
+    assert "structured output" in observer_system_prompt
     assert any(
         "ok=true" in str(message.content)
         for prompt in model.messages
@@ -670,50 +794,7 @@ def test_responder_keeps_model_table_output_without_backend_rewrite():
     )
 
 
-def test_numeric_contract_corrects_single_explicit_limit():
-    from agents.chat_graph import run_agent_graph
-
-    calls = []
-
-    def bounded_lookup(limit: int):
-        calls.append(limit)
-        return {
-            "columns": ["value"],
-            "rows": [{"value": index} for index in range(limit)],
-        }
-
-    default_call = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "bounded_lookup",
-                "args": {"limit": 100},
-                "id": "bounded-default",
-                "type": "tool_call",
-            }
-        ],
-    )
-    model = _ScriptedNativeModel(
-        [
-            default_call,
-            AIMessage(content="Три строки подтверждены."),
-            AIMessage(content="Готово."),
-        ]
-    )
-
-    out = run_agent_graph(
-        "Покажи 3 значения",
-        "Системный контекст",
-        model,
-        (_as_tool(bounded_lookup),),
-        max_steps=2,
-    )
-
-    assert calls == [3]
-    assert out == "Готово."
-
-
-def test_completion_audit_calls_tool_for_unfinished_second_step():
+def test_planner_calls_second_tool_after_observer_when_task_is_unfinished():
     from agents.chat_graph import run_agent_graph
 
     calls = []
@@ -739,11 +820,6 @@ def test_completion_audit_calls_tool_for_unfinished_second_step():
                     }
                 ],
             ),
-            AIMessage(content="Теперь покажу связи вторым инструментом."),
-            AIMessage(content="Оба инструментальных шага выполнены."),
-            AIMessage(content="Готово."),
-        ],
-        audit_responses=[
             AIMessage(
                 content="",
                 tool_calls=[
@@ -754,7 +830,9 @@ def test_completion_audit_calls_tool_for_unfinished_second_step():
                         "type": "tool_call",
                     }
                 ],
-            )
+            ),
+            AIMessage(content="Оба инструментальных шага выполнены."),
+            AIMessage(content="Готово."),
         ],
     )
 
@@ -768,19 +846,7 @@ def test_completion_audit_calls_tool_for_unfinished_second_step():
 
     assert out == "Готово."
     assert calls == ["first", "second:shared"]
-    assert len(model.audit_messages) >= 2
-    assert "ответ без tool_calls завершит весь граф" in str(
-        model.audit_messages[0][-1].content
-    )
-    assert "Фактически завершённые tools: ['first_tool']" in str(
-        model.audit_messages[0][-1].content
-    )
-    assert "не доказывает, что следующий шаг уже выполнен" in str(
-        model.audit_messages[0][-1].content
-    )
-    assert "Если пользователь указал N" in str(
-        model.audit_messages[0][-1].content
-    )
+    assert len(model.messages) == 4
 
 
 def test_error_payload_is_reported_to_planner_and_same_tool_can_retry():
@@ -848,7 +914,7 @@ def test_error_payload_is_reported_to_planner_and_same_tool_can_retry():
     )
     assert '"is_error": true' in observer_prompt
     assert "Этот инструментальный шаг содержал ошибку" in second_planner_prompt
-    assert "Повтор того же tool после ошибки разрешён" in second_planner_prompt
+    assert "После ошибки скорректируй действие" in second_planner_prompt
 
 
 def test_planner_uses_bound_tool_contracts_without_tool_specific_cases():
@@ -858,12 +924,28 @@ def test_planner_uses_bound_tool_contracts_without_tool_specific_cases():
         ("run_sql", "trace_neo4j_lineage")
     )
 
-    assert "description и схему аргументов" in instruction
-    assert "они являются его контрактом" in instruction
-    assert "передай ровно N" in instruction
+    assert "description и схему" in instruction
+    assert "сохраняй смысл" in instruction.lower()
+    assert "точные значения" in instruction
     assert "SQLITE_QUERY" not in instruction
     assert "GRAPH_NEO4J" not in instruction
     assert "table_name" not in instruction
+
+
+def test_tool_router_prompt_is_generic_and_catalog_driven():
+    from agents.tools.routing import _TOOL_ROUTER_PROMPT
+
+    assert "descriptions из каталогов" in _TOOL_ROUTER_PROMPT
+    assert "минимально достаточную палитру" in _TOOL_ROUTER_PROMPT
+    for domain_detail in (
+        "trace_neo4j_table_lineage",
+        "run_cypher",
+        "run_sql",
+        "COUNT",
+        "SQLite",
+        "Neo4j",
+    ):
+        assert domain_detail not in _TOOL_ROUTER_PROMPT
 
 
 def test_long_tool_output_reaches_planner_and_responder_with_handoff(caplog):
@@ -1278,7 +1360,7 @@ def test_run_agent_graph_can_use_show_plan_as_native_tool():
     assert "Получить список трансформаций." in observer_payload
 
 
-def test_run_agent_graph_passes_history_and_active_file_context():
+def test_run_agent_graph_passes_history_without_implicit_file_context():
     from agents.chat_graph import run_agent_graph
 
     model = _ScriptedNativeModel(
@@ -1297,19 +1379,17 @@ def test_run_agent_graph_passes_history_and_active_file_context():
             {"role": "user", "content": "Какие файлы загружены?"},
             {"role": "assistant", "content": "Загружен mapping.xlsx."},
         ],
-        file_id=42,
     )
 
     assert out == "На листе S2T."
     planner_messages = model.messages[0]
     contents = [str(message.content) for message in planner_messages]
     planner_prompt = "\n".join(contents)
-    assert any("file_id=42" in content for content in contents)
-    assert "Не применяй его к глобальной таблице" in planner_prompt
+    assert all("file_id=42" not in content for content in contents)
     assert "Какие файлы загружены?" in contents
     assert "Загружен mapping.xlsx." in contents
     assert "А какие в нём листы?" in contents
-    assert "доступные tools: нет" in planner_prompt
+    assert "доступные tools:\nнет" in planner_prompt
     assert "TABULAR_SQLITE" not in planner_prompt
     assert "GRAPH_NEO4J" not in planner_prompt
     assert "SQL_TEXT_LINEAGE" not in planner_prompt
@@ -1325,16 +1405,10 @@ def test_run_agent_graph_passes_history_and_active_file_context():
     assert "Фактов достаточно." in responder_system_text
     assert "точные значения" in responder_system_text
     assert "Выжимка observer" not in responder_system_text
-    assert "не связывай глобальный результат с активным" in responder_system_text
-    assert "глобальная таблица сейчас пуста" in responder_system_text
-
-    assert "валидный JSON-список списков" in responder_system_text
-    assert "Markdown-таблица" in responder_system_text
-    assert "запрещена" in responder_system_text
-    assert "браузер сам отрисует блок" in responder_system_text
-    assert "сохраняй все запрошенные" in responder_system_text
-    assert "text_diagram без изменений" in responder_system_text
-    assert "не пересказывай" in responder_system_text
+    assert "Сохраняй требуемую полноту" in responder_system_text
+    assert "s2t_transformations" not in responder_system_text
+    assert "target_table" not in responder_system_text
+    assert "Markdown-таблица" not in responder_system_text
 
     for prompt in [*model.messages, *model.observer.messages]:
         system_positions = [
