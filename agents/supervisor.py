@@ -13,6 +13,11 @@ from .agent import chat_model
 from .chat_graph import WorkerRunResult
 from .coordinator import COORDINATOR_CONTEXT_MAX_CHARS, coordinator_chat
 from .observability import get_callback_handler, langfuse_trace_context
+from .run_metrics import (
+    capture_agent_run,
+    get_run_metrics_callback,
+    record_display_tools,
+)
 from .worker import resolve_worker_display_refs
 
 logger = logging.getLogger(__name__)
@@ -272,20 +277,12 @@ def build_supervisor_graph(
     return graph.compile()
 
 
-def supervisor_chat(
-    user_query: str,
+def _supervisor_chat_impl(
+    clean_query: str,
     *,
     history: Optional[List[Dict[str, str]]] = None,
     session_id: Optional[str] = None,
 ) -> WorkerRunResult:
-    """Answer directly or coordinate one or more planned worker groups."""
-    clean_query = str(user_query or "").strip()
-    if not clean_query:
-        return WorkerRunResult(
-            answer="Запрос не должен быть пустым.",
-            display_items=[],
-        )
-
     initial_state: SupervisorGraphState = {
         "current_query": clean_query,
         "recent_history": [
@@ -301,6 +298,9 @@ def supervisor_chat(
     }
     callback = get_callback_handler()
     callbacks = [callback] if callback is not None else []
+    metrics_callback = get_run_metrics_callback()
+    if metrics_callback is not None and metrics_callback not in callbacks:
+        callbacks.append(metrics_callback)
     collected_display_refs: List[str] = []
     graph = build_supervisor_graph(
         chat_model,
@@ -323,13 +323,37 @@ def supervisor_chat(
             if not final_answer:
                 raise RuntimeError("Supervisor LangGraph завершился без ответа.")
             display_refs = list(final_state.get("display_refs") or [])
+            display_items = resolve_worker_display_refs(display_refs)
+            record_display_tools([item.name for item in display_items])
             return WorkerRunResult(
                 answer=final_answer,
-                display_items=resolve_worker_display_refs(display_refs),
+                display_items=display_items,
             )
         except Exception:
             resolve_worker_display_refs(collected_display_refs)
             raise
+
+
+def supervisor_chat(
+    user_query: str,
+    *,
+    history: Optional[List[Dict[str, str]]] = None,
+    session_id: Optional[str] = None,
+) -> WorkerRunResult:
+    """Answer directly or coordinate one or more planned worker groups."""
+    clean_query = str(user_query or "").strip()
+    if not clean_query:
+        return WorkerRunResult(
+            answer="Запрос не должен быть пустым.",
+            display_items=[],
+        )
+
+    with capture_agent_run(session_id):
+        return _supervisor_chat_impl(
+            clean_query,
+            history=history,
+            session_id=session_id,
+        )
 
 
 __all__ = [

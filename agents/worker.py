@@ -2,8 +2,9 @@
 
 The public worker contract accepts only one self-contained task. Tool and skill
 selection and the planner/tool/observer loop remain internal to the worker.
-The worker exposes only its concise answer and opaque references to every
-successful tool result; a higher-level coordinator selects UI results.
+The worker exposes its concise answer, a bounded internal cycle trace, and
+opaque references to every successful tool result; a higher-level coordinator
+selects UI results.
 """
 
 from __future__ import annotations
@@ -19,10 +20,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from .agent import build_chat_system_prompt, chat_model
 from .chat_graph import (
     DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS,
+    WorkerCycleTrace,
     WorkerDisplayItem,
     run_worker_graph,
 )
 from .observability import get_callback_handler
+from .run_metrics import get_run_metrics_callback, record_worker_task
 from .tools import get_tools, get_tools_for_names, load_skills
 from .tools.routing import select_chat_route
 
@@ -52,6 +55,7 @@ class WorkerAnswer(BaseModel):
 
     answer: str
     result_refs: List[WorkerResultRef] = Field(default_factory=list)
+    cycle_history: List[WorkerCycleTrace] = Field(default_factory=list)
     goal_satisfied: bool = True
     mismatches: List[str] = Field(default_factory=list)
 
@@ -115,10 +119,16 @@ def worker_chat(task: str) -> WorkerAnswer:
             mismatches=["Worker получил пустую task."],
         )
 
+    record_worker_task(clean_task)
+
     callback = get_callback_handler()
     callbacks = [callback] if callback is not None else []
+    metrics_callback = get_run_metrics_callback()
+    if metrics_callback is not None and metrics_callback not in callbacks:
+        callbacks.append(metrics_callback)
     available_tools = get_tools()
     attempted_palettes: List[Tuple[str, ...]] = []
+    cycle_history: List[WorkerCycleTrace] = []
     reroute_context: Dict[str, Any] | None = None
     reroute_count = 0
 
@@ -162,10 +172,23 @@ def worker_chat(task: str) -> WorkerAnswer:
             tool_message_preview_chars=WORKER_TOOL_MESSAGE_PREVIEW_CHARS,
             callbacks=callbacks,
         )
+        first_cycle_number = len(cycle_history) + 1
+        cycle_history.extend(
+            [
+                cycle.model_copy(
+                    update={
+                        "cycle": first_cycle_number + index,
+                        "routing_attempt": reroute_count + 1,
+                    }
+                )
+                for index, cycle in enumerate(graph_result.cycle_history)
+            ]
+        )
         if not graph_result.reroute_required:
             return WorkerAnswer(
                 answer=graph_result.answer,
                 result_refs=_store_display_items(graph_result.display_items),
+                cycle_history=cycle_history,
                 goal_satisfied=graph_result.goal_satisfied,
                 mismatches=graph_result.mismatches,
             )
@@ -178,6 +201,7 @@ def worker_chat(task: str) -> WorkerAnswer:
             return WorkerAnswer(
                 answer=reroute_reason,
                 result_refs=[],
+                cycle_history=cycle_history,
                 goal_satisfied=False,
                 mismatches=list(graph_result.mismatches),
             )

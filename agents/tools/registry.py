@@ -96,7 +96,7 @@ def get_tools_for_names(
     """Вернуть ровно выбранные read-only tools в порядке общего registry."""
     selected = tuple(dict.fromkeys(tool_names))
     if not selected:
-        raise ValueError("Нужно выбрать хотя бы один tool")
+        return ()
 
     unknown = [name for name in selected if name not in TOOLS_BY_NAME]
     if unknown:

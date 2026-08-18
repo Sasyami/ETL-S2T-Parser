@@ -93,9 +93,13 @@ def use_temp_db(tmp_path):
 def test_index(client):
     response = client.get('/')
     assert response.status_code == 200
-    assert b'AI Excel Parser' in response.data
+    assert b'ETL S2T Agent' in response.data
     body = response.data.decode("utf-8")
-    assert "void loadTransformations();" in body
+    assert "Чат с данными" in body
+    assert 'id="chatInput"' in body
+    assert 'rows="2" autofocus' in body
+    assert "Классический интерфейс" not in body
+    assert "setCurrentFile" not in body
     assert 'id="clearAllDataBtn"' in body
     assert "fetch('/storage', { method: 'DELETE' })" in body
     assert "clearTransformationsBtn" not in body
@@ -109,6 +113,7 @@ def test_chat_app_single_user_no_session_cookie(client):
     assert response.status_code == 200
     assert b'ETL S2T Agent' in response.data
     assert 'Set-Cookie' not in response.headers
+    assert response.get_data(as_text=True) == client.get('/').get_data(as_text=True)
 
 
 def test_chat_app_has_loading_indicators(client):
@@ -329,6 +334,39 @@ def test_chat_success(mock_agent, client):
         "display_items": [],
     }
     mock_agent.assert_called_once_with("List files")
+
+
+@patch("app.supervisor_chat")
+@patch("app.agent_chat")
+def test_chat_can_run_single_agent_baseline(
+    mock_single_agent,
+    mock_supervisor,
+    app,
+    client,
+):
+    app.config["CHAT_AGENT_MODE"] = "single_agent"
+    mock_single_agent.return_value = "Single-agent answer"
+
+    response = client.post(
+        "/chat",
+        json={
+            "query": "List files",
+            "history": [{"role": "user", "content": "Use SQLite"}],
+            "session_id": "baseline-session",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "answer": "Single-agent answer",
+        "display_items": [],
+    }
+    mock_single_agent.assert_called_once_with(
+        "List files",
+        history=[{"role": "user", "content": "Use SQLite"}],
+        session_id="baseline-session",
+    )
+    mock_supervisor.assert_not_called()
 
 
 @patch("app.supervisor_chat")

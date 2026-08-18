@@ -396,7 +396,6 @@
             <h1>Чат с данными</h1>
             <div class="d-flex align-items-center gap-3">
                 <button id="clearChatHistoryBtn" class="btn btn-outline-secondary btn-sm" type="button">Очистить историю</button>
-                <a href="/">Классический интерфейс</a>
             </div>
         </header>
 
@@ -404,7 +403,7 @@
 
         <footer class="composer">
             <div class="composer-inner">
-                <textarea id="chatInput" class="form-control" placeholder="Например: покажи таблицу трансформаций" rows="2"></textarea>
+                <textarea id="chatInput" class="form-control" placeholder="Например: покажи таблицу трансформаций" rows="2" autofocus></textarea>
                 <button id="sendBtn" class="btn btn-primary" type="button">Отправить</button>
             </div>
             <div id="busyText" class="busy" role="status" aria-live="polite"></div>
@@ -709,7 +708,6 @@
             );
             const graphNodes = Number((data.neo4j_deleted || {}).nodes || 0);
             const graphError = (data.neo4j_deleted || {}).error;
-            setCurrentFile({});
             fileInput.value = '';
             addMessage(
                 'system',

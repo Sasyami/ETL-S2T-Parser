@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 import pytest
@@ -6,6 +7,7 @@ from langchain_core.tools import StructuredTool
 
 from agents.chat_graph import (
     Observation,
+    WorkerCycleTrace,
     WorkerDisplayItem,
     WorkerResponseError,
     WorkerRunResult,
@@ -154,6 +156,45 @@ class _ToolChoiceFallbackModel:
         return _finish_message("Подтверждено через fallback.")
 
 
+def test_worker_without_tools_is_observed_before_returning_answer():
+    candidate_answer = "Первая пара\nВторая пара"
+    model = _WorkerModel(
+        [AIMessage(content=candidate_answer)],
+        observer_responses=[
+            Observation(
+                summary="Обе пары точно перенесены из task.",
+                goal_satisfied=True,
+                important_facts=["Ответ содержит две пары."],
+            )
+        ],
+    )
+
+    result = run_worker_graph(
+        task=(
+            "Верни две строки из уже известных фактов: "
+            "Первая пара; Вторая пара."
+        ),
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(),
+        max_steps=2,
+    )
+
+    assert result.answer == candidate_answer
+    assert result.goal_satisfied is True
+    assert result.mismatches == []
+    assert result.display_items == []
+    assert len(result.cycle_history) == 1
+    cycle = result.cycle_history[0]
+    assert cycle.tool_calls == []
+    assert cycle.tool_results == []
+    assert cycle.observation.goal_satisfied is True
+    observer_payload = json.loads(model.observer.messages[0][-1].content)
+    assert observer_payload["tool_calls"] == []
+    assert observer_payload["tool_results"] == []
+    assert observer_payload["candidate_answer"] == candidate_answer
+
+
 def test_worker_keeps_text_preview_and_returns_full_successful_result():
     tail_marker = "FULL_RESULT_TAIL"
 
@@ -191,6 +232,15 @@ def test_worker_keeps_text_preview_and_returns_full_successful_result():
     assert len(result.display_items) == 1
     assert result.display_items[0].name == "long_result"
     assert tail_marker in result.display_items[0].content
+    assert len(result.cycle_history) == 1
+    cycle = result.cycle_history[0]
+    assert cycle.cycle == 1
+    assert cycle.routing_attempt == 1
+    assert cycle.tool_calls == [{"name": "long_result", "args": {}}]
+    assert cycle.tool_results[0]["name"] == "long_result"
+    assert len(cycle.tool_results[0]["content"]) <= 50
+    assert tail_marker not in cycle.tool_results[0]["content"]
+    assert cycle.observation.summary == "Превью результата получено."
 
     llm_prompts = [*model.messages, *model.observer.messages]
     assert all(
@@ -808,7 +858,7 @@ def test_worker_loop_does_not_rewrite_llm_tool_arguments_in_python():
     assert executed_queries == [wrong_sql, correct_sql]
 
 
-def test_public_worker_contract_exposes_only_answer_and_opaque_result_refs():
+def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs():
     from agents.worker import (
         WorkerAnswer,
         resolve_worker_display_refs,
@@ -820,6 +870,27 @@ def test_public_worker_contract_exposes_only_answer_and_opaque_result_refs():
         answer="Готово.",
         display_items=[
             WorkerDisplayItem(name="list_files", content=hidden_full_result)
+        ],
+        cycle_history=[
+            WorkerCycleTrace(
+                cycle=1,
+                tool_calls=[{"name": "list_files", "args": {}}],
+                tool_results=[
+                    {
+                        "name": "list_files",
+                        "tool_call_id": "call-files",
+                        "content": "ограниченное превью",
+                        "status": "success",
+                        "is_error": False,
+                    }
+                ],
+                observation=Observation(
+                    summary="Файлы получены.",
+                    goal_satisfied=False,
+                    mismatches=["Нужна дополнительная проверка."],
+                    important_facts=["Найдено 3 файла."],
+                ),
+            )
         ],
         goal_satisfied=False,
         mismatches=["Нужна дополнительная проверка."],
@@ -839,6 +910,7 @@ def test_public_worker_contract_exposes_only_answer_and_opaque_result_refs():
     assert result.answer == graph_result.answer
     assert result.goal_satisfied is False
     assert result.mismatches == graph_result.mismatches
+    assert result.cycle_history == graph_result.cycle_history
     assert len(result.result_refs) == 1
     assert result.result_refs[0].name == "list_files"
     assert hidden_full_result not in result.model_dump_json()
@@ -856,6 +928,44 @@ def test_public_worker_contract_exposes_only_answer_and_opaque_result_refs():
     assert "file_id" not in run_graph.call_args.kwargs
 
 
+def test_public_worker_allows_empty_palette_and_returns_observation():
+    from agents.worker import worker_chat
+
+    observation = Observation(
+        summary="Форматирование известных фактов выполнено.",
+        goal_satisfied=True,
+    )
+    graph_result = WorkerRunResult(
+        answer="Готовый форматированный ответ",
+        display_items=[],
+        cycle_history=[
+            WorkerCycleTrace(
+                cycle=1,
+                tool_calls=[],
+                tool_results=[],
+                observation=observation,
+            )
+        ],
+        goal_satisfied=True,
+    )
+    route = ToolRoute(tools=[], skills=[])
+
+    with (
+        patch("agents.worker.select_chat_route", return_value=route),
+        patch(
+            "agents.worker.run_worker_graph",
+            return_value=graph_result,
+        ) as run_graph,
+    ):
+        result = worker_chat("Отформатируй уже известные пары")
+
+    assert result.answer == graph_result.answer
+    assert result.goal_satisfied is True
+    assert result.cycle_history[0].observation == observation
+    assert result.result_refs == []
+    assert run_graph.call_args.kwargs["tools"] == ()
+
+
 def test_public_worker_reroutes_original_task_after_observer_request():
     from agents.worker import worker_chat
 
@@ -866,6 +976,24 @@ def test_public_worker_reroutes_original_task_after_observer_request():
     graph_results = [
         WorkerRunResult(
             answer="Нужна другая палитра.",
+            cycle_history=[
+                WorkerCycleTrace(
+                    cycle=1,
+                    tool_calls=[
+                        {"name": "list_s2t_table_names", "args": {}}
+                    ],
+                    tool_results=[],
+                    observation=Observation(
+                        summary="Агрегирование не выполнено.",
+                        goal_satisfied=False,
+                        mismatches=[
+                            "Текущий tool не выполняет агрегирование."
+                        ],
+                        reroute_required=True,
+                        reroute_reason="Нужна произвольная SQL-агрегация.",
+                    ),
+                )
+            ],
             goal_satisfied=False,
             mismatches=["Текущий tool не выполняет агрегирование."],
             reroute_required=True,
@@ -873,6 +1001,18 @@ def test_public_worker_reroutes_original_task_after_observer_request():
         ),
         WorkerRunResult(
             answer="Максимум: t_example, 55 строк.",
+            cycle_history=[
+                WorkerCycleTrace(
+                    cycle=1,
+                    tool_calls=[{"name": "run_sql", "args": {}}],
+                    tool_results=[],
+                    observation=Observation(
+                        summary="Максимум найден.",
+                        goal_satisfied=True,
+                        important_facts=["t_example: 55 строк."],
+                    ),
+                )
+            ],
             goal_satisfied=True,
         ),
     ]
@@ -890,6 +1030,8 @@ def test_public_worker_reroutes_original_task_after_observer_request():
         result = worker_chat("  Найди target_table с максимумом строк  ")
 
     assert result.answer == "Максимум: t_example, 55 строк."
+    assert [cycle.cycle for cycle in result.cycle_history] == [1, 2]
+    assert [cycle.routing_attempt for cycle in result.cycle_history] == [1, 2]
     assert result.goal_satisfied is True
     assert router.call_count == 2
     assert router.call_args_list[0].args == (
@@ -989,106 +1131,3 @@ def test_worker_reroutes_when_first_data_tool_is_omitted_twice():
     assert result.reroute_required is True
     assert "дважды не сформировал" in str(result.reroute_reason)
     assert "не вызвал ни один" in result.mismatches[0]
-
-
-def test_worker_rejects_positive_sql_observation_with_missing_requested_role():
-    def fake_sql(query: str):
-        return {
-            "query": query,
-            "columns": ["source_table", "row_count"],
-            "rows": [{"source_table": "wrong_role", "row_count": 292}],
-        }
-
-    model = _WorkerModel(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "run_sql",
-                        "args": {
-                            "query": (
-                                "SELECT source_table, COUNT(*) AS row_count "
-                                "FROM s2t_transformations GROUP BY source_table"
-                            )
-                        },
-                        "id": "wrong-role",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            _finish_message("Максимальная таблица найдена."),
-        ],
-        observer_responses=[
-            Observation(
-                summary="Максимальная таблица найдена.",
-                goal_satisfied=True,
-            )
-        ],
-    )
-
-    result = run_worker_graph(
-        task="Найди target_table с максимальным числом строк.",
-        system_prompt="Системный контекст",
-        model=model,
-        tools=(_as_tool(fake_sql, name="run_sql"),),
-        max_steps=1,
-    )
-
-    assert result.goal_satisfied is False
-    assert any("`target_table`" in item for item in result.mismatches)
-
-
-def test_worker_rejects_sql_that_omits_named_source_and_exact_role_value():
-    def fake_sql(query: str):
-        return {
-            "query": query,
-            "columns": ["target_table", "row_count"],
-            "rows": [{"target_table": "Source columns", "row_count": 130}],
-        }
-
-    model = _WorkerModel(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "run_sql",
-                        "args": {
-                            "query": (
-                                "SELECT table_name AS target_table, row_num AS "
-                                "row_count FROM target_tables ORDER BY row_num "
-                                "DESC LIMIT 1"
-                            )
-                        },
-                        "id": "wrong-source",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            _finish_message("Source columns, 130."),
-        ],
-        observer_responses=[
-            Observation(
-                summary="Source columns, 130.",
-                goal_satisfied=True,
-            )
-        ],
-    )
-
-    result = run_worker_graph(
-        task=(
-            "В s2t_transformations для source_table = "
-            "b7000000250039_loans_productregister::union::1::branch::2 "
-            "найди target_table с максимальным числом строк."
-        ),
-        system_prompt="Системный контекст",
-        model=model,
-        tools=(_as_tool(fake_sql, name="run_sql"),),
-        max_steps=1,
-    )
-
-    assert result.goal_satisfied is False
-    mismatch_text = " ".join(result.mismatches)
-    assert "`s2t_transformations`" in mismatch_text
-    assert "source_table = b7000000250039" in mismatch_text

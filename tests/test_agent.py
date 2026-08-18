@@ -173,6 +173,23 @@ def test_agent_chat_delegates_to_native_tool_graph():
     load_runtime_skills.assert_called_once_with(("Excel и описания",))
 
 
+def test_agent_chat_passes_empty_palette_to_non_tool_graph():
+    with (
+        patch("agents.agent.run_agent_graph", return_value="Привет") as run_graph,
+        patch(
+            "agents.agent._select_chat_route",
+            return_value=ToolRoute(tools=[], skills=[]),
+        ),
+    ):
+        result = agent_chat("Ответь одним словом: привет")
+
+    assert result == "Привет"
+    assert run_graph.call_args.kwargs["tools"] == ()
+    assert "## Актуальная схема SQLite" not in (
+        run_graph.call_args.kwargs["system_prompt"]
+    )
+
+
 def test_chat_system_prompt_includes_sqlite_schema_only_for_run_sql():
     from agents.agent import build_chat_system_prompt
 
@@ -339,6 +356,9 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "descriptions из каталогов" in router_prompt
     assert "Tools дают planner доступные действия" in router_prompt
     assert "Skills выбирай независимо" in router_prompt
+    assert "минимальный набор по числу tools" in router_prompt
+    assert "специализированный tool не обязателен" in router_prompt
+    assert "Не выбирай одновременно общий и специализированный" in router_prompt
     assert "COUNT, DISTINCT, GROUP BY" not in router_prompt
     assert "обязательно включай `run_sql`" not in router_prompt
     assert "самостоятельно составить и выполнить SQL" not in model.messages[0].content
@@ -393,7 +413,9 @@ def test_worker_planner_finishes_natively_without_domain_specific_rules():
         worker_finish=True,
     )
 
-    assert "заверши работу через\nfinish_worker" in instruction
+    assert "заверши работу через finish_worker" in " ".join(
+        instruction.split()
+    )
     assert "сохраняй смысл" in instruction.lower()
     assert "точные значения task" in instruction
     assert "COUNT, DISTINCT, GROUP BY" not in instruction
@@ -489,6 +511,22 @@ def test_chat_tool_router_does_not_override_valid_llm_selection():
     assert len(model.calls) == 1
 
 
+def test_chat_tool_router_accepts_empty_selection_when_no_data_is_needed():
+    model = _SequenceToolRouterModel(
+        [AIMessage(content='{"tools":[],"skills":[]}')]
+    )
+
+    route = _select_chat_route(
+        "Ответь одним словом: привет",
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == []
+    assert route.skills == []
+    assert len(model.calls) == 1
+
+
 def test_chat_tool_router_rejects_invalid_llm_repair():
     model = _SequenceToolRouterModel(
         [
@@ -510,7 +548,6 @@ def test_chat_tool_router_rejects_invalid_llm_repair():
 def test_chat_tool_router_rejects_invalid_llm_plan():
     invalid_routes = [
         {"tools": ["unknown"], "skills": []},
-        {"tools": [], "skills": []},
         {"tools": ["run_sql"], "skills": ["unknown"]},
         {"tools": ["run_sql"]},
         {"tools": ["run_sql"], "skills": [], "reason": "extra field"},

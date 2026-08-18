@@ -715,6 +715,33 @@ def test_write_tool_reports_missing_target_table_and_keeps_existing_rows(s2t_db)
     assert dict(old_row) == {"target_table": "old_target", "target_field": "old_column"}
 
 
+def test_write_tool_ignores_rows_without_any_mapped_s2t_values(s2t_db):
+    file_id = _store_s2t(
+        ["Target Table", "Target Column", "Дата"],
+        [
+            ["t1", "c1", None],
+            [None, None, "2024-03-19"],
+        ],
+    )
+    sheet, column_ids = _column_ids(file_id)
+    mapping = {
+        "sheet_name": sheet["sheet_name"],
+        "field_column_ids": {
+            "target_table": column_ids["Target Table"],
+            "target_field": column_ids["Target Column"],
+        },
+        "evidence": {
+            **_evidence("target_table", column_ids["Target Table"]),
+            **_evidence("target_field", column_ids["Target Column"]),
+        },
+    }
+
+    result = write_s2t_transformations_from_plan(file_id, [mapping])
+
+    assert result["count"] == 1
+    assert verify_s2t_transformations(file_id)["count"] == 1
+
+
 def test_s2t_extraction_appends_without_deleting_stored_rows(s2t_db):
     file_id = _store_s2t(
         ["Target Table", "Target Column", "Source Table", "Source Column", "SQL Transform"],

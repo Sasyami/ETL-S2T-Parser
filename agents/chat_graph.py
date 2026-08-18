@@ -60,13 +60,16 @@ _PLANNER_HANDOFF_MAX_CHARS = 12000
 DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS = 6000
 _FINISH_WORKER_TOOL_NAME = "finish_worker"
 _WORKER_PLANNER_PROMPT = """
-Ты planner изолированного read-only worker. Решай переданную task только по
-подтверждённым результатам доступных data tools: {{AVAILABLE_TOOLS}}.
+Ты planner изолированного read-only worker. Доступные data tools:
+{{AVAILABLE_TOOLS}}.
 
-До первого успешного результата обязательно вызови подходящий data tool. На
-каждом следующем шаге оцени task, последний tool exchange и накопленную выжимку
-observer, затем либо вызови следующий tool, либо заверши работу через
-finish_worker. Читай description и схему выбранного tool, сохраняй смысл,
+Если data tools доступны, до первого успешного результата обязательно вызови
+подходящий data tool. Если список равен «нет», не придумывай новые факты и
+решай task только по точным фактам, уже явно содержащимся в ней; сформированный
+ответ будет отдельно проверен observer. На каждом следующем шаге оцени task,
+последний tool exchange и накопленную выжимку observer, затем либо вызови
+следующий tool, либо заверши работу через finish_worker. Читай description и
+схему выбранного tool, сохраняй смысл,
 ограничения и точные значения task. Не придумывай факты и не повторяй успешный
 вызов без новой причины. Не считай производный результат готовым входным фактом
 и не переименовывай заданную операцию. После ошибки исправь действие по
@@ -97,6 +100,11 @@ _OBSERVER_PROMPT = """
 аргументы последнего tool call и его результат. Проверь, выполнена ли именно
 запрошенная операция над теми же сущностями, ролями, полями, условиями и
 ограничениями. Успешное выполнение tool само по себе не подтверждает task.
+
+Если `tool_calls` и `tool_results` пусты, проверь поле `candidate_answer`. Такой
+режим допустим только когда task уже содержит все факты и не требует получения
+новых данных. Сопоставь candidate_answer непосредственно с task: не требуй
+фиктивный tool, но не подтверждай внешние факты, которых в task не было.
 
 Верни structured output по переданной схеме Observation. Поле `goal_satisfied`
 равно true только когда результат подтверждает выполнение всей task. Если
@@ -314,11 +322,24 @@ class Observation(BaseModel):
         return self
 
 
+class WorkerCycleTrace(BaseModel):
+    """Bounded planner/tool/observer exchange exposed to the coordinator."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cycle: int = Field(ge=1)
+    routing_attempt: int = Field(default=1, ge=1)
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_results: List[Dict[str, Any]] = Field(default_factory=list)
+    observation: Observation
+
+
 class AgentGraphState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     system_prompt: str
     planner_message: Optional[AIMessage]
     observations: List[Observation]
+    cycle_history: List[WorkerCycleTrace]
     tool_steps: int
     max_steps: int
 
@@ -470,6 +491,7 @@ class WorkerRunResult(BaseModel):
 
     answer: str
     display_items: List[WorkerDisplayItem] = Field(default_factory=list)
+    cycle_history: List[WorkerCycleTrace] = Field(default_factory=list)
     goal_satisfied: bool = Field(default=True, exclude=True)
     mismatches: List[str] = Field(default_factory=list, exclude=True)
     reroute_required: bool = Field(default=False, exclude=True)
@@ -782,112 +804,6 @@ def _fallback_observation(
     )
 
 
-def _enforce_required_sql_roles(
-    observation: Observation,
-    user_request: str,
-    tool_call_message: AIMessage,
-    tool_results: Sequence[ToolMessage],
-) -> Observation:
-    """Reject a positive audit when run_sql omitted an explicitly named role."""
-    if not observation.goal_satisfied:
-        return observation
-    sql_calls = [
-        call
-        for call in tool_call_message.tool_calls
-        if call.get("name") == "run_sql"
-    ]
-    if not sql_calls:
-        return observation
-
-    request_text = str(user_request or "").lower()
-    evidence_text = "\n".join(
-        [
-            *(
-                json.dumps(
-                    call.get("args") or {},
-                    ensure_ascii=False,
-                    default=str,
-                )
-                for call in sql_calls
-            ),
-            *(
-                _message_content_text(message.content)
-                for message in tool_results
-            ),
-        ]
-    ).lower()
-    role_names = (
-        "source_table",
-        "source_field",
-        "target_table",
-        "target_field",
-    )
-    missing_roles = [
-        role
-        for role in role_names
-        if re.search(rf"(?<!\w){re.escape(role)}(?!\w)", request_text)
-        and not re.search(
-            rf"(?<!\w){re.escape(role)}(?!\w)",
-            evidence_text,
-        )
-    ]
-    missing_sources = [
-        source_name
-        for source_name in ("s2t_transformations",)
-        if re.search(
-            rf"(?<!\w){re.escape(source_name)}(?!\w)",
-            request_text,
-        )
-        and not re.search(
-            rf"(?<!\w){re.escape(source_name)}(?!\w)",
-            evidence_text,
-        )
-    ]
-    named_role_values = [
-        (match.group(1).lower(), match.group(2).strip("`'\".()"))
-        for match in re.finditer(
-            r"(?<!\w)(source_table|target_table)\s*=\s*"
-            r"[`'\"]?([^\s,;`'\"]+)",
-            request_text,
-        )
-    ]
-    missing_role_values = [
-        (role, value)
-        for role, value in named_role_values
-        if value and value not in evidence_text
-    ]
-    if not missing_roles and not missing_sources and not missing_role_values:
-        return observation
-
-    return Observation(
-        summary=observation.summary,
-        goal_satisfied=False,
-        mismatches=[
-            *observation.mismatches,
-            *(
-                f"Требовалось поле `{role}`, но оно отсутствует и в "
-                "аргументах run_sql, и в его результате."
-                for role in missing_roles
-            ),
-            *(
-                f"Требовался источник `{source_name}`, но run_sql не "
-                "использовал его и не вернул из него результат."
-                for source_name in missing_sources
-            ),
-            *(
-                f"Требовалось условие `{role} = {value}`, но точное значение "
-                "отсутствует и в аргументах run_sql, и в его результате."
-                for role, value in missing_role_values
-            ),
-        ],
-        has_error=observation.has_error,
-        important_facts=observation.important_facts,
-        limitations=observation.limitations,
-        reroute_required=False,
-        reroute_reason=None,
-    )
-
-
 def build_agent_graph(
     model: Any,
     tools: Mapping[str, BaseTool] | Sequence[BaseTool],
@@ -900,10 +816,16 @@ def build_agent_graph(
     tool_list = _normalize_tools(tools)
     tool_names = tuple(tool.name for tool in tool_list)
     finish_schema = _finish_worker_tool_schema()
-    planner_model = model.bind_tools(
-        [*tool_list, finish_schema] if worker_finish else tool_list
+    planner_model = (
+        model.bind_tools([*tool_list, finish_schema])
+        if worker_finish
+        else (model.bind_tools(tool_list) if tool_list else model)
     )
-    first_data_model = model.bind_tools(tool_list) if worker_finish else None
+    first_data_model = (
+        model.bind_tools(tool_list)
+        if worker_finish and tool_list
+        else None
+    )
     first_tool_model = first_data_model
     if worker_finish and len(tool_list) == 1:
         try:
@@ -987,6 +909,7 @@ def build_agent_graph(
 
         if (
             worker_finish
+            and bool(tool_list)
             and state["tool_steps"] == 0
             and not any(
                 call.get("name") in tool_names
@@ -1249,7 +1172,32 @@ def build_agent_graph(
         }
 
     def observer(state: AgentGraphState) -> Dict[str, Any]:
-        tool_call_message, tool_results = _latest_tool_exchange(state["messages"])
+        planner_message = state.get("planner_message")
+        no_tool_cycle = bool(
+            worker_finish
+            and not tool_list
+            and planner_message is not None
+        )
+        candidate_answer = ""
+        if no_tool_cycle:
+            assert planner_message is not None
+            finish_calls = [
+                call
+                for call in planner_message.tool_calls
+                if call.get("name") == _FINISH_WORKER_TOOL_NAME
+            ]
+            if len(finish_calls) == 1 and len(planner_message.tool_calls) == 1:
+                candidate_answer = _worker_finish_payload(
+                    finish_calls[0]
+                ).answer
+            elif not planner_message.tool_calls:
+                candidate_answer = _message_text(planner_message)
+            tool_call_message = AIMessage(content=candidate_answer)
+            tool_results: List[ToolMessage] = []
+        else:
+            tool_call_message, tool_results = _latest_tool_exchange(
+                state["messages"]
+            )
 
         payload = {
             "user_request": _last_user_query(state["messages"]),
@@ -1272,6 +1220,7 @@ def build_agent_graph(
             "tool_results": [
                 _tool_message_payload(message) for message in tool_results
             ],
+            "candidate_answer": candidate_answer,
         }
 
         prior_state_rule = (
@@ -1315,26 +1264,31 @@ def build_agent_graph(
                 observation_payload = observation.model_dump()
                 observation_payload["has_error"] = True
                 observation = Observation.model_validate(observation_payload)
-            observation = _enforce_required_sql_roles(
-                observation,
-                payload["user_request"],
-                tool_call_message,
-                tool_results,
-            )
         except Exception as exc:
             logger.exception("Structured observer failed")
-            observation = _fallback_observation(
-                tool_call_message,
-                tool_results,
-                exc,
-            )
+            if no_tool_cycle:
+                observation = Observation(
+                    summary="Не удалось проверить ответ worker без tools.",
+                    goal_satisfied=False,
+                    mismatches=[
+                        "Structured observer не подтвердил candidate_answer."
+                    ],
+                    has_error=True,
+                    limitations=[f"Observer error: {type(exc).__name__}"],
+                )
+            else:
+                observation = _fallback_observation(
+                    tool_call_message,
+                    tool_results,
+                    exc,
+                )
 
         observation = _compact_observation(observation)
         logger.info(
             "Observer result: %s",
             observation.model_dump_json()[:2000],
         )
-        return {
+        update: Dict[str, Any] = {
             "observations": (
                 [observation]
                 if worker_finish
@@ -1344,6 +1298,27 @@ def build_agent_graph(
                 ]
             )
         }
+        if worker_finish:
+            prior_cycles = list(state.get("cycle_history") or [])
+            update["cycle_history"] = [
+                *prior_cycles,
+                WorkerCycleTrace(
+                    cycle=len(prior_cycles) + 1,
+                    tool_calls=[
+                        {
+                            "name": str(call.get("name") or "unknown_tool"),
+                            "args": call.get("args", {}),
+                        }
+                        for call in tool_call_message.tool_calls
+                    ],
+                    tool_results=[
+                        _tool_message_payload(message)
+                        for message in tool_results
+                    ],
+                    observation=observation,
+                ),
+            ]
+        return update
 
     def responder(state: AgentGraphState) -> Dict[str, Any]:
         response_instruction = _LEGACY_RESPONDER_PROMPT
@@ -1392,9 +1367,11 @@ def build_agent_graph(
 
     def route_after_planner(
         state: AgentGraphState,
-    ) -> Literal["prepare_tool", "responder", "finish"]:
+    ) -> Literal["prepare_tool", "observer", "responder", "finish"]:
         planner_message = state.get("planner_message")
         if worker_finish:
+            if not tool_list:
+                return "observer"
             if planner_message is not None and any(
                 call.get("name") == _FINISH_WORKER_TOOL_NAME
                 for call in planner_message.tool_calls
@@ -1409,6 +1386,14 @@ def build_agent_graph(
             return "prepare_tool"
         return "responder"
 
+    def route_after_observer(
+        state: AgentGraphState,
+    ) -> Literal["planner", "finish"]:
+        del state
+        if worker_finish and not tool_list:
+            return "finish"
+        return "planner"
+
     graph = StateGraph(AgentGraphState)
     graph.add_node("planner", planner)
     graph.add_node("prepare_tool", prepare_tool_call)
@@ -1422,13 +1407,21 @@ def build_agent_graph(
         route_after_planner,
         {
             "prepare_tool": "prepare_tool",
+            "observer": "observer",
             "responder": "responder",
             "finish": END,
         },
     )
     graph.add_edge("prepare_tool", "tools")
     graph.add_edge("tools", "observer")
-    graph.add_edge("observer", "planner")
+    graph.add_conditional_edges(
+        "observer",
+        route_after_observer,
+        {
+            "planner": "planner",
+            "finish": END,
+        },
+    )
     graph.add_edge("responder", END)
 
     return graph.compile()
@@ -1465,6 +1458,7 @@ def run_agent_graph(
         "system_prompt": system_prompt,
         "planner_message": None,
         "observations": [],
+        "cycle_history": [],
         "tool_steps": 0,
         "max_steps": bounded_steps,
     }
@@ -1554,6 +1548,7 @@ def run_worker_graph(
         "system_prompt": system_prompt,
         "planner_message": None,
         "observations": [],
+        "cycle_history": [],
         "tool_steps": 0,
         "max_steps": bounded_steps,
     }
@@ -1593,6 +1588,7 @@ def run_worker_graph(
         return WorkerRunResult(
             answer=reroute_reason,
             display_items=[],
+            cycle_history=list(final_state.get("cycle_history") or []),
             goal_satisfied=False,
             mismatches=list(latest_observation.mismatches),
             reroute_required=True,
@@ -1653,6 +1649,7 @@ def run_worker_graph(
     return WorkerRunResult(
         answer=answer,
         display_items=display_items,
+        cycle_history=list(final_state.get("cycle_history") or []),
         goal_satisfied=goal_satisfied,
         mismatches=mismatches,
     )

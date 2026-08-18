@@ -414,7 +414,7 @@ def test_resolve_file_uses_exact_filename_case_insensitively():
     )
 
 
-def test_registry_selects_exact_tools_by_name_and_rejects_invalid_selection():
+def test_registry_selects_exact_tools_by_name_and_allows_empty_selection():
     from agents.tools import get_tools_for_names
 
     selected = get_tools_for_names(("run_sql", "visualize_sql_lineage"))
@@ -423,8 +423,7 @@ def test_registry_selects_exact_tools_by_name_and_rejects_invalid_selection():
         "visualize_sql_lineage",
     }
 
-    with pytest.raises(ValueError, match="хотя бы один"):
-        get_tools_for_names(())
+    assert get_tools_for_names(()) == ()
 
     with pytest.raises(ValueError, match="unknown"):
         get_tools_for_names(("unknown",))

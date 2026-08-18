@@ -1,4 +1,4 @@
-"""LLM-driven LangGraph coordinator for isolated workers."""
+"""LLM-driven worker coordinator with an isolated final aggregator."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from .agent import chat_model
 from .observability import get_callback_handler, langfuse_trace_context
+from .run_metrics import get_run_metrics_callback, record_coordinator_plan
 from .worker import discard_worker_result_refs, worker_chat
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ COORDINATOR_MAX_WORKERS = 4
 COORDINATOR_CONTEXT_MAX_CHARS = 4000
 _PLAN_TOOL_NAME = "submit_worker_plan"
 _DISPATCH_TOOL_NAME = "dispatch_worker"
+_COORDINATE_TOOL_NAME = "submit_coordination_result"
 _FINISH_TOOL_NAME = "finish_coordination"
 
 
@@ -68,7 +70,7 @@ class WorkerDispatch(BaseModel):
 
 
 class CoordinationFinish(BaseModel):
-    """Aggregated answer and selected full worker results."""
+    """Coordinator synthesis over worker runs and selected UI results."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -103,6 +105,29 @@ class CoordinationFinish(BaseModel):
         return result
 
 
+class FinalAggregation(BaseModel):
+    """Final user-facing answer produced only from coordinator synthesis."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str = Field(min_length=1)
+
+    @field_validator("answer", mode="before")
+    @classmethod
+    def _serialize_structured_answer(cls, value: Any) -> Any:
+        if isinstance(value, (Mapping, list, tuple, int, float, bool)):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return value
+
+    @field_validator("answer")
+    @classmethod
+    def _strip_answer(cls, value: str) -> str:
+        clean_value = value.strip()
+        if not clean_value:
+            raise ValueError("answer must not be blank")
+        return clean_value
+
+
 class CoordinatorAnswer(BaseModel):
     """Coordinator output consumed by the top-level supervisor."""
 
@@ -123,6 +148,7 @@ class CoordinatorWorkerRun(TypedDict):
     goal: str
     task: str
     answer: str
+    cycle_history: List[Dict[str, Any]]
     result_refs: List[CoordinatorResultRef]
     goal_satisfied: bool
     mismatches: List[str]
@@ -135,6 +161,7 @@ class CoordinatorGraphState(TypedDict):
     next_step: int
     pending_task: Optional[str]
     worker_runs: List[CoordinatorWorkerRun]
+    coordinator_result: Optional[Dict[str, Any]]
     final_answer: Optional[str]
     selected_display_refs: List[str]
 
@@ -211,11 +238,18 @@ _DISPATCH_PROMPT = f"""
 цели. Подставляй подтверждённые предыдущим worker значения в зависимый шаг, не
 заставляя worker повторять завершённую работу.
 
+Каждый completed worker содержит краткий answer и ordered `cycle_history`:
+вызовы tools, ограниченные текстовые preview их результатов и structured
+observation. Используй историю, чтобы сохранить точный смысл подтверждённых
+фактов и зависимостей. Это не полные результаты tools. Ошибочные промежуточные
+циклы нужны только для понимания исправлений; подтверждёнными считай факты из
+цикла, observation которого завершает goal с `goal_satisfied=true`.
+
 Факты completed_workers являются подтверждёнными входными условиями зависимого
 шага, а не новой целью. Не проси текущий worker повторно получать, проверять,
 пересчитывать или возвращать их, если current_step.goal этого явно не требует.
 Task должна запрашивать только новые факты текущей операции; итоговый aggregator
-сам объединит их с ответами предыдущих workers.
+сам объединит их с ответами и историей предыдущих workers.
 
 Если original_task или current_step.goal содержит неразрешённую ссылку на
 объект, используй точное однозначное название из `context` и обязательно замени
@@ -255,8 +289,8 @@ Worker не должен восстанавливать источник по д
 original_task, а все повторения точных идентификаторов совпадают с источником.
 """.strip()
 
-_AGGREGATE_PROMPT = f"""
-Ты aggregator промежуточного coordinator. Сформируй итоговый ответ по исходной
+_COORDINATE_PROMPT = f"""
+Ты coordinator результатов workers. Сформируй самодостаточный результат по исходной
 задаче, плану и кратким ответам workers, затем выбери полезные полные результаты
 для отдельного показа в UI.
 
@@ -270,7 +304,7 @@ _AGGREGATE_PROMPT = f"""
 При требовании «только» верни ровно перечисленные пользователем элементы без
 вступления, заключения, подтверждения, интерпретации и иных пояснений.
 
-Верни ровно один native call `{_FINISH_TOOL_NAME}`:
+Верни ровно один native call `{_COORDINATE_TOOL_NAME}`:
 - `answer`: всегда строка с самодостаточным ответом пользователю без внутренних
   терминов. Даже если пользователь запросил JSON, объект или список, сериализуй
   требуемое представление внутрь строки `answer`; никогда не передавай объект,
@@ -278,13 +312,19 @@ _AGGREGATE_PROMPT = f"""
 - `display_result_keys`: ключи только тех доступных результатов, которые нужно
   показать полностью отдельно.
 
-Полные tool results намеренно не передаются. Не придумывай отсутствующие факты
-или ключи. Сохраняй связи между значениями и объединяй результаты зависимых
-шагов по смыслу исходной задачи. Сохраняй в answer точные идентификаторы,
-порядок и числовые значения из кратких worker-ответов, не заменяя их общими
-описаниями. Считай шаг выполненным только если краткий ответ worker явно
-подтверждает требуемый goal. При неоднозначности, противоречии или ошибке не
-назначай значению нужную роль и честно укажи, какой факт не подтверждён.
+Полные tool results намеренно не передаются. Каждый worker result содержит
+ordered `cycle_history`: точные tool calls, ограниченные текстовые preview и
+structured observations. Используй её вместе с кратким answer, чтобы не терять
+роль и происхождение фактов. Ошибочный промежуточный вызов не является фактом
+для итогового ответа; учитывай его только как исправленную попытку. Опирайся на
+important_facts и summary observation того цикла, который подтверждает goal.
+Не придумывай отсутствующие факты или ключи. Сохраняй связи между значениями и
+объединяй результаты зависимых шагов по смыслу исходной задачи. Сохраняй в
+answer точные идентификаторы, порядок и числовые значения из подтверждённых
+worker-результатов, не заменяя их общими описаниями. Считай шаг выполненным только если
+worker answer и его финальная observation подтверждают требуемый goal. При
+неоднозначности, противоречии или ошибке не назначай значению нужную
+роль и честно укажи, какой факт не подтверждён.
 Если у worker указан `goal_satisfied=false`, план остановлен на этом шаге:
 используй его `mismatches` для краткого пользовательского ограничения, не
 продолжай зависимые вычисления мысленно и не выбирай display results этого шага.
@@ -298,13 +338,33 @@ _AGGREGATE_PROMPT = f"""
 полученный результат.
 """.strip()
 
-_AGGREGATE_REPAIR_PROMPT = f"""
-Предыдущий native call `{_FINISH_TOOL_NAME}` не соответствует его технической
+_COORDINATE_REPAIR_PROMPT = f"""
+Предыдущий native call `{_COORDINATE_TOOL_NAME}` не соответствует его технической
 схеме. Верни исправленный native call ровно один раз. Поле `answer` обязательно
 должно быть строкой. Если пользовательский ответ имеет форму JSON-объекта,
 массива, числа или другой структуры, сериализуй её в текст внутри `answer`, не
 меняя подтверждённые факты. `display_result_keys` должен оставаться массивом
 доступных строковых ключей. Не добавляй новые факты и не вызывай другие tools.
+""".strip()
+
+_AGGREGATE_PROMPT = f"""
+Ты финальный aggregator. На входе находится только самодостаточный
+`coordinator_result`, уже собранный coordinator по результатам workers.
+
+Верни ровно один native call `{_FINISH_TOOL_NAME}` с единственным полем
+`answer`. Сохрани все факты, точные идентификаторы, числа, связи, порядок и
+форму ответа из `coordinator_result.answer`. Ничего не добавляй, не удаляй, не
+переоценивай и не пытайся восстановить исходную задачу или внутреннюю историю.
+Не упоминай coordinator, workers, tools и observations. Если answer уже готов
+для пользователя, перенеси его без смысловых изменений. Даже если это JSON,
+объект, массив или число, значение технического поля `answer` должно быть
+строкой.
+""".strip()
+
+_AGGREGATE_REPAIR_PROMPT = f"""
+Предыдущий native call `{_FINISH_TOOL_NAME}` не соответствует технической
+схеме. Верни исправленный native call с единственным строковым полем `answer`.
+Сохрани `coordinator_result.answer` без добавления и потери фактов.
 """.strip()
 
 
@@ -383,12 +443,15 @@ def _dispatch_tool_schema() -> Dict[str, Any]:
     }
 
 
-def _finish_tool_schema() -> Dict[str, Any]:
+def _coordination_result_tool_schema() -> Dict[str, Any]:
     return {
         "type": "function",
         "function": {
-            "name": _FINISH_TOOL_NAME,
-            "description": "Вернуть итог и выбрать полные результаты для UI.",
+            "name": _COORDINATE_TOOL_NAME,
+            "description": (
+                "Собрать результат coordinator и выбрать полные результаты "
+                "workers для UI."
+            ),
             "parameters": {
             "type": "object",
             "properties": {
@@ -405,6 +468,32 @@ def _finish_tool_schema() -> Dict[str, Any]:
                 },
             },
             "required": ["answer", "display_result_keys"],
+            "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _finish_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": _FINISH_TOOL_NAME,
+            "description": (
+                "Вернуть окончательный текст только из результата coordinator."
+            ),
+            "parameters": {
+            "type": "object",
+            "properties": {
+                "answer": {
+                    "type": "string",
+                    "description": (
+                        "Пользовательский ответ без добавления или потери "
+                        "фактов результата coordinator"
+                    ),
+                },
+            },
+            "required": ["answer"],
             "additionalProperties": False,
             },
         },
@@ -441,11 +530,12 @@ def build_coordinator_graph(
     callbacks: Optional[Sequence[Any]] = None,
     collected_result_refs: Optional[List[str]] = None,
 ):
-    """Build the LLM plan -> dispatch -> worker -> aggregate graph."""
+    """Build plan -> workers -> coordinate -> final aggregate graph."""
     callback_list = list(callbacks or [])
     model_config = {"callbacks": callback_list} if callback_list else None
     plan_model = model.bind_tools([_plan_tool_schema()])
     dispatch_model = model.bind_tools([_dispatch_tool_schema()])
+    coordinate_model = model.bind_tools([_coordination_result_tool_schema()])
     aggregate_model = model.bind_tools([_finish_tool_schema()])
 
     def invoke(selected_model: Any, messages: Sequence[BaseMessage]) -> Any:
@@ -488,6 +578,7 @@ def build_coordinator_graph(
             len(plan.steps),
             json.dumps(plan_payload, ensure_ascii=False),
         )
+        record_coordinator_plan(plan_payload)
         return {
             "plan": [step.model_dump() for step in plan.steps],
             "next_step": 0,
@@ -502,6 +593,7 @@ def build_coordinator_graph(
                 "goal": run["goal"],
                 "task": run["task"],
                 "answer": run["answer"],
+                "cycle_history": list(run["cycle_history"]),
             }
             for run in state["worker_runs"]
         ]
@@ -559,6 +651,10 @@ def build_coordinator_graph(
                 "goal": state["plan"][step_index]["goal"],
                 "task": worker_task,
                 "answer": worker_result.answer,
+                "cycle_history": [
+                    cycle.model_dump(mode="json")
+                    for cycle in worker_result.cycle_history
+                ],
                 "result_refs": [],
                 "goal_satisfied": False,
                 "mismatches": list(worker_result.mismatches),
@@ -585,6 +681,10 @@ def build_coordinator_graph(
             "goal": state["plan"][step_index]["goal"],
             "task": worker_task,
             "answer": worker_result.answer,
+            "cycle_history": [
+                cycle.model_dump(mode="json")
+                for cycle in worker_result.cycle_history
+            ],
             "result_refs": result_refs,
             "goal_satisfied": worker_result.goal_satisfied,
             "mismatches": list(worker_result.mismatches),
@@ -595,13 +695,14 @@ def build_coordinator_graph(
             "pending_task": None,
         }
 
-    def aggregate_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+    def coordinate_node(state: CoordinatorGraphState) -> Dict[str, Any]:
         worker_payload = [
             {
                 "step": run["step"],
                 "goal": run["goal"],
                 "task": run["task"],
                 "answer": run["answer"],
+                "cycle_history": list(run["cycle_history"]),
                 "goal_satisfied": run["goal_satisfied"],
                 "mismatches": list(run["mismatches"]),
                 "available_results": [
@@ -619,8 +720,8 @@ def build_coordinator_graph(
             for run in state["worker_runs"]
             for result_ref in run["result_refs"]
         }
-        aggregate_messages: List[BaseMessage] = [
-            SystemMessage(content=_AGGREGATE_PROMPT),
+        coordinate_messages: List[BaseMessage] = [
+            SystemMessage(content=_COORDINATE_PROMPT),
             HumanMessage(
                 content=json.dumps(
                     {
@@ -633,29 +734,29 @@ def build_coordinator_graph(
                 )
             ),
         ]
-        result = invoke(aggregate_model, aggregate_messages)
+        result = invoke(coordinate_model, coordinate_messages)
         try:
             finish = _native_payload(
                 result,
-                _FINISH_TOOL_NAME,
+                _COORDINATE_TOOL_NAME,
                 CoordinationFinish,
             )
         except CoordinatorResponseError:
             logger.warning(
-                "Coordinator aggregate call violated finish schema; "
+                "Coordinator synthesis call violated result schema; "
                 "requesting one LLM repair"
             )
             repaired_result = invoke(
-                aggregate_model,
+                coordinate_model,
                 [
-                    *aggregate_messages,
+                    *coordinate_messages,
                     result,
-                    HumanMessage(content=_AGGREGATE_REPAIR_PROMPT),
+                    HumanMessage(content=_COORDINATE_REPAIR_PROMPT),
                 ],
             )
             finish = _native_payload(
                 repaired_result,
-                _FINISH_TOOL_NAME,
+                _COORDINATE_TOOL_NAME,
                 CoordinationFinish,
             )
         assert isinstance(finish, CoordinationFinish)
@@ -668,23 +769,70 @@ def build_coordinator_graph(
                 + ", ".join(unknown_keys)
             )
         return {
-            "final_answer": finish.answer,
+            "coordinator_result": {
+                "answer": finish.answer,
+                "display_result_keys": list(finish.display_result_keys),
+            },
             "selected_display_refs": [
                 refs_by_key[key] for key in finish.display_result_keys
             ],
         }
 
+    def aggregate_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+        coordinator_result = state.get("coordinator_result")
+        if not coordinator_result:
+            raise CoordinatorResponseError(
+                "Финальный aggregator вызван без результата coordinator."
+            )
+        aggregate_messages: List[BaseMessage] = [
+            SystemMessage(content=_AGGREGATE_PROMPT),
+            HumanMessage(
+                content=json.dumps(
+                    {"coordinator_result": coordinator_result},
+                    ensure_ascii=False,
+                )
+            ),
+        ]
+        result = invoke(aggregate_model, aggregate_messages)
+        try:
+            aggregation = _native_payload(
+                result,
+                _FINISH_TOOL_NAME,
+                FinalAggregation,
+            )
+        except CoordinatorResponseError:
+            logger.warning(
+                "Final aggregate call violated finish schema; requesting one "
+                "LLM repair"
+            )
+            repaired_result = invoke(
+                aggregate_model,
+                [
+                    *aggregate_messages,
+                    result,
+                    HumanMessage(content=_AGGREGATE_REPAIR_PROMPT),
+                ],
+            )
+            aggregation = _native_payload(
+                repaired_result,
+                _FINISH_TOOL_NAME,
+                FinalAggregation,
+            )
+        assert isinstance(aggregation, FinalAggregation)
+        return {"final_answer": aggregation.answer}
+
     def route_after_worker(
         state: CoordinatorGraphState,
-    ) -> Literal["materialize", "aggregate"]:
+    ) -> Literal["materialize", "coordinate"]:
         if state["next_step"] < len(state["plan"]):
             return "materialize"
-        return "aggregate"
+        return "coordinate"
 
     graph = StateGraph(CoordinatorGraphState)
     graph.add_node("plan", plan_node)
     graph.add_node("materialize", materialize_node)
     graph.add_node("worker", worker_node)
+    graph.add_node("coordinate", coordinate_node)
     graph.add_node("aggregate", aggregate_node)
     graph.add_edge(START, "plan")
     graph.add_edge("plan", "materialize")
@@ -692,8 +840,9 @@ def build_coordinator_graph(
     graph.add_conditional_edges(
         "worker",
         route_after_worker,
-        {"materialize": "materialize", "aggregate": "aggregate"},
+        {"materialize": "materialize", "coordinate": "coordinate"},
     )
+    graph.add_edge("coordinate", "aggregate")
     graph.add_edge("aggregate", END)
     return graph.compile()
 
@@ -710,6 +859,9 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
 
     callback = get_callback_handler()
     callbacks = [callback] if callback is not None else []
+    metrics_callback = get_run_metrics_callback()
+    if metrics_callback is not None and metrics_callback not in callbacks:
+        callbacks.append(metrics_callback)
     collected_result_refs: List[str] = []
     graph = build_coordinator_graph(
         chat_model,
@@ -723,6 +875,7 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
         "next_step": 0,
         "pending_task": None,
         "worker_runs": [],
+        "coordinator_result": None,
         "final_answer": None,
         "selected_display_refs": [],
     }
@@ -764,6 +917,7 @@ __all__ = [
     "COORDINATOR_MAX_WORKERS",
     "COORDINATOR_CONTEXT_MAX_CHARS",
     "CoordinationFinish",
+    "FinalAggregation",
     "CoordinatorAnswer",
     "CoordinatorGraphState",
     "CoordinatorResponseError",

@@ -15,6 +15,7 @@ from langchain_core.utils.json import parse_json_markdown
 from .chat_graph import run_agent_graph
 from .header_classifier import predict_header_row
 from .llm_factory import create_chat_model, get_chat_model_name
+from .run_metrics import capture_agent_run, get_run_metrics_callback
 from .tools.routing import select_chat_route as _select_chat_route
 from .tools import (
     get_sqlite_schema_cheatsheet,
@@ -305,22 +306,17 @@ def _get_langfuse_callbacks() -> List[Any]:
     return [callback] if callback is not None else []
 
 
-def agent_chat(
-    user_query: str,
+def _agent_chat_impl(
+    clean_query: str,
     max_steps: int = 5,
     history: Optional[List[Dict[str, str]]] = None,
     session_id: Optional[str] = None,
     user_id: Optional[str] = None,
 ) -> str:
-    """
-    Запустить read-only LangGraph-агента с нативным tool calling.
-    """
-    clean_query = user_query.strip()
-
-    if not clean_query:
-        return "Запрос не должен быть пустым."
-
     callbacks = _get_langfuse_callbacks()
+    metrics_callback = get_run_metrics_callback()
+    if metrics_callback is not None and metrics_callback not in callbacks:
+        callbacks.append(metrics_callback)
     available_tools = get_tools()
     route = _select_chat_route(
         clean_query,
@@ -356,3 +352,25 @@ def agent_chat(
         trace_tags=["chat"],
         trace_metadata={},
     )
+
+
+def agent_chat(
+    user_query: str,
+    max_steps: int = 5,
+    history: Optional[List[Dict[str, str]]] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> str:
+    """Запустить read-only немультиагентный LangGraph."""
+    clean_query = str(user_query or "").strip()
+    if not clean_query:
+        return "Запрос не должен быть пустым."
+
+    with capture_agent_run(session_id):
+        return _agent_chat_impl(
+            clean_query,
+            max_steps=max_steps,
+            history=history,
+            session_id=session_id,
+            user_id=user_id,
+        )

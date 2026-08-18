@@ -152,6 +152,8 @@ def write_s2t_transformations_from_plan(
             values = {
                 field: clean_value(row.get(selected.get(field))) for field in S2T_FIELDS
             }
+            if not any(values.values()):
+                continue
             layers = resolve_sheet_layers(
                 mapping["sheet_name"], sheet_group=USEFULL_SHEET_GROUP
             )

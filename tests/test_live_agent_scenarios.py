@@ -2,7 +2,9 @@
 
 These tests intentionally execute one user request per test without mocks,
 parameterization, batching, or parallel calls. Enable them explicitly with
-``RUN_LIVE_AGENT_SCENARIOS=1``.
+``RUN_LIVE_AGENT_SCENARIOS=1``. Set ``LIVE_AGENT_MODE=single_agent`` to run
+the same acceptance scenarios through the non-multiagent baseline; the default
+is ``multiagent``.
 """
 
 from __future__ import annotations
@@ -14,19 +16,30 @@ import threading
 import urllib.error
 import urllib.request
 from csv import DictReader
+from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
+from time import perf_counter
 from typing import Iterator
 from uuid import uuid4
 
 import pytest
 
 import storage.database as db_storage
+from agents.run_metrics import AgentRunMetrics, consume_agent_run_metrics
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LIVE_DB_PATH = PROJECT_ROOT / "excel_data.db"
 LIVE_TRANSCRIPT_PATH = os.getenv("LIVE_AGENT_TRANSCRIPT_PATH", "").strip()
+LIVE_AGENT_MODE = (
+    os.getenv("LIVE_AGENT_MODE", "multiagent").strip().lower()
+    or "multiagent"
+)
+if LIVE_AGENT_MODE not in {"multiagent", "single_agent"}:
+    raise ValueError(
+        "LIVE_AGENT_MODE must be 'multiagent' or 'single_agent'"
+    )
 LIVE_AGENT_ENABLED = os.getenv("RUN_LIVE_AGENT_SCENARIOS", "").strip().lower() in {
     "1",
     "true",
@@ -110,24 +123,53 @@ def _payload_table_paths(payload: dict) -> list[list[str]]:
     return paths
 
 
+@dataclass(frozen=True)
+class _LiveExchange:
+    result: object
+    metrics: AgentRunMetrics
+    http_elapsed_seconds: float
+
+
 def _chat(client, query: str, *, history: list[dict] | None = None):
     from agents.chat_graph import WorkerRunResult
 
+    session_id = f"live-agent-{uuid4()}"
+    started_at = perf_counter()
     response = client.post(
         "/chat",
         json={
             "query": query,
             "history": list(history or []),
-            "session_id": f"live-agent-{uuid4()}",
+            "session_id": session_id,
         },
     )
+    http_elapsed_seconds = perf_counter() - started_at
     payload = response.get_json()
-    _record_live_exchange(query, response.status_code, payload)
+    metrics = consume_agent_run_metrics(session_id)
+    _record_live_exchange(
+        query,
+        response.status_code,
+        payload,
+        metrics=metrics,
+        http_elapsed_seconds=http_elapsed_seconds,
+    )
     assert response.status_code == 200, payload
-    return WorkerRunResult.model_validate(payload)
+    assert metrics is not None, "live run did not publish agent metrics"
+    return _LiveExchange(
+        result=WorkerRunResult.model_validate(payload),
+        metrics=metrics,
+        http_elapsed_seconds=http_elapsed_seconds,
+    )
 
 
-def _record_live_exchange(query: str, status_code: int, payload) -> None:
+def _record_live_exchange(
+    query: str,
+    status_code: int,
+    payload,
+    *,
+    metrics: AgentRunMetrics | None,
+    http_elapsed_seconds: float,
+) -> None:
     """Append a human-readable request/response pair for an opt-in live run."""
     if not LIVE_TRANSCRIPT_PATH:
         return
@@ -148,19 +190,97 @@ def _record_live_exchange(query: str, status_code: int, payload) -> None:
         answer = payload
         display_names = []
 
+    metrics_block = "Метрики недоступны"
+    if metrics is not None:
+        metrics_block = (
+            f"agent_seconds: {metrics.elapsed_seconds:.3f}\n"
+            f"http_seconds: {http_elapsed_seconds:.3f}\n"
+            f"llm_calls: {len(metrics.llm_calls)}\n"
+            f"tokens: input={metrics.input_tokens}, "
+            f"output={metrics.output_tokens}, total={metrics.total_tokens}, "
+            f"cache_read={metrics.cache_read_tokens}\n"
+            f"workers: {len(metrics.worker_tasks)}\n"
+            "tools: "
+            + (", ".join(item.name for item in metrics.tool_calls) or "Нет")
+            + "\n"
+            "displays: "
+            + (", ".join(metrics.display_tools) or "Нет")
+        )
+
     with _LIVE_TRANSCRIPT_LOCK:
         _LIVE_TRANSCRIPT_INDEX += 1
         block = (
             f"## {_LIVE_TRANSCRIPT_INDEX}. Запрос\n\n"
+            f"agent_mode: {LIVE_AGENT_MODE}\n\n"
             f"{query}\n\n"
             f"### Ответ — HTTP {status_code}\n\n"
             f"{answer}\n\n"
             "### Display-results\n\n"
             f"{', '.join(display_names) if display_names else 'Нет'}\n\n"
+            "### Execution metrics\n\n"
+            f"{metrics_block}\n\n"
         )
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
         with transcript_path.open("a", encoding="utf-8", newline="\n") as transcript:
             transcript.write(block)
+
+
+def _assert_minimal_name_sequence(
+    actual: list[str],
+    expected: list[str | set[str]],
+) -> None:
+    assert len(actual) == len(expected), {
+        "actual": actual,
+        "expected": expected,
+    }
+    for index, (actual_name, expected_name) in enumerate(
+        zip(actual, expected),
+        start=1,
+    ):
+        accepted_names = (
+            expected_name
+            if isinstance(expected_name, set)
+            else {expected_name}
+        )
+        assert actual_name in accepted_names, {
+            "position": index,
+            "actual": actual_name,
+            "accepted": sorted(accepted_names),
+        }
+
+
+def _assert_execution(
+    exchange: _LiveExchange,
+    *,
+    expected_tools: list[str | set[str]],
+    expected_displays: list[str | set[str]],
+    max_seconds: float,
+    max_llm_calls: int,
+    max_total_tokens: int,
+) -> None:
+    metrics = exchange.metrics
+    assert metrics.error is None, metrics.error
+    assert 0 < metrics.elapsed_seconds <= max_seconds, metrics
+    assert 0 < exchange.http_elapsed_seconds <= max_seconds + 5, metrics
+    _assert_minimal_name_sequence(
+        [item.name for item in metrics.tool_calls],
+        expected_tools,
+    )
+    if LIVE_AGENT_MODE == "multiagent":
+        actual_worker_count = len(metrics.worker_tasks)
+        assert len(metrics.coordinator_plan) == actual_worker_count, (
+            metrics.coordinator_plan
+        )
+    else:
+        assert metrics.worker_tasks == [], metrics.worker_tasks
+        assert metrics.coordinator_plan == [], metrics.coordinator_plan
+    _assert_minimal_name_sequence(metrics.display_tools, expected_displays)
+    assert 0 < len(metrics.llm_calls) <= max_llm_calls, metrics.llm_calls
+    assert all(item.total_tokens > 0 for item in metrics.llm_calls), metrics.llm_calls
+    assert metrics.input_tokens > 0
+    assert metrics.output_tokens > 0
+    assert metrics.total_tokens == metrics.input_tokens + metrics.output_tokens
+    assert metrics.total_tokens <= max_total_tokens, metrics
 
 
 class _LiveHttpResponse:
@@ -220,7 +340,9 @@ def live_chat_client(live_workspace_db):
     from werkzeug.serving import make_server
 
     previous_testing = flask_app.config.get("TESTING", False)
+    previous_agent_mode = flask_app.config.get("CHAT_AGENT_MODE", "multiagent")
     flask_app.config["TESTING"] = False
+    flask_app.config["CHAT_AGENT_MODE"] = LIVE_AGENT_MODE
     server = make_server("127.0.0.1", 0, flask_app, threaded=False)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -231,6 +353,7 @@ def live_chat_client(live_workspace_db):
         server.server_close()
         server_thread.join(timeout=10)
         flask_app.config["TESTING"] = previous_testing
+        flask_app.config["CHAT_AGENT_MODE"] = previous_agent_mode
 
 
 @pytest.fixture(autouse=True)
@@ -276,26 +399,44 @@ def _fetch_one(query: str, parameters: tuple[object, ...] = ()) -> tuple:
 def test_live_agent_answers_simple_conversation_without_display_results(
     live_chat_client,
 ):
-    result = _chat(live_chat_client, "Ответь одним словом: привет")
+    exchange = _chat(live_chat_client, "Ответь одним словом: привет")
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     assert result.display_items == []
+    _assert_execution(
+        exchange,
+        expected_tools=[],
+        expected_displays=[],
+        max_seconds=30,
+        max_llm_calls=3,
+        max_total_tokens=15_000,
+    )
 
 
 def test_live_agent_returns_exact_global_sqlite_count(live_chat_client):
     expected_count = int(
         _fetch_one("SELECT COUNT(*) FROM s2t_transformations")[0]
     )
-    result = _chat(
+    exchange = _chat(
         live_chat_client,
         "Через SQLite посчитай точное число строк в s2t_transformations. "
         "Нужен только итоговый count."
     )
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     assert expected_count in _integer_values(result.answer), result.answer
     assert len(result.answer) <= 220
     assert result.display_items == []
+    _assert_execution(
+        exchange,
+        expected_tools=[{"run_sql", "list_s2t_transformations"}],
+        expected_displays=[],
+        max_seconds=90,
+        max_llm_calls=12,
+        max_total_tokens=60_000,
+    )
 
 
 def test_live_agent_resolves_history_reference_into_task(
@@ -314,15 +455,24 @@ def test_live_agent_resolves_history_reference_into_task(
             "content": "Таблица s2t_transformations зафиксирована.",
         },
     ]
-    result = _chat(
+    exchange = _chat(
         live_chat_client,
         "Через SQLite посчитай в ней точное количество строк. Только число.",
         history=history,
     )
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     assert expected_count in _integer_values(result.answer), result.answer
     assert result.display_items == []
+    _assert_execution(
+        exchange,
+        expected_tools=[{"run_sql", "list_s2t_transformations"}],
+        expected_displays=[],
+        max_seconds=90,
+        max_llm_calls=12,
+        max_total_tokens=60_000,
+    )
 
 
 def test_live_agent_selects_full_sql_result_for_scrollable_ui(
@@ -342,11 +492,12 @@ def test_live_agent_selects_full_sql_result_for_scrollable_ui(
     if not expected_rows:
         pytest.skip("workspace files table is empty")
 
-    result = _chat(
+    exchange = _chat(
         live_chat_client,
         "Через SQLite выполни SELECT file_id, filename FROM files "
         "ORDER BY file_id и покажи полный результат отдельно в scrollable UI."
     )
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     assert len(result.answer) <= 500
@@ -369,6 +520,14 @@ def test_live_agent_selects_full_sql_result_for_scrollable_ui(
             {key: str(value) for key, value in row.items()}
             for row in expected_rows
         ]
+    _assert_execution(
+        exchange,
+        expected_tools=["run_sql"],
+        expected_displays=["run_sql"],
+        max_seconds=90,
+        max_llm_calls=12,
+        max_total_tokens=60_000,
+    )
 
 
 def test_live_agent_runs_dependent_workers_sequentially(
@@ -397,7 +556,7 @@ def test_live_agent_runs_dependent_workers_sequentially(
         )[0]
     )
 
-    result = _chat(
+    exchange = _chat(
         live_chat_client,
         "Через SQLite сначала найди target_table с максимальным числом строк "
         "в s2t_transformations. Затем отдельным зависимым шагом для найденной "
@@ -405,6 +564,7 @@ def test_live_agent_runs_dependent_workers_sequentially(
         "Верни имя target_table, число её строк и число source_table. "
         "Полный результат второго шага покажи отдельно.",
     )
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     assert str(target_table) in result.answer, result.answer
@@ -416,6 +576,14 @@ def test_live_agent_runs_dependent_workers_sequentially(
         _payload_contains_value(payload, source_count)
         for payload in payloads
     ), payloads
+    _assert_execution(
+        exchange,
+        expected_tools=["run_sql", "run_sql"],
+        expected_displays=["run_sql"],
+        max_seconds=150,
+        max_llm_calls=20,
+        max_total_tokens=120_000,
+    )
 
 
 def _two_hop_neo4j_path() -> list[str]:
@@ -499,12 +667,13 @@ def _neo4j_paths_between(
 
 def test_live_agent_returns_exact_neo4j_path_and_full_result(live_chat_client):
     source, middle, target = _two_hop_neo4j_path()
-    result = _chat(
+    exchange = _chat(
         live_chat_client,
         f"Через Neo4j найди точный путь длины 2 от таблицы {source} "
         f"до таблицы {target}. Не используй SQLite. Покажи только все узлы "
         "по порядку и глубину, а полный результат инструмента — отдельно."
     )
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     assert "sqlite" not in result.answer.lower(), result.answer
@@ -516,6 +685,14 @@ def test_live_agent_returns_exact_neo4j_path_and_full_result(live_chat_client):
         all(table_name in content for table_name in (source, middle, target))
         for content in display_contents
     ), display_contents
+    _assert_execution(
+        exchange,
+        expected_tools=[{"run_cypher", "trace_neo4j_table_path"}],
+        expected_displays=[{"run_cypher", "trace_neo4j_table_path"}],
+        max_seconds=150,
+        max_llm_calls=12,
+        max_total_tokens=80_000,
+    )
 
 
 def test_live_agent_returns_complete_three_edge_neo4j_path(live_chat_client):
@@ -524,13 +701,14 @@ def test_live_agent_returns_complete_three_edge_neo4j_path(live_chat_client):
     expected_paths = _neo4j_paths_between(source, target, 3)
     if not expected_paths:
         pytest.skip("Neo4j has no stable three-edge path for the selected endpoints")
-    result = _chat(
+    exchange = _chat(
         live_chat_client,
         f"Через Neo4j найди полный точный направленный путь длины 3 от таблицы "
         f"{source} до таблицы {target}. Не используй SQLite. В ответе покажи "
         "только все четыре узла по порядку и глубину. Полный результат со всеми "
         "шагами пути покажи отдельно в scrollable UI."
     )
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     lowered = result.answer.lower()
@@ -554,6 +732,14 @@ def test_live_agent_returns_complete_three_edge_neo4j_path(live_chat_client):
         and _payload_contains_value(payload, 3)
         for payload in path_payloads
     ), path_payloads
+    _assert_execution(
+        exchange,
+        expected_tools=[{"run_cypher", "trace_neo4j_table_path"}],
+        expected_displays=[{"run_cypher", "trace_neo4j_table_path"}],
+        max_seconds=180,
+        max_llm_calls=12,
+        max_total_tokens=100_000,
+    )
 
 
 def test_live_agent_preserves_exact_s2t_pairs_in_answer_and_full_result(
@@ -577,13 +763,14 @@ def test_live_agent_preserves_exact_s2t_pairs_in_answer_and_full_result(
     if len(expected_rows) != 4:
         pytest.skip("workspace database has fewer than four complete S2T pairs")
 
-    result = _chat(
+    exchange = _chat(
         live_chat_client,
         f"Через SQLite выполни ровно этот read-only запрос: {query}. "
         "Перечисли все 4 точные пары source_table.source_field -> "
         "target_table.target_field, не разделяя связанные стороны на отдельные "
         "списки. Полный табличный результат покажи отдельно в scrollable UI."
     )
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     for row in expected_rows:
@@ -617,6 +804,14 @@ def test_live_agent_preserves_exact_s2t_pairs_in_answer_and_full_result(
         assert payload.get("rows") == expected_rows
         assert payload.get("returned_rows") == len(expected_rows)
         assert payload.get("truncated") is False
+    _assert_execution(
+        exchange,
+        expected_tools=["run_sql"],
+        expected_displays=["run_sql"],
+        max_seconds=150,
+        max_llm_calls=20,
+        max_total_tokens=100_000,
+    )
 
 
 def test_live_agent_runs_three_dependent_sqlite_workers(
@@ -658,7 +853,7 @@ def test_live_agent_runs_three_dependent_sqlite_workers(
         (target_table,),
     )
 
-    result = _chat(
+    exchange = _chat(
         live_chat_client,
         "Через SQLite выполни три отдельных зависимых шага. Шаг 1: в "
         "s2t_transformations найди target_table с максимальным числом строк. "
@@ -670,6 +865,7 @@ def test_live_agent_runs_three_dependent_sqlite_workers(
         "различных source_table, лидирующую source_table и число её строк. "
         "Полный результат третьего шага покажи отдельно.",
     )
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     assert str(target_table) in result.answer, result.answer
@@ -684,6 +880,14 @@ def test_live_agent_runs_three_dependent_sqlite_workers(
         and _payload_contains_value(payload, int(top_source_count))
         for payload in payloads
     ), payloads
+    _assert_execution(
+        exchange,
+        expected_tools=["run_sql", "run_sql", "run_sql"],
+        expected_displays=["run_sql"],
+        max_seconds=180,
+        max_llm_calls=28,
+        max_total_tokens=160_000,
+    )
 
 
 def test_live_agent_passes_sqlite_result_into_full_neo4j_path(
@@ -708,7 +912,7 @@ def test_live_agent_passes_sqlite_result_into_full_neo4j_path(
     if str(expected_target) != expected_path[-1]:
         pytest.skip("SQLite and Neo4j fixtures do not describe the same path end")
 
-    result = _chat(
+    exchange = _chat(
         live_chat_client,
         f"Выполни два отдельных зависимых шага. Сначала через SQLite в "
         f"s2t_transformations для source_table = {immediate_source} найди "
@@ -718,6 +922,7 @@ def test_live_agent_passes_sqlite_result_into_full_neo4j_path(
         "все узлы пути по порядку и глубину. Полные результаты обоих шагов "
         "покажи отдельно в scrollable UI.",
     )
+    result = exchange.result
 
     _assert_public_answer(result.answer)
     assert int(expected_count) in _integer_values(result.answer), result.answer
@@ -734,3 +939,17 @@ def test_live_agent_passes_sqlite_result_into_full_neo4j_path(
         expected_path in _payload_table_paths(payload)
         for payload in payloads
     ), payloads
+    _assert_execution(
+        exchange,
+        expected_tools=[
+            "run_sql",
+            {"run_cypher", "trace_neo4j_table_path"},
+        ],
+        expected_displays=[
+            "run_sql",
+            {"run_cypher", "trace_neo4j_table_path"},
+        ],
+        max_seconds=180,
+        max_llm_calls=20,
+        max_total_tokens=140_000,
+    )

@@ -6,7 +6,7 @@ from threading import Lock
 from typing import List, Any, Dict, Optional
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from services.logging_setup import configure_logging
-from agents.agent import get_model_name
+from agents.agent import agent_chat, get_model_name
 from agents.supervisor import supervisor_chat
 from agents.sheet_group_classifier import classify_file_sheet_groups
 from services.analysis import (
@@ -32,6 +32,7 @@ logger.info("File logging enabled: %s", LOG_FILE_PATH)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
+app.config['CHAT_AGENT_MODE'] = os.getenv('CHAT_AGENT_MODE', 'multiagent')
 
 CHAT_HISTORY_MAX_MESSAGES = 12
 CHAT_HISTORY_MAX_MESSAGE_CHARS = 8000
@@ -140,10 +141,6 @@ def _get_analysis_progress(upload_id: str) -> Optional[Dict[str, Any]]:
 
 
 @app.route('/')
-def index():
-    return render_template('index.html')
-
-
 @app.route('/chat_app')
 def chat_app():
     return render_template('chat_app.html')
@@ -421,7 +418,17 @@ def chat():
             supervisor_kwargs["history"] = history
         if session_id:
             supervisor_kwargs["session_id"] = session_id
-        chat_result = supervisor_chat(query.strip(), **supervisor_kwargs)
+        agent_mode = str(
+            app.config.get("CHAT_AGENT_MODE") or "multiagent"
+        ).strip().lower()
+        if agent_mode == "multiagent":
+            chat_result = supervisor_chat(query.strip(), **supervisor_kwargs)
+        elif agent_mode == "single_agent":
+            chat_result = agent_chat(query.strip(), **supervisor_kwargs)
+        else:
+            raise ValueError(
+                "CHAT_AGENT_MODE must be 'multiagent' or 'single_agent'"
+            )
         if hasattr(chat_result, "model_dump"):
             payload = chat_result.model_dump()
         elif isinstance(chat_result, dict):

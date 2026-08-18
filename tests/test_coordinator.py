@@ -5,6 +5,7 @@ from unittest.mock import call, patch
 import pytest
 from langchain_core.messages import AIMessage
 
+from agents.chat_graph import Observation, WorkerCycleTrace
 from agents.coordinator import CoordinatorAnswer, CoordinatorResponseError
 from agents.worker import WorkerAnswer, WorkerResultRef
 
@@ -65,26 +66,28 @@ def test_coordinator_graph_has_llm_plan_worker_loop_and_aggregate():
     graph = build_coordinator_graph(_CoordinatorModel({}))
     graph_view = graph.get_graph()
 
-    assert {"plan", "materialize", "worker", "aggregate"}.issubset(
+    assert {"plan", "materialize", "worker", "coordinate", "aggregate"}.issubset(
         graph_view.nodes
     )
     edges = {(edge.source, edge.target) for edge in graph_view.edges}
     assert ("__start__", "plan") in edges
     assert ("plan", "materialize") in edges
     assert ("materialize", "worker") in edges
+    assert ("coordinate", "aggregate") in edges
     assert ("aggregate", "__end__") in edges
 
 
 def test_coordinator_prompts_are_generic_not_domain_contracts():
     from agents.coordinator import (
         _AGGREGATE_PROMPT,
+        _COORDINATE_PROMPT,
         _DISPATCH_PROMPT,
         _PLAN_PROMPT,
         _plan_tool_schema,
     )
 
     combined = "\n".join(
-        (_PLAN_PROMPT, _DISPATCH_PROMPT, _AGGREGATE_PROMPT)
+        (_PLAN_PROMPT, _DISPATCH_PROMPT, _COORDINATE_PROMPT, _AGGREGATE_PROMPT)
     )
     for domain_detail in (
         "target_table",
@@ -129,16 +132,21 @@ def test_coordinator_prompts_are_generic_not_domain_contracts():
     assert "worker должен получить «таблица X»" in " ".join(_DISPATCH_PROMPT.split())
     assert "не проси текущий worker повторно" in " ".join(_DISPATCH_PROMPT.split()).lower()
     assert "только новые факты текущей операции" in _DISPATCH_PROMPT
-    assert "Для `answer_only` не выбирай result keys" in _AGGREGATE_PROMPT
-    assert "Главный приоритет — правильный текстовый ответ" in _AGGREGATE_PROMPT
-    assert "Считай шаг выполненным только если" in _AGGREGATE_PROMPT
-    assert "при сомнении" in _AGGREGATE_PROMPT
-    assert "Не повторяй в answer отрицательные ограничения" in _AGGREGATE_PROMPT
-    assert "молча соблюдай такие запреты" in _AGGREGATE_PROMPT
-    assert "При требовании «только» верни ровно" in _AGGREGATE_PROMPT
-    assert "без\nвступления, заключения" in _AGGREGATE_PROMPT
-    assert "`answer`: всегда строка" in _AGGREGATE_PROMPT
-    assert "сериализуй" in _AGGREGATE_PROMPT
+    assert "cycle_history" in _DISPATCH_PROMPT
+    assert "Для `answer_only` не выбирай result keys" in _COORDINATE_PROMPT
+    assert "Главный приоритет — правильный текстовый ответ" in _COORDINATE_PROMPT
+    assert "Считай шаг выполненным только если" in _COORDINATE_PROMPT
+    assert "при сомнении" in _COORDINATE_PROMPT
+    assert "Не повторяй в answer отрицательные ограничения" in _COORDINATE_PROMPT
+    assert "молча соблюдай такие запреты" in _COORDINATE_PROMPT
+    assert "При требовании «только» верни ровно" in _COORDINATE_PROMPT
+    assert "без\nвступления, заключения" in _COORDINATE_PROMPT
+    assert "`answer`: всегда строка" in _COORDINATE_PROMPT
+    assert "сериализуй" in _COORDINATE_PROMPT
+    assert "cycle_history" in _COORDINATE_PROMPT
+    assert "только самодостаточный" in _AGGREGATE_PROMPT
+    assert "coordinator_result" in _AGGREGATE_PROMPT
+    assert "worker_results" not in _AGGREGATE_PROMPT
 
 
 def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
@@ -173,13 +181,20 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
                     "dispatch-2",
                 ),
             ],
-            "finish_coordination": [
+            "submit_coordination_result": [
                 _tool_message(
-                    "finish_coordination",
+                    "submit_coordination_result",
                     {
                         "answer": "Имя t_example проверено.",
                         "display_result_keys": ["step-2:result-1"],
                     },
+                    "coordinate-1",
+                )
+            ],
+            "finish_coordination": [
+                _tool_message(
+                    "finish_coordination",
+                    {"answer": "Имя t_example проверено."},
                     "finish-1",
                 )
             ],
@@ -189,6 +204,26 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
         WorkerAnswer(
             answer="Точное имя: t_example.",
             result_refs=[WorkerResultRef(ref="ref-first", name="lookup")],
+            cycle_history=[
+                WorkerCycleTrace(
+                    cycle=1,
+                    tool_calls=[{"name": "lookup", "args": {}}],
+                    tool_results=[
+                        {
+                            "name": "lookup",
+                            "tool_call_id": "call-lookup",
+                            "content": "{\"name\":\"t_example\"}",
+                            "status": "success",
+                            "is_error": False,
+                        }
+                    ],
+                    observation=Observation(
+                        summary="Точное имя найдено.",
+                        goal_satisfied=True,
+                        important_facts=["Имя: t_example."],
+                    ),
+                )
+            ],
         ),
         WorkerAnswer(
             answer="Имя t_example проверено.",
@@ -230,10 +265,25 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
     assert second_dispatch["completed_workers"][0]["answer"] == (
         "Точное имя: t_example."
     )
-    aggregate = _payload(model, "finish_coordination")
-    assert aggregate["worker_results"][1]["available_results"] == [
+    first_history = second_dispatch["completed_workers"][0]["cycle_history"]
+    assert first_history[0]["tool_calls"] == [
+        {"name": "lookup", "args": {}}
+    ]
+    assert first_history[0]["observation"]["important_facts"] == [
+        "Имя: t_example."
+    ]
+    coordinate = _payload(model, "submit_coordination_result")
+    assert coordinate["worker_results"][0]["cycle_history"] == first_history
+    assert coordinate["worker_results"][1]["available_results"] == [
         {"result_key": "step-2:result-1", "tool_name": "inspect"}
     ]
+    aggregate = _payload(model, "finish_coordination")
+    assert aggregate == {
+        "coordinator_result": {
+            "answer": "Имя t_example проверено.",
+            "display_result_keys": ["step-2:result-1"],
+        }
+    }
     assert "Coordinator planned worker_steps=2 plan=" in caplog.text
     assert '"step": 1' in caplog.text
     assert '"goal": "Найти имя"' in caplog.text
@@ -262,11 +312,11 @@ def test_coordinator_rejects_unknown_result_key_and_cleans_refs():
                     "dispatch-1",
                 )
             ],
-            "finish_coordination": [
+            "submit_coordination_result": [
                 _tool_message(
-                    "finish_coordination",
+                    "submit_coordination_result",
                     {"answer": "Факт получен.", "display_result_keys": ["unknown"]},
-                    "finish-1",
+                    "coordinate-1",
                 )
             ],
         }
@@ -310,6 +360,19 @@ def test_coordinator_aggregates_unsatisfied_worker_without_internal_error():
                     "dispatch-1",
                 )
             ],
+            "submit_coordination_result": [
+                _tool_message(
+                    "submit_coordination_result",
+                    {
+                        "answer": (
+                            "Не удалось подтвердить факт: tool вернул данные "
+                            "не по той сущности."
+                        ),
+                        "display_result_keys": [],
+                    },
+                    "coordinate-1",
+                )
+            ],
             "finish_coordination": [
                 _tool_message(
                     "finish_coordination",
@@ -317,8 +380,7 @@ def test_coordinator_aggregates_unsatisfied_worker_without_internal_error():
                         "answer": (
                             "Не удалось подтвердить факт: tool вернул данные "
                             "не по той сущности."
-                        ),
-                        "display_result_keys": [],
+                        )
                     },
                     "finish-1",
                 )
@@ -350,13 +412,14 @@ def test_coordinator_aggregates_unsatisfied_worker_without_internal_error():
         ),
         display_refs=[],
     )
-    aggregate = _payload(model, "finish_coordination")
-    assert aggregate["worker_results"] == [
+    coordinate = _payload(model, "submit_coordination_result")
+    assert coordinate["worker_results"] == [
         {
             "step": 1,
             "goal": "Получить факт",
             "task": "Получи факт.",
             "answer": "Факт не подтверждён.",
+            "cycle_history": [],
             "goal_satisfied": False,
             "mismatches": ["Tool вернул данные не по той сущности."],
             "available_results": [],
@@ -384,15 +447,22 @@ def test_coordinator_normalizes_structured_aggregate_answer_without_repair():
                     "dispatch-1",
                 )
             ],
-            "finish_coordination": [
+            "submit_coordination_result": [
                 _tool_message(
-                    "finish_coordination",
+                    "submit_coordination_result",
                     {
                         "answer": [{"value": 42}],
                         "display_result_keys": [],
                     },
-                    "finish-structured",
+                    "coordinate-structured",
                 ),
+            ],
+            "finish_coordination": [
+                _tool_message(
+                    "finish_coordination",
+                    {"answer": '[{"value":42}]'},
+                    "finish-structured",
+                )
             ],
         }
     )

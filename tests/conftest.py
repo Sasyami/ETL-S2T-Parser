@@ -82,10 +82,13 @@ def mock_embeddings(monkeypatch):
 @pytest.fixture
 def app(tmp_path):
     """Flask test client fixture."""
+    previous_agent_mode = flask_app.config.get('CHAT_AGENT_MODE')
     flask_app.config['TESTING'] = True
     flask_app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
     flask_app.config['DB_PATH'] = str(tmp_path / "flask_test.db")
+    flask_app.config['CHAT_AGENT_MODE'] = 'multiagent'
     yield flask_app
+    flask_app.config['CHAT_AGENT_MODE'] = previous_agent_mode
 
 @pytest.fixture
 def client(app):
