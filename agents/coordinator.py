@@ -17,7 +17,7 @@ from .worker import discard_worker_result_refs, worker_chat
 
 logger = logging.getLogger(__name__)
 
-COORDINATOR_MAX_WORKERS = 4
+COORDINATOR_MAX_WORKERS = 8
 COORDINATOR_CONTEXT_MAX_CHARS = 4000
 _PLAN_TOOL_NAME = "submit_worker_plan"
 _DISPATCH_TOOL_NAME = "dispatch_worker"
@@ -30,7 +30,13 @@ class WorkerPlanStep(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    goal: str = Field(min_length=1)
+    goal: str = Field(
+        min_length=1,
+        description=(
+            "Одна операция с данными, дающая один самостоятельно проверяемый "
+            "результат. Зависимая операция должна быть отдельным шагом."
+        ),
+    )
     presentation: Literal["answer_only", "full_results"]
 
     @field_validator("goal")
@@ -58,7 +64,13 @@ class WorkerDispatch(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    task: str = Field(min_length=1)
+    task: str = Field(
+        min_length=1,
+        description=(
+            "Самодостаточная задача ровно с одной операцией текущего шага; "
+            "не включает цели или требуемые результаты соседних шагов."
+        ),
+    )
 
     @field_validator("task")
     @classmethod
@@ -171,60 +183,36 @@ class CoordinatorResponseError(RuntimeError):
 
 
 _PLAN_PROMPT = f"""
-Ты planner промежуточного coordinator. Раздели входную задачу на минимальный
-последовательный план для изолированных generic workers.
+Ты planner промежуточного coordinator. Раздели входную задачу на упорядоченный
+план для изолированных generic workers и верни ровно один native call
+`{_PLAN_TOOL_NAME}` со списком `steps` длиной от 1 до
+{COORDINATOR_MAX_WORKERS}. Каждый step содержит только `goal` и `presentation`.
 
-Главный приоритет — правильный итоговый ответ. Сначала молча выдели все факты,
-связи и вычисления, которые требует исходная задача, и только затем строй план.
-Способ показа результата является вторичным и не должен менять смысл шагов.
+Правила декомпозиции:
+- один step описывает одну операцию с данными и один самостоятельно проверяемый
+  результат;
+- если операция использует результат предыдущей операции, создай отдельный
+  следующий step; нужный результат позднее подставит dispatcher;
+- не объединяй независимо проверяемые операции в одном goal и не создавай
+  отдельные steps для оформления, пересказа или повторного показа тех же данных;
+- сохраняй порядок, точные сущности, идентификаторы, значения, условия,
+  ограничения и запреты исходной задачи без переименования;
+- используй `context` только для однозначного разрешения ссылок и общих
+  ограничений. Если данных недостаточно, не угадывай и не достраивай предметную
+  схему.
 
-Верни ровно один native call `{_PLAN_TOOL_NAME}` со списком `steps` длиной от 1
-до {COORDINATOR_MAX_WORKERS}. Каждый шаг содержит только:
-- `goal`: самостоятельную смысловую цель worker;
-- `presentation`: `full_results`, если полный результат шага нужно показать
-  пользователю отдельно, иначе `answer_only`.
+`presentation` — только технический режим передачи результата и не влияет на
+декомпозицию. Не выбирай tools и skills, не выполняй задачу и не формулируй
+ответ пользователю.
+""".strip()
 
-Сохраняй смысл, ограничения и точные значения исходной задачи. Копируй точные
-идентификаторы, названия и роли без переименования. Для каждого goal сохраняй
-относящиеся к нему объект, операцию, условия, порядок, ограничения и факты,
-которые он должен вернуть. Не подменяй запрошенную сущность, роль или операцию
-похожей и не достраивай отсутствующую предметную схему. Создавай
-несколько шагов только для независимых частей либо настоящих зависимостей.
-
-Если task всё ещё содержит слова «он», «она», «оно», «они», «в нём», «в ней»,
-«там», «этот», «эта», «это», «выше» или «предыдущий» без названного рядом
-объекта, найди однозначный референт в `context` и запиши его точное название в
-goal. Например, task «посчитай в ней строки» и context «речь о таблице X»
-означают goal «посчитать строки в таблице X». Не оставляй местоимение в goal и
-не выбирай объект по умолчанию. Если context не разрешает ссылку однозначно, не
-угадывай объект: goal должен потребовать сообщить о недостатке данных.
-Шаг worker означает отдельное получение или проверку данных. Форматирование,
-пересказ, извлечение значений из уже полученного ответа и показ результата в UI
-не являются новыми worker-шагами: это выполнит aggregator.
-Если задача требует один раз получить данные, а остальные фразы описывают лишь
-форму ответа или отдельный показ того же результата, верни один step.
-`presentation` уже задаёт способ показа и никогда не становится отдельным goal.
-
-Если пользователь явно задал N отдельных операций с данными, верни ровно N
-steps в том же порядке: не объединяй их и не добавляй новые. Требования к форме
-ответа и показу результата не входят в N. Никогда не создавай повторный шаг для
-тех же данных только ради другого представления. Например, «получи данные,
-кратко ответь и покажи полный результат отдельно» — это один step с
-`presentation=full_results`. Для каждого шага
-сохрани относящиеся к нему источники, запреты, точные идентификаторы, числовые
-ограничения и требуемую операцию. `full_results` означает отдельный полный
-результат помимо текстового ответа и допустим только по явной просьбе показать
-полную выдачу отдельно, в UI или файле. Во всех остальных случаях выбирай
-`answer_only`. Формулировки «только итог», «только число», «только ответ» и
-«кратко» всегда означают `answer_only`, а не полный результат.
-Если отдельный показ запрошен для конкретного шага, не переноси `full_results`
-на остальные шаги. Goal каждого шага должен запросить все факты этого действия,
-которые понадобятся зависимым шагам или итоговому ответу.
-
-Если следующий шаг зависит от предыдущего, его goal должен описывать новую
-операцию, а нужные факты позднее добавит dispatcher. Не выбирай tools и skills,
-не выполняй задачу и не формулируй пользовательский ответ. Перед native call
-молча сопоставь получившиеся шаги со всеми действиями исходной задачи.
+_PLAN_REPAIR_PROMPT = f"""
+Предыдущий native call `{_PLAN_TOOL_NAME}` не соответствует технической схеме.
+Верни исправленный native call ровно один раз. Массив `steps` должен содержать
+от 1 до {COORDINATOR_MAX_WORKERS} элементов; каждый элемент должен иметь только
+непустой `goal` и `presentation` со значением `answer_only` или `full_results`.
+Исправь только формат native call: не объединяй независимо проверяемые операции,
+не отбрасывай требования, не добавляй новые факты и не вызывай другие tools.
 """.strip()
 
 _DISPATCH_PROMPT = f"""
@@ -237,13 +225,16 @@ _DISPATCH_PROMPT = f"""
 `context` и краткие ответы `completed_workers` лишь там, где они нужны текущей
 цели. Подставляй подтверждённые предыдущим worker значения в зависимый шаг, не
 заставляя worker повторять завершённую работу.
+Не добавляй в task отдельные результаты, которые нужны только соседним шагам:
+текущий worker должен выполнить ровно свою одну операцию.
 
 Каждый completed worker содержит краткий answer и ordered `cycle_history`:
 вызовы tools, ограниченные текстовые preview их результатов и structured
-observation. Используй историю, чтобы сохранить точный смысл подтверждённых
-фактов и зависимостей. Это не полные результаты tools. Ошибочные промежуточные
-циклы нужны только для понимания исправлений; подтверждёнными считай факты из
-цикла, observation которого завершает goal с `goal_satisfied=true`.
+observation, а поле `status=completed` явно отмечает завершённый пункт плана.
+Используй историю, чтобы сохранить точный смысл подтверждённых фактов и
+зависимостей. Это не полные результаты tools. Ошибочные промежуточные циклы
+нужны только для понимания исправлений; подтверждёнными считай факты из цикла,
+observation которого завершает goal с `goal_satisfied=true`.
 
 Факты completed_workers являются подтверждёнными входными условиями зависимого
 шага, а не новой целью. Не проси текущий worker повторно получать, проверять,
@@ -289,6 +280,14 @@ Worker не должен восстанавливать источник по д
 original_task, а все повторения точных идентификаторов совпадают с источником.
 """.strip()
 
+_DISPATCH_REPAIR_PROMPT = f"""
+Предыдущий native call `{_DISPATCH_TOOL_NAME}` не соответствует технической
+схеме. Верни исправленный native call ровно один раз с единственным непустым
+строковым полем `task`. Сохрани текущую операцию, точные идентификаторы,
+источники, условия и ограничения из входного payload. Не добавляй соседние
+шаги, tools, служебные поля или новые факты.
+""".strip()
+
 _COORDINATE_PROMPT = f"""
 Ты coordinator результатов workers. Сформируй самодостаточный результат по исходной
 задаче, плану и кратким ответам workers, затем выбери полезные полные результаты
@@ -314,9 +313,10 @@ _COORDINATE_PROMPT = f"""
 
 Полные tool results намеренно не передаются. Каждый worker result содержит
 ordered `cycle_history`: точные tool calls, ограниченные текстовые preview и
-structured observations. Используй её вместе с кратким answer, чтобы не терять
-роль и происхождение фактов. Ошибочный промежуточный вызов не является фактом
-для итогового ответа; учитывай его только как исправленную попытку. Опирайся на
+structured observations, а `status` явно отмечает пункт как `completed` или
+`failed`. Используй историю вместе с кратким answer, чтобы не терять роль и
+происхождение фактов. Ошибочный промежуточный вызов не является фактом для
+итогового ответа; учитывай его только как исправленную попытку. Опирайся на
 important_facts и summary observation того цикла, который подтверждает goal.
 Не придумывай отсутствующие факты или ключи. Сохраняй связи между значениями и
 объединяй результаты зависимых шагов по смыслу исходной задачи. Сохраняй в
@@ -390,20 +390,18 @@ def _plan_tool_schema() -> Dict[str, Any]:
                             "goal": {
                                 "type": "string",
                                 "description": (
-                                    "Одна самостоятельная операция получения "
-                                    "или проверки данных с точными сущностями, "
-                                    "условиями и требуемыми фактами, но не "
-                                    "форматирование и не показ уже полученного "
-                                    "результата"
+                                    "Одна операция с данными и один "
+                                    "самостоятельно проверяемый результат, с "
+                                    "точными сущностями и условиями"
                                 ),
                             },
                             "presentation": {
                                 "type": "string",
                                 "enum": ["answer_only", "full_results"],
                                 "description": (
-                                    "answer_only по умолчанию; full_results "
-                                    "только если пользователь явно просит "
-                                    "отдельно показать полную выдачу, UI или файл"
+                                    "Технический режим передачи результата: "
+                                    "answer_only — текстовый ответ; full_results "
+                                    "— ответ вместе с полным результатом"
                                 ),
                             },
                         },
@@ -431,7 +429,8 @@ def _dispatch_tool_schema() -> Dict[str, Any]:
                 "task": {
                     "type": "string",
                     "description": (
-                        "Самодостаточная пользовательская задача без "
+                        "Самодостаточная пользовательская задача ровно с одной "
+                        "операцией текущего step, без целей соседних steps и "
                         "служебной разметки coordinator"
                     ),
                 }
@@ -551,19 +550,36 @@ def build_coordinator_graph(
             ) from exc
 
     def plan_node(state: CoordinatorGraphState) -> Dict[str, Any]:
-        result = invoke(
-            plan_model,
-            [
-                SystemMessage(content=_PLAN_PROMPT),
-                HumanMessage(
-                    content=json.dumps(
-                        {"task": state["task"], "context": state["context"]},
-                        ensure_ascii=False,
-                    )
-                ),
-            ],
-        )
-        plan = _native_payload(result, _PLAN_TOOL_NAME, WorkerPlan)
+        plan_messages: List[BaseMessage] = [
+            SystemMessage(content=_PLAN_PROMPT),
+            HumanMessage(
+                content=json.dumps(
+                    {"task": state["task"], "context": state["context"]},
+                    ensure_ascii=False,
+                )
+            ),
+        ]
+        result = invoke(plan_model, plan_messages)
+        try:
+            plan = _native_payload(result, _PLAN_TOOL_NAME, WorkerPlan)
+        except CoordinatorResponseError:
+            logger.warning(
+                "Coordinator plan call violated plan schema; requesting one "
+                "LLM repair"
+            )
+            repaired_result = invoke(
+                plan_model,
+                [
+                    *plan_messages,
+                    result,
+                    HumanMessage(content=_PLAN_REPAIR_PROMPT),
+                ],
+            )
+            plan = _native_payload(
+                repaired_result,
+                _PLAN_TOOL_NAME,
+                WorkerPlan,
+            )
         assert isinstance(plan, WorkerPlan)
         plan_payload = [
             {
@@ -590,6 +606,7 @@ def build_coordinator_graph(
         completed_workers = [
             {
                 "step": run["step"],
+                "status": "completed",
                 "goal": run["goal"],
                 "task": run["task"],
                 "answer": run["answer"],
@@ -597,27 +614,48 @@ def build_coordinator_graph(
             }
             for run in state["worker_runs"]
         ]
-        result = invoke(
-            dispatch_model,
-            [
-                SystemMessage(content=_DISPATCH_PROMPT),
-                HumanMessage(
-                    content=json.dumps(
-                        {
-                            "original_task": state["task"],
-                            "context": state["context"],
-                            "current_step": {
-                                "step": step_index + 1,
-                                "goal": current_step["goal"],
-                            },
-                            "completed_workers": completed_workers,
+        dispatch_messages: List[BaseMessage] = [
+            SystemMessage(content=_DISPATCH_PROMPT),
+            HumanMessage(
+                content=json.dumps(
+                    {
+                        "original_task": state["task"],
+                        "context": state["context"],
+                        "current_step": {
+                            "step": step_index + 1,
+                            "goal": current_step["goal"],
                         },
-                        ensure_ascii=False,
-                    )
-                ),
-            ],
-        )
-        dispatch = _native_payload(result, _DISPATCH_TOOL_NAME, WorkerDispatch)
+                        "completed_workers": completed_workers,
+                    },
+                    ensure_ascii=False,
+                )
+            ),
+        ]
+        result = invoke(dispatch_model, dispatch_messages)
+        try:
+            dispatch = _native_payload(
+                result,
+                _DISPATCH_TOOL_NAME,
+                WorkerDispatch,
+            )
+        except CoordinatorResponseError:
+            logger.warning(
+                "Coordinator dispatch call violated dispatch schema; "
+                "requesting one LLM repair"
+            )
+            repaired_result = invoke(
+                dispatch_model,
+                [
+                    *dispatch_messages,
+                    result,
+                    HumanMessage(content=_DISPATCH_REPAIR_PROMPT),
+                ],
+            )
+            dispatch = _native_payload(
+                repaired_result,
+                _DISPATCH_TOOL_NAME,
+                WorkerDispatch,
+            )
         assert isinstance(dispatch, WorkerDispatch)
         logger.info(
             "Coordinator materialized worker step=%s task=%s",
@@ -699,6 +737,9 @@ def build_coordinator_graph(
         worker_payload = [
             {
                 "step": run["step"],
+                "status": (
+                    "completed" if run["goal_satisfied"] else "failed"
+                ),
                 "goal": run["goal"],
                 "task": run["task"],
                 "answer": run["answer"],

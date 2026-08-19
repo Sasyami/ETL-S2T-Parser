@@ -83,11 +83,17 @@ def test_coordinator_prompts_are_generic_not_domain_contracts():
         _COORDINATE_PROMPT,
         _DISPATCH_PROMPT,
         _PLAN_PROMPT,
+        _dispatch_tool_schema,
         _plan_tool_schema,
     )
 
     combined = "\n".join(
-        (_PLAN_PROMPT, _DISPATCH_PROMPT, _COORDINATE_PROMPT, _AGGREGATE_PROMPT)
+        (
+            _PLAN_PROMPT,
+            _DISPATCH_PROMPT,
+            _COORDINATE_PROMPT,
+            _AGGREGATE_PROMPT,
+        )
     )
     for domain_detail in (
         "target_table",
@@ -99,22 +105,20 @@ def test_coordinator_prompts_are_generic_not_domain_contracts():
     ):
         assert domain_detail not in combined
 
-    assert "явно задал N отдельных операций с данными" in _PLAN_PROMPT
-    assert "Главный приоритет — правильный итоговый ответ" in _PLAN_PROMPT
-    assert "не достраивай отсутствующую предметную схему" in _PLAN_PROMPT
+    assert len(_PLAN_PROMPT) < 2500
+    assert "один самостоятельно проверяемый" in _PLAN_PROMPT
+    assert "использует результат предыдущей операции" in _PLAN_PROMPT
+    assert "не объединяй независимо проверяемые операции" in _PLAN_PROMPT
+    assert "не влияет на\nдекомпозицию" in _PLAN_PROMPT
+    assert "не достраивай предметную" in _PLAN_PROMPT
     normalized_plan = " ".join(_PLAN_PROMPT.split()).lower()
-    assert "не оставляй местоимение в goal" in normalized_plan
-    assert "не выбирай объект по умолчанию" in normalized_plan
-    assert "не являются новыми worker-шагами" in _PLAN_PROMPT
-    assert "верни один step" in _PLAN_PROMPT
-    assert "никогда не становится отдельным goal" in _PLAN_PROMPT
-    assert "Никогда не создавай повторный шаг" in _PLAN_PROMPT
-    assert "это один step" in _PLAN_PROMPT
-    assert "только число" in _PLAN_PROMPT
-    assert "не переноси `full_results`" in _PLAN_PROMPT
-    assert "понадобятся зависимым шагам" in _PLAN_PROMPT
-    assert "answer_only по умолчанию" in str(_plan_tool_schema())
-    assert "не показ уже полученного результата" in str(_plan_tool_schema())
+    assert "используй `context` только" in normalized_plan
+    assert "не создавай отдельные steps для оформления" in normalized_plan
+    assert "ровно свою одну операцию" in _DISPATCH_PROMPT
+    assert "технический режим передачи результата" in str(
+        _plan_tool_schema()
+    ).lower()
+    assert "самостоятельно проверяемый результат" in str(_plan_tool_schema())
     assert "не придумывай отсутствующие во входе" in _DISPATCH_PROMPT.lower()
     assert "original_task" in _DISPATCH_PROMPT
     assert "Отдельный показ, экспорт" in _DISPATCH_PROMPT
@@ -147,6 +151,15 @@ def test_coordinator_prompts_are_generic_not_domain_contracts():
     assert "только самодостаточный" in _AGGREGATE_PROMPT
     assert "coordinator_result" in _AGGREGATE_PROMPT
     assert "worker_results" not in _AGGREGATE_PROMPT
+
+    plan_schema = _plan_tool_schema()["function"]["parameters"]
+    goal_schema = plan_schema["properties"]["steps"]["items"]["properties"][
+        "goal"
+    ]
+    assert "самостоятельно проверяемый результат" in goal_schema["description"]
+    dispatch_schema = _dispatch_tool_schema()["function"]["parameters"]
+    task_schema = dispatch_schema["properties"]["task"]
+    assert "ровно с одной операцией" in task_schema["description"]
 
 
 def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
@@ -265,6 +278,7 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
     assert second_dispatch["completed_workers"][0]["answer"] == (
         "Точное имя: t_example."
     )
+    assert second_dispatch["completed_workers"][0]["status"] == "completed"
     first_history = second_dispatch["completed_workers"][0]["cycle_history"]
     assert first_history[0]["tool_calls"] == [
         {"name": "lookup", "args": {}}
@@ -273,6 +287,7 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
         "Имя: t_example."
     ]
     coordinate = _payload(model, "submit_coordination_result")
+    assert coordinate["worker_results"][0]["status"] == "completed"
     assert coordinate["worker_results"][0]["cycle_history"] == first_history
     assert coordinate["worker_results"][1]["available_results"] == [
         {"result_key": "step-2:result-1", "tool_name": "inspect"}
@@ -416,6 +431,7 @@ def test_coordinator_aggregates_unsatisfied_worker_without_internal_error():
     assert coordinate["worker_results"] == [
         {
             "step": 1,
+            "status": "failed",
             "goal": "Получить факт",
             "task": "Получи факт.",
             "answer": "Факт не подтверждён.",
@@ -494,3 +510,141 @@ def test_coordinator_empty_task_does_not_call_llm():
 
     assert result.display_refs == []
     assert "пустой" in result.answer.lower() or "пуст" in result.answer.lower()
+
+
+def test_coordinator_repairs_plan_that_exceeds_worker_limit():
+    from agents.coordinator import coordinator_chat
+
+    invalid_steps = [
+        {"goal": f"Проверка {index}", "presentation": "answer_only"}
+        for index in range(1, 10)
+    ]
+    model = _CoordinatorModel(
+        {
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {"steps": invalid_steps},
+                    "plan-invalid",
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "goal": "Выполнить все девять связанных проверок",
+                                "presentation": "answer_only",
+                            }
+                        ]
+                    },
+                    "plan-repaired",
+                ),
+            ],
+            "dispatch_worker": [
+                _tool_message(
+                    "dispatch_worker",
+                    {"task": "Выполни все девять связанных проверок."},
+                    "dispatch-1",
+                )
+            ],
+            "submit_coordination_result": [
+                _tool_message(
+                    "submit_coordination_result",
+                    {"answer": "Все проверки выполнены.", "display_result_keys": []},
+                    "coordinate-1",
+                )
+            ],
+            "finish_coordination": [
+                _tool_message(
+                    "finish_coordination",
+                    {"answer": "Все проверки выполнены."},
+                    "finish-1",
+                )
+            ],
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            return_value=WorkerAnswer(answer="Все проверки выполнены."),
+        ),
+    ):
+        result = coordinator_chat("Выполни девять связанных проверок.")
+
+    assert result == CoordinatorAnswer(
+        answer="Все проверки выполнены.",
+        display_refs=[],
+    )
+    plan_messages = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_worker_plan"
+    ]
+    assert len(plan_messages) == 2
+    assert "от 1 до 8 элементов" in plan_messages[1][-1].content
+
+
+def test_coordinator_repairs_missing_dispatch_native_call():
+    from agents.coordinator import coordinator_chat
+
+    model = _CoordinatorModel(
+        {
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {"goal": "Получить факт", "presentation": "answer_only"}
+                        ]
+                    },
+                    "plan-1",
+                )
+            ],
+            "dispatch_worker": [
+                AIMessage(content="Получи факт без native call."),
+                _tool_message(
+                    "dispatch_worker",
+                    {"task": "Получи факт."},
+                    "dispatch-repaired",
+                ),
+            ],
+            "submit_coordination_result": [
+                _tool_message(
+                    "submit_coordination_result",
+                    {"answer": "Факт получен.", "display_result_keys": []},
+                    "coordinate-1",
+                )
+            ],
+            "finish_coordination": [
+                _tool_message(
+                    "finish_coordination",
+                    {"answer": "Факт получен."},
+                    "finish-1",
+                )
+            ],
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            return_value=WorkerAnswer(answer="Факт получен."),
+        ),
+    ):
+        result = coordinator_chat("Получи факт.")
+
+    assert result == CoordinatorAnswer(answer="Факт получен.", display_refs=[])
+    dispatch_messages = [
+        messages
+        for name, messages in model.messages
+        if name == "dispatch_worker"
+    ]
+    assert len(dispatch_messages) == 2
+    assert "единственным непустым" in dispatch_messages[1][-1].content
