@@ -186,6 +186,7 @@
   "source_columns": {
     "column_name": [
       "Название поля",
+      "Названиеполя",
       "Название поля/описание",
       "Column Name",
       "ColumnName",
@@ -218,6 +219,8 @@
     "description": [
       "comment",
       "Описание поля",
+      "Наименование поля",
+      "Комментарии к полю источника",
       "Column Attribute Definition",
       "Column Attribute Note"
     ]

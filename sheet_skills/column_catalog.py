@@ -73,7 +73,7 @@ def _normalise_flag(value: Any, header: Any = None) -> Tuple[Optional[int], bool
     if text is None:
         return None, False
     normalized = normalize_column_alias(text)
-    if normalized in {"notnull", "nonnull", "required"}:
+    if normalized in {"not null", "notnull", "non null", "nonnull", "required"}:
         return 1, False
     if normalized in {"null", "nullable"}:
         return 0, False
@@ -200,6 +200,10 @@ def _specialized_sheet_rows(
             not_null, invalid_not_null = _normalise_flag(
                 raw_not_null, not_null_header
             )
+            if selected.get("primary_key") and clean_value(raw_primary_key) is None:
+                primary_key = 0
+            if selected.get("not_null") and clean_value(raw_not_null) is None:
+                not_null = 0
             description = next(
                 (
                     value
@@ -444,6 +448,10 @@ def _raw_s2t_records(
                 raw_not_null,
                 headers_by_sheet[sheet_key].get(not_null_id) if not_null_id else None,
             )
+            if selected.get("primary_key") and clean_value(raw_primary_key) is None:
+                primary_key = 0
+            if not_null_id and clean_value(raw_not_null) is None:
+                not_null = 0
             result[target_name].append(
                 {
                     "file_id": file_id,
@@ -519,10 +527,9 @@ def _merge_catalog(
                         "column_name": record["column_name"],
                     }
                 )
-                continue
             current = {
                 **record,
-                "table_name": canonical_table_name,
+                "table_name": canonical_table_name or record["table_name"],
                 "_s2t_fields": set(),
                 "_sheet_fields": set(),
             }

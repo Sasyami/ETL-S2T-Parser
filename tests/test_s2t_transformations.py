@@ -26,7 +26,7 @@ from sheet_skills.additional_objects import (
 )
 from sheet_skills.structured_metadata import extract_structured_metadata
 from sheet_skills.table_catalog import extract_table_catalogs
-from sheet_skills.column_catalog import extract_column_catalogs
+from sheet_skills.column_catalog import _merge_catalog, extract_column_catalogs
 from storage.database import get_db_connection, init_db, store_excel_data
 from storage.s2t import (
     clear_s2t_transformations,
@@ -1285,6 +1285,7 @@ def test_column_catalog_recovers_headers_from_first_stored_data_row(s2t_db):
                 "data_rows": [
                     ["Название таблицы", "Название поля", "Тип поля", "NULL?", "PK", "Описание поля"],
                     ["raw.orders", "id", "uuid", "нет", "да", "Идентификатор заказа"],
+                    ["raw.orders", "payload", "jsonb", None, None, "Тело заказа"],
                 ],
             },
         ],
@@ -1311,7 +1312,17 @@ def test_column_catalog_recovers_headers_from_first_stored_data_row(s2t_db):
                 SELECT table_name, column_name, data_type, primary_key,
                        not_null, description, metadata_source
                 FROM source_columns
-                WHERE file_id = ?
+                WHERE file_id = ? AND column_name = 'id'
+                """,
+                (file_id,),
+            ).fetchone()
+        )
+        blank_flags = tuple(
+            conn.execute(
+                """
+                SELECT primary_key, not_null
+                FROM source_columns
+                WHERE file_id = ? AND column_name = 'payload'
                 """,
                 (file_id,),
             ).fetchone()
@@ -1327,6 +1338,38 @@ def test_column_catalog_recovers_headers_from_first_stored_data_row(s2t_db):
         "description": "Идентификатор заказа",
         "metadata_source": "columns_sheet",
     }
+    assert blank_flags == (0, 0)
+
+
+def test_column_catalog_preserves_sheet_column_without_s2t_link(s2t_db):
+    rows, report = _merge_catalog(
+        "source_columns",
+        [],
+        [
+            {
+                "file_id": 1,
+                "sheet_name": "Source columns",
+                "row_num": 7,
+                "table_name": "raw.unused",
+                "column_name": "payload",
+                "data_type": "jsonb",
+                "primary_key": 0,
+                "not_null": 0,
+                "description": "Дополнительная колонка",
+            }
+        ],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["metadata_source"] == "columns_sheet"
+    assert report["unlinked_rows"] == [
+        {
+            "sheet_name": "Source columns",
+            "row_num": 7,
+            "table_name": "raw.unused",
+            "column_name": "payload",
+        }
+    ]
 
 
 def test_structured_metadata_extraction_writes_configured_fields_and_duplicates(
