@@ -45,6 +45,48 @@
       "Тип данных",
       "Тип данных поля приемника"
     ],
+    "source_primary_key": [
+      "Первичный ключ поля источника",
+      "Первичный ключ источника",
+      "Source Is PK",
+      "Source PK",
+      "Первичный ключ",
+      "PK"
+    ],
+    "target_primary_key": [
+      "Первичный ключ поля приемника",
+      "Первичный ключ приемника",
+      "Target Is PK",
+      "Target PK",
+      "Первичный ключ",
+      "PK"
+    ],
+    "source_not_null": [
+      "Not null поля источника",
+      "Source Not Null",
+      "notnullsource",
+      "not null",
+      "NULL?"
+    ],
+    "target_not_null": [
+      "Not null поля приемника",
+      "Target Not Null",
+      "notnulltarget",
+      "not null",
+      "NULL?"
+    ],
+    "source_description": [
+      "Описание поля источника",
+      "Source Column Description",
+      "Source Attribute Definition",
+      "comment"
+    ],
+    "target_description": [
+      "Описание поля приемника",
+      "Target Column Description",
+      "Target Attribute Definition",
+      "comment"
+    ],
     "n_table_name": [
       "Название N-таблицы",
       "N-таблица"
@@ -142,14 +184,19 @@
     ]
   },
   "source_columns": {
-    "field_name": [
+    "column_name": [
       "Название поля",
+      "Название поля/описание",
+      "Column Name",
+      "ColumnName",
       "column"
     ],
     "table_name": [
       "Название таблицы",
       "Название таблицы-источника",
       "Название таблицы STAGE",
+      "Column Table Name",
+      "ColumnTableName",
       "table"
     ],
     "primary_key": [
@@ -157,8 +204,9 @@
       "Первичный ключ",
       "pk"
     ],
-    "not_null_flag": [
+    "not_null": [
       "NULL?",
+      "Column Null Option",
       "notnull",
       "notnullsource",
       "notnulltcp"
@@ -169,7 +217,51 @@
     ],
     "description": [
       "comment",
-      "Описание поля"
+      "Описание поля",
+      "Column Attribute Definition",
+      "Column Attribute Note"
+    ]
+  },
+  "target_columns": {
+    "column_name": [
+      "Название поля",
+      "Column Name",
+      "ColumnName",
+      "column"
+    ],
+    "table_name": [
+      "Название таблицы",
+      "Название таблицы-приемника",
+      "Column Table Name",
+      "ColumnTableName",
+      "table"
+    ],
+    "primary_key": [
+      "PK",
+      "Первичный ключ",
+      "Column IsPK",
+      "Column Is PK",
+      "pk"
+    ],
+    "not_null": [
+      "NULL?",
+      "Column Null Option",
+      "notnull",
+      "notnulltarget",
+      "notnulltcp"
+    ],
+    "data_type": [
+      "Тип поля",
+      "Тип данных",
+      "Column Datatype",
+      "Column Data Type",
+      "datatype"
+    ],
+    "description": [
+      "comment",
+      "Описание поля",
+      "Column Attribute Definition",
+      "Column Attribute Note"
     ]
   },
   "change_log": {

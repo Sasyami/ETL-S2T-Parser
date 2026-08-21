@@ -1,10 +1,38 @@
-"""Runtime prompt and SQLite schema context for the chat agent."""
+"""Runtime skills and lazily selected data schemas for the chat agent."""
 
-from typing import Iterable, List, Optional, Tuple
+import json
+from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
 from .common import PROJECT_ROOT
 
 PROMPTS_DIR = PROJECT_ROOT / "agents" / "prompts"
+CONFIG_DIR = PROJECT_ROOT / "config"
+
+SchemaName = Literal[
+    "SQLite ETL",
+    "S2T-маппинг",
+    "Excel-маппинги",
+    "Neo4j lineage",
+]
+
+SCHEMA_CATALOG: Dict[str, str] = {
+    "SQLite ETL": (
+        "Физические SQLite-таблицы и их реальные колонки, включая "
+        "additional_objects.sql, s2t_transformations и data."
+    ),
+    "S2T-маппинг": (
+        "Структура одного S2T-кортежа, роли source/target, алиасы заголовков "
+        "S2T-листа и правила ETL-слоёв."
+    ),
+    "Excel-маппинги": (
+        "Группы и алиасы листов, роли колонок каталогов/additional objects и "
+        "целевые поля настроенного извлечения."
+    ),
+    "Neo4j lineage": (
+        "Схема проекции ETLTable/ETLColumn и связей "
+        "TABLE_TRANSFORMS_TO/TRANSFORMS_TO."
+    ),
+}
 
 
 def _prompt_text(filename: str) -> str:
@@ -50,7 +78,6 @@ def get_sqlite_schema_cheatsheet() -> str:
     )
     s2t_display_columns = _format_backtick_list(("row_num", *S2T_RECORD_FIELDS))
     return (
-        "\n\n---\n\n"
         "## Актуальная схема SQLite\n\n"
         "Блок с таблицами и колонками сгенерирован из `storage/database.py`; не подменяй его устаревшей документацией.\n\n"
         "| Таблица | Роль | Колонки (реальные имена) |\n"
@@ -64,6 +91,92 @@ def get_sqlite_schema_cheatsheet() -> str:
         + f"- Для `s2t_transformations` по умолчанию показывай только {s2t_display_columns}, если пользователь явно не просит сырой DDL.\n"
         "- Не перечисляй `sqlite_master` и служебные таблицы, если пользователь прямо не спрашивает про внутреннюю реализацию БД.\n"
     )
+
+
+def _config_object(filename: str) -> Dict[str, object]:
+    """Read one checked-in JSON config used as a schema source of truth."""
+    return json.loads((CONFIG_DIR / filename).read_text(encoding="utf-8"))
+
+
+def _compact_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def get_s2t_mapping_schema_cheatsheet() -> str:
+    """Build the current S2T tuple and upload-column mapping schema."""
+    from storage.database import S2T_RECORD_FIELDS
+
+    column_mapping = _config_object("column_mapping.json")
+    extraction = _config_object("usefull_col_extraction.json")
+    table_layers = _config_object("table_layers.json")
+    return (
+        "## Схема S2T-маппинга\n\n"
+        "Источник истины — текущие config JSON и storage/database.py.\n"
+        "- Один сохранённый кортеж: "
+        + ", ".join(f"`{field}`" for field in S2T_RECORD_FIELDS)
+        + ".\n"
+        "- `source_*` описывает вход, `target_*` — результат; "
+        "`transformation_rule` хранит правило или SQL как текст.\n"
+        "- `s2t_transformations` глобальна: её нельзя автоматически фильтровать "
+        "по `file_id`. Пустой `target_table` недопустим при загрузке.\n"
+        "- Алиасы заголовков S2T-листа: "
+        + _compact_json(column_mapping.get("s2t", {}))
+        + "\n- Цель извлечения S2T: "
+        + _compact_json(extraction.get("s2t_transformations", {}))
+        + "\n- Правила слоёв: "
+        + _compact_json(table_layers)
+    )
+
+
+def get_excel_mapping_schema_cheatsheet() -> str:
+    """Build current non-S2T sheet and column matching schemas."""
+    column_mapping = _config_object("column_mapping.json")
+    column_mapping.pop("s2t", None)
+    extraction = _config_object("usefull_col_extraction.json")
+    extraction.pop("s2t_transformations", None)
+    return (
+        "## Схемы Excel-маппингов\n\n"
+        "Источник истины — текущие config JSON; имена ниже являются "
+        "настроенными ролями и алиасами, а не найденными строками файла.\n"
+        "- Группы и алиасы листов: "
+        + _compact_json(_config_object("sheet_groups.json"))
+        + "\n- Алиасы колонок по группам: "
+        + _compact_json(column_mapping)
+        + "\n- Целевые поля извлечения: "
+        + _compact_json(extraction)
+    )
+
+
+def get_neo4j_schema_cheatsheet() -> str:
+    """Return the public graph projection schema used by lineage tools."""
+    return (
+        "## Схема Neo4j lineage\n\n"
+        "- Узел `ETLTable`: точное имя таблицы в свойстве `name`.\n"
+        "- Узел `ETLColumn`: `key`, `table_name`, `name`; wildcard хранится "
+        "как отдельная колонка с `name=\"*\"`.\n"
+        "- `(:ETLColumn)-[:TRANSFORMS_TO]->(:ETLColumn)` — направленная "
+        "колонковая связь.\n"
+        "- `(:ETLTable)-[:TABLE_TRANSFORMS_TO]->(:ETLTable)` — направленная "
+        "табличная связь; SQL правила может находиться на ребре.\n"
+        "- Все узлы проекции имеют label `ETLProjection`; исходные факты "
+        "остаются в SQLite."
+    )
+
+
+def load_schemas(sections: Iterable[str]) -> str:
+    """Load only the exact data schemas selected by the router."""
+    loaders = {
+        "SQLite ETL": get_sqlite_schema_cheatsheet,
+        "S2T-маппинг": get_s2t_mapping_schema_cheatsheet,
+        "Excel-маппинги": get_excel_mapping_schema_cheatsheet,
+        "Neo4j lineage": get_neo4j_schema_cheatsheet,
+    }
+    selected: List[str] = []
+    for section in dict.fromkeys(str(item) for item in sections):
+        loader = loaders.get(section)
+        if loader is not None:
+            selected.append(loader().strip())
+    return "\n\n---\n\n".join(part for part in selected if part)
 
 
 def load_skills(sections: Optional[Iterable[str]] = None) -> str:

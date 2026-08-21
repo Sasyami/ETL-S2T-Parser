@@ -191,6 +191,7 @@ def _record_live_exchange(
         display_names = []
 
     metrics_block = "Метрики недоступны"
+    trace_block = "Трасса недоступна"
     if metrics is not None:
         metrics_block = (
             f"agent_seconds: {metrics.elapsed_seconds:.3f}\n"
@@ -206,6 +207,24 @@ def _record_live_exchange(
             "displays: "
             + (", ".join(metrics.display_tools) or "Нет")
         )
+        trace_block = "```json\n" + json.dumps(
+            {
+                "coordinator_plan": metrics.coordinator_plan,
+                "worker_tasks": metrics.worker_tasks,
+                "worker_routes": [
+                    item.model_dump(mode="json")
+                    for item in metrics.worker_routes
+                ],
+                "observations": [
+                    item.model_dump(mode="json")
+                    for item in metrics.observations
+                ],
+                "coordinate_result": metrics.coordinate_result,
+                "aggregate_result": metrics.aggregate_result,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n```"
 
     with _LIVE_TRANSCRIPT_LOCK:
         _LIVE_TRANSCRIPT_INDEX += 1
@@ -219,6 +238,8 @@ def _record_live_exchange(
             f"{', '.join(display_names) if display_names else 'Нет'}\n\n"
             "### Execution metrics\n\n"
             f"{metrics_block}\n\n"
+            "### Agent trace\n\n"
+            f"{trace_block}\n\n"
         )
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
         with transcript_path.open("a", encoding="utf-8", newline="\n") as transcript:
@@ -394,6 +415,156 @@ def _fetch_one(query: str, parameters: tuple[object, ...] = ()) -> tuple:
     if row is None:
         pytest.skip("workspace database has no row required by the scenario")
     return tuple(row)
+
+
+def _s2t_work_case_fixture() -> tuple[int, str, str, str, str]:
+    row = _fetch_one(
+        """
+        SELECT file_id, target_table, source_table, target_field, source_field
+        FROM s2t_transformations
+        WHERE LOWER(sheet_name) = 's2t'
+          AND target_table IS NOT NULL AND TRIM(target_table) <> ''
+          AND source_table IS NOT NULL AND TRIM(source_table) <> ''
+          AND target_field IS NOT NULL AND TRIM(target_field) <> ''
+          AND source_field IS NOT NULL AND TRIM(source_field) <> ''
+          AND transformation_rule IS NOT NULL
+          AND LOWER(transformation_rule) LIKE '%join%'
+          AND LOWER(transformation_rule) LIKE '%where%'
+        ORDER BY LENGTH(transformation_rule), id
+        LIMIT 1
+        """
+    )
+    return (
+        int(row[0]),
+        str(row[1]),
+        str(row[2]),
+        str(row[3]),
+        str(row[4]),
+    )
+
+
+def _work_case_data_types() -> tuple[str, str]:
+    file_id, target_table, source_table, target_field, source_field = (
+        _s2t_work_case_fixture()
+    )
+
+    def sheet_type(sheet_name: str, table_name: str, field_name: str) -> str:
+        conn = db_storage.get_db_connection()
+        try:
+            header_row = conn.execute(
+                """
+                SELECT headers_json
+                FROM file_sheet_headers
+                WHERE file_id = ? AND sheet_name = ? COLLATE NOCASE
+                """,
+                (file_id, sheet_name),
+            ).fetchone()
+            if header_row is None:
+                pytest.skip(f"workspace has no {sheet_name} headers")
+            headers = json.loads(header_row[0] or "[]")
+            ids_by_name = {
+                str(item.get("flat") or "").strip().casefold():
+                int(item.get("index", index)) + 1
+                for index, item in enumerate(headers)
+                if isinstance(item, dict)
+            }
+            table_id = ids_by_name.get("table")
+            column_id = ids_by_name.get("column")
+            datatype_id = ids_by_name.get("datatype")
+            if not all((table_id, column_id, datatype_id)):
+                pytest.skip(f"workspace {sheet_name} lacks table/column/datatype")
+            row = conn.execute(
+                """
+                SELECT datatype.value
+                FROM data AS table_name
+                JOIN data AS column_name
+                  ON column_name.file_id = table_name.file_id
+                 AND column_name.table_name = table_name.table_name
+                 AND column_name.row_num = table_name.row_num
+                JOIN data AS datatype
+                  ON datatype.file_id = table_name.file_id
+                 AND datatype.table_name = table_name.table_name
+                 AND datatype.row_num = table_name.row_num
+                WHERE table_name.file_id = ?
+                  AND table_name.table_name = ? COLLATE NOCASE
+                  AND table_name.column_id = ?
+                  AND table_name.value = ? COLLATE NOCASE
+                  AND column_name.column_id = ?
+                  AND column_name.value = ? COLLATE NOCASE
+                  AND datatype.column_id = ?
+                LIMIT 1
+                """,
+                (
+                    file_id,
+                    sheet_name,
+                    table_id,
+                    table_name,
+                    column_id,
+                    field_name,
+                    datatype_id,
+                ),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or not str(row[0] or "").strip():
+            pytest.skip(f"workspace has no datatype for {table_name}.{field_name}")
+        return str(row[0]).strip()
+
+    return (
+        sheet_type("source_columns", source_table, source_field),
+        sheet_type("target_columns", target_table, target_field),
+    )
+
+
+def _assert_s2t_work_case_execution(
+    exchange: _LiveExchange,
+    *,
+    max_seconds: float = 240,
+    max_llm_calls: int = 32,
+    max_total_tokens: int = 180_000,
+) -> None:
+    metrics = exchange.metrics
+    allowed_tools = {
+        "get_excel_row",
+        "list_columns",
+        "list_file_sheet_headers",
+        "list_s2t_transformations",
+        "parse_sql_column_lineage",
+        "parse_sql_table_lineage",
+        "run_sql",
+        "search_excel_values",
+        "search_s2t_transformations",
+        "show_plan",
+        "trace_transformation_path",
+    }
+    tool_names = [item.name for item in metrics.tool_calls]
+
+    assert metrics.error is None, metrics.error
+    assert 0 < metrics.elapsed_seconds <= max_seconds, metrics
+    assert 0 < exchange.http_elapsed_seconds <= max_seconds + 5, metrics
+    assert tool_names, "scenario returned without inspecting stored data"
+    assert set(tool_names) <= allowed_tools, tool_names
+    assert len(tool_names) <= 12, tool_names
+    if LIVE_AGENT_MODE == "multiagent":
+        assert metrics.coordinator_plan, metrics.coordinator_plan
+        assert 0 < len(metrics.worker_tasks) <= len(metrics.coordinator_plan), (
+            metrics.coordinator_plan,
+            metrics.worker_tasks,
+        )
+    else:
+        assert metrics.worker_tasks == [], metrics.worker_tasks
+        assert metrics.coordinator_plan == [], metrics.coordinator_plan
+    assert 0 < len(metrics.llm_calls) <= max_llm_calls, metrics.llm_calls
+    assert all(item.total_tokens > 0 for item in metrics.llm_calls), metrics.llm_calls
+    assert metrics.input_tokens > 0
+    assert metrics.output_tokens > 0
+    assert metrics.total_tokens == metrics.input_tokens + metrics.output_tokens
+    assert metrics.total_tokens <= max_total_tokens, metrics
+
+
+def _assert_answer_contains_any(answer: str, values: tuple[str, ...]) -> None:
+    lowered = answer.casefold()
+    assert any(value.casefold() in lowered for value in values), answer
 
 
 def test_live_agent_answers_simple_conversation_without_display_results(
@@ -952,4 +1123,542 @@ def test_live_agent_passes_sqlite_result_into_full_neo4j_path(
         max_seconds=180,
         max_llm_calls=20,
         max_total_tokens=140_000,
+    )
+
+
+def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
+    file_id, target_table, source_table, target_field, source_field = (
+        _s2t_work_case_fixture()
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"Для загруженного файла file_id={file_id} проверь кейс: в обязательном "
+        f"целевом поле {target_table}.{target_field} могут появляться NULL. "
+        f"Сопоставь факты из листов S2T, Source columns и Target columns для "
+        f"источника {source_table}.{source_field}: обязательность target, может "
+        "ли source быть NULL и есть ли защита COALESCE или WHERE. Дай вывод с "
+        "конкретными доказательствами, а если данных не хватает — явно укажи это.",
+    )
+    result = exchange.result
+
+    _assert_public_answer(result.answer)
+    assert target_table in result.answer, result.answer
+    _assert_answer_contains_any(result.answer, ("null", "coalesce", "where"))
+    _assert_s2t_work_case_execution(exchange)
+
+
+def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client):
+    file_id, target_table, source_table, target_field, source_field = (
+        _s2t_work_case_fixture()
+    )
+    source_type, target_type = _work_case_data_types()
+    exchange = _chat(
+        live_chat_client,
+        f"Через SQLite для файла file_id={file_id} проверь совместимость типов "
+        "в маппинге "
+        f"{source_table}.{source_field} -> {target_table}.{target_field}. "
+        "В таблице data имена source_columns, target_columns и s2t являются "
+        "именами Excel-листов, а ETL-таблицы — значениями ячеек: не ищи лист с "
+        "именем ETL-таблицы. Найди строки по точным table/column, сверь их "
+        "datatype и отдельно проверь CAST в глобальной s2t_transformations по "
+        "точным source_table, source_field, target_table, target_field без "
+        "фильтра file_id. Верни доказательства и однозначный вывод: совместимо, "
+        "несовместимо или данных недостаточно.",
+    )
+    result = exchange.result
+
+    _assert_public_answer(result.answer)
+    assert target_table in result.answer, result.answer
+    assert source_type.casefold() in result.answer.casefold(), result.answer
+    assert target_type.casefold() in result.answer.casefold(), result.answer
+    _assert_answer_contains_any(result.answer, ("тип", "cast"))
+    _assert_answer_contains_any(
+        result.answer,
+        ("совместим", "несовместим", "недостаточно"),
+    )
+    _assert_s2t_work_case_execution(exchange)
+
+
+def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
+    file_id, target_table, source_table, _, _ = _s2t_work_case_fixture()
+    exchange = _chat(
+        live_chat_client,
+        f"Для файла file_id={file_id} оцени риск дубликатов в target_table "
+        f"{target_table} из источника {source_table}. Проверь S2T и, если "
+        "источник порождён представлением, Additional objects. Покажи, есть ли "
+        "GROUP BY, DISTINCT, оконная дедупликация и какие JOIN могут размножать "
+        "строки. Нужен вывод с конкретными SQL-признаками.",
+    )
+    result = exchange.result
+
+    _assert_public_answer(result.answer)
+    assert target_table in result.answer, result.answer
+    _assert_answer_contains_any(
+        result.answer,
+        ("group by", "distinct", "join", "row_number"),
+    )
+    _assert_s2t_work_case_execution(exchange)
+
+
+def test_live_agent_checks_unmapped_required_target_fields(live_chat_client):
+    file_id, target_table, _, _, _ = _s2t_work_case_fixture()
+    exchange = _chat(
+        live_chat_client,
+        f"Для файла file_id={file_id} проверь, все ли обязательные поля "
+        f"target_table {target_table} заполняются. Сопоставь обязательные поля "
+        "из Target columns с маппингами S2T, посчитай обязательные поля без "
+        "маппинга и перечисли их. Не считай необязательные поля дефектами.",
+    )
+    result = exchange.result
+
+    _assert_public_answer(result.answer)
+    assert target_table in result.answer, result.answer
+    _assert_answer_contains_any(result.answer, ("обязатель", "маппинг"))
+    assert _integer_values(result.answer), result.answer
+    _assert_s2t_work_case_execution(exchange)
+
+
+def test_live_agent_checks_row_loss_risk(live_chat_client):
+    file_id, target_table, source_table, _, _ = _s2t_work_case_fixture()
+    exchange = _chat(
+        live_chat_client,
+        f"Через SQLite для файла file_id={file_id} оцени риск потери строк при "
+        "загрузке "
+        f"из {source_table} в {target_table}. Проверь S2T и связанный SQL из "
+        "Additional objects, если он есть. s2t_transformations глобальна: не "
+        "ограничивай её по file_id; file_id используй только для файловых "
+        "листов и Additional objects. ETL-имена здесь являются значениями, а "
+        "не именами Excel-листов: не ищи лист с именем source_table. Сначала "
+        "получи transformation_rule по точным source_table и target_table. "
+        "Перечисли конкретные WHERE и INNER JOIN, которые могут уменьшить число "
+        "строк, и отдели доказанные факты от предположений.",
+    )
+    result = exchange.result
+
+    _assert_public_answer(result.answer)
+    assert target_table in result.answer, result.answer
+    _assert_answer_contains_any(result.answer, ("where", "inner join", "join"))
+    _assert_s2t_work_case_execution(exchange)
+
+
+def test_live_agent_explains_table_transformation(live_chat_client):
+    file_id, target_table, source_table, target_field, source_field = (
+        _s2t_work_case_fixture()
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"Для файла file_id={file_id} объясни простыми шагами табличную "
+        f"трансформацию для маппинга {source_table}.{source_field} -> "
+        f"{target_table}.{target_field}. Используй сохранённое правило S2T: "
+        "какие таблицы соединяются, какие фильтры применяются, как устраняются "
+        "дубликаты и какое значение попадает в target. Не выдумывай отсутствующие "
+        "детали.",
+    )
+    result = exchange.result
+
+    _assert_public_answer(result.answer)
+    assert target_table in result.answer, result.answer
+    assert source_table in result.answer, result.answer
+    _assert_answer_contains_any(result.answer, ("join", "where", "row_number"))
+    _assert_s2t_work_case_execution(exchange)
+
+
+def test_live_agent_writes_s2t_test_protocol(live_chat_client):
+    file_id, target_table, source_table, _, _ = _s2t_work_case_fixture()
+    exchange = _chat(
+        live_chat_client,
+        f"Через SQLite получи из глобальной s2t_transformations фактические "
+        f"маппинги загрузки {source_table} -> {target_table}, а затем для файла "
+        f"file_id={file_id} составь исполнимый тест-протокол. "
+        "Включи проверки count(source) vs count(target), уникальности ключа, null-rate "
+        "обязательных полей и контроль трансформаций. Для каждой проверки дай "
+        "цель, SQL-шаблон и критерий прохождения. Source/target — логические "
+        "ETL-таблицы, а не имена Excel-листов: не ищи листы с такими именами. "
+        "Неизвестные физические имена не придумывай, обозначь их явными "
+        "плейсхолдерами в SQL-шаблонах.",
+    )
+    result = exchange.result
+
+    _assert_public_answer(result.answer)
+    assert target_table in result.answer, result.answer
+    _assert_answer_contains_any(result.answer, ("count", "количеств"))
+    _assert_answer_contains_any(result.answer, ("null", "null-rate"))
+    _assert_answer_contains_any(result.answer, ("distinct", "уникальн", "ключ"))
+    _assert_s2t_work_case_execution(exchange)
+
+
+def _assert_s2t_catalog_scenario(
+    exchange: _LiveExchange,
+    *,
+    required: tuple[str, ...] = (),
+    any_of: tuple[str, ...] = (),
+) -> None:
+    answer = exchange.result.answer
+    _assert_public_answer(answer)
+    lowered = answer.casefold()
+    for value in required:
+        assert value.casefold() in lowered, answer
+    if any_of:
+        _assert_answer_contains_any(answer, any_of)
+
+    metrics = exchange.metrics
+    assert metrics.error is None, metrics.error
+    assert 0 < metrics.elapsed_seconds <= 300, metrics
+    assert 0 < exchange.http_elapsed_seconds <= 305, metrics
+    assert metrics.tool_calls, "scenario returned without inspecting stored data"
+    if LIVE_AGENT_MODE == "multiagent":
+        assert metrics.coordinator_plan, metrics.coordinator_plan
+        assert 0 < len(metrics.worker_tasks) <= len(metrics.coordinator_plan), (
+            metrics.coordinator_plan,
+            metrics.worker_tasks,
+        )
+    else:
+        assert metrics.worker_tasks == [], metrics.worker_tasks
+        assert metrics.coordinator_plan == [], metrics.coordinator_plan
+    assert 0 < len(metrics.llm_calls) <= 80, metrics.llm_calls
+    assert metrics.total_tokens == metrics.input_tokens + metrics.output_tokens
+    assert 0 < metrics.total_tokens <= 320_000, metrics
+
+
+def test_live_agent_catalog_01_finds_target_field_source(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Откуда заполняется optn_id в t_optn? Найди source table, source field "
+        "и покажи transformation rule. Используй глобальную s2t_transformations.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("t_optn", "optn_id", "b3050000420005_paymentdetails"),
+        any_of=("object_id_uid", "product_entityid_uid"),
+    )
+
+
+def test_live_agent_catalog_02_finds_source_field_targets(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "В какие целевые таблицы передаётся c_closedate из "
+        "s_grnplm_as_t_didsd_700_db_stg.a_000025_t_loanscontract? Найди все "
+        "downstream S2T, не останавливайся на первом совпадении.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("c_closedate",),
+        any_of=("b700000025_agr_cred", "b700000025_agr_grntee"),
+    )
+
+
+def test_live_agent_catalog_03_lists_table_mapping(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Покажи полный маппинг b3050000420005_paymentdetails -> t_optn: "
+        "перечисли source column -> target column и transformation rules.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("b3050000420005_paymentdetails", "t_optn"),
+        any_of=("object_id_uid", "product_entityid_uid"),
+    )
+
+
+def test_live_agent_catalog_04_explains_calculated_field(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Как рассчитывается agr_cred_sum_crncy_amt в "
+        "b7000000250004_loansagreement? Покажи expression и все исходные поля.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("agr_cred_sum_crncy_amt",),
+        any_of=("c_debtlimit", "c_expenseslimit", "coalesce"),
+    )
+
+
+def test_live_agent_catalog_05_finds_business_metric_source(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Из какого поля берётся сумма задолженности или кредитного лимита "
+        "клиента? Ищи по бизнес-смыслу и описаниям, верни наиболее вероятные "
+        "S2T и объясни выбор техническими полями.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        any_of=("agr_cred_sum_crncy_amt", "c_debtlimit", "c_expenseslimit"),
+    )
+
+
+def test_live_agent_catalog_06_semantic_close_date_search(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Где у нас хранится дата закрытия договора? Найди технические поля без "
+        "требования точного совпадения русского текста и покажи S2T.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        any_of=("close_dt", "c_closedate", "closedate", "dateclose"),
+    )
+
+
+def test_live_agent_catalog_07_finds_business_filter_rule(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Как определяется, что клиент связан с депозитным договором в "
+        "t_agr_dep_cust? Покажи условия отбора и поля клиента.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("t_agr_dep_cust",),
+        any_of=("client_entityid_uid", "cust_id", "is not null"),
+    )
+
+
+def test_live_agent_catalog_08_searches_client_id_synonyms(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Найди идентификатор клиента в S2T, учитывая варианты client_id, "
+        "cust_id, client_entityid_uid и baseclientid. Верни таблицы и поля.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        any_of=("cust_id", "client_entityid_uid", "c_baseclientid"),
+    )
+
+
+def test_live_agent_catalog_09_maps_russian_term_to_technical_field(
+    live_chat_client,
+):
+    exchange = _chat(
+        live_chat_client,
+        "Найди техническое поле для даты удаления записи и соответствующее "
+        "S2T-правило. Ищи по русскому бизнес-термину, а не по заданному имени.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("del_dt",),
+        any_of=("ctl_action", "ctl_validfrom"),
+    )
+
+
+def test_live_agent_catalog_10_builds_full_lineage(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Покажи всю цепочку происхождения b700000025_agr_cred.c_closedate до "
+        "первичных source-таблиц. Включи subquery и branch по порядку.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("b700000025_agr_cred", "c_closedate"),
+        any_of=("branch", "subquery", "a_000025_t_loanscontract"),
+    )
+
+
+def test_live_agent_catalog_11_lists_intermediate_tables(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Через какие промежуточные таблицы проходит c_closedate от "
+        "s_grnplm_as_t_didsd_700_db_stg.a_000025_t_loanscontract до "
+        "b700000025_agr_cred? Перечисли маршрут по порядку.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("c_closedate", "b700000025_agr_cred"),
+        any_of=("branch", "v_agr_cred", "subquery"),
+    )
+
+
+def test_live_agent_catalog_12_compares_two_field_origins(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "fk_status_id в b700000025_agr_cred и fk_status_id в "
+        "b700000025_agr_grntee берутся из одного источника? Построй lineage для "
+        "обоих и дай явный итог с общими и различающимися источниками.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("b700000025_agr_cred", "b700000025_agr_grntee", "fk_status_id"),
+        any_of=("loanscontract", "loans_productparty"),
+    )
+
+
+def test_live_agent_catalog_13_finds_join_condition(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "По каким полям соединяются l_000025_t_loansagreement_stg и "
+        "l_000025_t_loanscontract_stg в сохранённых Additional objects? "
+        "Покажи JOIN condition и роли алиасов.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("fk_contract_id", "c_id"),
+        any_of=("join", "соедин"),
+    )
+
+
+def test_live_agent_catalog_14_finds_filtering(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Какие записи из b3050000420007_product не попадут в t_agr_dep? "
+        "Найди WHERE/FILTER условия и объясни исключение записей.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("b3050000420007_product", "t_agr_dep"),
+        any_of=("incr_flag", "where", "фильтр"),
+    )
+
+
+def test_live_agent_catalog_15_finds_constant_or_default(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Где при загрузке fk_productkind_id в "
+        "b700000025_agr_cred::subquery::v_agr_cred2 устанавливается константа "
+        "или default? Покажи literal и правило.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("fk_productkind_id", "-1010"),
+        any_of=("cast", "констант", "default"),
+    )
+
+
+def test_live_agent_catalog_16_finds_case_transformation(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Где используется CASE при расчёте del_dt в "
+        "b700000025_agr_cred::subquery::v_agr_cred1? Покажи условия и "
+        "результирующие значения.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("del_dt", "case"),
+        any_of=("ctl_action", "ctl_validfrom", "null"),
+    )
+
+
+def test_live_agent_catalog_17_finds_aggregation(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Откуда берётся agr_dep_purpose_type_cd в t_agr_dep_purpose_type и "
+        "как данные агрегируются? Покажи агрегат и уровень GROUP BY.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("agr_dep_purpose_type_cd", "t_agr_dep_purpose_type"),
+        any_of=("max", "group by", "specialcode"),
+    )
+
+
+def test_live_agent_catalog_18_investigates_wrong_value(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "В b700000025_agr_cred.c_closedate неправильная дата. Из каких "
+        "источников и преобразований она могла прийти? Восстанови lineage назад "
+        "и выдели места возможного изменения.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("b700000025_agr_cred", "c_closedate"),
+        any_of=("union all", "branch", "loanscontract", "loans_productparty"),
+    )
+
+
+def test_live_agent_catalog_19_investigates_null(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "del_dt в b700000025_agr_cred пустое. Посмотри, откуда оно загружается "
+        "и какие CASE/JOIN/FILTER могут привести к NULL.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("b700000025_agr_cred", "del_dt"),
+        any_of=("null", "case", "ctl_action"),
+    )
+
+
+def test_live_agent_catalog_20_finds_data_loss_points(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "В a_000025_t_loanscontract запись есть, а в b700000025_agr_cred её "
+        "нет. Какие S2T, промежуточные таблицы, JOIN и FILTER надо проверить? "
+        "Выдели возможные места потери записи.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("a_000025_t_loanscontract", "b700000025_agr_cred"),
+        any_of=("join", "where", "branch", "union"),
+    )
+    _assert_answer_contains_any(
+        exchange.result.answer,
+        ("::subquery::", "::branch::", "v_agr_cred"),
+    )
+
+
+def test_live_agent_catalog_21_traces_value_change(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "В источнике ctl_action='D', а в b700000025_agr_cred рассчитано del_dt. "
+        "Найди все преобразования по пути и укажи, где меняется представление "
+        "значения.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("ctl_action", "del_dt", "case", "ctl_validfrom"),
+        any_of=("null", "union all", "branch"),
+    )
+
+
+def test_live_agent_catalog_22_finds_multiple_sources(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Из каких источников может заполняться agr_cred_sum_crncy_amt в "
+        "b7000000250004_loansagreement? Учти CASE, COALESCE и альтернативные "
+        "source fields.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("agr_cred_sum_crncy_amt", "c_debtlimit", "c_expenseslimit"),
+        any_of=("case", "coalesce"),
+    )
+
+
+def test_live_agent_catalog_23_performs_impact_analysis(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Что затронет изменение "
+        "s_grnplm_as_t_didsd_700_db_stg.a_000025_t_loanscontract.c_closedate? "
+        "Выполни reverse lineage и перечисли downstream-поля, таблицы и "
+        "зависимые transformations.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("c_closedate", "branch", "union all"),
+        any_of=("b700000025_agr_cred", "b700000025_agr_grntee"),
+    )
+
+
+def test_live_agent_catalog_24_compares_two_mart_rules(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Сравни расчёт del_dt в b700000025_agr_cred и "
+        "b700000025_agr_grntee. Найди оба lineage и rules, явно скажи, "
+        "совпадает логика или различается и чем.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("b700000025_agr_cred", "b700000025_agr_grntee", "del_dt"),
+        any_of=("case", "ctl_action", "ctl_validfrom"),
+    )
+
+
+def test_live_agent_catalog_25_finds_conflicting_s2t(live_chat_client):
+    exchange = _chat(
+        live_chat_client,
+        "Есть ли несколько S2T, которые описывают загрузку "
+        "b700000025_agr_cred::subquery::v_agr_cred1.del_dt по-разному? Найди "
+        "все mappings, сравни source fields и transformation, выдели конфликт "
+        "или объясни, почему mappings дополняют друг друга.",
+    )
+    _assert_s2t_catalog_scenario(
+        exchange,
+        required=("del_dt", "ctl_action", "ctl_validfrom"),
+        any_of=("case", "конфликт", "дополня"),
     )

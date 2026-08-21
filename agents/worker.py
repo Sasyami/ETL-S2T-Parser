@@ -1,7 +1,8 @@
 """Isolated generic read-only worker experiment.
 
-The public worker contract accepts only one self-contained task. Tool and skill
-selection and the planner/tool/observer loop remain internal to the worker.
+The public worker contract accepts only one self-contained task. Tool, skill,
+and schema selection and the planner/tool/observer loop remain internal to the
+worker.
 The worker exposes its concise answer, a bounded internal cycle trace, and
 opaque references to every successful tool result; a higher-level coordinator
 selects UI results.
@@ -22,11 +23,17 @@ from .chat_graph import (
     DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS,
     WorkerCycleTrace,
     WorkerDisplayItem,
+    ensure_worker_tools,
     run_worker_graph,
 )
 from .observability import get_callback_handler
-from .run_metrics import get_run_metrics_callback, record_worker_task
-from .tools import get_tools, get_tools_for_names, load_skills
+from .run_metrics import (
+    get_run_metrics_callback,
+    record_worker_observation,
+    record_worker_route,
+    record_worker_task,
+)
+from .tools import get_tools, get_tools_for_names, load_schemas, load_skills
 from .tools.routing import select_chat_route
 
 logger = logging.getLogger(__name__)
@@ -144,18 +151,42 @@ def worker_chat(task: str) -> WorkerAnswer:
         palette = tuple(sorted(dict.fromkeys(route.tools)))
         attempted_palettes.append(palette)
         selected_tools = get_tools_for_names(route.tools)
+        worker_tools = ensure_worker_tools(selected_tools)
         selected_skills = load_skills(tuple(route.skills))
+        selected_schemas = load_schemas(tuple(route.schemas))
+        reroute_reason = (
+            str(reroute_context.get("reason") or "").strip()
+            if reroute_context is not None
+            else None
+        )
+        record_worker_route(
+            worker_task=clean_task,
+            routing_attempt=reroute_count + 1,
+            tools=[tool.name for tool in worker_tools],
+            skills=list(route.skills),
+            schemas=list(route.schemas),
+            reroute_reason=reroute_reason,
+        )
 
         logger.info(
-            "Worker routed tools=%s skills=%s reroute=%s",
-            [tool.name for tool in selected_tools],
-            route.skills,
-            reroute_count,
+            "Worker route: %s",
+            json.dumps(
+                {
+                    "task": clean_task,
+                    "routing_attempt": reroute_count + 1,
+                    "tools": [tool.name for tool in selected_tools],
+                    "worker_tools": [tool.name for tool in worker_tools],
+                    "skills": list(route.skills),
+                    "schemas": list(route.schemas),
+                    "reroute_reason": reroute_reason,
+                },
+                ensure_ascii=False,
+            )[:8000],
         )
 
         system_prompt = build_chat_system_prompt(
             selected_skills,
-            [tool.name for tool in selected_tools],
+            selected_schemas,
         )
         if reroute_context is not None:
             system_prompt = (
@@ -167,23 +198,42 @@ def worker_chat(task: str) -> WorkerAnswer:
             task=clean_task,
             system_prompt=system_prompt,
             model=chat_model,
-            tools=selected_tools,
+            tools=worker_tools,
             max_steps=WORKER_MAX_STEPS,
             tool_message_preview_chars=WORKER_TOOL_MESSAGE_PREVIEW_CHARS,
             callbacks=callbacks,
         )
         first_cycle_number = len(cycle_history) + 1
-        cycle_history.extend(
-            [
-                cycle.model_copy(
-                    update={
-                        "cycle": first_cycle_number + index,
-                        "routing_attempt": reroute_count + 1,
-                    }
-                )
-                for index, cycle in enumerate(graph_result.cycle_history)
-            ]
-        )
+        new_cycles = [
+            cycle.model_copy(
+                update={
+                    "cycle": first_cycle_number + index,
+                    "routing_attempt": reroute_count + 1,
+                }
+            )
+            for index, cycle in enumerate(graph_result.cycle_history)
+        ]
+        cycle_history.extend(new_cycles)
+        for cycle in new_cycles:
+            observation_payload = cycle.observation.model_dump()
+            record_worker_observation(
+                worker_task=clean_task,
+                cycle=cycle.cycle,
+                routing_attempt=cycle.routing_attempt,
+                observation=observation_payload,
+            )
+            logger.info(
+                "Worker observation: %s",
+                json.dumps(
+                    {
+                        "task": clean_task,
+                        "cycle": cycle.cycle,
+                        "routing_attempt": cycle.routing_attempt,
+                        "observation": observation_payload,
+                    },
+                    ensure_ascii=False,
+                )[:8000],
+            )
         if not graph_result.reroute_required:
             return WorkerAnswer(
                 answer=graph_result.answer,

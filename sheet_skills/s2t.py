@@ -144,8 +144,15 @@ def write_s2t_transformations_from_plan(
     source = inspection or _inspect_candidate_sheets(file_id)
     mappings = _validate_sheet_mappings(file_id, sheet_mappings, source)
     records, row_errors = [], []
+    sheet_results = []
     for mapping in mappings:
         selected = mapping["field_column_ids"]
+        sheet_result = {
+            "sheet_name": mapping["sheet_name"],
+            "rows_written": 0,
+            "empty_target_columns_count": 0,
+        }
+        sheet_results.append(sheet_result)
         for row_num, row in load_row_values(
             file_id, mapping["sheet_name"]
         ).items():
@@ -171,7 +178,7 @@ def write_s2t_transformations_from_plan(
                         "error": "В строке S2T не заполнена целевая таблица",
                     }
                 )
-            elif values.get("target_field"):
+            else:
                 records.append(
                     {
                         "file_id": file_id,
@@ -181,6 +188,9 @@ def write_s2t_transformations_from_plan(
                         **layers,
                     }
                 )
+                sheet_result["rows_written"] += 1
+                if not values.get("target_field"):
+                    sheet_result["empty_target_columns_count"] += 1
     if row_errors:
         report = {
             "status": "error",
@@ -190,7 +200,15 @@ def write_s2t_transformations_from_plan(
             "validation_errors": row_errors,
         }
         raise S2TRowValidationError(report["error"], report)
-    return {**insert_s2t_transformations(file_id, records), "sheet_mappings": mappings}
+    return {
+        **insert_s2t_transformations(file_id, records),
+        "sheet_mappings": mappings,
+        "sheet_results": sheet_results,
+        "empty_target_columns_count": sum(
+            int(item["empty_target_columns_count"])
+            for item in sheet_results
+        ),
+    }
 
 
 def _invoke_llm_plain_text(prompt: str) -> str:
@@ -213,7 +231,68 @@ def _short_samples(values: Iterable[Any]) -> List[str]:
     ]
 
 
-def _build_sheet_llm_prompt(sheet: Dict[str, Any]) -> str:
+def _llm_column_context(
+    sheet: Dict[str, Any], draft: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    columns = list(sheet.get("columns", []))
+    selected = (draft or {}).get("field_column_ids") or {}
+    indices = {
+        int(column["column_id"]): int(column.get("column_index") or 0)
+        for column in columns
+    }
+    anchors = {
+        "source": [
+            indices[int(selected[field])]
+            for field in ("source_table", "source_field")
+            if selected.get(field) and int(selected[field]) in indices
+        ],
+        "target": [
+            indices[int(selected[field])]
+            for field in ("target_table", "target_field")
+            if selected.get(field) and int(selected[field]) in indices
+        ],
+    }
+    occurrences: Dict[str, int] = {}
+    result = []
+    for position, column in enumerate(columns):
+        name = str(column.get("column_name_flat") or "").strip()
+        occurrences[name] = occurrences.get(name, 0) + 1
+        distances = {
+            role: min(
+                (abs(position - anchor) for anchor in role_anchors),
+                default=10**6,
+            )
+            for role, role_anchors in anchors.items()
+        }
+        side_hint = (
+            "unknown"
+            if distances["source"] == distances["target"]
+            else min(distances, key=distances.get)
+        )
+        result.append(
+            {
+                "column_name": name,
+                "occurrence": occurrences[name],
+                "side_hint": side_hint,
+                "previous_column": (
+                    columns[position - 1].get("column_name_flat")
+                    if position > 0
+                    else None
+                ),
+                "next_column": (
+                    columns[position + 1].get("column_name_flat")
+                    if position + 1 < len(columns)
+                    else None
+                ),
+                "sample_values": _short_samples(column.get("sample_values") or []),
+            }
+        )
+    return result
+
+
+def _build_sheet_llm_prompt(
+    sheet: Dict[str, Any], draft: Optional[Dict[str, Any]] = None
+) -> str:
     mapping = {
         field: aliases
         for field, aliases in get_sheet_column_mapping(USEFULL_SHEET_GROUP).items()
@@ -222,22 +301,19 @@ def _build_sheet_llm_prompt(sheet: Dict[str, Any]) -> str:
     payload = {
         "sheet_name": sheet.get("sheet_name"),
         "column_mapping_json": {USEFULL_SHEET_GROUP: mapping},
-        "columns": [
-            {
-                "column_name": column.get("column_name_flat"),
-                "sample_values": _short_samples(column.get("sample_values") or []),
-            }
-            for column in sheet.get("columns", [])
-        ],
+        "columns": _llm_column_context(sheet, draft),
     }
     return (
         "Сопоставь полезные колонки одного настроенного листа с доступными полями "
         f"группы column_mapping_json {USEFULL_SHEET_GROUP!r}. "
-        "Для каждого входного column_name верни один mapping_field из "
+        "Для каждого входного column_name и occurrence верни один mapping_field из "
         "column_mapping_json или null. Не придумывай значения и не назначай один "
-        "mapping_field нескольким колонкам. Верни только JSON без markdown: "
+        "mapping_field нескольким колонкам. Одинаковые заголовки различай по "
+        "occurrence, соседним колонкам и side_hint: source относится к блоку "
+        "источника, target — к блоку приёмника. Верни только JSON без markdown: "
         '{"sheet_name":"...","column_roles":[{"column_name":"...",'
-        '"mapping_field":"target_table"},{"column_name":"...","mapping_field":null}]}.\n\n'
+        '"occurrence":1,"mapping_field":"target_table"},{"column_name":"...",'
+        '"occurrence":1,"mapping_field":null}]}.\n\n'
         + json.dumps(payload, ensure_ascii=False, default=str)
     )
 
@@ -261,28 +337,31 @@ def _sheet_mapping_from_column_roles(
     if not isinstance(roles, list):
         raise ValueError(f"{sheet_name}: missing JSON list field column_roles")
 
-    columns, duplicates = {}, set()
+    columns: Dict[tuple[str, int], Dict[str, Any]] = {}
+    occurrences: Dict[str, int] = {}
     for column in sheet.get("columns", []):
         name = str(column.get("column_name_flat") or "").strip()
-        if name in columns:
-            duplicates.add(name)
         if name:
-            columns[name] = column
-    if duplicates:
-        raise ValueError(
-            f"{sheet_name}: duplicate column_name values: {sorted(duplicates)}"
-        )
+            occurrences[name] = occurrences.get(name, 0) + 1
+            columns[(name, occurrences[name])] = column
 
     selected, evidence, seen = {field: None for field in S2T_FIELDS}, {}, set()
     for item in roles:
         if not isinstance(item, dict):
             raise ValueError(f"{sheet_name}: column_roles items must be objects")
         name = str(item.get("column_name") or "").strip()
-        if name not in columns or name in seen:
+        try:
+            occurrence = int(item.get("occurrence") or 1)
+        except (TypeError, ValueError):
             raise ValueError(
-                f"{sheet_name}: unknown or duplicate column_name: {name!r}"
+                f"{sheet_name}: invalid occurrence for column_name {name!r}"
             )
-        seen.add(name)
+        key = (name, occurrence)
+        if key not in columns or key in seen:
+            raise ValueError(
+                f"{sheet_name}: unknown or duplicate column occurrence: {key!r}"
+            )
+        seen.add(key)
         field = _normalise_llm_field(item.get("mapping_field"))
         if field is None:
             continue
@@ -290,7 +369,7 @@ def _sheet_mapping_from_column_roles(
             raise ValueError(
                 f"{sheet_name}: mapping_field {field} is assigned to multiple columns"
             )
-        column = columns[name]
+        column = columns[key]
         selected[field] = column["column_id"]
         evidence[field] = column_evidence(column, "llm", field)
     missing = sorted(set(columns) - seen)
@@ -314,7 +393,9 @@ def _resolve_sheet_mapping(
         return {"mapping": mapping, "attempts": 0, "method": "deterministic"}
     try:
         candidate = _sheet_mapping_from_column_roles(
-            _extract_json_object(_invoke_llm_plain_text(_build_sheet_llm_prompt(sheet))),
+            _extract_json_object(
+                _invoke_llm_plain_text(_build_sheet_llm_prompt(sheet, draft))
+            ),
             sheet,
         )
         mapping = _validate_sheet_mappings(file_id, [candidate], inspection)[0]
@@ -374,13 +455,31 @@ def run_s2t_extraction_subagent(
             )
 
         aliases_added = persist_mapping_aliases(USEFULL_SHEET_GROUP, mappings)
-        written = write_s2t_transformations_from_plan(
+        write_report = write_s2t_transformations_from_plan(
             file_id, mappings, inspection=inspection
-        )["count"]
+        )
+        sheet_results_by_name = {
+            str(item["sheet_name"]).casefold(): item
+            for item in write_report["sheet_results"]
+        }
+        for sheet in sheets:
+            sheet_result = sheet_results_by_name.get(
+                str(sheet["sheet_name"]).casefold(),
+                {},
+            )
+            sheet["rows_written"] = int(sheet_result.get("rows_written", 0))
+            sheet["empty_target_columns_count"] = int(
+                sheet_result.get("empty_target_columns_count", 0)
+            )
         verification = verify_s2t_transformations(file_id)
         return _make_report(
             file_id, "ok", attempts, sheets=sheets, aliases_added=aliases_added,
-            written=written, verification=verification,
+            written=int(write_report["count"]),
+            empty_target_columns_count=int(
+                write_report["empty_target_columns_count"]
+            ),
+            verification=verification,
+            sheet_mappings=write_report["sheet_mappings"],
         )
     except S2TExtractionError:
         raise

@@ -238,6 +238,20 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
     assert result["rows"][0]["name"] == "src_contract"
     assert result["rows"][0]["score"] == 1.0
 
+    expected_scopes = {
+        "files": {"files"},
+        "tables": {"source_tables", "target_tables"},
+        "source_tables": {"source_tables"},
+        "target_tables": {"target_tables"},
+    }
+    for scope, row_scopes in expected_scopes.items():
+        scoped = semantic_search_descriptions.invoke(
+            {"query": "кредитные договоры", "scope": scope, "limit": 10}
+        )
+        assert scoped["scope"] == scope
+        assert {row["scope"] for row in scoped["rows"]} == row_scopes
+        assert scoped["total_candidates"] == len(row_scopes)
+
 
 def test_trace_transformation_path_combines_s2t_sql_and_additional_objects():
     from agents.tools import trace_transformation_path
@@ -462,6 +476,16 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     assert tools[
         "semantic_search_descriptions"
     ].args_schema.model_json_schema()["required"] == ["query"]
+    semantic_schema = tools[
+        "semantic_search_descriptions"
+    ].args_schema.model_json_schema()
+    assert semantic_schema["properties"]["scope"]["enum"] == [
+        "all",
+        "files",
+        "tables",
+        "source_tables",
+        "target_tables",
+    ]
     assert tools[
         "trace_transformation_path"
     ].args_schema.model_json_schema()["required"] == ["table_name"]
@@ -471,8 +495,14 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     assert "search_s2t_transformations" in path_description
     assert "всегда возвращает готовые text_diagram" in path_description
     assert "полную ссылку в table_name" in path_description
+    assert "WHEN внутри CASE выбирает значение" in path_description
+    assert "WHERE, HAVING" in path_description
+    assert "UNION и UNION ALL объединяют ветви" in path_description
+    assert "входы одного выражения" in path_description
+    assert "одну логическую трансформацию" in path_description
     s2t_list_description = tools["list_s2t_transformations"].description
-    assert "являются синонимами поля transformation_rule" in s2t_list_description
+    assert "точными ролевыми фильтрами" in s2t_list_description
+    assert "например только transformation_rule" in s2t_list_description
     assert "visualize_transformation_path" not in tools
     assert tools[
         "visualize_s2t_table_graph"
@@ -1377,9 +1407,25 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
 
     tools = get_tools_by_name()
 
-    assert "основной инструмент" in tools["list_s2t_transformations"].description
-    assert "таблицу трансформаций" in tools["list_s2t_transformations"].description
-    assert "табличного поиска" in tools["search_s2t_transformations"].description
+    assert "source_table и/или target_table" in tools[
+        "list_s2t_transformations"
+    ].description
+    assert "отдельными аргументами, не строкой в q" in tools[
+        "list_s2t_transformations"
+    ].description
+    assert "роль искомого значения неизвестна" in tools[
+        "search_s2t_transformations"
+    ].description
+    assert "неполным или неквалифицированным именем" in tools[
+        "search_s2t_transformations"
+    ].description
+    assert "разреши по результату точное полное" in tools[
+        "search_s2t_transformations"
+    ].description
+    assert "используй list_s2t_transformations" in tools[
+        "search_s2t_transformations"
+    ].description
+    assert "точные S2T-строки" in tools["run_sql"].description
     assert "это сценарий Neo4j" in tools["run_sql"].description
     assert "не должны содержать" in tools["run_sql"].description
     assert "фильтр по file_id" in tools["run_sql"].description
@@ -1394,6 +1440,11 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "только когда пользователь просит lineage" in tools[
         "trace_neo4j_lineage"
     ].description
+    assert "max_depth=1" in tools["trace_neo4j_lineage"].description
+    assert "только прямых соседей" in tools[
+        "trace_neo4j_lineage"
+    ].description
+    assert "глубину больше 1" in tools["trace_neo4j_lineage"].description
     assert "узлы ETLTable" in tools["run_cypher"].description
     assert "ETLTable хранится в свойстве name" in tools["run_cypher"].description
     assert "ETLColumn имя таблицы" in tools["run_cypher"].description
@@ -1435,8 +1486,16 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "не принимает file_id" in tools[
         "list_s2t_table_names"
     ].description
-    assert "зависимост" in tools["parse_sql_column_lineage"].description
-    assert "ничего не выполняет" in tools["parse_sql_column_lineage"].description
+    column_parser_description = " ".join(
+        tools["parse_sql_column_lineage"].description.split()
+    )
+    assert "lineage" in column_parser_description
+    assert "ничего не выполняет" in column_parser_description
+    assert "полный SQL уже дословно есть" in column_parser_description
+    assert "JOIN/ON, WHERE, GROUP BY" in column_parser_description
+    assert "planner должен анализировать такой текст напрямую" in (
+        column_parser_description
+    )
     assert "только исходные и целевую" in tools[
         "parse_sql_table_lineage"
     ].description

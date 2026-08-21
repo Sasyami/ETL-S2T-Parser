@@ -7,6 +7,7 @@ from agents.summarizer_agent import ensure_file_description, summarize_file
 from graph_storage import is_neo4j_configured
 from processing.excel import convert_to_serializable
 from services.graph_sync import sync_file_graph
+from sheet_skills.column_catalog import extract_column_catalogs
 from sheet_skills.s2t import S2TExtractionError, run_s2t_extraction_subagent
 from sheet_skills.structured_metadata import extract_structured_metadata
 from sheet_skills.table_catalog import extract_table_catalogs
@@ -69,7 +70,13 @@ def try_extract_s2t_transformations(
             file_id,
             sheet_group_analysis=sheet_group_analysis,
         )
+        column_catalogs = extract_column_catalogs(
+            file_id,
+            sheet_group_analysis,
+            s2t_sheet_mappings=report.get("sheet_mappings"),
+        )
         report["table_catalogs"] = table_catalogs
+        report["column_catalogs"] = column_catalogs
         report["structured_metadata"] = structured_metadata
         return int(report.get("verification", {}).get("count", 0)), None, report
     except S2TExtractionError as exc:
@@ -149,6 +156,9 @@ def finish_analysis(
         file_id,
         sheet_group_analysis=sheet_group_analysis,
     )
+    empty_target_columns_count = int(
+        extraction_report.get("empty_target_columns_count", 0)
+    )
 
     _emit_progress(
         progress_callback,
@@ -175,6 +185,7 @@ def finish_analysis(
             "description": description,
             "description_error": description_error,
             "s2t_transformations_count": count,
+            "s2t_empty_target_columns_count": empty_target_columns_count,
             "s2t_transformations_error": extraction_error,
             "s2t_extraction_report": extraction_report,
             "sheet_group_analysis": sheet_group_analysis,
@@ -190,10 +201,14 @@ def finish_analysis(
         phase="done",
         percent=100,
         message="Анализ файла завершен",
-        detail=f"Листов: {len(response_sheets)}, S2T transformations: {count}",
+        detail=(
+            f"Листов: {len(response_sheets)}, S2T transformations: {count}, "
+            f"пустых target columns: {empty_target_columns_count}"
+        ),
         file_id=file_id,
         filename=filename,
         s2t_transformations_count=count,
+        s2t_empty_target_columns_count=empty_target_columns_count,
         s2t_transformations_error=extraction_error,
         s2t_extraction_report=extraction_report,
     )

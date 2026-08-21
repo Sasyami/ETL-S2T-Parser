@@ -2,8 +2,10 @@
 
 from .common import PROJECT_ROOT
 from .context import (
+    SCHEMA_CATALOG,
     get_sqlite_schema_cheatsheet,
     load_chat_agent_context,
+    load_schemas,
     load_skills,
 )
 from .files import (
@@ -68,6 +70,7 @@ __all__ = [
     "ALL_TOOLS_BY_NAME",
     "PROJECT_ROOT",
     "READ_ONLY_TOOLS",
+    "SCHEMA_CATALOG",
     "SQL_EXPORT_DIR",
     "SQL_LINEAGE_EXPORT_DIR",
     "SQL_LINEAGE_EXPORT_URL_PREFIX",
@@ -93,6 +96,7 @@ __all__ = [
     "list_sheet_group_classifications",
     "list_sheets",
     "load_chat_agent_context",
+    "load_schemas",
     "load_skills",
     "resolve_file",
     "parse_sql_column_lineage",

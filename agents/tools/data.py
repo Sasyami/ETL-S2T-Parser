@@ -297,13 +297,18 @@ def _cosine_similarity(left: array, right: array) -> float:
 @tool(parse_docstring=True)
 def semantic_search_descriptions(
     query: str,
-    scope: Literal["all", "files", "source_tables", "target_tables"] = "all",
+    scope: Literal[
+        "all", "files", "tables", "source_tables", "target_tables"
+    ] = "all",
     limit: int = 10,
 ) -> Dict[str, Any]:
     """Найти файлы и логические таблицы по смыслу сохранённых описаний.
 
     Используй для вопросов о назначении, предметной области или сущности, когда
-    точное имя файла/таблицы неизвестно. Инструмент эмбеддит запрос той же
+    точное имя файла/таблицы неизвестно; поисковый домен scope: files — только
+    файлы, tables — все логические таблицы, source_tables — только исходные,
+    target_tables — только целевые, all — все перечисленные домены.
+    Инструмент эмбеддит запрос той же
     моделью, которой были записаны description_embedding, и считает cosine
     similarity по files, source_tables и target_tables. Это не поиск значений
     ячеек, точных S2T-имён и не lineage.
@@ -319,7 +324,7 @@ def semantic_search_descriptions(
 
     Args:
         query: Смысловой запрос на естественном языке.
-        scope: all либо одна таблица хранения описаний.
+        scope: Домен поиска: all, files, tables, source_tables или target_tables.
         limit: Максимальное число результатов, от 1 до 50.
     """
     text = str(query or "").strip()
@@ -350,7 +355,7 @@ def semantic_search_descriptions(
                 ).fetchall()
             )
         for table_name in ("source_tables", "target_tables"):
-            if scope not in ("all", table_name):
+            if scope not in ("all", "tables", table_name):
                 continue
             candidates.extend(
                 dict(row)

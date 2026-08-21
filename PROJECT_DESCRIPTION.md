@@ -18,9 +18,11 @@ Flask-приложение разбирает Excel-книги с Source-to-Targ
 
 ## Агентная часть
 
-`agents/tools/routing.py` отдельным обычным LLM-вызовом выбирает точные имена tools и runtime skills. Модель возвращает сырой JSON, который приложение строго валидирует. Эвристического fallback нет.
+`agents/tools/routing.py` отдельным LLM-вызовом одновременно выбирает точные имена tools, runtime skills и схемы данных/маппинги. Результат формируется через `with_structured_output(ToolRoute, method="function_calling")` и проверяется по доступным каталогам; любой из трёх списков может быть пустым независимо от остальных. Эвристического fallback нет.
 
-`agents/chat_graph.py` выполняет цикл planner → tool → observer → planner/responder. Следующий planner и responder получают исходные `ToolMessage`; observer возвращает компактный обычный текст без structured output. Skills загружаются лениво и независимо от tools.
+`agents/chat_graph.py` выполняет цикл planner → tool → observer → planner/responder. Следующий planner получает ограниченный последний tool-обмен и накопительную observer-выжимку; observer возвращает Pydantic-структуру `Observation`. Skills загружаются лениво и независимо от tools.
+
+В изолированном worker цикл всегда проходит через ToolMessage. При `tools=[]` worker автоматически добавляет внутренний no-op `analyze_known_facts`: он не читает хранилища и только передаёт анализ известных фактов observer.
 
 SQLite остаётся источником фактов. Neo4j содержит производную проекцию `ETLTable`/`TABLE_TRANSFORMS_TO` и `ETLColumn`/`TRANSFORMS_TO`; отсутствие данных в графе не доказывает их отсутствия в SQLite.
 

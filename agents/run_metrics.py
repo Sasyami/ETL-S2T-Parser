@@ -51,6 +51,37 @@ class ToolCallMetric(BaseModel):
     has_error: bool = False
 
 
+class ObservationMetric(BaseModel):
+    """One structured worker observation retained without full tool results."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    worker_task: str
+    cycle: int
+    routing_attempt: int
+    summary: str
+    goal_satisfied: bool
+    mismatches: List[str] = Field(default_factory=list)
+    has_error: bool = False
+    important_facts: List[str] = Field(default_factory=list)
+    limitations: List[str] = Field(default_factory=list)
+    reroute_required: bool = False
+    reroute_reason: Optional[str] = None
+
+
+class WorkerRouteMetric(BaseModel):
+    """One router selection for a worker task and reroute attempt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    worker_task: str
+    routing_attempt: int
+    tools: List[str] = Field(default_factory=list)
+    skills: List[str] = Field(default_factory=list)
+    schemas: List[str] = Field(default_factory=list)
+    reroute_reason: Optional[str] = None
+
+
 class AgentRunMetrics(BaseModel):
     """Completed metrics snapshot retained by session id for test inspection."""
 
@@ -62,6 +93,10 @@ class AgentRunMetrics(BaseModel):
     tool_calls: List[ToolCallMetric] = Field(default_factory=list)
     worker_tasks: List[str] = Field(default_factory=list)
     coordinator_plan: List[Dict[str, Any]] = Field(default_factory=list)
+    worker_routes: List[WorkerRouteMetric] = Field(default_factory=list)
+    observations: List[ObservationMetric] = Field(default_factory=list)
+    coordinate_result: Optional[Dict[str, Any]] = None
+    aggregate_result: Optional[str] = None
     display_tools: List[str] = Field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
@@ -140,6 +175,10 @@ class _RunCollector:
         self.tool_calls: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.worker_tasks: List[str] = []
         self.coordinator_plan: List[Dict[str, Any]] = []
+        self.worker_routes: List[WorkerRouteMetric] = []
+        self.observations: List[ObservationMetric] = []
+        self.coordinate_result: Optional[Dict[str, Any]] = None
+        self.aggregate_result: Optional[str] = None
         self.display_tools: List[str] = []
         self.error: Optional[str] = None
 
@@ -243,6 +282,14 @@ class _RunCollector:
                 tool_calls=tool_calls,
                 worker_tasks=list(self.worker_tasks),
                 coordinator_plan=[dict(item) for item in self.coordinator_plan],
+                worker_routes=list(self.worker_routes),
+                observations=list(self.observations),
+                coordinate_result=(
+                    dict(self.coordinate_result)
+                    if self.coordinate_result is not None
+                    else None
+                ),
+                aggregate_result=self.aggregate_result,
                 display_tools=list(self.display_tools),
                 input_tokens=sum(item.input_tokens for item in llm_calls),
                 output_tokens=sum(item.output_tokens for item in llm_calls),
@@ -361,6 +408,84 @@ def record_coordinator_plan(steps: List[Dict[str, Any]]) -> None:
             collector.coordinator_plan = [dict(item) for item in steps]
 
 
+def record_worker_route(
+    *,
+    worker_task: str,
+    routing_attempt: int,
+    tools: List[str],
+    skills: List[str],
+    schemas: List[str],
+    reroute_reason: Optional[str] = None,
+) -> None:
+    """Retain an already selected router palette for live diagnostics."""
+    if collector := _ACTIVE_RUN.get():
+        metric = WorkerRouteMetric(
+            worker_task=_clip(worker_task),
+            routing_attempt=max(1, int(routing_attempt)),
+            tools=[str(item) for item in tools],
+            skills=[str(item) for item in skills],
+            schemas=[str(item) for item in schemas],
+            reroute_reason=_clip(reroute_reason) or None,
+        )
+        with collector.lock:
+            collector.worker_routes.append(metric)
+
+
+def record_worker_observation(
+    *,
+    worker_task: str,
+    cycle: int,
+    routing_attempt: int,
+    observation: Mapping[str, Any],
+) -> None:
+    """Retain a bounded structured observation for live-run diagnostics."""
+    if collector := _ACTIVE_RUN.get():
+        metric = ObservationMetric(
+            worker_task=_clip(worker_task),
+            cycle=max(1, int(cycle)),
+            routing_attempt=max(1, int(routing_attempt)),
+            summary=_clip(observation.get("summary")),
+            goal_satisfied=bool(observation.get("goal_satisfied")),
+            mismatches=[
+                _clip(item) for item in observation.get("mismatches", [])
+            ],
+            has_error=bool(observation.get("has_error")),
+            important_facts=[
+                _clip(item)
+                for item in observation.get("important_facts", [])
+            ],
+            limitations=[
+                _clip(item) for item in observation.get("limitations", [])
+            ],
+            reroute_required=bool(observation.get("reroute_required")),
+            reroute_reason=(
+                _clip(observation.get("reroute_reason")) or None
+            ),
+        )
+        with collector.lock:
+            collector.observations.append(metric)
+
+
+def record_coordinate_result(result: Mapping[str, Any]) -> None:
+    """Retain the coordinator synthesis before final aggregation."""
+    if collector := _ACTIVE_RUN.get():
+        payload = {
+            "answer": _clip(result.get("answer")),
+            "display_result_keys": [
+                str(item) for item in result.get("display_result_keys", [])
+            ],
+        }
+        with collector.lock:
+            collector.coordinate_result = payload
+
+
+def record_aggregate_result(answer: str) -> None:
+    """Retain the final answer produced by the isolated aggregator."""
+    if collector := _ACTIVE_RUN.get():
+        with collector.lock:
+            collector.aggregate_result = _clip(answer)
+
+
 def record_display_tools(names: List[str]) -> None:
     if collector := _ACTIVE_RUN.get():
         with collector.lock:
@@ -376,11 +501,17 @@ def consume_agent_run_metrics(session_id: str) -> Optional[AgentRunMetrics]:
 __all__ = [
     "AgentRunMetrics",
     "LLMCallMetric",
+    "ObservationMetric",
     "ToolCallMetric",
+    "WorkerRouteMetric",
     "capture_agent_run",
     "consume_agent_run_metrics",
     "get_run_metrics_callback",
+    "record_aggregate_result",
+    "record_coordinate_result",
     "record_coordinator_plan",
     "record_display_tools",
+    "record_worker_observation",
+    "record_worker_route",
     "record_worker_task",
 ]

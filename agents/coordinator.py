@@ -12,7 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from .agent import chat_model
 from .observability import get_callback_handler, langfuse_trace_context
-from .run_metrics import get_run_metrics_callback, record_coordinator_plan
+from .run_metrics import (
+    get_run_metrics_callback,
+    record_aggregate_result,
+    record_coordinate_result,
+    record_coordinator_plan,
+)
 from .worker import discard_worker_result_refs, worker_chat
 
 logger = logging.getLogger(__name__)
@@ -34,7 +39,9 @@ class WorkerPlanStep(BaseModel):
         min_length=1,
         description=(
             "Одна операция с данными, дающая один самостоятельно проверяемый "
-            "результат. Зависимая операция должна быть отдельным шагом."
+            "результат. Несколько атрибутов одной найденной записи остаются "
+            "одним результатом. Отдельный шаг нужен только для новой операции "
+            "с данными, зависящей от ещё неизвестного результата."
         ),
     )
     presentation: Literal["answer_only", "full_results"]
@@ -191,8 +198,11 @@ _PLAN_PROMPT = f"""
 Правила декомпозиции:
 - один step описывает одну операцию с данными и один самостоятельно проверяемый
   результат;
-- если операция использует результат предыдущей операции, создай отдельный
-  следующий step; нужный результат позднее подставит dispatcher;
+- несколько запрошенных атрибутов одного найденного объекта или записи являются
+  одним результатом и остаются в одном step; не разделяй их получение,
+  перечисление или прямое объяснение, если новой операции с данными не требуется;
+- отдельный зависимый step создавай только для новой операции с данными,
+  аргументы которой нельзя определить до получения результата предыдущего step;
 - не объединяй независимо проверяемые операции в одном goal и не создавай
   отдельные steps для оформления, пересказа или повторного показа тех же данных;
 - сохраняй порядок, точные сущности, идентификаторы, значения, условия,
@@ -318,6 +328,18 @@ structured observations, а `status` явно отмечает пункт как
 происхождение фактов. Ошибочный промежуточный вызов не является фактом для
 итогового ответа; учитывай его только как исправленную попытку. Опирайся на
 important_facts и summary observation того цикла, который подтверждает goal.
+
+`original_task` также является допустимым источником точных названий субъекта,
+объектов, ролей, идентификаторов и заданных пользователем входных условий.
+Используй их, чтобы связать подтверждённые workers результаты с исходным
+предметом запроса и сделать answer самодостаточным. Повтор точного идентификатора
+из original_task не является добавлением нового факта. При этом не выдавай
+неподтверждённое предположение из формулировки task за найденный результат.
+Самодостаточный answer явно связывает каждое возвращаемое значение с запрошенным
+субъектом или ролью, используя их точные названия из original_task. Значение,
+выражение или список без такого названия не считается самодостаточным, даже если
+его смысл можно угадать из порядка или worker task.
+
 Не придумывай отсутствующие факты или ключи. Сохраняй связи между значениями и
 объединяй результаты зависимых шагов по смыслу исходной задачи. Сохраняй в
 answer точные идентификаторы, порядок и числовые значения из подтверждённых
@@ -392,7 +414,10 @@ def _plan_tool_schema() -> Dict[str, Any]:
                                 "description": (
                                     "Одна операция с данными и один "
                                     "самостоятельно проверяемый результат, с "
-                                    "точными сущностями и условиями"
+                                    "точными сущностями и условиями. Несколько "
+                                    "атрибутов одной найденной записи остаются "
+                                    "одним результатом; отдельный шаг нужен "
+                                    "только для новой операции с данными"
                                 ),
                             },
                             "presentation": {
@@ -457,8 +482,9 @@ def _coordination_result_tool_schema() -> Dict[str, Any]:
                 "answer": {
                     "type": "string",
                     "description": (
-                        "Правильный ответ в запрошенной форме, содержащий "
-                        "только явно подтверждённые worker-ответами факты"
+                        "Самодостаточный ответ в запрошенной форме: точные "
+                        "идентификаторы и входные условия из original_task "
+                        "связывают только с подтверждёнными workers результатами"
                     ),
                 },
                 "display_result_keys": {
@@ -809,11 +835,17 @@ def build_coordinator_graph(
                 "Coordinator выбрал неизвестные result keys: "
                 + ", ".join(unknown_keys)
             )
+        coordinator_result = {
+            "answer": finish.answer,
+            "display_result_keys": list(finish.display_result_keys),
+        }
+        record_coordinate_result(coordinator_result)
+        logger.info(
+            "Coordinator result before aggregate: %s",
+            json.dumps(coordinator_result, ensure_ascii=False)[:8000],
+        )
         return {
-            "coordinator_result": {
-                "answer": finish.answer,
-                "display_result_keys": list(finish.display_result_keys),
-            },
+            "coordinator_result": coordinator_result,
             "selected_display_refs": [
                 refs_by_key[key] for key in finish.display_result_keys
             ],
@@ -860,6 +892,14 @@ def build_coordinator_graph(
                 FinalAggregation,
             )
         assert isinstance(aggregation, FinalAggregation)
+        record_aggregate_result(aggregation.answer)
+        logger.info(
+            "Coordinator aggregate result: %s",
+            json.dumps(
+                {"answer": aggregation.answer},
+                ensure_ascii=False,
+            )[:8000],
+        )
         return {"final_answer": aggregation.answer}
 
     def route_after_worker(

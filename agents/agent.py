@@ -18,10 +18,10 @@ from .llm_factory import create_chat_model, get_chat_model_name
 from .run_metrics import capture_agent_run, get_run_metrics_callback
 from .tools.routing import select_chat_route as _select_chat_route
 from .tools import (
-    get_sqlite_schema_cheatsheet,
     get_tools,
     get_tools_for_names,
     load_chat_agent_context,
+    load_schemas,
     load_skills,
 )
 
@@ -95,7 +95,6 @@ header_chat_model_with_retry = header_chat_model.with_retry(
 
 
 CHAT_AGENT_CONTEXT = load_chat_agent_context()
-SQLITE_SCHEMA_CONTEXT = get_sqlite_schema_cheatsheet()
 
 # Стандартный ToolNode работает со списком BaseTool.
 TOOLS = get_tools()
@@ -103,15 +102,16 @@ TOOLS = get_tools()
 
 def build_chat_system_prompt(
     selected_skills: str,
-    selected_tool_names: Sequence[str],
+    selected_schemas: str,
 ) -> str:
-    """Compose only the runtime context required by the selected tools."""
+    """Compose only the skills and data schemas selected by the router."""
     parts = [CHAT_AGENT_CONTEXT.strip()]
     clean_skills = str(selected_skills or "").strip()
     if clean_skills:
         parts.append(f"Навыки:\n{clean_skills}")
-    if "run_sql" in set(selected_tool_names):
-        parts.append(SQLITE_SCHEMA_CONTEXT.strip())
+    clean_schemas = str(selected_schemas or "").strip()
+    if clean_schemas:
+        parts.append(f"Схемы данных и маппинги:\n{clean_schemas}")
     return "\n\n".join(part for part in parts if part)
 
 
@@ -327,16 +327,18 @@ def _agent_chat_impl(
     )
     selected_tools = get_tools_for_names(route.tools)
     selected_skills = load_skills(tuple(route.skills))
+    selected_schemas = load_schemas(tuple(route.schemas))
 
     logger.info(
-        "Chat routed tools=%s skills=%s",
+        "Chat routed tools=%s skills=%s schemas=%s",
         [tool.name for tool in selected_tools],
         route.skills,
+        route.schemas,
     )
 
     system_prompt = build_chat_system_prompt(
         selected_skills,
-        [tool.name for tool in selected_tools],
+        selected_schemas,
     )
 
     return run_agent_graph(

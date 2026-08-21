@@ -473,9 +473,10 @@
 
     function showLastUpload(data) {
         lastUploadTransformationsCount = Number(data.s2t_transformations_count || 0);
+        const emptyTargetColumnsCount = Number(data.s2t_empty_target_columns_count || 0);
         lastUploadedFileNameEl.textContent = data.filename || 'Файл загружен';
         lastUploadedFileIdEl.textContent = data.file_id || '-';
-        currentTransformationsEl.textContent = `${lastUploadTransformationsCount} строк`;
+        currentTransformationsEl.textContent = `${lastUploadTransformationsCount} строк · пустых target columns: ${emptyTargetColumnsCount}`;
         clearAllDataBtn.disabled = busy;
     }
 
@@ -520,9 +521,15 @@
             const s2tError = data.s2t_transformations_error
                 ? `\n\nS2T extraction не записан: ${data.s2t_transformations_error}`
                 : '';
+            const s2tSheetStats = (data.s2t_extraction_report?.sheets || [])
+                .map((sheet) => `${sheet.sheet_name}: ${Number(sheet.empty_target_columns_count || 0)}`)
+                .join(', ');
+            const emptyTargetColumns = s2tSheetStats
+                ? `\nПустые target columns по S2T-листам: ${s2tSheetStats}`
+                : `\nПустые target columns: ${Number(data.s2t_empty_target_columns_count || 0)}`;
             addMessage(
                 'agent',
-                `Файл загружен: ${data.filename}\nID файла: ${data.file_id}\nЛисты: ${sheets}\nS2T transformations: ${lastUploadTransformationsCount}${s2tError}${summary}${summaryError}`
+                `Файл загружен: ${data.filename}\nID файла: ${data.file_id}\nЛисты: ${sheets}\nS2T transformations: ${lastUploadTransformationsCount}${emptyTargetColumns}${s2tError}${summary}${summaryError}`
             );
             if (lastUploadTransformationsCount > 0) {
                 addMessage('system', 'Можно спросить: "Покажи таблицу трансформаций".');
@@ -531,7 +538,7 @@
                 status: 'done',
                 percent: 100,
                 message: 'Анализ файла завершен',
-                detail: `Листов: ${(data.sheets || []).length}, S2T transformations: ${lastUploadTransformationsCount}`
+                detail: `Листов: ${(data.sheets || []).length}, S2T transformations: ${lastUploadTransformationsCount}, пустых target columns: ${Number(data.s2t_empty_target_columns_count || 0)}`
             });
         } catch (error) {
             updateAnalysisProgress({

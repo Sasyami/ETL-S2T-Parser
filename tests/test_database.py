@@ -14,10 +14,12 @@ from storage.database import (
     S2T_TRANSFORMATION_COLUMNS,
     S2T_FIELDS,
     S2T_LAYER_FIELDS,
+    SOURCE_COLUMN_COLUMNS,
     SOURCE_TABLE_COLUMNS,
     STORAGE_SCHEMA_COLUMNS,
     STORAGE_SCHEMA_TABLE_ORDER,
     TARGET_TABLE_COLUMNS,
+    TARGET_COLUMN_COLUMNS,
     USER_FACING_TABLES,
     clear_all_data,
     get_file,
@@ -49,6 +51,8 @@ def test_init_db(temp_db):
     for table_name, expected_columns in (
         ("source_tables", SOURCE_TABLE_COLUMNS),
         ("target_tables", TARGET_TABLE_COLUMNS),
+        ("source_columns", SOURCE_COLUMN_COLUMNS),
+        ("target_columns", TARGET_COLUMN_COLUMNS),
         ("additional_objects", ADDITIONAL_OBJECT_COLUMNS),
         ("pxf_to_a", PXF_TO_A_COLUMNS),
     ):
@@ -96,6 +100,8 @@ def test_storage_schema_constants_cover_current_tables():
         "file_sheet_headers",
         "source_tables",
         "target_tables",
+        "source_columns",
+        "target_columns",
         "additional_objects",
         "pxf_to_a",
         "s2t_transformations",
@@ -107,6 +113,12 @@ def test_storage_schema_constants_cover_current_tables():
     )
     assert tuple(get_usefull_col_extraction_target("target_tables")["fields"]) == tuple(
         TARGET_TABLE_COLUMNS[4:-1]
+    )
+    assert tuple(get_usefull_col_extraction_target("source_columns")["fields"]) == tuple(
+        SOURCE_COLUMN_COLUMNS[4:-1]
+    )
+    assert tuple(get_usefull_col_extraction_target("target_columns")["fields"]) == tuple(
+        TARGET_COLUMN_COLUMNS[4:-1]
     )
     assert tuple(get_usefull_col_extraction_target("additional_objects")["fields"]) == tuple(
         ADDITIONAL_OBJECT_COLUMNS[4:]
@@ -237,6 +249,8 @@ def test_clear_all_data_deletes_every_row_and_keeps_schema(temp_db):
         "file_sheet_headers": 1,
         "source_tables": 1,
         "target_tables": 1,
+        "source_columns": 0,
+        "target_columns": 0,
         "additional_objects": 1,
         "pxf_to_a": 1,
         "s2t_transformations": 1,
@@ -309,6 +323,31 @@ def test_init_db_rejects_old_table_catalog_schema_without_mutating_data(temp_db)
     assert cursor.execute(
         "SELECT name FROM sqlite_master WHERE name LIKE '%_numeric'"
     ).fetchall() == []
+
+
+def test_init_db_adds_column_catalog_tables_to_previous_current_schema(temp_db):
+    temp_db.execute(
+        "INSERT INTO files (filename, upload_time, model_used) VALUES (?, ?, ?)",
+        ("existing.xlsx", "2026-08-21", "model"),
+    )
+    temp_db.execute("DROP TABLE source_columns")
+    temp_db.execute("DROP TABLE target_columns")
+    temp_db.commit()
+
+    init_db()
+
+    assert temp_db.execute("SELECT filename FROM files").fetchone()[0] == "existing.xlsx"
+    for table_name, expected_columns in (
+        ("source_columns", SOURCE_COLUMN_COLUMNS),
+        ("target_columns", TARGET_COLUMN_COLUMNS),
+    ):
+        actual_columns = tuple(
+            row[1]
+            for row in temp_db.execute(
+                f'PRAGMA table_info("{table_name}")'
+            ).fetchall()
+        )
+        assert actual_columns == tuple(expected_columns)
 
 
 def test_init_db_rejects_incompatible_identifier_schema(temp_db):

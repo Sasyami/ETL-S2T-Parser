@@ -83,6 +83,7 @@ def test_coordinator_prompts_are_generic_not_domain_contracts():
         _COORDINATE_PROMPT,
         _DISPATCH_PROMPT,
         _PLAN_PROMPT,
+        _coordination_result_tool_schema,
         _dispatch_tool_schema,
         _plan_tool_schema,
     )
@@ -107,7 +108,9 @@ def test_coordinator_prompts_are_generic_not_domain_contracts():
 
     assert len(_PLAN_PROMPT) < 2500
     assert "один самостоятельно проверяемый" in _PLAN_PROMPT
-    assert "использует результат предыдущей операции" in _PLAN_PROMPT
+    assert "атрибутов одного найденного объекта или записи" in _PLAN_PROMPT
+    assert "прямое объяснение" in _PLAN_PROMPT
+    assert "аргументы которой нельзя определить" in _PLAN_PROMPT
     assert "не объединяй независимо проверяемые операции" in _PLAN_PROMPT
     assert "не влияет на\nдекомпозицию" in _PLAN_PROMPT
     assert "не достраивай предметную" in _PLAN_PROMPT
@@ -148,15 +151,33 @@ def test_coordinator_prompts_are_generic_not_domain_contracts():
     assert "`answer`: всегда строка" in _COORDINATE_PROMPT
     assert "сериализуй" in _COORDINATE_PROMPT
     assert "cycle_history" in _COORDINATE_PROMPT
+    assert "`original_task` также является допустимым источником" in (
+        _COORDINATE_PROMPT
+    )
+    assert "не является добавлением нового факта" in _COORDINATE_PROMPT
+    assert "явно связывает каждое возвращаемое значение" in _COORDINATE_PROMPT
+    assert "без такого названия не считается самодостаточным" in (
+        _COORDINATE_PROMPT
+    )
     assert "только самодостаточный" in _AGGREGATE_PROMPT
     assert "coordinator_result" in _AGGREGATE_PROMPT
     assert "worker_results" not in _AGGREGATE_PROMPT
+
+    coordinate_schema = _coordination_result_tool_schema()["function"][
+        "parameters"
+    ]
+    answer_schema = coordinate_schema["properties"]["answer"]
+    assert "идентификаторы и входные условия из original_task" in (
+        answer_schema["description"]
+    )
 
     plan_schema = _plan_tool_schema()["function"]["parameters"]
     goal_schema = plan_schema["properties"]["steps"]["items"]["properties"][
         "goal"
     ]
     assert "самостоятельно проверяемый результат" in goal_schema["description"]
+    assert "атрибутов одной найденной записи" in goal_schema["description"]
+    assert "новой операции с данными" in goal_schema["description"]
     dispatch_schema = _dispatch_tool_schema()["function"]["parameters"]
     task_schema = dispatch_schema["properties"]["task"]
     assert "ровно с одной операцией" in task_schema["description"]
@@ -306,6 +327,9 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
     assert '"step": 2' in caplog.text
     assert '"goal": "Проверить найденное имя"' in caplog.text
     assert '"presentation": "full_results"' in caplog.text
+    assert "Coordinator result before aggregate:" in caplog.text
+    assert "Coordinator aggregate result:" in caplog.text
+    assert caplog.text.count("Имя t_example проверено.") >= 2
 
 
 def test_coordinator_rejects_unknown_result_key_and_cleans_refs():

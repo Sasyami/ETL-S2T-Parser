@@ -287,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "Имя test-функции или полный pytest node id. Можно повторять; "
-            "без параметра запускаются все 10 сценариев."
+            "без параметра запускаются все сценарии."
         ),
     )
     parser.add_argument(

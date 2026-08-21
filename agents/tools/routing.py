@@ -1,16 +1,17 @@
-"""LLM routing that directly selects tools and lazily loads their skills."""
+"""LLM routing that selects tools, skills, and data schemas independently."""
 
 from __future__ import annotations
 
 import json
 import logging
 import re
-from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
-from langchain_core.utils.json import parse_json_markdown
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from .context import SCHEMA_CATALOG, SchemaName
 
 logger = logging.getLogger(__name__)
 
@@ -39,92 +40,139 @@ SKILL_CATALOG: Dict[str, str] = {
 }
 
 
+_TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
+    "list_s2t_transformations": {
+        "use_when": (
+            "Известно точное полное source_table/target_table в сохранённом "
+            "S2T либо нужны точные columns его строк."
+        ),
+        "not_for": (
+            "Неполное или неквалифицированное имя; поиск значения с "
+            "неизвестной ролью; агрегации."
+        ),
+        "fallback_only": False,
+    },
+    "search_s2t_transformations": {
+        "use_when": (
+            "Нужен поиск одной подстроки по S2T: роль значения неизвестна "
+            "либо таблица названа неполным или неквалифицированным именем, "
+            "даже если её роль source/target известна."
+        ),
+        "not_for": (
+            "Точное полное source_table/target_table с известной ролью; "
+            "точные возвращаемые columns; агрегации."
+        ),
+        "fallback_only": False,
+    },
+    "trace_transformation_path": {
+        "use_when": (
+            "Нужен многошаговый сохранённый S2T-путь от точного полного имени: "
+            "правила, SQL, JOIN/FILTER и промежуточные таблицы. Tool сам "
+            "возвращает полный путь и подтверждение Neo4j; не добавляй отдельные "
+            "list/Neo4j tools для повторного получения тех же фактов. Если имя "
+            "дано фрагментом или без квалификатора, выбирай одновременно "
+            "search_s2t_transformations для разрешения точного имени."
+        ),
+        "not_for": (
+            "Сравнение физических записей; неизвестное точное имя без "
+            "search_s2t_transformations; одна прямая S2T-строка."
+        ),
+        "fallback_only": False,
+    },
+    "run_sql": {
+        "use_when": (
+            "Нужен read-only SQLite-срез, выражение или агрегация, которых нет "
+            "в готовом специализированном tool."
+        ),
+        "not_for": (
+            "Точные S2T-строки по source_table/target_table/columns; логические "
+            "ETL-таблицы как физические SQLite-таблицы."
+        ),
+        "fallback_only": True,
+    },
+    "parse_sql_column_lineage": {
+        "use_when": (
+            "Полный SQL уже явно передан в task, истории или подтверждённом "
+            "результате tool, и нужно происхождение выходных SELECT-колонок: "
+            "их expression и source_columns."
+        ),
+        "not_for": (
+            "Поиск или объяснение JOIN/ON, WHERE, GROUP BY, HAVING, ORDER BY, "
+            "ролей алиасов и других произвольных частей SQL; table.column без "
+            "SQL; чтение сохранённого SQL; интерактивная визуализация."
+        ),
+        "fallback_only": False,
+    },
+    "visualize_sql_lineage": {
+        "use_when": (
+            "Полный SQL-текст уже явно дан в task, истории или результате "
+            "другого выбранного tool, и пользователь просит его интерактивный "
+            "lineage-граф."
+        ),
+        "not_for": (
+            "Имя таблицы или колонки без SQL; сохранённый S2T-путь или "
+            "transformation; получение SQL из хранилища."
+        ),
+        "fallback_only": False,
+    },
+}
+
+
 class ToolRoutingError(RuntimeError):
     """Raised when the tool-router cannot produce a valid selection."""
 
 
 class ToolRoute(BaseModel):
-    """Strict validation schema for raw independent tool/skill selection."""
+    """Strict structured schema for independent capability selection."""
 
     model_config = ConfigDict(extra="forbid")
 
     tools: List[str]
     skills: List[SkillName]
+    schemas: List[SchemaName]
 
 
 _TOOL_ROUTER_PROMPT = """
-Ты router read-only worker. По текущей задаче, недавней истории и переданным
-каталогам выбери минимально достаточную палитру tools и нужные skills.
+Ты router read-only worker. По задаче, недавней истории и каталогам выбери
+необходимые tools, skills и schemas. Точные имена и назначение бери только из каталогов.
 
-Ориентируйся на смысл задачи и descriptions из каталогов. Сохраняй ограничения
-и точные значения запроса. Tools дают planner доступные действия, но не задают
-порядок их вызова. Skills выбирай независимо; список может быть пустым.
-Выбирай минимальный набор по числу tools. Если один общий tool способен
-полностью и правильно решить data-задачу, выбери только его: специализированный
-tool не обязателен и не имеет приоритета над общим. Не выбирай одновременно
-общий и специализированный tools с взаимозаменяемыми возможностями. Не добавляй
-tools для форматирования, пересказа или объединения уже переданных фактов.
-Если задача полностью решается по фактам, уже явно переданным в самой задаче
-или истории, и получать новые данные не требуется, верни пустые списки
-`{"tools":[],"skills":[]}`. Не выбирай фиктивный tool только ради непустого
-маршрута.
+Полностью покрой все операции с данными. Поля `use_when`, `not_for` и
+`fallback_only` являются контрактом выбора, а не справочным текстом. Tool с
+`fallback_only=true` выбирай только когда ни один готовый специализированный
+tool не покрывает операцию. Если результат одного tool нужен как
+обязательный вход другого, выбери оба. Обязательный вход должен быть явно дан в
+задаче или истории либо получаться другим выбранным tool. Инструмент обработки
+переданного текста или объекта не заменяет инструмент, который сначала должен
+получить этот текст или объект из хранилища. Не придумывай входы из названий
+сущностей и не считай похожий вид результата достаточным основанием для выбора.
 
-Если payload содержит `reroute_context`, учти причину предыдущего неуспешного
-запуска и снова выбери минимально достаточную палитру. Разрешено повторить любую
-палитру из `previous_tool_palettes`: это правильно, если доступные tools подходят,
-а исправить нужно их вызов, аргументы или запрос. Меняй палитру только когда для
-задачи действительно нужна другая возможность. Точные имена tools выбирай по
-каталогу.
+Schemas — это фактическая структура данных и настроенные маппинги, которые
+могут понадобиться planner для корректного вызова tools или анализа известных
+фактов. Выбирай schema только если её структура или маппинги нужны самой задаче.
+Schemas, skills и tools выбирай независимо: наличие tool не обязывает выбирать
+schema или skill. Каждый из списков `tools`, `skills` и `schemas` может быть
+пустым независимо от остальных. Оставляй `tools=[]`, если новые вызовы данных
+не нужны и для ответа достаточно переданных фактов, выбранного skill или schema.
 
-Не отвечай пользователю, не составляй аргументы и не вызывай tools. Верни ровно
-один JSON-объект без Markdown, пояснений и дополнительных полей:
-{"tools":["точное_имя_tool"],"skills":["точное_имя_skill"]}
+Не добавляй взаимозаменяемые дубли и tools для оформления уже полученных фактов.
+Если новые данные и контекст не нужны, оставь все три списка пустыми.
+
+При наличии `reroute_context` учти причину неуспеха. Палитру можно повторить,
+если исправить нужно вызов или аргументы; меняй её только при нехватке нужной
+возможности.
+
+Не отвечай пользователю и не вызывай tools. Заполни только поля `tools`,
+`skills` и `schemas` structured-схемы.
 """.strip()
 
 _TOOL_ROUTER_REPAIR_PROMPT = """
-Предыдущий ответ отклонён строгой схемой router. Исправь только формат ответа с
-учётом текста ошибки ниже. Повторно выбери tools и skills по исходному payload и
-верни один нативный вызов функции select_tools_and_skills. В её аргументах
-должен быть ровно один JSON-объект с двумя и только двумя ключами:
-{"tools":["точное_имя_tool"],"skills":["точное_имя_skill"]}
-Не добавляй description, reason, пояснения, описания skills или другие поля. Не
-пиши обычный текст и не используй Markdown.
+Предыдущий structured output отклонён схемой router. Повторно выбери tools,
+skills и schemas по исходному payload и заполни только поля `tools`, `skills` и
+`schemas` переданной схемы. Не добавляй description, reason, пояснения или
+другие поля. Каждый из трёх списков может быть пустым независимо от остальных.
 
 Ошибка валидации: {validation_error}
 """.strip()
-_ROUTE_REPAIR_TOOL_NAME = "select_tools_and_skills"
-
-
-def _router_response_text(result: Any) -> str:
-    content = result.content if isinstance(result, BaseMessage) else result
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, Mapping):
-                text = block.get("text") or block.get("content")
-                if text is not None:
-                    parts.append(str(text))
-        return "".join(parts).strip()
-    return str(content or "").strip()
-
-
-def _parse_router_response(result: Any) -> Mapping[str, Any]:
-    raw_text = _router_response_text(result)
-    if not raw_text:
-        raise ToolRoutingError("Tool-router вернул пустой ответ")
-    try:
-        parsed = parse_json_markdown(raw_text)
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        raise ToolRoutingError(
-            "Tool-router вернул невалидный JSON-текст"
-        ) from exc
-    if not isinstance(parsed, Mapping):
-        raise ToolRoutingError("Tool-router должен вернуть один JSON-объект")
-    return parsed
 
 
 def _history_payload(
@@ -150,14 +198,18 @@ def _compact_tool_description(tool: BaseTool) -> str:
     return text
 
 
-def _tool_catalog(tools: Sequence[BaseTool]) -> List[Dict[str, str]]:
-    return [
-        {
-            "name": tool.name,
-            "description": _compact_tool_description(tool),
-        }
-        for tool in tools
-    ]
+def _tool_catalog(tools: Sequence[BaseTool]) -> List[Dict[str, Any]]:
+    catalog: List[Dict[str, Any]] = []
+    for tool in tools:
+        contract = _TOOL_ROUTING_CONTRACTS.get(tool.name)
+        if contract is None:
+            contract = {
+                "use_when": _compact_tool_description(tool),
+                "not_for": "",
+                "fallback_only": False,
+            }
+        catalog.append({"name": tool.name, **contract})
+    return catalog
 
 
 def _validated_route(
@@ -172,51 +224,23 @@ def _validated_route(
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise ToolRoutingError(
-            "Tool-router вернул невалидный JSON-маршрут"
+            "Tool-router вернул невалидный structured-маршрут"
         ) from exc
 
     selected_tools = list(dict.fromkeys(route.tools))
     selected_skills = list(dict.fromkeys(route.skills))
+    selected_schemas = list(dict.fromkeys(route.schemas))
     available_names = {tool.name for tool in available_tools}
     unknown = [name for name in selected_tools if name not in available_names]
     if unknown:
         raise ToolRoutingError(
             f"Tool-router выбрал неизвестные tools: {', '.join(unknown)}"
         )
-    return ToolRoute(tools=selected_tools, skills=selected_skills)
-
-
-def _route_repair_tool_schema() -> Dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": _ROUTE_REPAIR_TOOL_NAME,
-            "description": (
-                "Вернуть исправленный строгий маршрут tools и skills без пояснений."
-            ),
-            "parameters": ToolRoute.model_json_schema(),
-        },
-    }
-
-
-def _native_repair_payload(result: Any) -> Optional[Mapping[str, Any]]:
-    if not isinstance(result, AIMessage) or not result.tool_calls:
-        return None
-    matching_calls = [
-        call
-        for call in result.tool_calls
-        if call.get("name") == _ROUTE_REPAIR_TOOL_NAME
-    ]
-    if len(matching_calls) != 1:
-        raise ToolRoutingError(
-            "Tool-router repair должен вернуть один select_tools_and_skills"
-        )
-    args = matching_calls[0].get("args")
-    if not isinstance(args, Mapping):
-        raise ToolRoutingError(
-            "Tool-router repair вернул невалидные аргументы"
-        )
-    return args
+    return ToolRoute(
+        tools=selected_tools,
+        skills=selected_skills,
+        schemas=selected_schemas,
+    )
 
 
 def select_chat_route(
@@ -228,7 +252,7 @@ def select_chat_route(
     callbacks: Optional[Sequence[Any]] = None,
     reroute_context: Optional[Mapping[str, Any]] = None,
 ) -> ToolRoute:
-    """Select exact tools and request-relevant skills with one raw LLM call."""
+    """Select exact tools, skills, and schemas via structured output."""
     clean_query = str(user_query or "").strip()
     if not clean_query:
         raise ToolRoutingError("Tool-router получил пустой запрос")
@@ -240,6 +264,7 @@ def select_chat_route(
         "recent_history": _history_payload(history),
         "available_tools": _tool_catalog(available_tools),
         "available_skills": SKILL_CATALOG,
+        "available_schemas": SCHEMA_CATALOG,
     }
     if reroute_context:
         payload["reroute_context"] = dict(reroute_context)
@@ -248,79 +273,65 @@ def select_chat_route(
         HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
     ]
     config = {"callbacks": list(callbacks)} if callbacks else None
-    def invoke_router(
-        call_messages: Sequence[BaseMessage],
-        *,
-        selected_model: Any = None,
-    ) -> Any:
-        active_model = selected_model if selected_model is not None else model
+
+    with_structured_output = getattr(model, "with_structured_output", None)
+    if not callable(with_structured_output):
+        raise ToolRoutingError(
+            "LLM tool-router не поддерживает structured output"
+        )
+    try:
+        structured_model = with_structured_output(
+            ToolRoute,
+            method="function_calling",
+        )
+    except TypeError:
+        # Compatibility with wrappers that expose the LangChain method without
+        # the optional method keyword.
+        structured_model = with_structured_output(ToolRoute)
+    except Exception as exc:
+        raise ToolRoutingError(
+            f"Ошибка настройки structured output tool-router: {type(exc).__name__}"
+        ) from exc
+
+    def invoke_router(call_messages: Sequence[BaseMessage]) -> Any:
         try:
             return (
-                active_model.invoke(call_messages, config=config)
+                structured_model.invoke(call_messages, config=config)
                 if config is not None
-                else active_model.invoke(call_messages)
+                else structured_model.invoke(call_messages)
             )
         except Exception as exc:
             raise ToolRoutingError(
                 f"Ошибка LLM tool-router: {type(exc).__name__}"
             ) from exc
 
-    result = invoke_router(messages)
     try:
-        return _validated_route(
-            _parse_router_response(result),
-            available_tools,
-        )
+        return _validated_route(invoke_router(messages), available_tools)
     except ToolRoutingError as first_error:
-        raw_text = _router_response_text(result)
         logger.warning(
-            "Tool-router response rejected; requesting one LLM repair: error=%s raw=%s",
+            "Tool-router structured output rejected; requesting one LLM repair: error=%s",
             first_error,
-            raw_text[:2000],
         )
         repair_messages: List[BaseMessage] = [
             *messages,
-            AIMessage(content=raw_text),
             HumanMessage(
                 content=_TOOL_ROUTER_REPAIR_PROMPT.replace(
                     "{validation_error}", str(first_error)
                 )
             ),
         ]
-        repair_model = model
-        bind_tools = getattr(model, "bind_tools", None)
-        if callable(bind_tools):
-            try:
-                repair_model = bind_tools(
-                    [_route_repair_tool_schema()],
-                    tool_choice=_ROUTE_REPAIR_TOOL_NAME,
-                )
-            except TypeError:
-                repair_model = bind_tools([_route_repair_tool_schema()])
-
-        repaired_result = invoke_router(
-            repair_messages,
-            selected_model=repair_model,
-        )
         try:
-            native_payload = _native_repair_payload(repaired_result)
             return _validated_route(
-                (
-                    native_payload
-                    if native_payload is not None
-                    else _parse_router_response(repaired_result)
-                ),
+                invoke_router(repair_messages),
                 available_tools,
             )
-        except ToolRoutingError:
-            logger.warning(
-                "Tool-router repair rejected: raw=%s",
-                _router_response_text(repaired_result)[:2000],
-            )
+        except ToolRoutingError as repair_error:
+            logger.warning("Tool-router structured repair rejected: %s", repair_error)
             raise
 
 
 __all__ = [
+    "SCHEMA_CATALOG",
     "SKILL_CATALOG",
     "ToolRoute",
     "ToolRoutingError",

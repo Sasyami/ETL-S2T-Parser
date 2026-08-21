@@ -13,7 +13,7 @@ from agents.chat_graph import (
     WorkerRunResult,
     run_worker_graph,
 )
-from agents.tools import get_tools, load_skills
+from agents.tools import get_tools, load_schemas, load_skills
 from agents.tools.routing import ToolRoute
 
 
@@ -48,8 +48,15 @@ def test_worker_prompt_does_not_require_full_table_in_text():
     normalized_prompt = " ".join(_WORKER_PLANNER_PROMPT.split())
     assert "Полные результаты не копируй" in normalized_prompt
     assert "не переименовывай заданную операцию" in _WORKER_PLANNER_PROMPT
+    assert "Не конструируй отсутствующий объект" in _WORKER_PLANNER_PROMPT
+    assert "аргументы бери из" in _WORKER_PLANNER_PROMPT
+    assert "Если обязательного входа\nнет, этот tool не подходит" in (
+        _WORKER_PLANNER_PROMPT
+    )
     assert "answer должен содержать ровно их" in _WORKER_PLANNER_PROMPT
     assert "без вступления, заключения" in _WORKER_PLANNER_PROMPT
+    assert "Палитра worker никогда не пуста" in _WORKER_PLANNER_PROMPT
+    assert "внутренний `analyze_known_facts`" in _WORKER_PLANNER_PROMPT
     assert "scrollable" not in _WORKER_PLANNER_PROMPT
 
 
@@ -159,7 +166,20 @@ class _ToolChoiceFallbackModel:
 def test_worker_without_tools_is_observed_before_returning_answer():
     candidate_answer = "Первая пара\nВторая пара"
     model = _WorkerModel(
-        [AIMessage(content=candidate_answer)],
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "analyze_known_facts",
+                        "args": {"answer": candidate_answer},
+                        "id": "call-analysis",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message(candidate_answer),
+        ],
         observer_responses=[
             Observation(
                 summary="Обе пары точно перенесены из task.",
@@ -186,13 +206,24 @@ def test_worker_without_tools_is_observed_before_returning_answer():
     assert result.display_items == []
     assert len(result.cycle_history) == 1
     cycle = result.cycle_history[0]
-    assert cycle.tool_calls == []
-    assert cycle.tool_results == []
+    assert cycle.tool_calls == [
+        {
+            "name": "analyze_known_facts",
+            "args": {"answer": candidate_answer},
+        }
+    ]
+    assert len(cycle.tool_results) == 1
+    assert cycle.tool_results[0]["name"] == "analyze_known_facts"
     assert cycle.observation.goal_satisfied is True
     observer_payload = json.loads(model.observer.messages[0][-1].content)
-    assert observer_payload["tool_calls"] == []
-    assert observer_payload["tool_results"] == []
-    assert observer_payload["candidate_answer"] == candidate_answer
+    assert observer_payload["tool_calls"][0]["name"] == "analyze_known_facts"
+    assert observer_payload["tool_results"][0]["name"] == "analyze_known_facts"
+    planner_system = str(model.messages[0][0].content)
+    assert "Доступные worker tools:\nanalyze_known_facts" in planner_system
+    assert "Палитра worker никогда не пуста" in planner_system
+    observer_system = str(model.observer.messages[0][0].content)
+    assert "не является новым внешним фактом" in observer_system
+    assert observer_payload["candidate_answer"] == ""
 
 
 def test_worker_keeps_text_preview_and_returns_full_successful_result():
@@ -371,9 +402,8 @@ def test_worker_repairs_plain_text_before_first_data_tool_call():
 
     assert result.answer == "Подтверждено."
     assert [item.name for item in result.display_items] == ["lookup"]
-    assert "Предыдущий обычный текст не выполняет task" in str(
-        model.messages[1][-1].content
-    )
+    repair_prompt = " ".join(str(model.messages[1][-1].content).split())
+    assert "Предыдущий обычный текст не выполняет task" in repair_prompt
 
 
 def test_worker_falls_back_when_forced_first_tool_call_transport_fails():
@@ -455,6 +485,90 @@ def test_worker_planner_keeps_only_latest_tool_exchange():
     ]
     assert second_prompt_tool_ids == ["call-first"]
     assert final_prompt_tool_ids == ["call-second"]
+
+
+def test_worker_observer_evaluates_current_result_with_prior_state():
+    calls = []
+
+    def find_source():
+        calls.append("source")
+        return {"source_table": "source_contracts"}
+
+    def find_rule():
+        calls.append("rule")
+        return {"transformation_rule": "source.c_closedate"}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "find_source",
+                        "args": {},
+                        "id": "call-source",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "find_rule",
+                        "args": {},
+                        "id": "call-rule",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Источник и правило подтверждены."),
+        ],
+        observer_responses=[
+            Observation(
+                summary="Источник: source_contracts.",
+                goal_satisfied=False,
+                mismatches=["Правило преобразования ещё не подтверждено."],
+                important_facts=["Источник: source_contracts."],
+            ),
+            Observation(
+                summary=(
+                    "Источник: source_contracts. Правило: "
+                    "source.c_closedate."
+                ),
+                goal_satisfied=True,
+                important_facts=[
+                    "Источник: source_contracts.",
+                    "Правило: source.c_closedate.",
+                ],
+            ),
+        ],
+    )
+
+    result = run_worker_graph(
+        task="Найди источник и правило преобразования c_closedate.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(find_source), _as_tool(find_rule)),
+        max_steps=3,
+    )
+
+    assert result.goal_satisfied is True
+    assert calls == ["source", "rule"]
+    assert len(model.observer.messages) == 2
+    second_observer_prompt = model.observer.messages[1]
+    second_payload = json.loads(second_observer_prompt[-1].content)
+    assert len(second_payload["prior_state"]) == 1
+    assert second_payload["prior_state"][0]["summary"] == (
+        "Источник: source_contracts."
+    )
+    observer_system_prompt = " ".join(
+        str(second_observer_prompt[0].content).split()
+    )
+    assert "Оцени выполнение task по совокупности prior_state" in (
+        observer_system_prompt
+    )
+    assert "не по последнему tool call изолированно" in observer_system_prompt
 
 
 def test_worker_rejects_legacy_display_selection_field():
@@ -858,7 +972,9 @@ def test_worker_loop_does_not_rewrite_llm_tool_arguments_in_python():
     assert executed_queries == [wrong_sql, correct_sql]
 
 
-def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs():
+def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
+    caplog,
+):
     from agents.worker import (
         WorkerAnswer,
         resolve_worker_display_refs,
@@ -895,14 +1011,22 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs():
         goal_satisfied=False,
         mismatches=["Нужна дополнительная проверка."],
     )
-    route = ToolRoute(tools=["list_files"], skills=["Excel и описания"])
+    route = ToolRoute(
+        tools=["list_files"],
+        skills=["Excel и описания"],
+        schemas=["Excel-маппинги"],
+    )
+    caplog.set_level("INFO", logger="agents.worker")
     with (
         patch("agents.worker.select_chat_route", return_value=route) as router,
         patch(
             "agents.worker.run_worker_graph",
             return_value=graph_result,
         ) as run_graph,
+        patch("agents.worker.record_worker_route") as route_recorder,
+        patch("agents.worker.record_worker_observation") as observation_recorder,
         patch("agents.worker.load_skills", wraps=load_skills),
+        patch("agents.worker.load_schemas", wraps=load_schemas),
     ):
         result = worker_chat("  Покажи файлы  ")
 
@@ -926,6 +1050,26 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs():
     ]
     assert "history" not in run_graph.call_args.kwargs
     assert "file_id" not in run_graph.call_args.kwargs
+    route_recorder.assert_called_once_with(
+        worker_task="Покажи файлы",
+        routing_attempt=1,
+        tools=["list_files"],
+        skills=["Excel и описания"],
+        schemas=["Excel-маппинги"],
+        reroute_reason=None,
+    )
+    observation_recorder.assert_called_once()
+    observation_call = observation_recorder.call_args.kwargs
+    assert observation_call["worker_task"] == "Покажи файлы"
+    assert observation_call["cycle"] == 1
+    assert observation_call["routing_attempt"] == 1
+    assert observation_call["observation"]["goal_satisfied"] is False
+    assert observation_call["observation"]["mismatches"] == [
+        "Нужна дополнительная проверка."
+    ]
+    assert "Worker route:" in caplog.text
+    assert "Worker observation:" in caplog.text
+    assert '"goal_satisfied": false' in caplog.text
 
 
 def test_public_worker_allows_empty_palette_and_returns_observation():
@@ -948,7 +1092,7 @@ def test_public_worker_allows_empty_palette_and_returns_observation():
         ],
         goal_satisfied=True,
     )
-    route = ToolRoute(tools=[], skills=[])
+    route = ToolRoute(tools=[], skills=[], schemas=[])
 
     with (
         patch("agents.worker.select_chat_route", return_value=route),
@@ -963,15 +1107,25 @@ def test_public_worker_allows_empty_palette_and_returns_observation():
     assert result.goal_satisfied is True
     assert result.cycle_history[0].observation == observation
     assert result.result_refs == []
-    assert run_graph.call_args.kwargs["tools"] == ()
+    assert [
+        tool.name for tool in run_graph.call_args.kwargs["tools"]
+    ] == ["analyze_known_facts"]
 
 
 def test_public_worker_reroutes_original_task_after_observer_request():
     from agents.worker import worker_chat
 
     routes = [
-        ToolRoute(tools=["list_s2t_table_names"], skills=["S2T-строки"]),
-        ToolRoute(tools=["run_sql"], skills=["SQLite SQL"]),
+        ToolRoute(
+            tools=["list_s2t_table_names"],
+            skills=["S2T-строки"],
+            schemas=[],
+        ),
+        ToolRoute(
+            tools=["run_sql"],
+            skills=["SQLite SQL"],
+            schemas=["SQLite ETL"],
+        ),
     ]
     graph_results = [
         WorkerRunResult(
@@ -1060,6 +1214,7 @@ def test_public_worker_can_execute_repeated_reroute_palette():
     repeated_route = ToolRoute(
         tools=["list_s2t_table_names"],
         skills=["S2T-строки"],
+        schemas=[],
     )
     graph_results = [
         WorkerRunResult(

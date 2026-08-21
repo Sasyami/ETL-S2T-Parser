@@ -118,9 +118,9 @@ def run_sql(
 ) -> Dict[str, Any]:
     """Выполнить составленный агентом или переданный read-only SQL по SQLite.
 
-    Используй для произвольных табличных срезов, фильтрации, точных подсчётов,
-    DISTINCT, GROUP BY, SUM, MIN, MAX, нестандартных агрегаций, строк
-    S2T-маппинга и обычных связей source → target.
+    Используй только для срезов, выражений или агрегаций, которых нет в готовых
+    tools; точные S2T-строки по source_table/target_table и выбранным колонкам
+    получай через list_s2t_transformations.
     Для стандартных списков source/target, их пересечения, объединения и разности
     выбирай list_s2t_table_names, а не этот tool.
     Если нестандартная аналитика всё же требует пересечения двух множеств, SQL
@@ -129,7 +129,8 @@ def run_sql(
     HAVING не доказывает пересечение и может вернуть значение только из одного
     множества.
     Доступная пользовательская схема включает files, file_sheet_headers,
-    source_tables, target_tables, additional_objects, pxf_to_a,
+    source_tables, target_tables, source_columns, target_columns,
+    additional_objects, pxf_to_a,
     s2t_transformations и data. Логические ETL-таблицы вида t_* не являются
     физическими SQLite-таблицами: не выполняй для них PRAGMA и не пиши `FROM t_*`;
     ищи их имена в source_table/target_table и связанных строках.

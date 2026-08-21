@@ -106,6 +106,8 @@ def test_index(client):
     assert 'id="includeHiddenRows"' in body
     assert "Учитывать скрытые строки" in body
     assert "formData.append('include_hidden_rows', String(includeHiddenRows.checked))" in body
+    assert "s2t_empty_target_columns_count" in body
+    assert "empty_target_columns_count" in body
 
 
 def test_chat_app_single_user_no_session_cookie(client):
@@ -243,6 +245,7 @@ def test_upload(mock_generate_description, mock_summarize, mock_store, mock_pars
     assert json_data['description'] == 'Test description'
     assert json_data['description_error'] is None
     assert json_data['s2t_transformations_count'] == 0
+    assert json_data['s2t_empty_target_columns_count'] == 0
     assert json_data['s2t_transformations_error'] is None
     assert json_data['s2t_extraction_report']['status'] == 'ok'
     assert json_data["sheets"][0]["header"]["row_count"] == 1
@@ -286,6 +289,7 @@ def test_upload_records_analysis_progress(mock_generate_description, mock_summar
     assert progress["file_id"] == 102
     assert progress["filename"] == "test.xlsx"
     assert progress["s2t_transformations_error"] is None
+    assert progress["s2t_empty_target_columns_count"] == 0
     assert progress["history"]
 
 
@@ -740,6 +744,8 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
             "file_sheet_headers": 1,
             "source_tables": 1,
             "target_tables": 1,
+            "source_columns": 0,
+            "target_columns": 0,
             "additional_objects": 1,
             "pxf_to_a": 1,
             "s2t_transformations": 1,
@@ -759,6 +765,8 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
             "file_sheet_headers",
             "source_tables",
             "target_tables",
+            "source_columns",
+            "target_columns",
             "additional_objects",
             "pxf_to_a",
             "s2t_transformations",
@@ -798,6 +806,8 @@ def test_delete_all_storage_clears_sqlite_when_neo4j_fails(
             "file_sheet_headers": 0,
             "source_tables": 0,
             "target_tables": 0,
+            "source_columns": 0,
+            "target_columns": 0,
             "additional_objects": 0,
             "pxf_to_a": 0,
             "s2t_transformations": 0,
