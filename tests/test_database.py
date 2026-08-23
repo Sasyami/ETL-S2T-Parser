@@ -29,6 +29,7 @@ from storage.database import (
     update_file_description,
     update_file_summary,
     get_columns_by_sheet,
+    migrate_column_catalog_schema,
     migrate_s2t_layer_columns,
 )
 from storage.s2t import backfill_s2t_layers
@@ -348,6 +349,70 @@ def test_init_db_adds_column_catalog_tables_to_previous_current_schema(temp_db):
             ).fetchall()
         )
         assert actual_columns == tuple(expected_columns)
+
+
+@pytest.mark.parametrize("with_description_aliases", [False, True])
+def test_init_db_removes_obsolete_column_catalog_fields(
+    temp_db, with_description_aliases
+):
+    legacy_tail = ("metadata_source", "description_embedding") + (
+        ("description_aliases",) if with_description_aliases else ()
+    )
+    previous_columns = {
+        "source_columns": SOURCE_COLUMN_COLUMNS[:-1] + legacy_tail,
+        "target_columns": TARGET_COLUMN_COLUMNS[:-1] + legacy_tail,
+    }
+    for table_name, columns in previous_columns.items():
+        temp_db.execute(f'ALTER TABLE "{table_name}" RENAME TO "{table_name}_old"')
+        definitions = []
+        for column in columns:
+            if column == "id":
+                definitions.append('"id" INTEGER PRIMARY KEY')
+            elif column in {"primary_key", "not_null"}:
+                definitions.append(f'"{column}" INTEGER')
+            elif column == "description_embedding":
+                definitions.append('"description_embedding" BLOB')
+            else:
+                definitions.append(f'"{column}" TEXT')
+        temp_db.execute(
+            f'CREATE TABLE "{table_name}" ({", ".join(definitions)})'
+        )
+        temp_db.execute(
+            f"""
+            INSERT INTO "{table_name}"
+            (id, file_id, sheet_name, row_num, table_name, column_name,
+             description, metadata_source, description_embedding)
+            VALUES (1, 10, 'Columns', 0, 'orders', 'id', 'Identifier', 's2t', X'0102')
+            """
+        )
+        temp_db.execute(f'DROP TABLE "{table_name}_old"')
+    temp_db.commit()
+
+    init_db()
+
+    for table_name, expected_columns in (
+        ("source_columns", SOURCE_COLUMN_COLUMNS),
+        ("target_columns", TARGET_COLUMN_COLUMNS),
+    ):
+        actual_columns = tuple(
+            row[1]
+            for row in temp_db.execute(
+                f'PRAGMA table_info("{table_name}")'
+            ).fetchall()
+        )
+        assert actual_columns == tuple(expected_columns)
+        row = temp_db.execute(
+            f'SELECT description, description_embedding '
+            f'FROM "{table_name}"'
+        ).fetchone()
+        assert tuple(row) == (
+            "Identifier",
+            None if with_description_aliases else b"\x01\x02",
+        )
+    assert migrate_column_catalog_schema() == {
+        "changed": False,
+        "tables_rebuilt": [],
+    }
 
 
 def test_init_db_rejects_incompatible_identifier_schema(temp_db):

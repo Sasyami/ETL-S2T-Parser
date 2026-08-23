@@ -120,6 +120,111 @@ def test_run_sql_rejects_write_queries():
     assert result["rows"] == []
 
 
+def test_saved_sqlite_tool_result_is_queryable_with_bound_schema():
+    from langchain_core.messages import ToolMessage
+
+    from agents.tools import get_tools
+    from agents.tools.saved_results import (
+        bind_saved_result_schemas,
+        persist_sqlite_tool_message,
+        query_saved_result,
+        saved_result_store_scope,
+    )
+
+    with saved_result_store_scope() as store:
+        message = ToolMessage(
+            content=json.dumps(
+                {
+                    "total": 3,
+                    "rows": [
+                        {"target_table": "t_a", "row_count": 2},
+                        {"target_table": "t_b", "row_count": 5},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-s2t",
+            name="list_s2t_transformations",
+        )
+
+        enriched = persist_sqlite_tool_message(message)
+        payload = json.loads(enriched.content)
+        saved = payload["saved_result"]
+        result_ref = saved["result_ref"]
+
+        assert saved["source_tool"] == "list_s2t_transformations"
+        assert saved["row_count"] == 2
+        assert saved["source_total"] == 3
+        assert saved["truncated"] is True
+        assert saved["columns"] == [
+            {"name": "target_table", "sqlite_type": "TEXT"},
+            {"name": "row_count", "sqlite_type": "INTEGER"},
+        ]
+        assert store.descriptor(result_ref) is not None
+
+        bound_tools = bind_saved_result_schemas(
+            get_tools(),
+            f"Посчитай строки в {result_ref}",
+        )
+        bound_query_tool = next(
+            item for item in bound_tools if item.name == "query_saved_result"
+        )
+        assert result_ref in bound_query_tool.description
+        assert '"target_table" TEXT' in bound_query_tool.description
+        assert "truncated=true" in bound_query_tool.description
+
+        queried = query_saved_result.invoke(
+            {
+                "result_ref": result_ref,
+                "query": (
+                    "SELECT target_table, row_count FROM result "
+                    "WHERE row_count >= 5"
+                ),
+            }
+        )
+        assert queried["rows"] == [
+            {"target_table": "t_b", "row_count": 5}
+        ]
+        assert queried["input_truncated"] is True
+
+        forbidden = query_saved_result.invoke(
+            {
+                "result_ref": result_ref,
+                "query": "SELECT name FROM sqlite_master",
+            }
+        )
+        assert forbidden["error"] == "Saved result SQL query failed"
+
+
+def test_query_saved_result_is_scoped_and_read_only():
+    from agents.tools.saved_results import (
+        query_saved_result,
+        saved_result_store_scope,
+    )
+
+    with saved_result_store_scope() as store:
+        descriptor = store.save_payload(
+            source_tool="run_sql",
+            payload={"columns": ["value"], "rows": [{"value": 1}]},
+        )
+        assert descriptor is not None
+        rejected = query_saved_result.invoke(
+            {
+                "result_ref": descriptor.result_ref,
+                "query": "DELETE FROM result",
+            }
+        )
+        assert "Only SELECT" in rejected["error"]
+
+    missing_scope = query_saved_result.invoke(
+        {
+            "result_ref": descriptor.result_ref,
+            "query": "SELECT * FROM result",
+        }
+    )
+    assert missing_scope["error"] == "No active saved-result store"
+
+
 def test_search_excel_values_and_restore_source_row():
     from agents.tools import get_excel_row, search_excel_values
 
@@ -226,6 +331,48 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
         """,
         (13, 10, "Target", 0, "t_client", "Клиенты", vector([0.8, 0.2])),
     )
+    conn.execute(
+        """
+        INSERT INTO source_columns
+        (id, file_id, sheet_name, row_num, table_name, column_name,
+         data_type, primary_key, not_null, description, description_embedding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            15,
+            10,
+            "Source columns",
+            0,
+            "src_contract",
+            "contract_number",
+            "uuid",
+            1,
+            1,
+            "Номер кредитного договора",
+            vector([0.9, 0.1]),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO target_columns
+        (id, file_id, sheet_name, row_num, table_name, column_name,
+         data_type, primary_key, not_null, description, description_embedding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            17,
+            10,
+            "Target columns",
+            0,
+            "t_client",
+            "client_name",
+            "text",
+            0,
+            0,
+            "Имя клиента",
+            vector([0.2, 0.8]),
+        ),
+    )
     conn.commit()
     conn.close()
 
@@ -233,7 +380,7 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
         {"query": "кредитные договоры", "limit": 3}
     )
     assert result["embedding_model"] == "test-model"
-    assert result["total_candidates"] == 3
+    assert result["total_candidates"] == 5
     assert result["rows"][0]["scope"] == "source_tables"
     assert result["rows"][0]["name"] == "src_contract"
     assert result["rows"][0]["score"] == 1.0
@@ -243,6 +390,9 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
         "tables": {"source_tables", "target_tables"},
         "source_tables": {"source_tables"},
         "target_tables": {"target_tables"},
+        "columns": {"source_columns", "target_columns"},
+        "source_columns": {"source_columns"},
+        "target_columns": {"target_columns"},
     }
     for scope, row_scopes in expected_scopes.items():
         scoped = semantic_search_descriptions.invoke(
@@ -251,6 +401,136 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
         assert scoped["scope"] == scope
         assert {row["scope"] for row in scoped["rows"]} == row_scopes
         assert scoped["total_candidates"] == len(row_scopes)
+    columns = semantic_search_descriptions.invoke(
+        {"query": "номер договора", "scope": "source_columns", "limit": 10}
+    )
+    assert columns["rows"][0]["table_name"] == "src_contract"
+    assert columns["rows"][0]["column_name"] == "contract_number"
+    subset = semantic_search_descriptions.invoke(
+        {
+            "query": "номер договора",
+            "scope": "source_columns",
+            "file_id": 10,
+            "table_name": "src_contract",
+            "data_type": "uuid",
+            "primary_key": True,
+            "not_null": True,
+            "limit": 10,
+        }
+    )
+    assert subset["total_candidates"] == 1
+    assert subset["subset"] == {
+        "file_id": 10,
+        "table_name": "src_contract",
+        "data_type": "uuid",
+        "primary_key": True,
+        "not_null": True,
+    }
+    invalid_subset = semantic_search_descriptions.invoke(
+        {"query": "договор", "scope": "tables", "primary_key": True}
+    )
+    assert invalid_subset["error"] == (
+        "column subset filters require a column scope"
+    )
+
+
+def test_column_catalog_tools_support_exact_and_substring_subsets():
+    from agents.tools import list_column_catalog, search_column_catalog
+
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO files (file_id, filename, upload_time) VALUES (30, 'columns.xlsx', '2026-01-01')"
+    )
+    conn.executemany(
+        """
+        INSERT INTO source_columns
+        (id, file_id, sheet_name, row_num, table_name, column_name, data_type,
+         primary_key, not_null, description)
+        VALUES (?, 30, 'Source columns', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                31,
+                0,
+                "raw.contract",
+                "contract_id",
+                "uuid",
+                1,
+                1,
+                "Идентификатор кредитного договора",
+            ),
+            (
+                32,
+                1,
+                "raw.contract",
+                "payload",
+                "jsonb",
+                0,
+                0,
+                "Тело сообщения",
+            ),
+        ],
+    )
+    conn.execute(
+        """
+        INSERT INTO target_columns
+        (id, file_id, sheet_name, row_num, table_name, column_name, data_type,
+         primary_key, not_null, description)
+        VALUES (33, 30, 'Target columns', 0, 'mart.contract', 'contract_id',
+                'uuid', 1, 1, 'Ключ договора')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    exact = list_column_catalog.invoke(
+        {
+            "scope": "source_columns",
+            "file_id": 30,
+            "table_name": "RAW.CONTRACT",
+            "column_name": "contract_id",
+            "primary_key": True,
+            "not_null": True,
+            "columns": ["record_id", "table_name", "column_name", "data_type"],
+        }
+    )
+    assert exact["total_matches"] == 1
+    assert exact["rows"] == [
+        {
+            "record_id": 31,
+            "table_name": "raw.contract",
+            "column_name": "contract_id",
+            "data_type": "uuid",
+        }
+    ]
+
+    searched = search_column_catalog.invoke(
+        {
+            "needle": "договор",
+            "scope": "columns",
+            "file_id": 30,
+            "data_type": "uuid",
+            "primary_key": True,
+        }
+    )
+    assert searched["query"] == "договор"
+    assert searched["total_matches"] == 2
+    assert {row["column_role"] for row in searched["rows"]} == {
+        "source",
+        "target",
+    }
+    description_search = search_column_catalog.invoke(
+        {"needle": "сообщения", "scope": "source_columns"}
+    )
+    assert description_search["total_matches"] == 1
+    assert description_search["rows"][0]["column_name"] == "payload"
+    assert search_column_catalog.invoke({"needle": " "})["error"] == (
+        "needle must be non-empty"
+    )
+    invalid_columns = list_column_catalog.invoke(
+        {"columns": ["column_name", "description_embedding"]}
+    )
+    assert "unknown columns" in invalid_columns["error"]
 
 
 def test_trace_transformation_path_combines_s2t_sql_and_additional_objects():
@@ -485,6 +765,32 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
         "tables",
         "source_tables",
         "target_tables",
+        "columns",
+        "source_columns",
+        "target_columns",
+    ]
+    assert set(semantic_schema["properties"]) == {
+        "query",
+        "scope",
+        "limit",
+        "file_id",
+        "table_name",
+        "column_name",
+        "data_type",
+        "primary_key",
+        "not_null",
+    }
+    assert tools[
+        "search_column_catalog"
+    ].args_schema.model_json_schema()["required"] == ["needle"]
+    column_list_schema = tools[
+        "list_column_catalog"
+    ].args_schema.model_json_schema()
+    assert "required" not in column_list_schema
+    assert column_list_schema["properties"]["scope"]["enum"] == [
+        "columns",
+        "source_columns",
+        "target_columns",
     ]
     assert tools[
         "trace_transformation_path"

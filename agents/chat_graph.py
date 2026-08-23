@@ -170,6 +170,11 @@ task. Проверяй точные сущности, роли, поля, зна
 Результат внутреннего `analyze_known_facts` не является новым внешним фактом.
 Проверяй его `answer` только по фактам из task и выбранного системного контекста.
 
+Служебный блок `saved_result` внутри ToolMessage содержит только result_ref,
+схему и полноту временно сохранённых строк. Не считай его отдельным бизнес-
+фактом и не включай result_ref в пользовательскую выжимку. Если
+`truncated=true`, сохранённые строки не подтверждают вывод о полном наборе.
+
 Объект анализа, который planner сам составил только ради обязательного аргумента
 tool и который отсутствует в task и подтверждённых результатах, не подтверждает
 исходную операцию. Отметь это как mismatch; если доступная палитра не умеет
@@ -1159,6 +1164,11 @@ def build_agent_graph(
             if not isinstance(message, ToolMessage):
                 tool_messages.append(message)
                 continue
+
+            if not _tool_message_has_error(message):
+                from .tools.saved_results import persist_sqlite_tool_message
+
+                message = persist_sqlite_tool_message(message)
 
             if raw_tool_results is not None:
                 raw_tool_results[message.tool_call_id] = message

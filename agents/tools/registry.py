@@ -11,6 +11,7 @@ from .files import (
     update_file_description,
     update_table_info_from_user_query,
 )
+from .columns import list_column_catalog, search_column_catalog
 from .planning import show_plan
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
 from .neo4j import (
@@ -34,6 +35,7 @@ from .sheets import (
     list_sheets,
 )
 from .sql import run_sql
+from .saved_results import query_saved_result
 from .sql_lineage import (
     parse_sql_column_lineage,
     parse_sql_table_lineage,
@@ -46,12 +48,15 @@ READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     search_excel_values,
     get_excel_row,
     semantic_search_descriptions,
+    list_column_catalog,
+    search_column_catalog,
     visualize_s2t_table_graph,
     trace_transformation_path,
     parse_sql_column_lineage,
     parse_sql_table_lineage,
     visualize_sql_lineage,
     run_sql,
+    query_saved_result,
     run_cypher,
     trace_neo4j_lineage,
     trace_neo4j_table_lineage,

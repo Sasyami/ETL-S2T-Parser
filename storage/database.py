@@ -73,10 +73,14 @@ TARGET_TABLE_COLUMNS = (
     EXTRACTION_METADATA_COLUMNS + TARGET_TABLE_FIELDS + ("description_embedding",)
 )
 SOURCE_COLUMN_COLUMNS = (
-    EXTRACTION_METADATA_COLUMNS + SOURCE_COLUMN_FIELDS + ("metadata_source",)
+    EXTRACTION_METADATA_COLUMNS
+    + SOURCE_COLUMN_FIELDS
+    + ("description_embedding",)
 )
 TARGET_COLUMN_COLUMNS = (
-    EXTRACTION_METADATA_COLUMNS + TARGET_COLUMN_FIELDS + ("metadata_source",)
+    EXTRACTION_METADATA_COLUMNS
+    + TARGET_COLUMN_FIELDS
+    + ("description_embedding",)
 )
 ADDITIONAL_OBJECT_COLUMNS = EXTRACTION_METADATA_COLUMNS + ADDITIONAL_OBJECT_FIELDS
 PXF_TO_A_COLUMNS = EXTRACTION_METADATA_COLUMNS + PXF_TO_A_FIELDS
@@ -299,7 +303,7 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
                 sheet_name TEXT,
                 row_num INTEGER,
                 {fields_sql},
-                metadata_source TEXT
+                description_embedding BLOB
             )
             """
         )
@@ -441,6 +445,7 @@ def init_db() -> None:
             )
             if not legacy_mismatches:
                 _create_current_tables(cursor)
+                _migrate_column_catalog_schema(cursor)
             mismatches = _schema_mismatches(cursor)
             if mismatches:
                 raise DatabaseSchemaError(
@@ -458,6 +463,101 @@ def init_db() -> None:
     finally:
         conn.close()
     logger.info("Database initialized with the current schema")
+
+
+def _migrate_column_catalog_schema(cursor: sqlite3.Cursor) -> List[str]:
+    """Remove derived provenance/alias fields while preserving catalog facts."""
+    rebuilt: List[str] = []
+    for table_name, fields in (
+        ("source_columns", SOURCE_COLUMN_FIELDS),
+        ("target_columns", TARGET_COLUMN_FIELDS),
+    ):
+        actual_columns = _table_columns(cursor, table_name)
+        current_columns = list(
+            EXTRACTION_METADATA_COLUMNS + fields + ("description_embedding",)
+        )
+        if actual_columns == current_columns:
+            continue
+        base_columns = list(EXTRACTION_METADATA_COLUMNS + fields)
+        supported_previous = {
+            tuple(base_columns + ["metadata_source"]),
+            tuple(base_columns + ["metadata_source", "description_embedding"]),
+            tuple(
+                base_columns
+                + [
+                    "metadata_source",
+                    "description_embedding",
+                    "description_aliases",
+                ]
+            ),
+        }
+        if tuple(actual_columns) not in supported_previous:
+            continue
+
+        replacement = f"{table_name}__catalog_schema"
+        fields_sql = _column_catalog_fields_sql(fields, "                ")
+        cursor.execute(
+            f"""
+            CREATE TABLE {_sql_identifier(replacement)} (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER,
+                sheet_name TEXT,
+                row_num INTEGER,
+                {fields_sql},
+                description_embedding BLOB
+            )
+            """
+        )
+        copy_columns = base_columns + ["description_embedding"]
+        invalidate_embedding = "description_aliases" in actual_columns
+        select_columns = [
+            (
+                "NULL"
+                if column == "description_embedding" and invalidate_embedding
+                else _sql_identifier(column)
+                if column in actual_columns
+                else "NULL"
+            )
+            for column in copy_columns
+        ]
+        cursor.execute(
+            f"INSERT INTO {_sql_identifier(replacement)} "
+            f"({', '.join(_sql_identifier(column) for column in copy_columns)}) "
+            f"SELECT {', '.join(select_columns)} "
+            f"FROM {_sql_identifier(table_name)}"
+        )
+        cursor.execute(f"DROP TABLE {_sql_identifier(table_name)}")
+        cursor.execute(
+            f"ALTER TABLE {_sql_identifier(replacement)} "
+            f"RENAME TO {_sql_identifier(table_name)}"
+        )
+        rebuilt.append(table_name)
+    return rebuilt
+
+
+def migrate_column_catalog_schema() -> Dict[str, Any]:
+    """Remove obsolete column provenance/alias fields from prior schemas."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN")
+        rebuilt = _migrate_column_catalog_schema(cursor)
+        mismatches = _schema_mismatches(
+            cursor, ("source_columns", "target_columns")
+        )
+        if mismatches:
+            raise DatabaseSchemaError(
+                "Нельзя обновить схему каталогов колонок: "
+                + "; ".join(mismatches)
+            )
+        _create_indexes(cursor)
+        conn.commit()
+        return {"changed": bool(rebuilt), "tables_rebuilt": rebuilt}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def migrate_s2t_layer_columns() -> Dict[str, Any]:

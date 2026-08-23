@@ -24,8 +24,14 @@ class _SupervisorModel:
         return self.responses.pop(0)
 
 
-def _delegate_message(task, *, context="", call_id="delegate-1", extra_args=None):
-    args = {"task": task, "context": context}
+def _delegate_message(
+    resolved_references="",
+    *,
+    context="",
+    call_id="delegate-1",
+    extra_args=None,
+):
+    args = {"resolved_references": resolved_references, "context": context}
     args.update(extra_args or {})
     return AIMessage(
         content="",
@@ -75,17 +81,13 @@ def test_supervisor_prompt_keeps_decision_and_handoff_llm_driven():
 
     normalized_prompt = " ".join(_SUPERVISOR_PROMPT.split()).lower()
     assert "реши, ответить сразу или вызвать" in normalized_prompt
-    assert "конкретное самодостаточное поручение" in normalized_prompt
+    assert "будет передан coordinator программно и дословно" in normalized_prompt
     assert "не добавляй новых целей" in normalized_prompt.lower()
-    assert "не придумывай требования" in normalized_prompt
-    assert "не требуй json" in normalized_prompt
-    assert "только когда его явно задал пользователь" in normalized_prompt
-    assert "именно исполнимое поручение" in normalized_prompt
-    assert "дословно сохраняй значимые идентификаторы" in normalized_prompt
+    assert "не пересказывай, не сокращай" in normalized_prompt
+    assert "не превращай его в план" in normalized_prompt
     assert "при единственном однозначном референте" in normalized_prompt
-    assert "никогда не передавай такую неразрешённую ссылку" in normalized_prompt
-    assert "посчитай строки в таблице x" in normalized_prompt
-    assert "является частью task, а не context" in normalized_prompt
+    assert "«в ней» = таблица x" in normalized_prompt
+    assert "относится к `resolved_references`, а не к context" in normalized_prompt
     assert "только компактные устойчивые правила" in normalized_prompt
     assert "в context остались только повторно применимые договорённости" in normalized_prompt
 
@@ -107,12 +109,15 @@ def test_supervisor_answers_directly_when_coordinator_is_not_needed():
     coordinator.assert_not_called()
     assert len(model.bound_tools) == 1
     parameters = model.bound_tools[0]["function"]["parameters"]
-    assert set(parameters["properties"]) == {"task", "context"}
-    assert parameters["required"] == ["task", "context"]
+    assert set(parameters["properties"]) == {"resolved_references", "context"}
+    assert parameters["required"] == ["resolved_references", "context"]
     assert parameters["properties"]["context"]["maxLength"] == 4000
-    task_description = parameters["properties"]["task"]["description"]
+    references_description = parameters["properties"]["resolved_references"][
+        "description"
+    ]
     context_description = parameters["properties"]["context"]["description"]
-    assert "Исполнимое самодостаточное поручение" in task_description
+    assert "разрешения ссылок current_query" in references_description
+    assert "пустая строка" in references_description
     assert "разовые объекты, ID, числа, результаты" in context_description
     assert parameters["additionalProperties"] is False
 
@@ -120,12 +125,12 @@ def test_supervisor_answers_directly_when_coordinator_is_not_needed():
 def test_supervisor_delegates_whole_goal_and_returns_coordinator_result():
     from agents.supervisor import supervisor_chat
 
-    task = "Для файла с file_id=42 перечисли все листы и их число."
+    resolved_references = "«в нём» = файл с file_id=42."
     common_context = (
         "Под словом «листы» в этом диалоге всегда понимаются листы Excel."
     )
     model = _SupervisorModel(
-        [_delegate_message(task, context=common_context)]
+        [_delegate_message(resolved_references, context=common_context)]
     )
     coordinator_result = CoordinatorAnswer(
         answer="В файле два листа: S2T и Дополнительные объекты.",
@@ -165,7 +170,12 @@ def test_supervisor_delegates_whole_goal_and_returns_coordinator_result():
         answer=coordinator_result.answer,
         display_items=resolved_items,
     )
-    coordinator.assert_called_once_with(task, context=common_context)
+    coordinator.assert_called_once_with(
+        "Какие в нём листы и сколько их?\n\n"
+        "Однозначно разрешённые ссылки из истории:\n"
+        "«в нём» = файл с file_id=42.",
+        context=common_context,
+    )
     resolve_refs.assert_called_once_with(["ref-sheets"])
     assert _payload(model) == {
         "current_query": "Какие в нём листы и сколько их?",
@@ -174,12 +184,14 @@ def test_supervisor_delegates_whole_goal_and_returns_coordinator_result():
     assert len(model.messages) == 1
 
 
-def test_supervisor_passes_native_task_without_validation_or_repair():
+def test_supervisor_ignores_unexpected_llm_task_rewrite():
     from agents.supervisor import supervisor_chat
 
     decision = _delegate_message(
-        "Покажи файлы",
-        extra_args={"tools": ["list_files"]},
+        extra_args={
+            "task": "Покажи только один файл",
+            "tools": ["list_files"],
+        },
     )
     model = _SupervisorModel([decision])
     model_patch, callback_patch, trace_patch = _supervisor_patches(model)
@@ -202,11 +214,11 @@ def test_supervisor_passes_native_task_without_validation_or_repair():
     assert len(model.messages) == 1
 
 
-def test_supervisor_uses_llm_delegated_task_without_python_rewrite():
+def test_supervisor_passes_current_query_verbatim_instead_of_llm_rewrite():
     from agents.supervisor import supervisor_chat
 
     decision = _delegate_message(
-        "Проверь две таблицы через SQLite,",
+        extra_args={"task": "Проверь две таблицы через SQLite."},
     )
     model = _SupervisorModel([decision])
     model_patch, callback_patch, trace_patch = _supervisor_patches(model)
@@ -227,7 +239,7 @@ def test_supervisor_uses_llm_delegated_task_without_python_rewrite():
 
     assert result.answer == "Путь найден."
     coordinator.assert_called_once_with(
-        "Проверь две таблицы через SQLite,",
+        query,
         context="",
     )
 
@@ -236,12 +248,12 @@ def test_supervisor_prompt_is_generic_and_preserves_semantics():
     from agents.supervisor import _SUPERVISOR_PROMPT, _delegate_tool_schema
 
     normalized_prompt = " ".join(_SUPERVISOR_PROMPT.split()).lower()
-    assert "дословно сохраняй" in normalized_prompt
-    assert "не заменяй их похожими" in normalized_prompt
+    assert "программно и дословно" in normalized_prompt
+    assert "не пересказывай, не сокращай, не исправляй" in normalized_prompt
     assert "устойчивые правила и устоявшиеся идеи" in normalized_prompt
-    assert "ссылки на историю уже разрешены" in str(_delegate_tool_schema()).lower()
+    assert "разрешения ссылок current_query" in str(_delegate_tool_schema()).lower()
     assert "не помещай в context" in normalized_prompt
-    assert "текущую task или её сокращённый пересказ" in normalized_prompt
+    assert "current_query или его сокращённый пересказ" in normalized_prompt
     assert "конкретные объекты, id, имена, числа и результаты" in normalized_prompt
     for domain_detail in ("Neo4j", "SQLite", "s2t_transformations", "file_id"):
         assert domain_detail not in _SUPERVISOR_PROMPT

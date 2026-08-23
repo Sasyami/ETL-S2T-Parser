@@ -125,6 +125,7 @@ def test_parser_reads_each_sheet_once(sample_excel_bytes):
 
     assert read_excel.call_count == 1
     assert "nrows" not in read_excel.call_args.kwargs
+    assert read_excel.call_args.kwargs["keep_default_na"] is False
     assert sheets[0]["columns"] == ["Name", "Age"]
     assert sheets[0]["header"] == {
         "start_row": 0,
@@ -132,6 +133,32 @@ def test_parser_reads_each_sheet_once(sample_excel_bytes):
         "nested": False,
     }
     assert sheets[0]["data_rows"] == [["Alice", 30], ["Bob", 25]]
+
+
+def test_parser_preserves_excel_strings_that_pandas_treats_as_na_by_default():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Flags"
+    sheet.append(["ID", "Nullable"])
+    sheet.append([1, "NULL"])
+    sheet.append([2, "NA"])
+    sheet.append([3, "N/A"])
+    sheet.append([4, None])
+    output = io.BytesIO()
+    workbook.save(output)
+
+    with patch(
+        "processing.excel.get_header_decision",
+        return_value=(0, 1, False),
+    ):
+        sheets = parse_excel_with_decisions(output.getvalue())
+
+    assert sheets[0]["data_rows"] == [
+        [1, "NULL"],
+        [2, "NA"],
+        [3, "N/A"],
+        [4, None],
+    ]
 
 
 def test_parser_uses_automatic_header_decision_for_untitled_rows():

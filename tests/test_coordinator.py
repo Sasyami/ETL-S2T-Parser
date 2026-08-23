@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage
 from agents.chat_graph import Observation, WorkerCycleTrace
 from agents.coordinator import CoordinatorAnswer, CoordinatorResponseError
 from agents.worker import WorkerAnswer, WorkerResultRef
+from agents.tools.saved_results import SavedResultColumn, SavedResultDescriptor
 
 
 def _tool_message(name, args, call_id):
@@ -238,6 +239,16 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
         WorkerAnswer(
             answer="Точное имя: t_example.",
             result_refs=[WorkerResultRef(ref="ref-first", name="lookup")],
+            saved_results=[
+                SavedResultDescriptor(
+                    result_ref="saved-first",
+                    source_tool="lookup",
+                    row_count=1,
+                    columns=[
+                        SavedResultColumn(name="name", sqlite_type="TEXT")
+                    ],
+                )
+            ],
             cycle_history=[
                 WorkerCycleTrace(
                     cycle=1,
@@ -300,6 +311,16 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
         "Точное имя: t_example."
     )
     assert second_dispatch["completed_workers"][0]["status"] == "completed"
+    assert second_dispatch["completed_workers"][0]["saved_results"] == [
+        {
+            "result_ref": "saved-first",
+            "source_tool": "lookup",
+            "row_count": 1,
+            "source_total": None,
+            "truncated": False,
+            "columns": [{"name": "name", "sqlite_type": "TEXT"}],
+        }
+    ]
     first_history = second_dispatch["completed_workers"][0]["cycle_history"]
     assert first_history[0]["tool_calls"] == [
         {"name": "lookup", "args": {}}
@@ -463,6 +484,7 @@ def test_coordinator_aggregates_unsatisfied_worker_without_internal_error():
             "goal_satisfied": False,
             "mismatches": ["Tool вернул данные не по той сущности."],
             "available_results": [],
+            "saved_results": [],
         }
     ]
     discard.assert_called_once_with(["ref-failed"])

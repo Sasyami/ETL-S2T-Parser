@@ -74,15 +74,26 @@ def _inspect_candidate_sheets(
 
 
 def _deterministic_sheet_mapping(
-    sheet: Dict[str, Any], threshold: float = 0.70
+    sheet: Dict[str, Any],
+    threshold: float = 0.70,
+    *,
+    sheet_group: str = USEFULL_SHEET_GROUP,
+    fields: Iterable[str] = S2T_FIELDS,
 ) -> Dict[str, Any]:
-    return match_fields(sheet, USEFULL_SHEET_GROUP, S2T_FIELDS, threshold)
+    return match_fields(sheet, sheet_group, tuple(fields), threshold)
 
 
 def _validate_sheet_mappings(
-    file_id: int, mappings: List[Dict[str, Any]], inspection: Dict[str, Any]
+    file_id: int,
+    mappings: List[Dict[str, Any]],
+    inspection: Dict[str, Any],
+    *,
+    fields: Iterable[str] = S2T_FIELDS,
+    required_fields: Iterable[str] = ("target_table",),
 ) -> List[Dict[str, Any]]:
     del file_id
+    configured_fields = tuple(fields)
+    required = tuple(required_fields)
     sheets = {
         str(sheet["sheet_name"]).casefold(): sheet
         for sheet in inspection.get("sheets", [])
@@ -96,11 +107,13 @@ def _validate_sheet_mappings(
             raise ValueError(f"Unknown configured sheet_name: {sheet_name}")
         if not isinstance(selected_raw, dict):
             raise ValueError(f"{sheet_name}: missing field_column_ids object")
-        unknown = sorted(set(selected_raw) - set(S2T_FIELDS))
+        unknown = sorted(set(selected_raw) - set(configured_fields))
         if unknown:
             raise ValueError(f"{sheet_name}: unknown configured fields {unknown}")
 
-        selected = {field: selected_raw.get(field) or None for field in S2T_FIELDS}
+        selected = {
+            field: selected_raw.get(field) or None for field in configured_fields
+        }
         valid_ids = {column["column_id"] for column in sheet.get("columns", [])}
         invalid = {
             field: column_id
@@ -116,8 +129,11 @@ def _validate_sheet_mappings(
             raise ValueError(
                 f"{sheet_name}: one physical column is assigned to multiple fields"
             )
-        if not selected.get("target_table"):
-            raise ValueError(f"{sheet_name}: required target_table is not mapped")
+        missing_required = [field for field in required if not selected.get(field)]
+        if missing_required:
+            raise ValueError(
+                f"{sheet_name}: required fields are not mapped: {missing_required}"
+            )
 
         evidence = dict(mapping.get("evidence") or {})
         missing_evidence = [
@@ -232,7 +248,10 @@ def _short_samples(values: Iterable[Any]) -> List[str]:
 
 
 def _llm_column_context(
-    sheet: Dict[str, Any], draft: Optional[Dict[str, Any]] = None
+    sheet: Dict[str, Any],
+    draft: Optional[Dict[str, Any]] = None,
+    *,
+    include_side_context: bool = True,
 ) -> List[Dict[str, Any]]:
     columns = list(sheet.get("columns", []))
     selected = (draft or {}).get("field_column_ids") or {}
@@ -269,67 +288,111 @@ def _llm_column_context(
             if distances["source"] == distances["target"]
             else min(distances, key=distances.get)
         )
-        result.append(
-            {
-                "column_name": name,
-                "occurrence": occurrences[name],
-                "side_hint": side_hint,
-                "previous_column": (
-                    columns[position - 1].get("column_name_flat")
-                    if position > 0
-                    else None
-                ),
-                "next_column": (
-                    columns[position + 1].get("column_name_flat")
-                    if position + 1 < len(columns)
-                    else None
-                ),
-                "sample_values": _short_samples(column.get("sample_values") or []),
-            }
-        )
+        item = {
+            "column_name": name,
+            "occurrence": occurrences[name],
+            "sample_values": _short_samples(column.get("sample_values") or []),
+        }
+        if include_side_context:
+            item.update(
+                {
+                    "side_hint": side_hint,
+                    "previous_column": (
+                        columns[position - 1].get("column_name_flat")
+                        if position > 0
+                        else None
+                    ),
+                    "next_column": (
+                        columns[position + 1].get("column_name_flat")
+                        if position + 1 < len(columns)
+                        else None
+                    ),
+                }
+            )
+        result.append(item)
     return result
 
 
 def _build_sheet_llm_prompt(
-    sheet: Dict[str, Any], draft: Optional[Dict[str, Any]] = None
+    sheet: Dict[str, Any],
+    draft: Optional[Dict[str, Any]] = None,
+    *,
+    sheet_group: str = USEFULL_SHEET_GROUP,
+    fields: Iterable[str] = S2T_FIELDS,
+    include_side_context: bool = True,
 ) -> str:
+    configured_fields = tuple(fields)
     mapping = {
         field: aliases
-        for field, aliases in get_sheet_column_mapping(USEFULL_SHEET_GROUP).items()
-        if field in set(S2T_FIELDS)
+        for field, aliases in get_sheet_column_mapping(sheet_group).items()
+        if field in set(configured_fields)
     }
     payload = {
         "sheet_name": sheet.get("sheet_name"),
-        "column_mapping_json": {USEFULL_SHEET_GROUP: mapping},
-        "columns": _llm_column_context(sheet, draft),
+        "column_mapping_json": {sheet_group: mapping},
+        "columns": _llm_column_context(
+            sheet, draft, include_side_context=include_side_context
+        ),
     }
+    context_instruction = (
+        " Одинаковые заголовки различай по occurrence, соседним колонкам и "
+        "side_hint: source относится к блоку источника, target — к блоку "
+        "приёмника."
+        if include_side_context
+        else " Одинаковые заголовки различай по occurrence и sample_values."
+    )
+    example_field = configured_fields[0] if configured_fields else None
+    example = json.dumps(
+        {
+            "sheet_name": "...",
+            "column_roles": [
+                {
+                    "column_name": "...",
+                    "occurrence": 1,
+                    "mapping_field": example_field,
+                },
+                {
+                    "column_name": "...",
+                    "occurrence": 1,
+                    "mapping_field": None,
+                },
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     return (
         "Сопоставь полезные колонки одного настроенного листа с доступными полями "
-        f"группы column_mapping_json {USEFULL_SHEET_GROUP!r}. "
+        f"группы column_mapping_json {sheet_group!r}. "
         "Для каждого входного column_name и occurrence верни один mapping_field из "
         "column_mapping_json или null. Не придумывай значения и не назначай один "
-        "mapping_field нескольким колонкам. Одинаковые заголовки различай по "
-        "occurrence, соседним колонкам и side_hint: source относится к блоку "
-        "источника, target — к блоку приёмника. Верни только JSON без markdown: "
-        '{"sheet_name":"...","column_roles":[{"column_name":"...",'
-        '"occurrence":1,"mapping_field":"target_table"},{"column_name":"...",'
-        '"occurrence":1,"mapping_field":null}]}.\n\n'
+        "mapping_field нескольким колонкам."
+        + context_instruction
+        + " Верни только JSON без markdown: "
+        + example
+        + ".\n\n"
         + json.dumps(payload, ensure_ascii=False, default=str)
     )
 
 
-def _normalise_llm_field(value: Any) -> Optional[str]:
+def _normalise_llm_field(
+    value: Any, fields: Iterable[str] = S2T_FIELDS
+) -> Optional[str]:
     if value is None:
         return None
     text = str(value).strip()
-    if text not in S2T_FIELDS:
+    if text not in set(fields):
         raise ValueError(f"Unknown configured mapping_field: {text}")
     return text
 
 
 def _sheet_mapping_from_column_roles(
-    parsed: Dict[str, Any], sheet: Dict[str, Any]
+    parsed: Dict[str, Any],
+    sheet: Dict[str, Any],
+    *,
+    fields: Iterable[str] = S2T_FIELDS,
 ) -> Dict[str, Any]:
+    configured_fields = tuple(fields)
     sheet_name = str(sheet.get("sheet_name") or "")
     if parsed.get("sheet_name") and parsed["sheet_name"] != sheet.get("sheet_name"):
         raise ValueError(f"{sheet_name}: LLM returned wrong sheet_name")
@@ -345,7 +408,9 @@ def _sheet_mapping_from_column_roles(
             occurrences[name] = occurrences.get(name, 0) + 1
             columns[(name, occurrences[name])] = column
 
-    selected, evidence, seen = {field: None for field in S2T_FIELDS}, {}, set()
+    selected, evidence, seen = {
+        field: None for field in configured_fields
+    }, {}, set()
     for item in roles:
         if not isinstance(item, dict):
             raise ValueError(f"{sheet_name}: column_roles items must be objects")
@@ -362,7 +427,7 @@ def _sheet_mapping_from_column_roles(
                 f"{sheet_name}: unknown or duplicate column occurrence: {key!r}"
             )
         seen.add(key)
-        field = _normalise_llm_field(item.get("mapping_field"))
+        field = _normalise_llm_field(item.get("mapping_field"), configured_fields)
         if field is None:
             continue
         if selected[field]:
@@ -385,20 +450,54 @@ def _sheet_mapping_from_column_roles(
 
 
 def _resolve_sheet_mapping(
-    file_id: int, sheet: Dict[str, Any], inspection: Dict[str, Any]
+    file_id: int,
+    sheet: Dict[str, Any],
+    inspection: Dict[str, Any],
+    *,
+    sheet_group: str = USEFULL_SHEET_GROUP,
+    fields: Iterable[str] = S2T_FIELDS,
+    required_fields: Iterable[str] = ("target_table",),
+    include_side_context: bool = True,
 ) -> Dict[str, Any]:
-    draft = _deterministic_sheet_mapping(sheet)
-    if all(draft["field_column_ids"].get(field) for field in S2T_FIELDS):
-        mapping = _validate_sheet_mappings(file_id, [draft], inspection)[0]
+    configured_fields = tuple(fields)
+    required = tuple(required_fields)
+    draft = _deterministic_sheet_mapping(
+        sheet, sheet_group=sheet_group, fields=configured_fields
+    )
+    if all(
+        draft["field_column_ids"].get(field) for field in configured_fields
+    ):
+        mapping = _validate_sheet_mappings(
+            file_id,
+            [draft],
+            inspection,
+            fields=configured_fields,
+            required_fields=required,
+        )[0]
         return {"mapping": mapping, "attempts": 0, "method": "deterministic"}
     try:
         candidate = _sheet_mapping_from_column_roles(
             _extract_json_object(
-                _invoke_llm_plain_text(_build_sheet_llm_prompt(sheet, draft))
+                _invoke_llm_plain_text(
+                    _build_sheet_llm_prompt(
+                        sheet,
+                        draft,
+                        sheet_group=sheet_group,
+                        fields=configured_fields,
+                        include_side_context=include_side_context,
+                    )
+                )
             ),
             sheet,
+            fields=configured_fields,
         )
-        mapping = _validate_sheet_mappings(file_id, [candidate], inspection)[0]
+        mapping = _validate_sheet_mappings(
+            file_id,
+            [candidate],
+            inspection,
+            fields=configured_fields,
+            required_fields=required,
+        )[0]
         return {"mapping": mapping, "attempts": 1, "method": "llm"}
     except Exception as exc:
         return {
@@ -407,6 +506,26 @@ def _resolve_sheet_mapping(
             "method": "llm",
             "error": str(exc) or "useful-column matching failed",
         }
+
+
+def resolve_configured_sheet_mapping(
+    file_id: int,
+    sheet: Dict[str, Any],
+    *,
+    sheet_group: str,
+    fields: Iterable[str],
+    required_fields: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Resolve one configured sheet via aliases, then one LLM check if incomplete."""
+    return _resolve_sheet_mapping(
+        file_id,
+        sheet,
+        {"file_id": file_id, "sheets": [sheet]},
+        sheet_group=sheet_group,
+        fields=tuple(fields),
+        required_fields=tuple(required_fields),
+        include_side_context=False,
+    )
 
 
 def _make_report(

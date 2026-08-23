@@ -41,6 +41,38 @@ SKILL_CATALOG: Dict[str, str] = {
 
 
 _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
+    "list_column_catalog": {
+        "use_when": (
+            "Известны роль и точные фильтры каталога колонок либо нужна "
+            "структурная подвыборка по file/table/column/type/PK/not-null/source "
+            "с выбранными возвращаемыми полями."
+        ),
+        "not_for": "Фрагмент имени, смысл описания, S2T-маппинг или lineage.",
+        "fallback_only": False,
+    },
+    "search_column_catalog": {
+        "use_when": (
+            "Нужен поиск подстроки по имени, типу или описанию колонки; scope и "
+            "точные фильтры могут предварительно ограничить подвыборку."
+        ),
+        "not_for": "Смысловая близость или уже известные точные table/column.",
+        "fallback_only": False,
+    },
+    "semantic_search_descriptions": {
+        "use_when": (
+            "Смысловой поиск по неизвестному точному имени. scope: files — "
+            "только файлы; tables — все логические таблицы; source_tables — "
+            "только исходные таблицы; target_tables — только целевые таблицы; "
+            "columns — все колонки; source_columns — только исходные колонки; "
+            "target_columns — только целевые колонки; all — только если домен "
+            "неизвестен. Для колонковых scope допустимы точные фильтры "
+            "подвыборки до cosine-ранжирования."
+        ),
+        "not_for": (
+            "Точное имя объекта, поиск значений ячеек, S2T-маппинги или lineage."
+        ),
+        "fallback_only": False,
+    },
     "list_s2t_transformations": {
         "use_when": (
             "Известно точное полное source_table/target_table в сохранённом "
@@ -89,6 +121,19 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
             "ETL-таблицы как физические SQLite-таблицы."
         ),
         "fallback_only": True,
+    },
+    "query_saved_result": {
+        "use_when": (
+            "Task содержит точный result_ref предыдущего worker и требует "
+            "новый read-only SQL-срез, фильтр, сортировку или агрегацию именно "
+            "по сохранённым строкам этого результата."
+        ),
+        "not_for": (
+            "Нет result_ref; нужно заново читать основную SQLite-базу; "
+            "сохранённый результат помечен truncated=true, а вывод требуется "
+            "по полному исходному набору."
+        ),
+        "fallback_only": False,
     },
     "parse_sql_column_lineage": {
         "use_when": (

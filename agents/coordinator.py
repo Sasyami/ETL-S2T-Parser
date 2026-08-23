@@ -19,6 +19,7 @@ from .run_metrics import (
     record_coordinator_plan,
 )
 from .worker import discard_worker_result_refs, worker_chat
+from .tools.saved_results import saved_result_store_scope
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,7 @@ class CoordinatorWorkerRun(TypedDict):
     answer: str
     cycle_history: List[Dict[str, Any]]
     result_refs: List[CoordinatorResultRef]
+    saved_results: List[Dict[str, Any]]
     goal_satisfied: bool
     mismatches: List[str]
 
@@ -246,6 +248,13 @@ observation, а поле `status=completed` явно отмечает завер
 нужны только для понимания исправлений; подтверждёнными считай факты из цикла,
 observation которого завершает goal с `goal_satisfied=true`.
 
+Поле `saved_results` содержит непрозрачные result_ref и схемы табличных
+результатов предыдущего worker, но не сами строки. Если текущая операция должна
+применяться именно к полному сохранённому набору и `truncated=false`, включи
+точный result_ref в task. Схема выбранного результата будет передана worker
+вместе с подходящим runtime tool. Если `truncated=true`, такой результат
+содержит только preview: не используй его для вывода о полном исходном наборе.
+
 Факты completed_workers являются подтверждёнными входными условиями зависимого
 шага, а не новой целью. Не проси текущий worker повторно получать, проверять,
 пересчитывать или возвращать их, если current_step.goal этого явно не требует.
@@ -320,6 +329,9 @@ _COORDINATE_PROMPT = f"""
   массив, число или null как значение этого технического поля;
 - `display_result_keys`: ключи только тех доступных результатов, которые нужно
   показать полностью отдельно.
+
+Не включай в пользовательский `answer` служебные result_ref, saved_results и
+описания их схем, если пользователь явно не запросил внутреннюю диагностику.
 
 Полные tool results намеренно не передаются. Каждый worker result содержит
 ordered `cycle_history`: точные tool calls, ограниченные текстовые preview и
@@ -637,6 +649,7 @@ def build_coordinator_graph(
                 "task": run["task"],
                 "answer": run["answer"],
                 "cycle_history": list(run["cycle_history"]),
+                "saved_results": list(run["saved_results"]),
             }
             for run in state["worker_runs"]
         ]
@@ -720,6 +733,10 @@ def build_coordinator_graph(
                     for cycle in worker_result.cycle_history
                 ],
                 "result_refs": [],
+                "saved_results": [
+                    item.model_dump(mode="json")
+                    for item in worker_result.saved_results
+                ],
                 "goal_satisfied": False,
                 "mismatches": list(worker_result.mismatches),
             }
@@ -750,6 +767,10 @@ def build_coordinator_graph(
                 for cycle in worker_result.cycle_history
             ],
             "result_refs": result_refs,
+            "saved_results": [
+                item.model_dump(mode="json")
+                for item in worker_result.saved_results
+            ],
             "goal_satisfied": worker_result.goal_satisfied,
             "mismatches": list(worker_result.mismatches),
         }
@@ -779,6 +800,7 @@ def build_coordinator_graph(
                     }
                     for result_ref in run["result_refs"]
                 ],
+                "saved_results": list(run["saved_results"]),
             }
             for run in state["worker_runs"]
         ]
@@ -965,10 +987,13 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
         "run_name": "worker_coordinator",
     }
 
-    with langfuse_trace_context(
-        trace_name="worker_coordinator",
-        metadata={"max_workers": COORDINATOR_MAX_WORKERS},
-        tags=["coordinator", "worker", "experiment"],
+    with (
+        saved_result_store_scope(),
+        langfuse_trace_context(
+            trace_name="worker_coordinator",
+            metadata={"max_workers": COORDINATOR_MAX_WORKERS},
+            tags=["coordinator", "worker", "experiment"],
+        ),
     ):
         try:
             final_state = graph.invoke(initial_state, config=config)

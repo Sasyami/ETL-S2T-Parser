@@ -66,14 +66,32 @@
       "Source Not Null",
       "notnullsource",
       "not null",
-      "NULL?"
+      "NULL?",
+      "Nullable",
+      "Allows NULL",
+      "NULL allowed",
+      "Required",
+      "Mandatory",
+      "Обязательное поле",
+      "Обязательность заполнения",
+      "Допускается NULL",
+      "Допускается пустое значение?"
     ],
     "target_not_null": [
       "Not null поля приемника",
       "Target Not Null",
       "notnulltarget",
       "not null",
-      "NULL?"
+      "NULL?",
+      "Nullable",
+      "Allows NULL",
+      "NULL allowed",
+      "Required",
+      "Mandatory",
+      "Обязательное поле",
+      "Обязательность заполнения",
+      "Допускается NULL",
+      "Допускается пустое значение?"
     ],
     "source_description": [
       "Описание поля источника",
@@ -210,7 +228,17 @@
       "Column Null Option",
       "notnull",
       "notnullsource",
-      "notnulltcp"
+      "notnulltcp",
+      "Not Null",
+      "Nullable",
+      "Allows NULL",
+      "NULL allowed",
+      "Required",
+      "Mandatory",
+      "Обязательное поле",
+      "Обязательность заполнения",
+      "Допускается NULL",
+      "Допускается пустое значение?"
     ],
     "data_type": [
       "Тип поля",
@@ -251,7 +279,17 @@
       "Column Null Option",
       "notnull",
       "notnulltarget",
-      "notnulltcp"
+      "notnulltcp",
+      "Not Null",
+      "Nullable",
+      "Allows NULL",
+      "NULL allowed",
+      "Required",
+      "Mandatory",
+      "Обязательное поле",
+      "Обязательность заполнения",
+      "Допускается NULL",
+      "Допускается пустое значение?"
     ],
     "data_type": [
       "Тип поля",

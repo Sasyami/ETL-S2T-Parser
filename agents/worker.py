@@ -33,7 +33,12 @@ from .run_metrics import (
     record_worker_route,
     record_worker_task,
 )
-from .tools import get_tools, get_tools_for_names, load_schemas, load_skills
+from .tools import get_tools, load_schemas, load_skills
+from .tools.saved_results import (
+    SavedResultDescriptor,
+    bind_saved_result_schemas,
+    get_active_saved_result_store,
+)
 from .tools.routing import select_chat_route
 
 logger = logging.getLogger(__name__)
@@ -62,6 +67,7 @@ class WorkerAnswer(BaseModel):
 
     answer: str
     result_refs: List[WorkerResultRef] = Field(default_factory=list)
+    saved_results: List[SavedResultDescriptor] = Field(default_factory=list)
     cycle_history: List[WorkerCycleTrace] = Field(default_factory=list)
     goal_satisfied: bool = True
     mismatches: List[str] = Field(default_factory=list)
@@ -133,13 +139,27 @@ def worker_chat(task: str) -> WorkerAnswer:
     metrics_callback = get_run_metrics_callback()
     if metrics_callback is not None and metrics_callback not in callbacks:
         callbacks.append(metrics_callback)
-    available_tools = get_tools()
+    saved_store = get_active_saved_result_store()
+    initial_saved_refs = {
+        item.result_ref for item in saved_store.descriptors()
+    } if saved_store is not None else set()
+
+    def newly_saved_results() -> List[SavedResultDescriptor]:
+        if saved_store is None:
+            return []
+        return [
+            item
+            for item in saved_store.descriptors()
+            if item.result_ref not in initial_saved_refs
+        ]
+
     attempted_palettes: List[Tuple[str, ...]] = []
     cycle_history: List[WorkerCycleTrace] = []
     reroute_context: Dict[str, Any] | None = None
     reroute_count = 0
 
     while True:
+        available_tools = bind_saved_result_schemas(get_tools(), clean_task)
         route_kwargs: Dict[str, Any] = {
             "model": chat_model,
             "available_tools": available_tools,
@@ -150,7 +170,10 @@ def worker_chat(task: str) -> WorkerAnswer:
         route = select_chat_route(clean_task, **route_kwargs)
         palette = tuple(sorted(dict.fromkeys(route.tools)))
         attempted_palettes.append(palette)
-        selected_tools = get_tools_for_names(route.tools)
+        selected_names = set(route.tools)
+        selected_tools = tuple(
+            item for item in available_tools if item.name in selected_names
+        )
         worker_tools = ensure_worker_tools(selected_tools)
         selected_skills = load_skills(tuple(route.skills))
         selected_schemas = load_schemas(tuple(route.schemas))
@@ -238,6 +261,7 @@ def worker_chat(task: str) -> WorkerAnswer:
             return WorkerAnswer(
                 answer=graph_result.answer,
                 result_refs=_store_display_items(graph_result.display_items),
+                saved_results=newly_saved_results(),
                 cycle_history=cycle_history,
                 goal_satisfied=graph_result.goal_satisfied,
                 mismatches=graph_result.mismatches,
@@ -251,6 +275,7 @@ def worker_chat(task: str) -> WorkerAnswer:
             return WorkerAnswer(
                 answer=reroute_reason,
                 result_refs=[],
+                saved_results=newly_saved_results(),
                 cycle_history=cycle_history,
                 goal_satisfied=False,
                 mismatches=list(graph_result.mismatches),

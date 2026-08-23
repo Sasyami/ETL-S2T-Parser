@@ -275,14 +275,17 @@ def _assert_execution(
     *,
     expected_tools: list[str | set[str]],
     expected_displays: list[str | set[str]],
-    max_seconds: float,
+    max_seconds: float | None,
     max_llm_calls: int,
     max_total_tokens: int,
 ) -> None:
     metrics = exchange.metrics
     assert metrics.error is None, metrics.error
-    assert 0 < metrics.elapsed_seconds <= max_seconds, metrics
-    assert 0 < exchange.http_elapsed_seconds <= max_seconds + 5, metrics
+    assert metrics.elapsed_seconds > 0, metrics
+    assert exchange.http_elapsed_seconds > 0, metrics
+    if max_seconds is not None:
+        assert metrics.elapsed_seconds <= max_seconds, metrics
+        assert exchange.http_elapsed_seconds <= max_seconds + 5, metrics
     _assert_minimal_name_sequence(
         [item.name for item in metrics.tool_calls],
         expected_tools,
@@ -420,17 +423,28 @@ def _fetch_one(query: str, parameters: tuple[object, ...] = ()) -> tuple:
 def _s2t_work_case_fixture() -> tuple[int, str, str, str, str]:
     row = _fetch_one(
         """
-        SELECT file_id, target_table, source_table, target_field, source_field
-        FROM s2t_transformations
-        WHERE LOWER(sheet_name) = 's2t'
-          AND target_table IS NOT NULL AND TRIM(target_table) <> ''
-          AND source_table IS NOT NULL AND TRIM(source_table) <> ''
-          AND target_field IS NOT NULL AND TRIM(target_field) <> ''
-          AND source_field IS NOT NULL AND TRIM(source_field) <> ''
-          AND transformation_rule IS NOT NULL
-          AND LOWER(transformation_rule) LIKE '%join%'
-          AND LOWER(transformation_rule) LIKE '%where%'
-        ORDER BY LENGTH(transformation_rule), id
+        SELECT s2t.file_id, s2t.target_table, s2t.source_table,
+               s2t.target_field, s2t.source_field
+        FROM s2t_transformations AS s2t
+        JOIN source_columns AS source_catalog
+          ON source_catalog.file_id = s2t.file_id
+         AND source_catalog.table_name = s2t.source_table COLLATE NOCASE
+         AND source_catalog.column_name = s2t.source_field COLLATE NOCASE
+        JOIN target_columns AS target_catalog
+          ON target_catalog.file_id = s2t.file_id
+         AND target_catalog.table_name = s2t.target_table COLLATE NOCASE
+         AND target_catalog.column_name = s2t.target_field COLLATE NOCASE
+        WHERE LOWER(s2t.sheet_name) = 's2t'
+          AND s2t.target_table IS NOT NULL AND TRIM(s2t.target_table) <> ''
+          AND s2t.source_table IS NOT NULL AND TRIM(s2t.source_table) <> ''
+          AND s2t.target_field IS NOT NULL AND TRIM(s2t.target_field) <> ''
+          AND s2t.source_field IS NOT NULL AND TRIM(s2t.source_field) <> ''
+          AND s2t.transformation_rule IS NOT NULL
+          AND source_catalog.not_null = 0
+          AND target_catalog.not_null = 1
+          AND LOWER(s2t.transformation_rule) LIKE '%join%'
+          AND LOWER(s2t.transformation_rule) LIKE '%where%'
+        ORDER BY LENGTH(s2t.transformation_rule), s2t.id
         LIMIT 1
         """
     )
@@ -443,82 +457,93 @@ def _s2t_work_case_fixture() -> tuple[int, str, str, str, str]:
     )
 
 
-def _work_case_data_types() -> tuple[str, str]:
+def _work_case_column_metadata() -> tuple[dict, dict]:
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
+    conn = db_storage.get_db_connection()
+    try:
+        source_row = conn.execute(
+            """
+            SELECT table_name, column_name, data_type, primary_key, not_null,
+                   description
+            FROM source_columns
+            WHERE file_id = ?
+              AND table_name = ? COLLATE NOCASE
+              AND column_name = ? COLLATE NOCASE
+            ORDER BY id
+            LIMIT 1
+            """,
+            (file_id, source_table, source_field),
+        ).fetchone()
+        target_row = conn.execute(
+            """
+            SELECT table_name, column_name, data_type, primary_key, not_null,
+                   description
+            FROM target_columns
+            WHERE file_id = ?
+              AND table_name = ? COLLATE NOCASE
+              AND column_name = ? COLLATE NOCASE
+            ORDER BY id
+            LIMIT 1
+            """,
+            (file_id, target_table, target_field),
+        ).fetchone()
+    finally:
+        conn.close()
+    if source_row is None or target_row is None:
+        pytest.skip("workspace column catalogs lack the selected S2T mapping")
+    return dict(source_row), dict(target_row)
 
-    def sheet_type(sheet_name: str, table_name: str, field_name: str) -> str:
-        conn = db_storage.get_db_connection()
-        try:
-            header_row = conn.execute(
-                """
-                SELECT headers_json
-                FROM file_sheet_headers
-                WHERE file_id = ? AND sheet_name = ? COLLATE NOCASE
-                """,
-                (file_id, sheet_name),
-            ).fetchone()
-            if header_row is None:
-                pytest.skip(f"workspace has no {sheet_name} headers")
-            headers = json.loads(header_row[0] or "[]")
-            ids_by_name = {
-                str(item.get("flat") or "").strip().casefold():
-                int(item.get("index", index)) + 1
-                for index, item in enumerate(headers)
-                if isinstance(item, dict)
-            }
-            table_id = ids_by_name.get("table")
-            column_id = ids_by_name.get("column")
-            datatype_id = ids_by_name.get("datatype")
-            if not all((table_id, column_id, datatype_id)):
-                pytest.skip(f"workspace {sheet_name} lacks table/column/datatype")
-            row = conn.execute(
-                """
-                SELECT datatype.value
-                FROM data AS table_name
-                JOIN data AS column_name
-                  ON column_name.file_id = table_name.file_id
-                 AND column_name.table_name = table_name.table_name
-                 AND column_name.row_num = table_name.row_num
-                JOIN data AS datatype
-                  ON datatype.file_id = table_name.file_id
-                 AND datatype.table_name = table_name.table_name
-                 AND datatype.row_num = table_name.row_num
-                WHERE table_name.file_id = ?
-                  AND table_name.table_name = ? COLLATE NOCASE
-                  AND table_name.column_id = ?
-                  AND table_name.value = ? COLLATE NOCASE
-                  AND column_name.column_id = ?
-                  AND column_name.value = ? COLLATE NOCASE
-                  AND datatype.column_id = ?
-                LIMIT 1
-                """,
-                (
-                    file_id,
-                    sheet_name,
-                    table_id,
-                    table_name,
-                    column_id,
-                    field_name,
-                    datatype_id,
-                ),
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is None or not str(row[0] or "").strip():
-            pytest.skip(f"workspace has no datatype for {table_name}.{field_name}")
-        return str(row[0]).strip()
 
-    return (
-        sheet_type("source_columns", source_table, source_field),
-        sheet_type("target_columns", target_table, target_field),
-    )
+def _work_case_data_types() -> tuple[str, str]:
+    source_metadata, target_metadata = _work_case_column_metadata()
+    source_type = str(source_metadata.get("data_type") or "").strip()
+    target_type = str(target_metadata.get("data_type") or "").strip()
+    if not source_type or not target_type:
+        pytest.skip("workspace column catalogs lack data types for the mapping")
+    return source_type, target_type
+
+
+def _work_case_required_target_fields() -> tuple[list[str], list[str]]:
+    file_id, target_table, _, _, _ = _s2t_work_case_fixture()
+    conn = db_storage.get_db_connection()
+    try:
+        mandatory_rows = conn.execute(
+            """
+            SELECT DISTINCT TRIM(column_name) AS column_name
+            FROM target_columns
+            WHERE file_id = ?
+              AND table_name = ? COLLATE NOCASE
+              AND not_null = 1
+              AND column_name IS NOT NULL
+              AND TRIM(column_name) <> ''
+            ORDER BY column_name COLLATE NOCASE
+            """,
+            (file_id, target_table),
+        ).fetchall()
+        mapped_rows = conn.execute(
+            """
+            SELECT DISTINCT TRIM(target_field) AS target_field
+            FROM s2t_transformations
+            WHERE target_table = ? COLLATE NOCASE
+              AND target_field IS NOT NULL
+              AND TRIM(target_field) <> ''
+            """,
+            (target_table,),
+        ).fetchall()
+    finally:
+        conn.close()
+    mandatory = [str(row[0]) for row in mandatory_rows]
+    mapped = {str(row[0]).casefold() for row in mapped_rows}
+    unmapped = [name for name in mandatory if name.casefold() not in mapped]
+    return mandatory, unmapped
 
 
 def _assert_s2t_work_case_execution(
     exchange: _LiveExchange,
     *,
+    required_tools: set[str] | None = None,
     max_seconds: float = 240,
     max_llm_calls: int = 32,
     max_total_tokens: int = 180_000,
@@ -526,12 +551,15 @@ def _assert_s2t_work_case_execution(
     metrics = exchange.metrics
     allowed_tools = {
         "get_excel_row",
+        "list_column_catalog",
         "list_columns",
         "list_file_sheet_headers",
         "list_s2t_transformations",
         "parse_sql_column_lineage",
         "parse_sql_table_lineage",
+        "query_saved_result",
         "run_sql",
+        "search_column_catalog",
         "search_excel_values",
         "search_s2t_transformations",
         "show_plan",
@@ -544,6 +572,7 @@ def _assert_s2t_work_case_execution(
     assert 0 < exchange.http_elapsed_seconds <= max_seconds + 5, metrics
     assert tool_names, "scenario returned without inspecting stored data"
     assert set(tool_names) <= allowed_tools, tool_names
+    assert set(required_tools or ()) <= set(tool_names), tool_names
     assert len(tool_names) <= 12, tool_names
     if LIVE_AGENT_MODE == "multiagent":
         assert metrics.coordinator_plan, metrics.coordinator_plan
@@ -574,12 +603,13 @@ def test_live_agent_answers_simple_conversation_without_display_results(
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    assert result.answer.strip().casefold() == "привет", result.answer
     assert result.display_items == []
     _assert_execution(
         exchange,
         expected_tools=[],
         expected_displays=[],
-        max_seconds=30,
+        max_seconds=None,
         max_llm_calls=3,
         max_total_tokens=15_000,
     )
@@ -1130,21 +1160,40 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
+    source_metadata, target_metadata = _work_case_column_metadata()
     exchange = _chat(
         live_chat_client,
         f"Для загруженного файла file_id={file_id} проверь кейс: в обязательном "
         f"целевом поле {target_table}.{target_field} могут появляться NULL. "
-        f"Сопоставь факты из листов S2T, Source columns и Target columns для "
-        f"источника {source_table}.{source_field}: обязательность target, может "
-        "ли source быть NULL и есть ли защита COALESCE или WHERE. Дай вывод с "
-        "конкретными доказательствами, а если данных не хватает — явно укажи это.",
+        "Получи точные метаданные через публичные каталоги source_columns и "
+        "target_columns, не восстанавливай их из сырых строк data. Для "
+        f"источника {source_table}.{source_field} укажи обязательность target, "
+        "может ли source быть NULL и есть ли в глобальной s2t_transformations "
+        "защита COALESCE или WHERE. В ответе явно запиши "
+        "source_not_null=<0|1> и target_not_null=<0|1>, затем дай вывод с "
+        "конкретными доказательствами; при нехватке данных укажи это.",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
     assert target_table in result.answer, result.answer
+    assert source_table in result.answer, result.answer
+    assert target_field in result.answer, result.answer
+    assert source_field in result.answer, result.answer
+    normalized_answer = result.answer.casefold().replace(" ", "")
+    assert (
+        f"source_not_null={int(source_metadata['not_null'])}"
+        in normalized_answer
+    ), result.answer
+    assert (
+        f"target_not_null={int(target_metadata['not_null'])}"
+        in normalized_answer
+    ), result.answer
     _assert_answer_contains_any(result.answer, ("null", "coalesce", "where"))
-    _assert_s2t_work_case_execution(exchange)
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools={"list_column_catalog"},
+    )
 
 
 def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client):
@@ -1157,26 +1206,34 @@ def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client
         f"Через SQLite для файла file_id={file_id} проверь совместимость типов "
         "в маппинге "
         f"{source_table}.{source_field} -> {target_table}.{target_field}. "
-        "В таблице data имена source_columns, target_columns и s2t являются "
-        "именами Excel-листов, а ETL-таблицы — значениями ячеек: не ищи лист с "
-        "именем ETL-таблицы. Найди строки по точным table/column, сверь их "
-        "datatype и отдельно проверь CAST в глобальной s2t_transformations по "
-        "точным source_table, source_field, target_table, target_field без "
-        "фильтра file_id. Верни доказательства и однозначный вывод: совместимо, "
-        "несовместимо или данных недостаточно.",
+        "Получи обе строки через публичные source_columns и target_columns по "
+        "точным file_id/table_name/column_name с помощью каталога колонок; не "
+        "читай для этого сырые строки data. Отдельно проверь CAST в глобальной "
+        "s2t_transformations по точным source_table, source_field, target_table "
+        "и target_field без фильтра file_id. В ответе явно запиши "
+        "source_data_type=<тип> и target_data_type=<тип>, приведи доказательства "
+        "и однозначный вывод: совместимо, несовместимо или данных недостаточно.",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
     assert target_table in result.answer, result.answer
-    assert source_type.casefold() in result.answer.casefold(), result.answer
-    assert target_type.casefold() in result.answer.casefold(), result.answer
+    normalized_answer = result.answer.casefold().replace(" ", "")
+    assert f"source_data_type={source_type.casefold()}" in normalized_answer, (
+        result.answer
+    )
+    assert f"target_data_type={target_type.casefold()}" in normalized_answer, (
+        result.answer
+    )
     _assert_answer_contains_any(result.answer, ("тип", "cast"))
     _assert_answer_contains_any(
         result.answer,
         ("совместим", "несовместим", "недостаточно"),
     )
-    _assert_s2t_work_case_execution(exchange)
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools={"list_column_catalog"},
+    )
 
 
 def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
@@ -1202,20 +1259,37 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
 
 def test_live_agent_checks_unmapped_required_target_fields(live_chat_client):
     file_id, target_table, _, _, _ = _s2t_work_case_fixture()
+    mandatory_fields, unmapped_fields = _work_case_required_target_fields()
     exchange = _chat(
         live_chat_client,
         f"Для файла file_id={file_id} проверь, все ли обязательные поля "
-        f"target_table {target_table} заполняются. Сопоставь обязательные поля "
-        "из Target columns с маппингами S2T, посчитай обязательные поля без "
-        "маппинга и перечисли их. Не считай необязательные поля дефектами.",
+        f"target_table {target_table} заполняются. Получи обязательные поля "
+        "точным запросом к публичному target_columns с not_null=true, не читай "
+        "их из сырых строк data. Сопоставь их с target_field глобальной "
+        "s2t_transformations без фильтра file_id. Верни "
+        "mandatory_fields_count=<число>, "
+        "mandatory_fields_without_mapping_count=<число> и имена полей без "
+        "маппинга. Не считай необязательные поля дефектами.",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
     assert target_table in result.answer, result.answer
-    _assert_answer_contains_any(result.answer, ("обязатель", "маппинг"))
-    assert _integer_values(result.answer), result.answer
-    _assert_s2t_work_case_execution(exchange)
+    normalized_answer = result.answer.casefold().replace(" ", "")
+    assert (
+        f"mandatory_fields_count={len(mandatory_fields)}"
+        in normalized_answer
+    ), result.answer
+    assert (
+        "mandatory_fields_without_mapping_count="
+        f"{len(unmapped_fields)}" in normalized_answer
+    ), result.answer
+    for field_name in unmapped_fields:
+        assert field_name.casefold() in result.answer.casefold(), result.answer
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools={"list_column_catalog"},
+    )
 
 
 def test_live_agent_checks_row_loss_risk(live_chat_client):

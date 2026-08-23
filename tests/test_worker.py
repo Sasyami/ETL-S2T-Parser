@@ -336,6 +336,120 @@ def test_worker_returns_all_successful_tool_results_for_coordinator():
     assert "second" in result.display_items[1].content
 
 
+def test_worker_graph_materializes_sqlite_tool_rows_in_active_store():
+    from agents.tools.saved_results import (
+        query_saved_result,
+        saved_result_store_scope,
+    )
+
+    def lookup_rows():
+        return {
+            "total": 2,
+            "rows": [
+                {"name": "first", "score": 1},
+                {"name": "second", "score": 2},
+            ],
+        }
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_s2t_transformations",
+                        "args": {},
+                        "id": "call-sqlite",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Строки получены."),
+        ]
+    )
+
+    with saved_result_store_scope() as store:
+        result = run_worker_graph(
+            task="Получи строки",
+            system_prompt="Системный контекст",
+            model=model,
+            tools=(
+                _as_tool(
+                    lookup_rows,
+                    name="list_s2t_transformations",
+                ),
+            ),
+            max_steps=2,
+        )
+
+        descriptors = store.descriptors()
+        assert len(descriptors) == 1
+        descriptor = descriptors[0]
+        assert descriptor.source_tool == "list_s2t_transformations"
+        assert descriptor.row_count == 2
+        assert descriptor.truncated is False
+        assert "saved_result" in result.display_items[0].content
+        assert "saved_result" in result.cycle_history[0].tool_results[0][
+            "content"
+        ]
+
+        queried = query_saved_result.invoke(
+            {
+                "result_ref": descriptor.result_ref,
+                "query": "SELECT name FROM result WHERE score = 2",
+            }
+        )
+        assert queried["rows"] == [{"name": "second"}]
+
+
+def test_worker_binds_referenced_saved_result_schema_into_selected_tool():
+    from agents.tools.saved_results import saved_result_store_scope
+    from agents.worker import worker_chat
+
+    route = ToolRoute(
+        tools=["query_saved_result"],
+        skills=["SQLite SQL"],
+        schemas=[],
+    )
+    graph_result = WorkerRunResult(
+        answer="Найдено: 1.",
+        display_items=[],
+        goal_satisfied=True,
+    )
+
+    with saved_result_store_scope() as store:
+        descriptor = store.save_payload(
+            source_tool="run_sql",
+            payload={
+                "columns": ["target_table", "row_count"],
+                "rows": [{"target_table": "t_example", "row_count": 1}],
+            },
+        )
+        assert descriptor is not None
+        task = f"Отфильтруй сохранённый результат {descriptor.result_ref}."
+
+        with (
+            patch("agents.worker.select_chat_route", return_value=route) as router,
+            patch(
+                "agents.worker.run_worker_graph",
+                return_value=graph_result,
+            ) as run_graph,
+        ):
+            result = worker_chat(task)
+
+    assert result.answer == "Найдено: 1."
+    assert result.saved_results == []
+    available_tools = router.call_args.kwargs["available_tools"]
+    routed_tool = next(
+        item for item in available_tools if item.name == "query_saved_result"
+    )
+    assert descriptor.result_ref in routed_tool.description
+    assert '"target_table" TEXT' in routed_tool.description
+    selected_tool = run_graph.call_args.kwargs["tools"][0]
+    assert selected_tool.name == "query_saved_result"
+    assert descriptor.result_ref in selected_tool.description
+
+
 def test_worker_accepts_plain_planner_finish_without_responder_call():
     def lookup():
         return {"value": "confirmed"}

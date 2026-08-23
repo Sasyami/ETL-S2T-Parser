@@ -22,6 +22,8 @@ def test_load_skills_contains_tool_orchestration_and_domain_context():
         "trace_neo4j_lineage",
         "search_excel_values",
         "semantic_search_descriptions",
+        "list_column_catalog",
+        "search_column_catalog",
         "trace_transformation_path",
     ):
         assert tool_name in text
@@ -30,6 +32,9 @@ def test_load_skills_contains_tool_orchestration_and_domain_context():
         "`tables`",
         "`source_tables`",
         "`target_tables`",
+        "`columns`",
+        "`source_columns`",
+        "`target_columns`",
     ):
         assert semantic_scope in text
     assert "`all` — только без" in text

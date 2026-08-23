@@ -411,6 +411,18 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "tables — все логические таблицы" in semantic_description
     assert "source_tables — только исходные" in semantic_description
     assert "target_tables — только целевые" in semantic_description
+    assert "columns — все колонки" in semantic_description
+    assert "source_columns — только исходные" in semantic_description
+    assert "target_columns — только целевые" in semantic_description
+    assert "фильтры подвыборки" in semantic_description
+    list_columns_contract = contracts["list_column_catalog"]
+    assert "точные фильтры каталога колонок" in list_columns_contract["use_when"]
+    assert "выбранными возвращаемыми полями" in list_columns_contract["use_when"]
+    assert "Фрагмент имени" in list_columns_contract["not_for"]
+    search_columns_contract = contracts["search_column_catalog"]
+    assert "поиск подстроки" in search_columns_contract["use_when"]
+    assert "ограничить подвыборку" in search_columns_contract["use_when"]
+    assert "Смысловая близость" in search_columns_contract["not_for"]
     sql_graph_contract = contracts["visualize_sql_lineage"]
     assert "Полный SQL-текст уже явно дан" in sql_graph_contract["use_when"]
     assert "интерактивный lineage-граф" in sql_graph_contract["use_when"]

@@ -15,6 +15,7 @@ from .files import (
     update_file_description,
     update_table_info_from_user_query,
 )
+from .columns import list_column_catalog, search_column_catalog
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
 from .planning import show_plan
 from .neo4j import (
@@ -56,6 +57,16 @@ from .sheets import (
     list_sheets,
 )
 from .sql import SQL_EXPORT_DIR, run_sql
+from .saved_results import (
+    SavedResultColumn,
+    SavedResultDescriptor,
+    SavedResultStore,
+    bind_saved_result_schemas,
+    get_active_saved_result_store,
+    persist_sqlite_tool_message,
+    query_saved_result,
+    saved_result_store_scope,
+)
 from .sql_lineage import (
     SQL_LINEAGE_EXPORT_DIR,
     SQL_LINEAGE_EXPORT_URL_PREFIX,
@@ -89,6 +100,7 @@ __all__ = [
     "get_tools_for_names",
     "get_write_tools",
     "list_columns",
+    "list_column_catalog",
     "list_file_sheet_headers",
     "list_files",
     "list_s2t_table_names",
@@ -105,7 +117,16 @@ __all__ = [
     "visualize_s2t_table_graph",
     "run_cypher",
     "run_sql",
+    "query_saved_result",
+    "SavedResultColumn",
+    "SavedResultDescriptor",
+    "SavedResultStore",
+    "bind_saved_result_schemas",
+    "get_active_saved_result_store",
+    "persist_sqlite_tool_message",
+    "saved_result_store_scope",
     "search_s2t_transformations",
+    "search_column_catalog",
     "search_excel_values",
     "semantic_search_descriptions",
     "show_plan",
