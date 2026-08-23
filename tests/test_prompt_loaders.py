@@ -53,9 +53,10 @@ def test_s2t_skill_routes_table_name_set_operations_to_domain_tool():
     assert "JOIN, EXISTS, NOT EXISTS" not in text
 
 
-def test_load_skills_includes_transformation_path_analysis_skill():
-    text = load_skills()
-    assert "Путь S2T-преобразования" in text
+def test_s2t_skill_includes_transformation_path_analysis_rules():
+    text = load_skills(["S2T-строки"])
+    assert "## S2T-строки" in text
+    assert "Путь S2T-преобразования" not in text
     assert "прямую трансформацию" in text
     assert "Отсутствие подтверждения Neo4j не отменяет факты SQLite" in text
     assert "source_table.source_field → target_table.target_field" in text
@@ -64,28 +65,26 @@ def test_load_skills_includes_transformation_path_analysis_skill():
     assert "`UNION`/`UNION ALL` объединяет ветви" in text
     assert "входы одного выражения" in text
     assert "одну логическую трансформацию" in text
-    assert "не отсутствие" in text
 
 
 def test_load_skills_can_select_one_section():
-    text = load_skills(["SQL lineage"])
+    text = load_skills(["Neo4j"])
 
-    assert "## SQL lineage" in text
-    assert "parse_sql_column_lineage" in text
-    assert "visualize_sql_lineage" in text
-    assert "диалект SQLGlot" in text
+    assert "## Neo4j" in text
+    assert "trace_neo4j_lineage" in text
+    assert "TABLE_TRANSFORMS_TO" in text
     assert "## S2T-строки" not in text
+    assert "## Excel и описания" not in text
+
+
+def test_load_skills_can_select_excel_section():
+    text = load_skills(["Excel и описания"])
+
+    assert "## Excel и описания" in text
+    assert "search_excel_values" in text
+    assert "semantic_search_descriptions" in text
+    assert "list_column_catalog" in text
     assert "## Neo4j" not in text
-
-
-def test_load_skills_can_select_sql_execution_section():
-    text = load_skills(["SQLite SQL"])
-
-    assert "## SQLite SQL" in text
-    assert "run_sql" in text
-    assert "не физические ETL-таблицы" in text
-    assert "source_table" in text
-    assert "## SQL lineage" not in text
 
 
 def test_load_schemas_selects_current_s2t_mappings_without_other_domains():

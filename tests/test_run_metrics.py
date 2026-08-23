@@ -5,13 +5,13 @@ from agents.run_metrics import (
     capture_agent_run,
     consume_agent_run_metrics,
     get_run_metrics_callback,
-    record_aggregate_result,
-    record_coordinate_result,
     record_coordinator_plan,
     record_display_tools,
     record_worker_observation,
     record_worker_route,
     record_worker_task,
+    record_upstream_answer,
+    record_upstream_evidence,
 )
 
 
@@ -57,7 +57,7 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
             worker_task="Выполни SELECT 1",
             routing_attempt=1,
             tools=["run_sql"],
-            skills=["SQLite SQL"],
+            skills=[],
             schemas=["SQLite ETL"],
         )
         record_worker_route(
@@ -83,10 +83,13 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
                 "reroute_reason": None,
             },
         )
-        record_coordinate_result(
-            {"answer": "Единица получена.", "display_result_keys": []}
+        record_upstream_evidence(
+            {
+                "confirmed_facts": ["Значение равно 1."],
+                "unresolved_requirements": [],
+            }
         )
-        record_aggregate_result("Единица получена.")
+        record_upstream_answer("Единица получена.")
         record_display_tools(["run_sql"])
 
     metrics = consume_agent_run_metrics(session_id)
@@ -104,7 +107,7 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     assert route.worker_task == "Выполни SELECT 1"
     assert route.routing_attempt == 1
     assert route.tools == ["run_sql"]
-    assert route.skills == ["SQLite SQL"]
+    assert route.skills == []
     assert route.schemas == ["SQLite ETL"]
     assert route.reroute_reason is None
     reroute = metrics.worker_routes[1]
@@ -121,11 +124,11 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     assert observation.summary == "Получено значение 1."
     assert observation.goal_satisfied is True
     assert observation.important_facts == ["Значение равно 1."]
-    assert metrics.coordinate_result == {
-        "answer": "Единица получена.",
-        "display_result_keys": [],
+    assert metrics.upstream_evidence == {
+        "confirmed_facts": ["Значение равно 1."],
+        "unresolved_requirements": [],
     }
-    assert metrics.aggregate_result == "Единица получена."
+    assert metrics.upstream_answer == "Единица получена."
     assert metrics.display_tools == ["run_sql"]
     assert metrics.elapsed_seconds >= 0
     assert consume_agent_run_metrics(session_id) is None

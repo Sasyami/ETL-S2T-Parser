@@ -507,7 +507,7 @@ def test_column_catalog_tools_support_exact_and_substring_subsets():
     searched = search_column_catalog.invoke(
         {
             "needle": "договор",
-            "scope": "columns",
+            "scope": "all_tables",
             "file_id": 30,
             "data_type": "uuid",
             "primary_key": True,
@@ -524,13 +524,59 @@ def test_column_catalog_tools_support_exact_and_substring_subsets():
     )
     assert description_search["total_matches"] == 1
     assert description_search["rows"][0]["column_name"] == "payload"
-    assert search_column_catalog.invoke({"needle": " "})["error"] == (
+    assert search_column_catalog.invoke(
+        {"needle": " ", "scope": "all_tables"}
+    )["error"] == (
         "needle must be non-empty"
     )
     invalid_columns = list_column_catalog.invoke(
-        {"columns": ["column_name", "description_embedding"]}
+        {
+            "scope": "all_tables",
+            "columns": ["column_name", "description_embedding"],
+        }
     )
     assert "unknown columns" in invalid_columns["error"]
+
+
+def test_list_column_catalog_uses_explicit_all_tables_scope():
+    from agents.tools import list_column_catalog
+
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO files (file_id, filename, upload_time) "
+        "VALUES (31, 'all-columns.xlsx', '2026-01-01')"
+    )
+    for table_name, record_id, role_table in (
+        ("raw.all_columns", 41, "source_columns"),
+        ("mart.all_columns", 42, "target_columns"),
+    ):
+        conn.execute(
+            f"""
+            INSERT INTO {role_table}
+            (id, file_id, sheet_name, row_num, table_name, column_name,
+             data_type, primary_key, not_null, description)
+            VALUES (?, 31, 'Columns', 1, ?, 'required_id',
+                    'uuid', 1, 1, 'Обязательный идентификатор')
+            """,
+            (record_id, table_name),
+        )
+    conn.commit()
+    conn.close()
+
+    result = list_column_catalog.invoke(
+        {
+            "scope": "all_tables",
+            "file_id": 31,
+            "not_null": True,
+        }
+    )
+    assert "error" not in result
+    assert result["scope"] == "all_tables"
+    assert result["filters"] == {"file_id": 31, "not_null": True}
+    assert {row["column_role"] for row in result["rows"]} == {
+        "source",
+        "target",
+    }
 
 
 def test_trace_transformation_path_combines_s2t_sql_and_additional_objects():
@@ -782,13 +828,13 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     }
     assert tools[
         "search_column_catalog"
-    ].args_schema.model_json_schema()["required"] == ["needle"]
+    ].args_schema.model_json_schema()["required"] == ["needle", "scope"]
     column_list_schema = tools[
         "list_column_catalog"
     ].args_schema.model_json_schema()
-    assert "required" not in column_list_schema
+    assert column_list_schema["required"] == ["scope"]
     assert column_list_schema["properties"]["scope"]["enum"] == [
-        "columns",
+        "all_tables",
         "source_columns",
         "target_columns",
     ]
@@ -844,6 +890,8 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
         "columns",
         "target_table",
         "source_table",
+        "target_field",
+        "source_field",
     }
     columns_schema = list_s2t_schema["properties"]["columns"]
     assert columns_schema["default"] is None
@@ -1713,7 +1761,10 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
 
     tools = get_tools_by_name()
 
-    assert "source_table и/или target_table" in tools[
+    assert "source/target table или field" in tools[
+        "list_s2t_transformations"
+    ].description
+    assert "source_table, source_field, target_table" in tools[
         "list_s2t_transformations"
     ].description
     assert "отдельными аргументами, не строкой в q" in tools[
@@ -2352,6 +2403,42 @@ def test_list_s2t_transformations_filters_exact_target_table():
     assert result["total"] == 1
     assert result["filters"] == {"target_table": "t_target"}
     assert result["rows"][0]["target_field"] == "wanted"
+
+
+def test_list_s2t_transformations_filters_exact_source_target_fields():
+    from agents.tools import list_s2t_transformations
+
+    conn = get_db_connection()
+    conn.executemany(
+        """INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field)
+        VALUES (?, 61, 'S2T', ?, ?, ?, ?, ?)""",
+        [
+            (221, 1, "s_exact", "source_id", "t_exact", "target_id"),
+            (222, 2, "s_exact", "other_id", "t_exact", "target_id"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = list_s2t_transformations.invoke(
+        {
+            "source_table": "s_exact",
+            "source_field": "source_id",
+            "target_table": "t_exact",
+            "target_field": "target_id",
+        }
+    )
+
+    assert result["total"] == 1
+    assert result["rows"][0]["source_field"] == "source_id"
+    assert result["filters"] == {
+        "target_table": "t_exact",
+        "source_table": "s_exact",
+        "target_field": "target_id",
+        "source_field": "source_id",
+    }
 
 
 def test_list_s2t_transformations_empty_result_is_global_not_file_error():

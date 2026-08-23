@@ -9,7 +9,7 @@ from langchain_core.tools import tool
 from .common import clamped_int
 
 
-ColumnScope = Literal["columns", "source_columns", "target_columns"]
+ColumnScope = Literal["all_tables", "source_columns", "target_columns"]
 
 COLUMN_RESULT_FIELDS = (
     "record_id",
@@ -198,7 +198,7 @@ def _query_catalog(
 
 @tool(parse_docstring=True)
 def list_column_catalog(
-    scope: ColumnScope = "columns",
+    scope: ColumnScope,
     limit: int = 50,
     columns: Optional[List[str]] = None,
     file_id: Optional[int] = None,
@@ -211,18 +211,24 @@ def list_column_catalog(
     """Получить подвыборку каталога колонок по точным структурным фильтрам.
 
     Используй для известной роли и точных значений table_name/column_name либо
-    для выборки по file_id, типу, PK и not-null. scope
-    columns объединяет source_columns и target_columns; ролевые scope читают
-    только один каталог. Для фрагмента имени или текста сначала используй
+    для выборки по file_id, типу, PK и not-null. Обязательный scope
+    all_tables объединяет source_columns и target_columns; ролевые scope читают
+    только один каталог. Выбирай all_tables только если task явно требует обе
+    стороны либо не ограничивает роль колонки. Один вызов применяет одинаковые table_name и
+    column_name ко всему выбранному scope: разные source/target пары получай
+    отдельными вызовами, не ищи target по идентификаторам source. Для фрагмента имени или текста сначала используй
     search_column_catalog, для смысла описания — semantic_search_descriptions.
+    Передавай все относящиеся к операции точные фильтры, явно названные в task:
+    если названы file_id, table_name и not_null, нельзя опускать table_name и
+    расширять результат до всех таблиц файла.
     Без columns возвращает все публичные поля, но никогда не возвращает BLOB.
 
     Args:
-        scope: columns, source_columns или target_columns.
+        scope: Обязательная область: all_tables, source_columns или target_columns; all_tables выбирай только для обеих сторон или неизвестной роли.
         limit: Максимальное число строк, от 1 до 100.
         columns: Опциональная подвыборка возвращаемых публичных полей.
         file_id: Опциональный точный идентификатор явно выбранной загрузки.
-        table_name: Опциональное точное полное имя таблицы.
+        table_name: Опциональное точное полное имя таблицы; обязательно передай, если оно явно задано task.
         column_name: Опциональное точное имя колонки.
         data_type: Опциональный точный тип данных.
         primary_key: Опциональный фильтр признака первичного ключа.
@@ -244,7 +250,7 @@ def list_column_catalog(
 @tool(parse_docstring=True)
 def search_column_catalog(
     needle: str,
-    scope: ColumnScope = "columns",
+    scope: ColumnScope,
     limit: int = 50,
     file_id: Optional[int] = None,
     table_name: Optional[str] = None,
@@ -261,7 +267,7 @@ def search_column_catalog(
 
     Args:
         needle: Непустая искомая подстрока длиной до 300 символов.
-        scope: columns, source_columns или target_columns.
+        scope: Обязательная область: all_tables, source_columns или target_columns; all_tables выбирай только для обеих сторон или неизвестной роли.
         limit: Максимальное число строк, от 1 до 100.
         file_id: Опциональный точный идентификатор явно выбранной загрузки.
         table_name: Опциональное точное имя таблицы для ограничения поиска.

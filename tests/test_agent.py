@@ -1,4 +1,5 @@
 import json
+from typing import get_args
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,11 +12,13 @@ from agents.agent import (
     get_header_decision,
 )
 from agents.tools import get_tools, load_schemas, load_skills
+from agents.tools.context import SchemaName
 from agents.tools.routing import (
     SCHEMA_CATALOG,
     SKILL_CATALOG,
     ToolRoute,
     ToolRoutingError,
+    _TOOL_ROUTING_CONTRACTS,
 )
 
 
@@ -202,7 +205,7 @@ def test_chat_system_prompt_includes_only_explicitly_selected_schemas():
 
     without_sql = build_chat_system_prompt("## Neo4j\nGraph rules", "")
     with_sql = build_chat_system_prompt(
-        "## SQLite SQL\nSQL rules",
+        "## S2T-строки\nS2T rules",
         load_schemas(("SQLite ETL",)),
     )
 
@@ -255,10 +258,10 @@ def test_chat_tool_router_validates_structured_selection():
     cases = [
         (
             ["run_sql"],
-            ["SQLite SQL"],
+            [],
             ["SQLite ETL"],
             ["run_sql"],
-            ["SQLite SQL"],
+            [],
             ["SQLite ETL"],
         ),
         (
@@ -336,7 +339,7 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     model = _ToolRouterModel(
         {
             "tools": ["run_sql"],
-            "skills": ["SQLite SQL", "S2T-строки"],
+            "skills": ["S2T-строки"],
             "schemas": ["SQLite ETL"],
         }
     )
@@ -347,7 +350,7 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
         available_tools=get_tools(),
     )
     assert route.tools == ["run_sql"]
-    assert route.skills == ["SQLite SQL", "S2T-строки"]
+    assert route.skills == ["S2T-строки"]
     assert route.schemas == ["SQLite ETL"]
 
     payload = json.loads(model.messages[1].content)
@@ -356,7 +359,11 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert {item["name"] for item in payload["available_tools"]} == {
         tool.name for tool in get_tools()
     }
+    assert set(_TOOL_ROUTING_CONTRACTS) == {
+        tool.name for tool in get_tools()
+    }
     assert all(item["use_when"] for item in payload["available_tools"])
+    assert all(item["not_for"] for item in payload["available_tools"])
     assert all(
         set(item)
         == {
@@ -372,13 +379,26 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     }
     run_sql_contract = contracts["run_sql"]
     assert "срез, выражение или агрегация" in run_sql_contract["use_when"]
-    assert "готовом специализированном tool" in run_sql_contract["use_when"]
+    assert "публичным таблицам SQLite" in run_sql_contract["use_when"]
+    assert "нельзя выполнять" in run_sql_contract["use_when"]
     assert "Точные S2T-строки" in run_sql_contract["not_for"]
     assert "логические ETL-таблицы" in run_sql_contract["not_for"]
+    assert "transformation_rule" in run_sql_contract["not_for"]
+    assert "$$-имена" in run_sql_contract["not_for"]
     assert run_sql_contract["fallback_only"] is True
+    excel_value_contract = contracts["search_excel_values"]
+    assert "Excel-ячеек" in excel_value_contract["use_when"]
+    assert "таблицы data" in excel_value_contract["use_when"]
+    assert "логические ETL-таблицы" in excel_value_contract["not_for"]
+    assert "не выполняет запросы" in excel_value_contract["not_for"]
+    assert excel_value_contract["fallback_only"] is False
     s2t_list_contract = contracts["list_s2t_transformations"]
-    assert "source_table/target_table" in s2t_list_contract["use_when"]
+    assert "source/target table или field" in s2t_list_contract["use_when"]
+    assert "source_field" in s2t_list_contract["use_when"]
+    assert "target_field" in s2t_list_contract["use_when"]
     assert "точные columns" in s2t_list_contract["use_when"]
+    assert "одну буквальную подстроку" in s2t_list_contract["use_when"]
+    assert "file_id не применяется" in s2t_list_contract["use_when"]
     assert "Неполное или неквалифицированное имя" in (
         s2t_list_contract["not_for"]
     )
@@ -390,9 +410,10 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "неполным или неквалифицированным именем" in (
         s2t_search_contract["use_when"]
     )
-    assert "Точное полное source_table/target_table" in (
+    assert "Точные source/target table или field" in (
         s2t_search_contract["not_for"]
     )
+    assert "составная строка" in s2t_search_contract["not_for"]
     assert s2t_search_contract["fallback_only"] is False
     path_contract = contracts["trace_transformation_path"]
     assert "многошаговый сохранённый S2T-путь" in path_contract["use_when"]
@@ -404,8 +425,8 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "Сравнение физических записей" in path_contract["not_for"]
     assert path_contract["fallback_only"] is False
     table_names_description = contracts["list_s2t_table_names"]["use_when"]
-    assert "уникальные имена S2T-таблиц" in table_names_description
-    assert "детерминированный инструмент" in table_names_description
+    assert "Глобальные множества source/target" in table_names_description
+    assert "union/intersection/difference" in table_names_description
     semantic_description = contracts["semantic_search_descriptions"]["use_when"]
     assert "files — только файлы" in semantic_description
     assert "tables — все логические таблицы" in semantic_description
@@ -416,12 +437,23 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "target_columns — только целевые" in semantic_description
     assert "фильтры подвыборки" in semantic_description
     list_columns_contract = contracts["list_column_catalog"]
-    assert "точные фильтры каталога колонок" in list_columns_contract["use_when"]
-    assert "выбранными возвращаемыми полями" in list_columns_contract["use_when"]
+    assert "Точный структурный срез каталога колонок" in (
+        list_columns_contract["use_when"]
+    )
+    assert "file/table/column/type/PK/not-null/source" in (
+        list_columns_contract["use_when"]
+    )
+    assert "пары вызывай отдельно" in list_columns_contract["use_when"]
+    assert "обязательно" in list_columns_contract["use_when"]
+    assert "scope обязателен" in list_columns_contract["use_when"]
+    assert "all_tables" in list_columns_contract["use_when"]
+    assert "последующая агрегация" in list_columns_contract[
+        "use_when"
+    ].casefold()
     assert "Фрагмент имени" in list_columns_contract["not_for"]
     search_columns_contract = contracts["search_column_catalog"]
     assert "поиск подстроки" in search_columns_contract["use_when"]
-    assert "ограничить подвыборку" in search_columns_contract["use_when"]
+    assert "точными фильтрами" in search_columns_contract["use_when"]
     assert "Смысловая близость" in search_columns_contract["not_for"]
     sql_graph_contract = contracts["visualize_sql_lineage"]
     assert "Полный SQL-текст уже явно дан" in sql_graph_contract["use_when"]
@@ -435,20 +467,34 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "JOIN/ON" in parse_column_contract["not_for"]
     assert "WHERE" in parse_column_contract["not_for"]
     assert "чтение сохранённого SQL" in parse_column_contract["not_for"]
+    parse_table_contract = contracts["parse_sql_table_lineage"]
+    assert "Полный SQL уже явно передан" in parse_table_contract["use_when"]
+    assert "поиск additional objects" in parse_table_contract["not_for"]
+    assert "WHERE/JOIN/GROUP BY/DISTINCT" in parse_table_contract["not_for"]
     column_lineage_description = contracts["trace_neo4j_lineage"]["use_when"]
-    assert "max_depth=1" in column_lineage_description
-    assert "только прямых соседей" in column_lineage_description
-    assert "глубину больше 1" in column_lineage_description
-    assert "конечные узлы не достигнуты" in column_lineage_description
+    assert "точной именованной ETL-колонки" in column_lineage_description
+    assert "нужную глубину" in column_lineage_description
     global_graph_description = contracts["visualize_s2t_table_graph"]["use_when"]
     assert "глобальный" in global_graph_description
-    assert "Не используй для конкретного" in global_graph_description
+    assert "Конкретный SQL" in contracts["visualize_s2t_table_graph"]["not_for"]
     assert sum(
         len(item["use_when"]) + len(item["not_for"])
         for item in payload["available_tools"]
     ) < 7000
-    assert payload["available_skills"] == SKILL_CATALOG
-    assert payload["available_schemas"] == SCHEMA_CATALOG
+    assert payload["available_skills"] == [
+        {"name": name, "description": description}
+        for name, description in SKILL_CATALOG.items()
+    ]
+    assert payload["available_schemas"] == [
+        {"name": name, "description": description}
+        for name, description in SCHEMA_CATALOG.items()
+    ]
+    assert set(SCHEMA_CATALOG) == set(get_args(SchemaName))
+    assert all(SCHEMA_CATALOG.values())
+    assert "произвольного run_sql" in SCHEMA_CATALOG["SQLite ETL"]
+    assert "source/target-роли" in SCHEMA_CATALOG["S2T-маппинг"]
+    assert "физических заголовков" in SCHEMA_CATALOG["Excel-маппинги"]
+    assert "произвольного run_cypher" in SCHEMA_CATALOG["Neo4j lineage"]
     router_prompt = " ".join(model.messages[0].content.split())
     assert "необходимые tools, skills и schemas" in router_prompt
     assert "назначение бери только из каталогов" in router_prompt
@@ -473,7 +519,7 @@ def test_chat_tool_router_receives_explicit_reroute_context():
     model = _ToolRouterModel(
         {
             "tools": ["run_sql"],
-            "skills": ["SQLite SQL"],
+            "skills": [],
             "schemas": ["SQLite ETL"],
         }
     )
@@ -533,7 +579,7 @@ def test_chat_tool_router_requests_function_calling_structured_output():
     model = _ToolRouterModel(
         ToolRoute(
             tools=["run_sql"],
-            skills=["SQLite SQL"],
+            skills=[],
             schemas=["SQLite ETL"],
         )
     )
@@ -544,7 +590,7 @@ def test_chat_tool_router_requests_function_calling_structured_output():
         available_tools=get_tools(),
     )
     assert route.tools == ["run_sql"]
-    assert route.skills == ["SQLite SQL"]
+    assert route.skills == []
     assert model.structured_schema is ToolRoute
     assert model.structured_method == "function_calling"
 
@@ -582,6 +628,74 @@ def test_chat_tool_router_repairs_invalid_structured_result_with_one_more_llm_ca
     assert repair_config == {"callbacks": ["router-callback"]}
     assert "structured output отклонён" in str(repair_messages[-1].content)
     assert "Не добавляй description" in str(repair_messages[-1].content)
+
+
+def test_chat_tool_router_repairs_missing_explicit_column_catalog():
+    model = _SequenceToolRouterModel(
+        [
+            ToolRoute(
+                tools=["run_sql", "list_s2t_transformations"],
+                skills=["S2T-строки"],
+                schemas=["SQLite ETL"],
+            ),
+            ToolRoute(
+                tools=["list_column_catalog", "list_s2t_transformations"],
+                skills=["S2T-строки"],
+                schemas=["SQLite ETL"],
+            ),
+        ]
+    )
+
+    route = _select_chat_route(
+        "Получи обязательные поля из публичного target_columns.",
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == [
+        "list_column_catalog",
+        "list_s2t_transformations",
+    ]
+    assert len(model.calls) == 2
+    assert "маршрут обязан включать list_column_catalog" in str(
+        model.calls[1][0][-1].content
+    )
+
+
+def test_chat_tool_router_repairs_all_route_errors_in_one_attempt():
+    model = _SequenceToolRouterModel(
+        [
+            ToolRoute(
+                tools=["search_s2t_transformations"],
+                skills=["S2T-строки"],
+                schemas=["SQLite ETL"],
+            ),
+            ToolRoute(
+                tools=["list_column_catalog", "list_s2t_transformations"],
+                skills=["S2T-строки"],
+                schemas=["SQLite ETL"],
+            ),
+        ]
+    )
+
+    route = _select_chat_route(
+        (
+            "Получи строки target_columns для table_name=t_optn и сопоставь "
+            "их с target_table=t_optn."
+        ),
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == [
+        "list_column_catalog",
+        "list_s2t_transformations",
+    ]
+    assert len(model.calls) == 2
+    repair_prompt = str(model.calls[1][0][-1].content)
+    assert "маршрут обязан включать list_column_catalog" in repair_prompt
+    assert "маршрут обязан включать list_s2t_transformations" in repair_prompt
+    assert "нельзя заменять подстрочным" in repair_prompt
 
 
 def test_chat_tool_router_does_not_override_valid_llm_selection():
@@ -643,7 +757,7 @@ def test_chat_tool_router_allows_empty_tools_with_skill_or_schema_context():
         [
             ToolRoute(
                 tools=[],
-                skills=["SQL lineage"],
+                skills=["Neo4j"],
                 schemas=["S2T-маппинг"],
             )
         ]
@@ -656,7 +770,7 @@ def test_chat_tool_router_allows_empty_tools_with_skill_or_schema_context():
     )
 
     assert route.tools == []
-    assert route.skills == ["SQL lineage"]
+    assert route.skills == ["Neo4j"]
     assert route.schemas == ["S2T-маппинг"]
 
 
@@ -842,7 +956,12 @@ def test_observation_requires_separate_mismatch_for_failed_goal():
 
 
 def test_observer_prompt_requires_semantic_task_comparison():
-    from agents.chat_graph import _OBSERVER_PROMPT, _WORKER_PLANNER_PROMPT
+    from agents.chat_graph import (
+        Observation,
+        _OBSERVER_REPAIR_PROMPT,
+        _OBSERVER_PROMPT,
+        _WORKER_PLANNER_PROMPT,
+    )
 
     normalized_observer_prompt = " ".join(_OBSERVER_PROMPT.split())
     assert len(_OBSERVER_PROMPT) < 3500
@@ -853,15 +972,22 @@ def test_observer_prompt_requires_semantic_task_comparison():
     assert "target_table" in _OBSERVER_PROMPT
     assert "source_table" in _OBSERVER_PROMPT
     assert "сам по себе не подтверждает" in _OBSERVER_PROMPT
-    assert "фильтруемыми, группируемыми и возвращаемыми полями" in (
-        _OBSERVER_PROMPT
-    )
+    assert "фильтруемыми и возвращаемыми полями" in _OBSERVER_PROMPT
     assert "source_field" in _OBSERVER_PROMPT
-    assert "все конкретные отличия" in _OBSERVER_PROMPT
+    assert "все ещё не исправленные ошибки" in _OBSERVER_PROMPT
     assert "факт, значение, фильтр или операция отсутствует" in (
         normalized_observer_prompt
     )
     assert "повторно получать не требуется" in normalized_observer_prompt
+    assert "каждый ролевой фильтр tool call должен быть явно задан task" in (
+        normalized_observer_prompt.lower()
+    )
+    assert "любой дополнительный фильтр — придуманный" in (
+        normalized_observer_prompt.lower()
+    )
+    assert "не зеркаль target-роль в source-роль и наоборот" in (
+        normalized_observer_prompt.lower()
+    )
     assert "промежуточные узлы" in _OBSERVER_PROMPT
     assert "один полный путь достаточен" in normalized_observer_prompt.lower()
     assert "полный или транзитивный impact/downstream" in _OBSERVER_PROMPT
@@ -869,7 +995,21 @@ def test_observer_prompt_requires_semantic_task_comparison():
     assert "ограничение глубины" in _OBSERVER_PROMPT
     assert "Последний tool call не" in _OBSERVER_PROMPT
     assert "совокупность подтверждённых фактов" in _OBSERVER_PROMPT
-    assert "не копируй прошлые" in normalized_observer_prompt.lower()
+    assert "переноси их до явного подтверждения" in (
+        normalized_observer_prompt.lower()
+    )
+    assert "удаляй только исправленные ошибки" in normalized_observer_prompt.lower()
+    mismatches_description = Observation.model_json_schema()["properties"][
+        "mismatches"
+    ]["description"]
+    assert "перенесённые из prior_state" in mismatches_description
+    assert "если текущий результат явно их не устранил" in (
+        mismatches_description
+    )
+    assert "Исправленные несоответствия удаляются" in mismatches_description
+    assert "Data tool уже выполнен" in _OBSERVER_REPAIR_PROMPT
+    assert "не требуй его повторного" in _OBSERVER_REPAIR_PROMPT
+    assert "тот же исходный user_request" in _OBSERVER_REPAIR_PROMPT
     assert "невозможно\nисправить" in _OBSERVER_PROMPT
     assert "planner сам составил" in _OBSERVER_PROMPT
     assert "не подтверждает\nисходную операцию" in _OBSERVER_PROMPT

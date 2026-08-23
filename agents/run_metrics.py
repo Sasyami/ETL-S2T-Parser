@@ -95,8 +95,8 @@ class AgentRunMetrics(BaseModel):
     coordinator_plan: List[Dict[str, Any]] = Field(default_factory=list)
     worker_routes: List[WorkerRouteMetric] = Field(default_factory=list)
     observations: List[ObservationMetric] = Field(default_factory=list)
-    coordinate_result: Optional[Dict[str, Any]] = None
-    aggregate_result: Optional[str] = None
+    upstream_evidence: Optional[Dict[str, Any]] = None
+    upstream_answer: Optional[str] = None
     display_tools: List[str] = Field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
@@ -177,8 +177,8 @@ class _RunCollector:
         self.coordinator_plan: List[Dict[str, Any]] = []
         self.worker_routes: List[WorkerRouteMetric] = []
         self.observations: List[ObservationMetric] = []
-        self.coordinate_result: Optional[Dict[str, Any]] = None
-        self.aggregate_result: Optional[str] = None
+        self.upstream_evidence: Optional[Dict[str, Any]] = None
+        self.upstream_answer: Optional[str] = None
         self.display_tools: List[str] = []
         self.error: Optional[str] = None
 
@@ -284,12 +284,12 @@ class _RunCollector:
                 coordinator_plan=[dict(item) for item in self.coordinator_plan],
                 worker_routes=list(self.worker_routes),
                 observations=list(self.observations),
-                coordinate_result=(
-                    dict(self.coordinate_result)
-                    if self.coordinate_result is not None
+                upstream_evidence=(
+                    dict(self.upstream_evidence)
+                    if self.upstream_evidence is not None
                     else None
                 ),
-                aggregate_result=self.aggregate_result,
+                upstream_answer=self.upstream_answer,
                 display_tools=list(self.display_tools),
                 input_tokens=sum(item.input_tokens for item in llm_calls),
                 output_tokens=sum(item.output_tokens for item in llm_calls),
@@ -466,24 +466,27 @@ def record_worker_observation(
             collector.observations.append(metric)
 
 
-def record_coordinate_result(result: Mapping[str, Any]) -> None:
-    """Retain the coordinator synthesis before final aggregation."""
+def record_upstream_evidence(result: Mapping[str, Any]) -> None:
+    """Retain verified upstream evidence before downstream presentation."""
     if collector := _ACTIVE_RUN.get():
         payload = {
-            "answer": _clip(result.get("answer")),
-            "display_result_keys": [
-                str(item) for item in result.get("display_result_keys", [])
+            "confirmed_facts": [
+                _clip(item) for item in result.get("confirmed_facts", [])
+            ],
+            "unresolved_requirements": [
+                _clip(item)
+                for item in result.get("unresolved_requirements", [])
             ],
         }
         with collector.lock:
-            collector.coordinate_result = payload
+            collector.upstream_evidence = payload
 
 
-def record_aggregate_result(answer: str) -> None:
-    """Retain the final answer produced by the isolated aggregator."""
+def record_upstream_answer(answer: str) -> None:
+    """Retain the final answer produced by downstream presentation."""
     if collector := _ACTIVE_RUN.get():
         with collector.lock:
-            collector.aggregate_result = _clip(answer)
+            collector.upstream_answer = _clip(answer)
 
 
 def record_display_tools(names: List[str]) -> None:
@@ -507,8 +510,8 @@ __all__ = [
     "capture_agent_run",
     "consume_agent_run_metrics",
     "get_run_metrics_callback",
-    "record_aggregate_result",
-    "record_coordinate_result",
+    "record_upstream_answer",
+    "record_upstream_evidence",
     "record_coordinator_plan",
     "record_display_tools",
     "record_worker_observation",

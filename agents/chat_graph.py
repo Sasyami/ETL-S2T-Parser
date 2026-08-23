@@ -115,6 +115,7 @@ answer должен содержать ровно их: без вступлен�
 Прочитай отдельный блок «Что выполнено неправильно», исправь каждый указанный
 пункт и вызови подходящий worker tool. Завершай работу только когда observer
 вернул `goal_satisfied=true` либо лимит data-tool шагов уже исчерпан.
+
 """.strip()
 
 _LEGACY_PLANNER_PROMPT = """
@@ -143,9 +144,9 @@ task. Проверяй точные сущности, роли, поля, зна
 - `goal_satisfied=true`, только если совокупность подтверждённых фактов из
   `prior_state` и текущего результата закрывает всю task. Последний tool call не
   обязан один повторять уже подтверждённые части;
-- при `goal_satisfied=false` перечисли в `mismatches` все конкретные отличия
-  именно текущего call/result от ещё незакрытой части task. Не копируй прошлые
-  mismatches и не возвращай уже исправленные отличия. При true список пуст;
+- при `goal_satisfied=false` `mismatches` — все ещё не исправленные ошибки из
+  prior_state и текущего результата. Переноси их до явного подтверждения
+  исправления; удаляй только исправленные ошибки, не дублируй. При true список пуст;
 - `summary` — компактная накопительная выжимка подтверждённых фактов, нужных для
   ответа. Не превращай ошибки, ограничения и предположения в факты;
 - `important_facts` содержит только подтверждённые факты для следующего шага,
@@ -154,10 +155,12 @@ task. Проверяй точные сущности, роли, поля, зна
   это текущим mismatch. Одного неисправленного смыслового отличия достаточно для
   `goal_satisfied=false`.
 
-`source_table`, `source_field`, `target_table` и `target_field` — разные роли и
-не подтверждают друг друга. Сопоставляй требуемую роль с фактически выбранными,
-фильтруемыми, группируемыми и возвращаемыми полями. Уже подтверждённый факт,
-переданный в task как условие нового действия, повторно получать не требуется.
+`source_table`, `source_field`, `target_table` и `target_field` — разные роли.
+Каждый ролевой фильтр tool call должен быть явно задан task или подтверждён
+prior_state. Любой дополнительный фильтр — придуманный: добавь mismatch и верни
+`goal_satisfied=false`, даже при 0 строк. Не зеркаль
+target-роль в source-роль и наоборот. Сопоставляй требуемую роль с фактически
+фильтруемыми и возвращаемыми полями. Факт из task повторно получать не требуется.
 
 Если task просит полный направленный путь, результат должен содержать оба конца
 и промежуточные узлы по порядку. Один полный путь достаточен, если пользователь
@@ -240,6 +243,16 @@ native call одного из доступных data tools. Используй 
 отвечай обычным текстом.
 """.strip()
 
+_OBSERVER_REPAIR_PROMPT = """
+Предыдущий observer-вызов не вернул валидный structured output Observation.
+Повторно оцени тот же исходный user_request, prior_state, tool_calls и
+tool_results из payload выше. Data tool уже выполнен: не требуй его повторного
+вызова только из-за ошибки формата observer. Верни только один валидный
+structured output Observation без Markdown и дополнительного текста.
+
+Ошибка structured output: {validation_error}
+""".strip()
+
 
 class ChatHistoryMessage(TypedDict):
     role: Literal["user", "assistant"]
@@ -267,10 +280,11 @@ class Observation(BaseModel):
     mismatches: List[str] = Field(
         default_factory=list,
         description=(
-            "Конкретные несоответствия текущего tool call или результата той "
-            "ещё незакрытой части исходной task, которую должен был выполнить "
-            "текущий шаг. Не содержит прошлые или уже исправленные "
-            "несоответствия. Пусто только при goal_satisfied=true."
+            "Все ещё не исправленные конкретные несоответствия исходной task: "
+            "как выявленные текущим результатом, так и перенесённые из "
+            "prior_state, если текущий результат явно их не устранил. "
+            "Исправленные несоответствия удаляются. Пусто только при "
+            "goal_satisfied=true."
         ),
     )
     has_error: bool = Field(
@@ -570,10 +584,11 @@ def _runtime_context(
     parts: List[str] = []
 
     if include_observations:
-        for index, observation in enumerate(
-            state.get("observations") or [],
-            start=1,
-        ):
+        observations = list(state.get("observations") or [])
+        latest_observations = (
+            [(len(observations), observations[-1])] if observations else []
+        )
+        for index, observation in latest_observations:
             observation_parts = [
                 f"Выжимка observer для шага {index}:\n{observation.summary}"
             ]
@@ -896,7 +911,19 @@ def build_agent_graph(
 
     def planner(state: AgentGraphState) -> Dict[str, Any]:
         limit_reached = state["tool_steps"] >= state["max_steps"]
-        finish_only = limit_reached
+        latest_observation = (
+            (state.get("observations") or [])[-1]
+            if state.get("observations")
+            else None
+        )
+        finish_only = bool(
+            limit_reached
+            or (
+                worker_finish
+                and latest_observation is not None
+                and latest_observation.goal_satisfied
+            )
+        )
         if finish_only and worker_finish:
             selected_model = finish_model
         elif finish_only:
@@ -1001,11 +1028,6 @@ def build_agent_graph(
                 }
             reply = repaired_reply
 
-        latest_observation = (
-            (state.get("observations") or [])[-1]
-            if state.get("observations")
-            else None
-        )
         semantic_retry_required = (
             worker_finish
             and not finish_only
@@ -1288,39 +1310,53 @@ def build_agent_graph(
             ),
         ]
 
-        try:
-            result = observer_model.invoke(observer_messages)
+        def parse_observation(result: Any) -> Observation:
             observation = (
                 result
                 if isinstance(result, Observation)
                 else Observation.model_validate(result)
             )
-            tool_has_error = any(
+            if any(
                 _tool_message_has_error(message)
                 for message in tool_results
-            )
-            if tool_has_error:
+            ):
                 observation_payload = observation.model_dump()
                 observation_payload["has_error"] = True
-                observation = Observation.model_validate(observation_payload)
-        except Exception as exc:
-            logger.exception("Structured observer failed")
-            if no_tool_cycle:
-                observation = Observation(
-                    summary="Не удалось проверить ответ worker без tools.",
-                    goal_satisfied=False,
-                    mismatches=[
-                        "Structured observer не подтвердил candidate_answer."
-                    ],
-                    has_error=True,
-                    limitations=[f"Observer error: {type(exc).__name__}"],
+                return Observation.model_validate(observation_payload)
+            return observation
+
+        try:
+            observation = parse_observation(
+                observer_model.invoke(observer_messages)
+            )
+        except Exception as first_error:
+            logger.warning(
+                "Structured observer output rejected; repeating observer "
+                "without repeating data tools: %s",
+                first_error,
+            )
+            repair_messages: List[BaseMessage] = [
+                *observer_messages,
+                HumanMessage(
+                    content=_OBSERVER_REPAIR_PROMPT.replace(
+                        "{validation_error}",
+                        f"{type(first_error).__name__}: {first_error}",
+                    )
+                ),
+            ]
+            try:
+                observation = parse_observation(
+                    observer_model.invoke(repair_messages)
                 )
-            else:
-                observation = _fallback_observation(
-                    tool_call_message,
-                    tool_results,
-                    exc,
+            except Exception as repair_error:
+                logger.exception(
+                    "Structured observer repair failed; stopping worker "
+                    "without repeating data tools"
                 )
+                raise WorkerResponseError(
+                    "Observer дважды не вернул валидный structured output; "
+                    "data tool повторно не вызван."
+                ) from repair_error
 
         observation = _compact_observation(observation)
         logger.info(

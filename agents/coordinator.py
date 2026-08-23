@@ -1,4 +1,4 @@
-"""LLM-driven worker coordinator with an isolated final aggregator."""
+"""LLM-driven workers with separate upstream and downstream coordination."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ from .agent import chat_model
 from .observability import get_callback_handler, langfuse_trace_context
 from .run_metrics import (
     get_run_metrics_callback,
-    record_aggregate_result,
-    record_coordinate_result,
     record_coordinator_plan,
+    record_upstream_answer,
+    record_upstream_evidence,
 )
 from .worker import discard_worker_result_refs, worker_chat
 from .tools.saved_results import saved_result_store_scope
@@ -27,8 +27,8 @@ COORDINATOR_MAX_WORKERS = 8
 COORDINATOR_CONTEXT_MAX_CHARS = 4000
 _PLAN_TOOL_NAME = "submit_worker_plan"
 _DISPATCH_TOOL_NAME = "dispatch_worker"
-_COORDINATE_TOOL_NAME = "submit_coordination_result"
-_FINISH_TOOL_NAME = "finish_coordination"
+_UPSTREAM_EVIDENCE_TOOL_NAME = "submit_upstream_evidence"
+_UPSTREAM_ANSWER_TOOL_NAME = "finish_upstream_answer"
 
 
 class WorkerPlanStep(BaseModel):
@@ -39,10 +39,10 @@ class WorkerPlanStep(BaseModel):
     goal: str = Field(
         min_length=1,
         description=(
-            "Одна операция с данными, дающая один самостоятельно проверяемый "
-            "результат. Несколько атрибутов одной найденной записи остаются "
-            "одним результатом. Отдельный шаг нужен только для новой операции "
-            "с данными, зависящей от ещё неизвестного результата."
+            "Одна пользовательская проверка или один самостоятельно "
+            "проверяемый результат. Несколько чтений и атрибутов остаются "
+            "одним шагом, если все их входы уже известны. Отдельный шаг нужен "
+            "только для операции с аргументом из предыдущего результата."
         ),
     )
     presentation: Literal["answer_only", "full_results"]
@@ -64,6 +64,11 @@ class WorkerPlan(BaseModel):
     steps: List[WorkerPlanStep] = Field(
         min_length=1,
         max_length=COORDINATOR_MAX_WORKERS,
+        description=(
+            "По умолчанию один шаг на всю пользовательскую проверку. "
+            "Несколько шагов допустимы только для истинной зависимости, когда "
+            "аргумент следующего вызова отсутствует во входе и должен быть найден."
+        ),
     )
 
 
@@ -89,44 +94,41 @@ class WorkerDispatch(BaseModel):
         return clean_value
 
 
-class CoordinationFinish(BaseModel):
-    """Coordinator synthesis over worker runs and selected UI results."""
+class UpstreamEvidence(BaseModel):
+    """Verified evidence assembled from completed worker runs."""
 
     model_config = ConfigDict(extra="forbid")
 
-    answer: str = Field(min_length=1)
-    display_result_keys: List[str] = Field(default_factory=list)
+    confirmed_facts: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Самодостаточные подтверждённые факты с точными объектами, "
+            "ролями и значениями; без пользовательского оформления."
+        ),
+    )
+    unresolved_requirements: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Все требования исходной task, которые не подтверждены или "
+            "противоречат друг другу."
+        ),
+    )
 
-    @field_validator("answer", mode="before")
+    @field_validator("confirmed_facts", "unresolved_requirements")
     @classmethod
-    def _serialize_structured_answer(cls, value: Any) -> Any:
-        if isinstance(value, (Mapping, list, tuple, int, float, bool)):
-            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        return value
-
-    @field_validator("answer")
-    @classmethod
-    def _strip_answer(cls, value: str) -> str:
-        clean_value = value.strip()
-        if not clean_value:
-            raise ValueError("answer must not be blank")
-        return clean_value
-
-    @field_validator("display_result_keys")
-    @classmethod
-    def _deduplicate_keys(cls, values: List[str]) -> List[str]:
+    def _clean_items(cls, values: List[str]) -> List[str]:
         result: List[str] = []
         for value in values:
             clean_value = str(value or "").strip()
             if not clean_value:
-                raise ValueError("display_result_keys must not contain blanks")
+                raise ValueError("upstream evidence must not contain blanks")
             if clean_value not in result:
                 result.append(clean_value)
         return result
 
 
-class FinalAggregation(BaseModel):
-    """Final user-facing answer produced only from coordinator synthesis."""
+class UpstreamAnswer(BaseModel):
+    """Final user-facing answer returned along the upstream path."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -182,7 +184,7 @@ class CoordinatorGraphState(TypedDict):
     next_step: int
     pending_task: Optional[str]
     worker_runs: List[CoordinatorWorkerRun]
-    coordinator_result: Optional[Dict[str, Any]]
+    upstream_result: Optional[Dict[str, Any]]
     final_answer: Optional[str]
     selected_display_refs: List[str]
 
@@ -191,22 +193,37 @@ class CoordinatorResponseError(RuntimeError):
     """Raised when an LLM response violates a structural coordinator contract."""
 
 
-_PLAN_PROMPT = f"""
-Ты planner промежуточного coordinator. Раздели входную задачу на упорядоченный
+_DOWNSTREAM_PLAN_PROMPT = f"""
+Ты downstream planner coordinator. Проведи задачу сверху вниз: раздели её на упорядоченный
 план для изолированных generic workers и верни ровно один native call
 `{_PLAN_TOOL_NAME}` со списком `steps` длиной от 1 до
 {COORDINATOR_MAX_WORKERS}. Каждый step содержит только `goal` и `presentation`.
 
 Правила декомпозиции:
-- один step описывает одну операцию с данными и один самостоятельно проверяемый
-  результат;
+- по умолчанию верни ровно один step, содержащий всю пользовательскую проверку;
+- создавай несколько steps только при истинной зависимости: конкретный аргумент
+  следующей операции отсутствует в исходной task, и без результата предыдущего
+  step следующий вызов данных сформировать невозможно;
+- один step описывает одну пользовательскую проверку или один самостоятельно
+  проверяемый результат;
 - несколько запрошенных атрибутов одного найденного объекта или записи являются
   одним результатом и остаются в одном step; не разделяй их получение,
   перечисление или прямое объяснение, если новой операции с данными не требуется;
-- отдельный зависимый step создавай только для новой операции с данными,
-  аргументы которой нельзя определить до получения результата предыдущего step;
-- не объединяй независимо проверяемые операции в одном goal и не создавай
-  отдельные steps для оформления, пересказа или повторного показа тех же данных;
+- одна проверка, сравнение или объяснение остаётся одним step, даже если требует
+  нескольких чтений из явно названных источников или нескольких tools, когда
+  все идентификаторы и фильтры уже заданы. Не разделяй получение опорных фактов,
+  их сравнение и прямой вывод на отдельные steps;
+- несколько источников доказательств для одного итогового вывода остаются одним
+  step, даже если task вводит источник словом «отдельно» или «дополнительно»;
+- один и тот же итоговый вывод, сравнение или требуемое поле ответа не может
+  повторяться в goals разных steps;
+- разные источники, атрибуты, проверки, части анализа и разделы итогового ответа
+  сами по себе не являются зависимостью и не создают отдельные steps;
+- не создавай отдельные steps для получения опорных фактов, оформления,
+  пересказа или повторного показа тех же данных;
+- покрой каждым запрошенным фактом, источником, ограничением и элементом формы
+  ответа ровно один goal. Опциональный дополнительный источник включай в ту же
+  проверку, а не превращай в блокирующий предварительный step;
 - сохраняй порядок, точные сущности, идентификаторы, значения, условия,
   ограничения и запреты исходной задачи без переименования;
 - используй `context` только для однозначного разрешения ссылок и общих
@@ -218,88 +235,47 @@ _PLAN_PROMPT = f"""
 ответ пользователю.
 """.strip()
 
-_PLAN_REPAIR_PROMPT = f"""
+_DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
 Предыдущий native call `{_PLAN_TOOL_NAME}` не соответствует технической схеме.
 Верни исправленный native call ровно один раз. Массив `steps` должен содержать
 от 1 до {COORDINATOR_MAX_WORKERS} элементов; каждый элемент должен иметь только
 непустой `goal` и `presentation` со значением `answer_only` или `full_results`.
-Исправь только формат native call: не объединяй независимо проверяемые операции,
-не отбрасывай требования, не добавляй новые факты и не вызывай другие tools.
+Исправь только формат native call. По умолчанию используй один step; несколько
+допустимы лишь для аргумента, который должен быть найден предыдущим step. Не
+отбрасывай требования, не добавляй новые факты и не вызывай другие tools.
 """.strip()
 
-_DISPATCH_PROMPT = f"""
-Ты dispatcher промежуточного coordinator. Материализуй `current_step` в одну
+_DOWNSTREAM_DISPATCH_PROMPT = f"""
+Ты downstream dispatcher coordinator. Материализуй `current_step` в одну
 самодостаточную задачу для изолированного generic worker.
 
 Верни ровно один native call `{_DISPATCH_TOOL_NAME}` с полем `task`. Worker
-получит только эту строку. `original_task` задаёт ограничения и точные значения,
-а `current_step.goal` — единственную операцию этого worker. Используй общий
-`context` и краткие ответы `completed_workers` лишь там, где они нужны текущей
-цели. Подставляй подтверждённые предыдущим worker значения в зависимый шаг, не
-заставляя worker повторять завершённую работу.
-Не добавляй в task отдельные результаты, которые нужны только соседним шагам:
-текущий worker должен выполнить ровно свою одну операцию.
+получит только эту строку.
 
-Каждый completed worker содержит краткий answer и ordered `cycle_history`:
-вызовы tools, ограниченные текстовые preview их результатов и structured
-observation, а поле `status=completed` явно отмечает завершённый пункт плана.
-Используй историю, чтобы сохранить точный смысл подтверждённых фактов и
-зависимостей. Это не полные результаты tools. Ошибочные промежуточные циклы
-нужны только для понимания исправлений; подтверждёнными считай факты из цикла,
-observation которого завершает goal с `goal_satisfied=true`.
+Главные правила:
+- `current_step.goal` — единственная операция текущего worker. Не заменяй её
+  операцией прошлого или соседнего step и не возвращай worker к уже завершённой
+  проверке;
+- перенеси все относящиеся к current_step источники, сущности, роли, фильтры,
+  область данных, запреты и форму ответа. `original_task` используй только для
+  восстановления этих ограничений, не добавляя цели соседних steps;
+- `completed_workers` используй только если аргумент current_step зависит от их
+  результата. Не проси повторно получать или проверять завершённые факты;
+- подтверждёнными считай только факты из финального `cycle_history`, где
+  observation имеет `goal_satisfied=true`. Точные идентификаторы копируй
+  посимвольно, сохраняя их роль; неоднозначному значению роль не назначай;
+- если текущей операции нужен полный `saved_results` с `truncated=false`, включи
+  его точный result_ref. При `truncated=true` preview не доказывает полный набор;
+- неразрешённую ссылку замени однозначным названием из `context`. Если его нет,
+  явно сохрани необходимость уточнения, не выбирая объект самостоятельно;
+- не добавляй tools, skills, план, служебные поля, рассуждения, показ или экспорт.
 
-Поле `saved_results` содержит непрозрачные result_ref и схемы табличных
-результатов предыдущего worker, но не сами строки. Если текущая операция должна
-применяться именно к полному сохранённому набору и `truncated=false`, включи
-точный result_ref в task. Схема выбранного результата будет передана worker
-вместе с подходящим runtime tool. Если `truncated=true`, такой результат
-содержит только preview: не используй его для вывода о полном исходном наборе.
-
-Факты completed_workers являются подтверждёнными входными условиями зависимого
-шага, а не новой целью. Не проси текущий worker повторно получать, проверять,
-пересчитывать или возвращать их, если current_step.goal этого явно не требует.
-Task должна запрашивать только новые факты текущей операции; итоговый aggregator
-сам объединит их с ответами и историей предыдущих workers.
-
-Если original_task или current_step.goal содержит неразрешённую ссылку на
-объект, используй точное однозначное название из `context` и обязательно замени
-им ссылку в task. Не передавай worker слова «в нём», «в ней», «там», «этот»,
-«эта» или «это» вместо названия объекта. Если context содержит факт «речь о
-таблице X», worker должен получить «таблица X». Если однозначного названия нет,
-не выбирай произвольный объект и сформулируй невозможность выполнения без
-уточнения.
-
-Считай значение подтверждённым для текущей цели только если предыдущий ответ
-явно связывает его с требуемой сущностью, ролью или вычислением. Не присваивай
-общему или неоднозначному значению нужный смысл самостоятельно. Если нужный
-факт не подтверждён, не выдумывай его и явно сохрани это ограничение в task.
-Точные идентификаторы из предыдущего ответа копируй посимвольно, не исправляй,
-не сокращай и не создавай их варианты. Все упоминания одного идентификатора
-внутри task должны совпадать.
-
-Сохраняй относящиеся к шагу источники, запреты, идентификаторы, числа, связи и
-операцию дословно по смыслу. Не превращай вычисляемую величину в якобы готовое
-поле и не придумывай отсутствующие во входе сущности, поля или значения. Не
-опускай явно названный исходный набор данных, хранилище или систему: повтори их
-в task, даже если они кажутся очевидными из original_task. Подставляя результат
-предыдущего шага, сохраняй его исходную роль: значение роли остаётся условием
-внутри исходного набора данных и не становится новым источником или объектом.
-Worker не должен восстанавливать источник по догадке.
-
-Не
-добавляй цели соседних шагов, tools, skills, план, служебные поля или
-рассуждения. Отдельный показ, экспорт и выбор полного результата выполняются
-за пределами worker. Не добавляй эти требования в task и не отвлекай worker от
-получения фактов для правильного текстового ответа. При этом сохраняй
-ограничения на форму самого текстового ответа, например просьбу вернуть только
-число или перечислить значения в заданном порядке.
-
-Перед native call молча проверь, что task явно содержит источник, требуемую
-сущность или роль, операцию, условия и факты для ответа из current_step и
-original_task, а все повторения точных идентификаторов совпадают с источником.
+Перед native call сверь task с `current_step.goal`: каждый требуемый текущим
+шагом факт и идентификатор присутствует, завершённая операция не повторена, а
+цели предыдущего и следующего steps отсутствуют.
 """.strip()
 
-_DISPATCH_REPAIR_PROMPT = f"""
+_DOWNSTREAM_DISPATCH_REPAIR_PROMPT = f"""
 Предыдущий native call `{_DISPATCH_TOOL_NAME}` не соответствует технической
 схеме. Верни исправленный native call ровно один раз с единственным непустым
 строковым полем `task`. Сохрани текущую операцию, точные идентификаторы,
@@ -307,98 +283,70 @@ _DISPATCH_REPAIR_PROMPT = f"""
 шаги, tools, служебные поля или новые факты.
 """.strip()
 
-_COORDINATE_PROMPT = f"""
-Ты coordinator результатов workers. Сформируй самодостаточный результат по исходной
-задаче, плану и кратким ответам workers, затем выбери полезные полные результаты
-для отдельного показа в UI.
+_UPSTREAM_EVIDENCE_PROMPT = f"""
+Ты upstream evidence coordinator. Проведи результаты worker снизу вверх:
+проверь и объедини их,
+но не формулируй пользовательский ответ и не занимайся его оформлением.
 
-Главный приоритет — правильный текстовый ответ. Перед завершением молча сверь
-его с исходной задачей: все запрошенные факты, связи, вычисления, порядок,
-ограничения и форма ответа должны быть соблюдены. Не добавляй сведения, которых
-пользователь не просил, особенно если он потребовал «только» конкретный итог.
-Не повторяй в answer отрицательные ограничения и названия источников, способов
-или действий, которые требовалось не использовать: молча соблюдай такие запреты.
-Упоминай их только если пользователь отдельно попросил подтвердить соблюдение.
-При требовании «только» верни ровно перечисленные пользователем элементы без
-вступления, заключения, подтверждения, интерпретации и иных пояснений.
+Верни ровно один native call `{_UPSTREAM_EVIDENCE_TOOL_NAME}`:
+- `confirmed_facts` — самодостаточные подтверждённые факты, необходимые
+  исходной task;
+- `unresolved_requirements` — все требования task, которые не подтверждены,
+  противоречат друг другу или потеряны.
 
-Верни ровно один native call `{_COORDINATE_TOOL_NAME}`:
-- `answer`: всегда строка с самодостаточным ответом пользователю без внутренних
-  терминов. Даже если пользователь запросил JSON, объект или список, сериализуй
-  требуемое представление внутрь строки `answer`; никогда не передавай объект,
-  массив, число или null как значение этого технического поля;
-- `display_result_keys`: ключи только тех доступных результатов, которые нужно
-  показать полностью отдельно.
+Каждый worker result содержит `goal`, `task`, краткий `answer`, ordered
+`cycle_history`, `goal_satisfied` и `mismatches`. Подтверждённым считай только
+факт из шага с `goal_satisfied=true`, который поддержан его финальной
+structured observation и фактическим tool preview. Ошибочный промежуточный
+вызов, намерение worker и неподтверждённый текст answer фактами не являются.
 
-Не включай в пользовательский `answer` служебные result_ref, saved_results и
-описания их схем, если пользователь явно не запросил внутреннюю диагностику.
+Используй `original_task` только для точных названий объектов, ролей,
+идентификаторов и входных условий. Не превращай утверждение из task в найденный
+факт. В каждом confirmed fact дословно сохрани объект, роль, значение, порядок
+и связь между ними; значение без субъекта или стороны сравнения не является
+самодостаточным. Не смешивай evidence разных объектов. При конфликте ничего не
+угадывай: перенеси требование в unresolved_requirements.
 
-Полные tool results намеренно не передаются. Каждый worker result содержит
-ordered `cycle_history`: точные tool calls, ограниченные текстовые preview и
-structured observations, а `status` явно отмечает пункт как `completed` или
-`failed`. Используй историю вместе с кратким answer, чтобы не терять роль и
-происхождение фактов. Ошибочный промежуточный вызов не является фактом для
-итогового ответа; учитывай его только как исправленную попытку. Опирайся на
-important_facts и summary observation того цикла, который подтверждает goal.
-
-`original_task` также является допустимым источником точных названий субъекта,
-объектов, ролей, идентификаторов и заданных пользователем входных условий.
-Используй их, чтобы связать подтверждённые workers результаты с исходным
-предметом запроса и сделать answer самодостаточным. Повтор точного идентификатора
-из original_task не является добавлением нового факта. При этом не выдавай
-неподтверждённое предположение из формулировки task за найденный результат.
-Самодостаточный answer явно связывает каждое возвращаемое значение с запрошенным
-субъектом или ролью, используя их точные названия из original_task. Значение,
-выражение или список без такого названия не считается самодостаточным, даже если
-его смысл можно угадать из порядка или worker task.
-
-Не придумывай отсутствующие факты или ключи. Сохраняй связи между значениями и
-объединяй результаты зависимых шагов по смыслу исходной задачи. Сохраняй в
-answer точные идентификаторы, порядок и числовые значения из подтверждённых
-worker-результатов, не заменяя их общими описаниями. Считай шаг выполненным только если
-worker answer и его финальная observation подтверждают требуемый goal. При
-неоднозначности, противоречии или ошибке не назначай значению нужную
-роль и честно укажи, какой факт не подтверждён.
-Если у worker указан `goal_satisfied=false`, план остановлен на этом шаге:
-используй его `mismatches` для краткого пользовательского ограничения, не
-продолжай зависимые вычисления мысленно и не выбирай display results этого шага.
-
-Выбор display results вторичен и не должен влиять на `answer`; при сомнении
-можно вернуть пустой список. Выбирай display result только для шага с
-`presentation=full_results`, если его
-полный результат доступен. Для `answer_only` не выбирай result keys. Показ в UI
-не меняет полноту текстового ответа и не является отдельным шагом. Если worker
-не выполнил часть плана, честно укажи это и не выдавай описание намерения за
-полученный результат.
+Проверь покрытие всей original_task. Если worker имеет goal_satisfied=false,
+перенеси все его актуальные mismatches в unresolved_requirements и не продолжай
+зависимое вычисление мысленно. Не добавляй result refs, UI-решения, формат
+ответа, вступление или вывод для пользователя.
 """.strip()
 
-_COORDINATE_REPAIR_PROMPT = f"""
-Предыдущий native call `{_COORDINATE_TOOL_NAME}` не соответствует его технической
-схеме. Верни исправленный native call ровно один раз. Поле `answer` обязательно
-должно быть строкой. Если пользовательский ответ имеет форму JSON-объекта,
-массива, числа или другой структуры, сериализуй её в текст внутри `answer`, не
-меняя подтверждённые факты. `display_result_keys` должен оставаться массивом
-доступных строковых ключей. Не добавляй новые факты и не вызывай другие tools.
+_UPSTREAM_EVIDENCE_REPAIR_PROMPT = f"""
+Предыдущий native call `{_UPSTREAM_EVIDENCE_TOOL_NAME}` не соответствует технической
+схеме. Верни его ровно один раз с двумя массивами непустых строк:
+`confirmed_facts` и `unresolved_requirements`. Исправь только структуру, не
+добавляй факты и не формулируй пользовательский ответ.
 """.strip()
 
-_AGGREGATE_PROMPT = f"""
-Ты финальный aggregator. На входе находится только самодостаточный
-`coordinator_result`, уже собранный coordinator по результатам workers.
+_UPSTREAM_ANSWER_PROMPT = f"""
+Ты upstream answer coordinator. Заверши обратный путь результатов к supervisor:
+сформируй окончательный ответ только
+по `original_task`, устойчивому `context` и проверенному `upstream_evidence`.
+Не обращайся к workers и не переоценивай доказательства.
 
-Верни ровно один native call `{_FINISH_TOOL_NAME}` с единственным полем
-`answer`. Сохрани все факты, точные идентификаторы, числа, связи, порядок и
-форму ответа из `coordinator_result.answer`. Ничего не добавляй, не удаляй, не
-переоценивай и не пытайся восстановить исходную задачу или внутреннюю историю.
-Не упоминай coordinator, workers, tools и observations. Если answer уже готов
-для пользователя, перенеси его без смысловых изменений. Даже если это JSON,
-объект, массив или число, значение технического поля `answer` должно быть
-строкой.
+Верни ровно один native call `{_UPSTREAM_ANSWER_TOOL_NAME}` с единственным строковым
+полем `answer`. Используй только `confirmed_facts`; каждое
+`unresolved_requirements` кратко отрази как неподтверждённое требование, не
+додумывая ответ.
+
+Сохрани точные идентификаторы, роли, значения, связи и порядок. Имена и входные
+условия можно дословно брать из original_task для подписывания подтверждённых
+фактов, но нельзя считать их результатами проверки. Соблюдай запрошенный формат.
+Если пользователь потребовал «только» конкретные элементы, не добавляй
+вступление, заключение или описание внутренних действий. Если задан буквальный
+шаблон вида `имя=<значение>`, сохрани имя и знак `=` дословно. JSON, список,
+число или объект сериализуй в строку поля `answer`.
+
+Не упоминай upstream/downstream coordinator, workers, tools, observations,
+result refs и внутреннюю схему.
 """.strip()
 
-_AGGREGATE_REPAIR_PROMPT = f"""
-Предыдущий native call `{_FINISH_TOOL_NAME}` не соответствует технической
-схеме. Верни исправленный native call с единственным строковым полем `answer`.
-Сохрани `coordinator_result.answer` без добавления и потери фактов.
+_UPSTREAM_ANSWER_REPAIR_PROMPT = f"""
+Предыдущий native call `{_UPSTREAM_ANSWER_TOOL_NAME}` не соответствует технической
+схеме. Верни его ровно один раз с единственным непустым строковым полем
+`answer`. Исправь только транспортный формат, не добавляя и не удаляя факты.
 """.strip()
 
 
@@ -418,18 +366,23 @@ def _plan_tool_schema() -> Dict[str, Any]:
                     "type": "array",
                     "minItems": 1,
                     "maxItems": COORDINATOR_MAX_WORKERS,
+                    "description": (
+                        "По умолчанию один шаг на всю проверку; несколько "
+                        "только когда аргумент следующего вызова отсутствует "
+                        "во входе и должен быть найден предыдущим шагом"
+                    ),
                     "items": {
                         "type": "object",
                         "properties": {
                             "goal": {
                                 "type": "string",
-                                "description": (
-                                    "Одна операция с данными и один "
-                                    "самостоятельно проверяемый результат, с "
+                            "description": (
+                                    "Одна пользовательская проверка или один "
+                                    "самостоятельно проверяемый результат с "
                                     "точными сущностями и условиями. Несколько "
-                                    "атрибутов одной найденной записи остаются "
-                                    "одним результатом; отдельный шаг нужен "
-                                    "только для новой операции с данными"
+                                    "чтений остаются одним шагом, если все "
+                                    "входы известны; отдельный шаг нужен только "
+                                    "для аргумента из предыдущего результата"
                                 ),
                             },
                             "presentation": {
@@ -479,45 +432,49 @@ def _dispatch_tool_schema() -> Dict[str, Any]:
     }
 
 
-def _coordination_result_tool_schema() -> Dict[str, Any]:
+def _upstream_evidence_tool_schema() -> Dict[str, Any]:
     return {
         "type": "function",
         "function": {
-            "name": _COORDINATE_TOOL_NAME,
+            "name": _UPSTREAM_EVIDENCE_TOOL_NAME,
             "description": (
-                "Собрать результат coordinator и выбрать полные результаты "
-                "workers для UI."
+                "Зафиксировать проверенные факты workers отдельно от "
+                "пользовательского представления."
             ),
             "parameters": {
             "type": "object",
             "properties": {
-                "answer": {
-                    "type": "string",
-                    "description": (
-                        "Самодостаточный ответ в запрошенной форме: точные "
-                        "идентификаторы и входные условия из original_task "
-                        "связывают только с подтверждёнными workers результатами"
-                    ),
-                },
-                "display_result_keys": {
+                "confirmed_facts": {
                     "type": "array",
                     "items": {"type": "string"},
+                    "description": (
+                        "Самодостаточные подтверждённые факты с точными "
+                        "объектами, ролями, связями и значениями"
+                    ),
+                },
+                "unresolved_requirements": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Все требования исходной task, которые не удалось "
+                        "подтвердить без догадки"
+                    ),
                 },
             },
-            "required": ["answer", "display_result_keys"],
+            "required": ["confirmed_facts", "unresolved_requirements"],
             "additionalProperties": False,
             },
         },
     }
 
 
-def _finish_tool_schema() -> Dict[str, Any]:
+def _upstream_answer_tool_schema() -> Dict[str, Any]:
     return {
         "type": "function",
         "function": {
-            "name": _FINISH_TOOL_NAME,
+            "name": _UPSTREAM_ANSWER_TOOL_NAME,
             "description": (
-                "Вернуть окончательный текст только из результата coordinator."
+                "Оформить проверенные upstream-факты в окончательный ответ."
             ),
             "parameters": {
             "type": "object",
@@ -525,8 +482,8 @@ def _finish_tool_schema() -> Dict[str, Any]:
                 "answer": {
                     "type": "string",
                     "description": (
-                        "Пользовательский ответ без добавления или потери "
-                        "фактов результата coordinator"
+                        "Пользовательский ответ только из подтверждённых "
+                        "upstream-фактов и явно указанных ограничений"
                     ),
                 },
             },
@@ -567,13 +524,28 @@ def build_coordinator_graph(
     callbacks: Optional[Sequence[Any]] = None,
     collected_result_refs: Optional[List[str]] = None,
 ):
-    """Build plan -> workers -> coordinate -> final aggregate graph."""
+    """Build downstream task flow and upstream result flow around workers."""
     callback_list = list(callbacks or [])
     model_config = {"callbacks": callback_list} if callback_list else None
-    plan_model = model.bind_tools([_plan_tool_schema()])
-    dispatch_model = model.bind_tools([_dispatch_tool_schema()])
-    coordinate_model = model.bind_tools([_coordination_result_tool_schema()])
-    aggregate_model = model.bind_tools([_finish_tool_schema()])
+    def bind_required_tool(schema: Dict[str, Any], tool_name: str) -> Any:
+        try:
+            return model.bind_tools([schema], tool_choice=tool_name)
+        except TypeError:
+            return model.bind_tools([schema])
+
+    plan_model = bind_required_tool(_plan_tool_schema(), _PLAN_TOOL_NAME)
+    dispatch_model = bind_required_tool(
+        _dispatch_tool_schema(),
+        _DISPATCH_TOOL_NAME,
+    )
+    upstream_evidence_model = bind_required_tool(
+        _upstream_evidence_tool_schema(),
+        _UPSTREAM_EVIDENCE_TOOL_NAME,
+    )
+    upstream_answer_model = bind_required_tool(
+        _upstream_answer_tool_schema(),
+        _UPSTREAM_ANSWER_TOOL_NAME,
+    )
 
     def invoke(selected_model: Any, messages: Sequence[BaseMessage]) -> Any:
         try:
@@ -587,9 +559,9 @@ def build_coordinator_graph(
                 f"Ошибка LLM coordinator: {type(exc).__name__}"
             ) from exc
 
-    def plan_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+    def downstream_plan_node(state: CoordinatorGraphState) -> Dict[str, Any]:
         plan_messages: List[BaseMessage] = [
-            SystemMessage(content=_PLAN_PROMPT),
+            SystemMessage(content=_DOWNSTREAM_PLAN_PROMPT),
             HumanMessage(
                 content=json.dumps(
                     {"task": state["task"], "context": state["context"]},
@@ -610,7 +582,7 @@ def build_coordinator_graph(
                 [
                     *plan_messages,
                     result,
-                    HumanMessage(content=_PLAN_REPAIR_PROMPT),
+                    HumanMessage(content=_DOWNSTREAM_PLAN_REPAIR_PROMPT),
                 ],
             )
             plan = _native_payload(
@@ -638,7 +610,9 @@ def build_coordinator_graph(
             "next_step": 0,
         }
 
-    def materialize_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+    def downstream_materialize_node(
+        state: CoordinatorGraphState,
+    ) -> Dict[str, Any]:
         step_index = state["next_step"]
         current_step = state["plan"][step_index]
         completed_workers = [
@@ -654,7 +628,7 @@ def build_coordinator_graph(
             for run in state["worker_runs"]
         ]
         dispatch_messages: List[BaseMessage] = [
-            SystemMessage(content=_DISPATCH_PROMPT),
+            SystemMessage(content=_DOWNSTREAM_DISPATCH_PROMPT),
             HumanMessage(
                 content=json.dumps(
                     {
@@ -687,7 +661,7 @@ def build_coordinator_graph(
                 [
                     *dispatch_messages,
                     result,
-                    HumanMessage(content=_DISPATCH_REPAIR_PROMPT),
+                    HumanMessage(content=_DOWNSTREAM_DISPATCH_REPAIR_PROMPT),
                 ],
             )
             dispatch = _native_payload(
@@ -696,12 +670,20 @@ def build_coordinator_graph(
                 WorkerDispatch,
             )
         assert isinstance(dispatch, WorkerDispatch)
+        worker_task = dispatch.task
+        if len(state["plan"]) == 1:
+            worker_task = state["task"].strip()
+            context = state["context"].strip()
+            if context:
+                worker_task = (
+                    f"{worker_task}\n\nУстойчивые правила контекста:\n{context}"
+                )
         logger.info(
             "Coordinator materialized worker step=%s task=%s",
             step_index + 1,
-            dispatch.task[:1000],
+            worker_task[:1000],
         )
-        return {"pending_task": dispatch.task}
+        return {"pending_task": worker_task}
 
     def worker_node(state: CoordinatorGraphState) -> Dict[str, Any]:
         worker_task = str(state.get("pending_task") or "").strip()
@@ -780,7 +762,7 @@ def build_coordinator_graph(
             "pending_task": None,
         }
 
-    def coordinate_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+    def upstream_evidence_node(state: CoordinatorGraphState) -> Dict[str, Any]:
         worker_payload = [
             {
                 "step": run["step"],
@@ -793,24 +775,11 @@ def build_coordinator_graph(
                 "cycle_history": list(run["cycle_history"]),
                 "goal_satisfied": run["goal_satisfied"],
                 "mismatches": list(run["mismatches"]),
-                "available_results": [
-                    {
-                        "result_key": result_ref["result_key"],
-                        "tool_name": result_ref["name"],
-                    }
-                    for result_ref in run["result_refs"]
-                ],
-                "saved_results": list(run["saved_results"]),
             }
             for run in state["worker_runs"]
         ]
-        refs_by_key = {
-            result_ref["result_key"]: result_ref["ref"]
-            for run in state["worker_runs"]
-            for result_ref in run["result_refs"]
-        }
-        coordinate_messages: List[BaseMessage] = [
-            SystemMessage(content=_COORDINATE_PROMPT),
+        upstream_messages: List[BaseMessage] = [
+            SystemMessage(content=_UPSTREAM_EVIDENCE_PROMPT),
             HumanMessage(
                 content=json.dumps(
                     {
@@ -823,135 +792,138 @@ def build_coordinator_graph(
                 )
             ),
         ]
-        result = invoke(coordinate_model, coordinate_messages)
+        result = invoke(upstream_evidence_model, upstream_messages)
         try:
-            finish = _native_payload(
+            evidence = _native_payload(
                 result,
-                _COORDINATE_TOOL_NAME,
-                CoordinationFinish,
+                _UPSTREAM_EVIDENCE_TOOL_NAME,
+                UpstreamEvidence,
             )
         except CoordinatorResponseError:
             logger.warning(
-                "Coordinator synthesis call violated result schema; "
+                "Upstream coordinator violated evidence schema; "
                 "requesting one LLM repair"
             )
             repaired_result = invoke(
-                coordinate_model,
+                upstream_evidence_model,
                 [
-                    *coordinate_messages,
+                    *upstream_messages,
                     result,
-                    HumanMessage(content=_COORDINATE_REPAIR_PROMPT),
+                    HumanMessage(content=_UPSTREAM_EVIDENCE_REPAIR_PROMPT),
                 ],
             )
-            finish = _native_payload(
+            evidence = _native_payload(
                 repaired_result,
-                _COORDINATE_TOOL_NAME,
-                CoordinationFinish,
+                _UPSTREAM_EVIDENCE_TOOL_NAME,
+                UpstreamEvidence,
             )
-        assert isinstance(finish, CoordinationFinish)
-        unknown_keys = [
-            key for key in finish.display_result_keys if key not in refs_by_key
+        assert isinstance(evidence, UpstreamEvidence)
+        upstream_result = evidence.model_dump()
+        selected_display_refs = [
+            result_ref["ref"]
+            for run in state["worker_runs"]
+            if run["goal_satisfied"]
+            and state["plan"][run["step"] - 1]["presentation"]
+            == "full_results"
+            for result_ref in run["result_refs"]
         ]
-        if unknown_keys:
-            raise CoordinatorResponseError(
-                "Coordinator выбрал неизвестные result keys: "
-                + ", ".join(unknown_keys)
-            )
-        coordinator_result = {
-            "answer": finish.answer,
-            "display_result_keys": list(finish.display_result_keys),
-        }
-        record_coordinate_result(coordinator_result)
+        record_upstream_evidence(upstream_result)
         logger.info(
-            "Coordinator result before aggregate: %s",
-            json.dumps(coordinator_result, ensure_ascii=False)[:8000],
+            "Upstream coordinator evidence: %s",
+            json.dumps(upstream_result, ensure_ascii=False)[:8000],
         )
         return {
-            "coordinator_result": coordinator_result,
-            "selected_display_refs": [
-                refs_by_key[key] for key in finish.display_result_keys
-            ],
+            "upstream_result": upstream_result,
+            "selected_display_refs": selected_display_refs,
         }
 
-    def aggregate_node(state: CoordinatorGraphState) -> Dict[str, Any]:
-        coordinator_result = state.get("coordinator_result")
-        if not coordinator_result:
+    def upstream_answer_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+        upstream_result = state.get("upstream_result")
+        if not upstream_result:
             raise CoordinatorResponseError(
-                "Финальный aggregator вызван без результата coordinator."
+                "Upstream answer coordinator вызван без upstream evidence."
             )
-        aggregate_messages: List[BaseMessage] = [
-            SystemMessage(content=_AGGREGATE_PROMPT),
+        upstream_answer_messages: List[BaseMessage] = [
+            SystemMessage(content=_UPSTREAM_ANSWER_PROMPT),
             HumanMessage(
                 content=json.dumps(
-                    {"coordinator_result": coordinator_result},
+                    {
+                        "original_task": state["task"],
+                        "context": state["context"],
+                        "upstream_evidence": upstream_result,
+                    },
                     ensure_ascii=False,
                 )
             ),
         ]
-        result = invoke(aggregate_model, aggregate_messages)
+        result = invoke(upstream_answer_model, upstream_answer_messages)
         try:
-            aggregation = _native_payload(
+            upstream_answer = _native_payload(
                 result,
-                _FINISH_TOOL_NAME,
-                FinalAggregation,
+                _UPSTREAM_ANSWER_TOOL_NAME,
+                UpstreamAnswer,
             )
         except CoordinatorResponseError:
             logger.warning(
-                "Final aggregate call violated finish schema; requesting one "
-                "LLM repair"
+                "Upstream answer coordinator violated answer schema; requesting "
+                "one LLM repair"
             )
             repaired_result = invoke(
-                aggregate_model,
+                upstream_answer_model,
                 [
-                    *aggregate_messages,
+                    *upstream_answer_messages,
                     result,
-                    HumanMessage(content=_AGGREGATE_REPAIR_PROMPT),
+                    HumanMessage(content=_UPSTREAM_ANSWER_REPAIR_PROMPT),
                 ],
             )
-            aggregation = _native_payload(
+            upstream_answer = _native_payload(
                 repaired_result,
-                _FINISH_TOOL_NAME,
-                FinalAggregation,
+                _UPSTREAM_ANSWER_TOOL_NAME,
+                UpstreamAnswer,
             )
-        assert isinstance(aggregation, FinalAggregation)
-        record_aggregate_result(aggregation.answer)
+        assert isinstance(upstream_answer, UpstreamAnswer)
+        final_answer = upstream_answer.answer
+        record_upstream_answer(final_answer)
         logger.info(
-            "Coordinator aggregate result: %s",
+            "Upstream coordinator answer: %s",
             json.dumps(
-                {"answer": aggregation.answer},
+                {"answer": final_answer},
                 ensure_ascii=False,
             )[:8000],
         )
-        return {"final_answer": aggregation.answer}
+        return {"final_answer": final_answer}
 
     def route_after_worker(
         state: CoordinatorGraphState,
-    ) -> Literal["materialize", "coordinate"]:
+    ) -> Literal["downstream_materialize", "upstream_evidence"]:
         if state["next_step"] < len(state["plan"]):
-            return "materialize"
-        return "coordinate"
+            return "downstream_materialize"
+        return "upstream_evidence"
 
     graph = StateGraph(CoordinatorGraphState)
-    graph.add_node("plan", plan_node)
-    graph.add_node("materialize", materialize_node)
+    graph.add_node("downstream_plan", downstream_plan_node)
+    graph.add_node("downstream_materialize", downstream_materialize_node)
     graph.add_node("worker", worker_node)
-    graph.add_node("coordinate", coordinate_node)
-    graph.add_node("aggregate", aggregate_node)
-    graph.add_edge(START, "plan")
-    graph.add_edge("plan", "materialize")
-    graph.add_edge("materialize", "worker")
+    graph.add_node("upstream_evidence", upstream_evidence_node)
+    graph.add_node("upstream_answer", upstream_answer_node)
+    graph.add_edge(START, "downstream_plan")
+    graph.add_edge("downstream_plan", "downstream_materialize")
+    graph.add_edge("downstream_materialize", "worker")
     graph.add_conditional_edges(
         "worker",
         route_after_worker,
-        {"materialize": "materialize", "coordinate": "coordinate"},
+        {
+            "downstream_materialize": "downstream_materialize",
+            "upstream_evidence": "upstream_evidence",
+        },
     )
-    graph.add_edge("coordinate", "aggregate")
-    graph.add_edge("aggregate", END)
+    graph.add_edge("upstream_evidence", "upstream_answer")
+    graph.add_edge("upstream_answer", END)
     return graph.compile()
 
 
 def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
-    """Plan workers, execute them, aggregate answers, and select UI results."""
+    """Send tasks downstream to workers and return verified results upstream."""
     clean_task = str(task or "").strip()
     clean_context = str(context or "").strip()[:COORDINATOR_CONTEXT_MAX_CHARS]
     if not clean_task:
@@ -978,7 +950,7 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
         "next_step": 0,
         "pending_task": None,
         "worker_runs": [],
-        "coordinator_result": None,
+        "upstream_result": None,
         "final_answer": None,
         "selected_display_refs": [],
     }
@@ -1022,8 +994,8 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
 __all__ = [
     "COORDINATOR_MAX_WORKERS",
     "COORDINATOR_CONTEXT_MAX_CHARS",
-    "CoordinationFinish",
-    "FinalAggregation",
+    "UpstreamEvidence",
+    "UpstreamAnswer",
     "CoordinatorAnswer",
     "CoordinatorGraphState",
     "CoordinatorResponseError",

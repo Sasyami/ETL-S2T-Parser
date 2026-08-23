@@ -163,6 +163,100 @@ class _ToolChoiceFallbackModel:
         return _finish_message("Подтверждено через fallback.")
 
 
+def test_worker_repairs_observer_without_repeating_data_tool():
+    tool_calls = []
+
+    def lookup():
+        tool_calls.append("lookup")
+        return {"value": 42}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-lookup",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Значение: 42."),
+        ],
+        observer_responses=[
+            {
+                "summary": "Невалидная отрицательная observation.",
+                "goal_satisfied": False,
+                "mismatches": [],
+            },
+            Observation(
+                summary="Значение 42 подтверждено.",
+                goal_satisfied=True,
+                important_facts=["Значение: 42."],
+            ),
+        ],
+    )
+
+    result = run_worker_graph(
+        task="Получи значение.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+    )
+
+    assert result.answer == "Значение: 42."
+    assert tool_calls == ["lookup"]
+    assert len(model.observer.messages) == 2
+    repair_messages = model.observer.messages[1]
+    assert "Data tool уже выполнен" in repair_messages[-1].content
+    assert "не требуй его повторного" in repair_messages[-1].content
+
+
+def test_worker_stops_after_second_invalid_observer_without_repeating_tool():
+    tool_calls = []
+
+    def lookup():
+        tool_calls.append("lookup")
+        return {"value": 42}
+
+    invalid_observation = {
+        "summary": "Невалидная отрицательная observation.",
+        "goal_satisfied": False,
+        "mismatches": [],
+    }
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-lookup",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        ],
+        observer_responses=[invalid_observation, invalid_observation],
+    )
+
+    with pytest.raises(WorkerResponseError, match="Observer дважды"):
+        run_worker_graph(
+            task="Получи значение.",
+            system_prompt="Системный контекст",
+            model=model,
+            tools=(_as_tool(lookup),),
+            max_steps=2,
+        )
+
+    assert tool_calls == ["lookup"]
+    assert len(model.observer.messages) == 2
+
+
 def test_worker_without_tools_is_observed_before_returning_answer():
     candidate_answer = "Первая пара\nВторая пара"
     model = _WorkerModel(
@@ -408,7 +502,7 @@ def test_worker_binds_referenced_saved_result_schema_into_selected_tool():
 
     route = ToolRoute(
         tools=["query_saved_result"],
-        skills=["SQLite SQL"],
+        skills=[],
         schemas=[],
     )
     graph_result = WorkerRunResult(
@@ -572,7 +666,18 @@ def test_worker_planner_keeps_only_latest_tool_exchange():
                 ],
             ),
             _finish_message("Готово."),
-        ]
+        ],
+        observer_responses=[
+            Observation(
+                summary="Получен только первый результат.",
+                goal_satisfied=False,
+                mismatches=["Второй результат ещё не получен."],
+            ),
+            Observation(
+                summary="Получены оба результата.",
+                goal_satisfied=True,
+            ),
+        ],
     )
 
     result = run_worker_graph(
@@ -599,6 +704,33 @@ def test_worker_planner_keeps_only_latest_tool_exchange():
     ]
     assert second_prompt_tool_ids == ["call-first"]
     assert final_prompt_tool_ids == ["call-second"]
+
+
+def test_worker_planner_keeps_only_latest_cumulative_observation():
+    from agents.chat_graph import _runtime_context
+
+    first = Observation(
+        summary="Первый результат неполон.",
+        goal_satisfied=False,
+        mismatches=["Не найден источник."],
+    )
+    latest = Observation(
+        summary="Источник найден, правило ещё отсутствует.",
+        goal_satisfied=False,
+        mismatches=["Не найдено правило преобразования."],
+        important_facts=["Источник: source_contracts."],
+    )
+
+    context = _runtime_context({"observations": [first, latest]})
+
+    assert context is not None
+    assert "Выжимка observer для шага 2" in context
+    assert "Источник найден, правило ещё отсутствует." in context
+    assert "Не найдено правило преобразования." in context
+    assert "Источник: source_contracts." in context
+    assert "Выжимка observer для шага 1" not in context
+    assert "Первый результат неполон." not in context
+    assert "Не найден источник." not in context
 
 
 def test_worker_observer_evaluates_current_result_with_prior_state():
@@ -889,7 +1021,18 @@ def test_worker_llm_can_correct_its_tool_call_after_observation():
                 ],
             ),
             _finish_message("Максимум: t_rate_rule_param, 55 строк."),
-        ]
+        ],
+        observer_responses=[
+            Observation(
+                summary="Получена агрегация по source_table вместо target_table.",
+                goal_satisfied=False,
+                mismatches=["Task требует агрегацию по target_table."],
+            ),
+            Observation(
+                summary="Получена требуемая агрегация по target_table.",
+                goal_satisfied=True,
+            ),
+        ],
     )
 
     result = run_worker_graph(
@@ -1068,7 +1211,18 @@ def test_worker_loop_does_not_rewrite_llm_tool_arguments_in_python():
                 ],
             ),
             _finish_message("Уникальных source_table: 5."),
-        ]
+        ],
+        observer_responses=[
+            Observation(
+                summary="Подсчитаны строки target_tables, а не source_table S2T.",
+                goal_satisfied=False,
+                mismatches=["Запрос выполнен не по s2t_transformations."],
+            ),
+            Observation(
+                summary="Подсчитаны distinct непустые source_table S2T.",
+                goal_satisfied=True,
+            ),
+        ],
     )
 
     result = run_worker_graph(
@@ -1237,7 +1391,7 @@ def test_public_worker_reroutes_original_task_after_observer_request():
         ),
         ToolRoute(
             tools=["run_sql"],
-            skills=["SQLite SQL"],
+            skills=[],
             schemas=["SQLite ETL"],
         ),
     ]

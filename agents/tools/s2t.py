@@ -14,14 +14,24 @@ def list_s2t_transformations(
     columns: Optional[List[str]] = None,
     target_table: Optional[str] = None,
     source_table: Optional[str] = None,
+    target_field: Optional[str] = None,
+    source_field: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Получить строки S2T с точными ролевыми фильтрами и выбранными колонками.
 
-    Выбирай, если известны точные полные source_table и/или target_table либо
-    нужно вернуть конкретные columns, например только transformation_rule;
+    Выбирай, если известны точные source/target table или field либо нужно
+    вернуть конкретные columns, например только transformation_rule. Для
+    точного маппинга передавай source_table, source_field, target_table и
+    target_field отдельными аргументами;
     неполное или неквалифицированное имя сначала разрешай через
     search_s2t_transformations. Ролевые условия передавай отдельными аргументами, не строкой в q.
+    Если task явно называет target_table/target_field или
+    source_table/source_field, передавай все названные ролевые фильтры; не
+    заменяй их search_s2t_transformations и не опускай table-фильтр.
+    q — ровно одна буквальная подстрока, не объединяй в ней несколько полей,
+    значений или условий. Tool не принимает file_id: конкретный file_id из
+    запроса не переносится на глобальную s2t_transformations.
     Без columns возвращает row_num и все поля S2T. q — дополнительный поиск
     подстроки по значениям.
     Читает глобальную s2t_transformations без file_id и сохраняет дубликаты.
@@ -33,6 +43,8 @@ def list_s2t_transformations(
         columns: Точные имена возвращаемых колонок; null означает все колонки.
         target_table: Опциональное точное имя целевой таблицы без имени поля и операторов.
         source_table: Опциональное точное имя исходной таблицы без имени поля и операторов.
+        target_field: Опциональное точное имя целевого поля без имени таблицы и операторов.
+        source_field: Опциональное точное имя исходного поля без имени таблицы и операторов.
     """
     from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
 
@@ -44,6 +56,8 @@ def list_s2t_transformations(
         columns=columns,
         target_table=target_table,
         source_table=source_table,
+        target_field=target_field,
+        source_field=source_field,
     )
 
 
@@ -58,9 +72,12 @@ def search_s2t_transformations(
     Выбирай, когда роль искомого значения неизвестна либо известная таблица
     названа неполным или неквалифицированным именем. Во втором случае сначала
     разреши по результату точное полное source_table/target_table, затем передай
-    его специализированному tool следующего шага. Если уже известно точное
-    полное source_table/target_table или нужны конкретные возвращаемые колонки,
-    используй list_s2t_transformations. Это не семантический поиск: needle
+    его специализированному tool следующего шага. Если уже известны точные
+    роли таблиц или полей либо нужны конкретные возвращаемые колонки, используй list_s2t_transformations
+    и передай каждую роль отдельным аргументом. Использование точного
+    target_table/target_field или source_table/source_field как needle
+    запрещено: это ролевые фильтры, а не подстрочный поиск. Это не
+    семантический поиск: needle
     проверяется как подстрока в target/source table, field, layer и
     transformation_rule. Читает глобальную s2t_transformations без file_id,
     сохраняет дубликаты и возвращает только первые limit совпадений.

@@ -80,6 +80,8 @@ def list_s2t_transformations(
     columns: Optional[List[str]] = None,
     target_table: Optional[str] = None,
     source_table: Optional[str] = None,
+    target_field: Optional[str] = None,
+    source_field: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return minimal stored S2T transformations for UI/API browsing."""
     clean_limit = None if limit is None else max(1, min(int(limit or 200), 1000))
@@ -113,6 +115,8 @@ def list_s2t_transformations(
     exact_filters = {
         "target_table": str(target_table or "").strip(),
         "source_table": str(source_table or "").strip(),
+        "target_field": str(target_field or "").strip(),
+        "source_field": str(source_field or "").strip(),
     }
     for field_name, field_value in exact_filters.items():
         if field_value:

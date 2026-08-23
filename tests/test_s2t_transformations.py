@@ -2695,3 +2695,39 @@ def test_list_s2t_transformations_selects_columns(s2t_db):
 
     assert result["columns"] == ["transformation_rule"]
     assert result["rows"] == [{"transformation_rule": "source.value"}]
+
+
+def test_list_s2t_transformations_filters_exact_mapping_fields(s2t_db):
+    conn = get_db_connection()
+    conn.executemany(
+        """
+        INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field)
+        VALUES (?, 10, 'S2T', ?, ?, ?, ?, ?)
+        """,
+        [
+            (21, 1, "s_exact", "source_id", "t_exact", "target_id"),
+            (22, 2, "s_exact", "other_id", "t_exact", "target_id"),
+            (23, 3, "s_exact", "source_id", "t_exact", "other_id"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = list_s2t_transformations(
+        file_id=None,
+        source_table="s_exact",
+        source_field="source_id",
+        target_table="t_exact",
+        target_field="target_id",
+    )
+
+    assert result["total"] == 1
+    assert result["filters"] == {
+        "target_table": "t_exact",
+        "source_table": "s_exact",
+        "target_field": "target_id",
+        "source_field": "source_id",
+    }
+    assert result["rows"][0]["row_num"] == 1

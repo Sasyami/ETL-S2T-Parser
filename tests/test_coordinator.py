@@ -40,9 +40,12 @@ class _CoordinatorModel:
     def __init__(self, responses):
         self.responses = {name: list(items) for name, items in responses.items()}
         self.messages = []
+        self.tool_choices = []
 
-    def bind_tools(self, tools):
-        return _BoundModel(self, tools[0]["function"]["name"])
+    def bind_tools(self, tools, tool_choice=None):
+        tool_name = tools[0]["function"]["name"]
+        self.tool_choices.append((tool_name, tool_choice))
+        return _BoundModel(self, tool_name)
 
 
 def _payload(model, tool_name, occurrence=0):
@@ -61,40 +64,53 @@ def _patches(model):
     )
 
 
-def test_coordinator_graph_has_llm_plan_worker_loop_and_aggregate():
+def test_coordinator_graph_routes_tasks_downstream_and_results_upstream():
     from agents.coordinator import build_coordinator_graph
 
-    graph = build_coordinator_graph(_CoordinatorModel({}))
+    model = _CoordinatorModel({})
+    graph = build_coordinator_graph(model)
     graph_view = graph.get_graph()
 
-    assert {"plan", "materialize", "worker", "coordinate", "aggregate"}.issubset(
-        graph_view.nodes
-    )
+    assert model.tool_choices == [
+        ("submit_worker_plan", "submit_worker_plan"),
+        ("dispatch_worker", "dispatch_worker"),
+        ("submit_upstream_evidence", "submit_upstream_evidence"),
+        ("finish_upstream_answer", "finish_upstream_answer"),
+    ]
+
+    assert {
+        "downstream_plan",
+        "downstream_materialize",
+        "worker",
+        "upstream_evidence",
+        "upstream_answer",
+    }.issubset(graph_view.nodes)
     edges = {(edge.source, edge.target) for edge in graph_view.edges}
-    assert ("__start__", "plan") in edges
-    assert ("plan", "materialize") in edges
-    assert ("materialize", "worker") in edges
-    assert ("coordinate", "aggregate") in edges
-    assert ("aggregate", "__end__") in edges
+    assert ("__start__", "downstream_plan") in edges
+    assert ("downstream_plan", "downstream_materialize") in edges
+    assert ("downstream_materialize", "worker") in edges
+    assert ("upstream_evidence", "upstream_answer") in edges
+    assert ("upstream_answer", "__end__") in edges
 
 
 def test_coordinator_prompts_are_generic_not_domain_contracts():
     from agents.coordinator import (
-        _AGGREGATE_PROMPT,
-        _COORDINATE_PROMPT,
-        _DISPATCH_PROMPT,
-        _PLAN_PROMPT,
-        _coordination_result_tool_schema,
+        _DOWNSTREAM_DISPATCH_PROMPT,
+        _DOWNSTREAM_PLAN_PROMPT,
+        _UPSTREAM_ANSWER_PROMPT,
+        _UPSTREAM_EVIDENCE_PROMPT,
         _dispatch_tool_schema,
         _plan_tool_schema,
+        _upstream_answer_tool_schema,
+        _upstream_evidence_tool_schema,
     )
 
     combined = "\n".join(
         (
-            _PLAN_PROMPT,
-            _DISPATCH_PROMPT,
-            _COORDINATE_PROMPT,
-            _AGGREGATE_PROMPT,
+            _DOWNSTREAM_PLAN_PROMPT,
+            _DOWNSTREAM_DISPATCH_PROMPT,
+            _UPSTREAM_EVIDENCE_PROMPT,
+            _UPSTREAM_ANSWER_PROMPT,
         )
     )
     for domain_detail in (
@@ -107,78 +123,76 @@ def test_coordinator_prompts_are_generic_not_domain_contracts():
     ):
         assert domain_detail not in combined
 
-    assert len(_PLAN_PROMPT) < 2500
-    assert "один самостоятельно проверяемый" in _PLAN_PROMPT
-    assert "атрибутов одного найденного объекта или записи" in _PLAN_PROMPT
-    assert "прямое объяснение" in _PLAN_PROMPT
-    assert "аргументы которой нельзя определить" in _PLAN_PROMPT
-    assert "не объединяй независимо проверяемые операции" in _PLAN_PROMPT
-    assert "не влияет на\nдекомпозицию" in _PLAN_PROMPT
-    assert "не достраивай предметную" in _PLAN_PROMPT
-    normalized_plan = " ".join(_PLAN_PROMPT.split()).lower()
+    assert len(_DOWNSTREAM_PLAN_PROMPT) < 2600
+    assert "пользовательскую проверку или один самостоятельно" in _DOWNSTREAM_PLAN_PROMPT
+    assert "атрибутов одного найденного объекта или записи" in _DOWNSTREAM_PLAN_PROMPT
+    assert "прямое объяснение" in _DOWNSTREAM_PLAN_PROMPT
+    assert "одна проверка, сравнение или объяснение" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Не разделяй получение опорных фактов" in _DOWNSTREAM_PLAN_PROMPT
+    assert "следующий вызов данных сформировать невозможно" in _DOWNSTREAM_PLAN_PROMPT
+    assert "по умолчанию верни ровно один step" in _DOWNSTREAM_PLAN_PROMPT
+    assert "только при истинной зависимости" in _DOWNSTREAM_PLAN_PROMPT
+    assert "сами по себе не являются зависимостью" in _DOWNSTREAM_PLAN_PROMPT
+    assert "не влияет на\nдекомпозицию" in _DOWNSTREAM_PLAN_PROMPT
+    assert "не достраивай предметную" in _DOWNSTREAM_PLAN_PROMPT
+    assert "сверху вниз" in _DOWNSTREAM_PLAN_PROMPT
+    normalized_plan = " ".join(_DOWNSTREAM_PLAN_PROMPT.split()).lower()
     assert "используй `context` только" in normalized_plan
-    assert "не создавай отдельные steps для оформления" in normalized_plan
-    assert "ровно свою одну операцию" in _DISPATCH_PROMPT
+    assert "оформления, пересказа или повторного показа" in normalized_plan
+    assert "единственная операция текущего worker" in _DOWNSTREAM_DISPATCH_PROMPT
     assert "технический режим передачи результата" in str(
         _plan_tool_schema()
     ).lower()
     assert "самостоятельно проверяемый результат" in str(_plan_tool_schema())
-    assert "не придумывай отсутствующие во входе" in _DISPATCH_PROMPT.lower()
-    assert "original_task" in _DISPATCH_PROMPT
-    assert "Отдельный показ, экспорт" in _DISPATCH_PROMPT
-    assert "не отвлекай worker" in _DISPATCH_PROMPT
-    assert "только число" in " ".join(_DISPATCH_PROMPT.split())
-    assert "только если предыдущий ответ" in _DISPATCH_PROMPT
-    assert "неоднозначному значению нужный смысл" in _DISPATCH_PROMPT
-    assert "копируй посимвольно" in _DISPATCH_PROMPT
-    assert "не создавай их варианты" in _DISPATCH_PROMPT
-    normalized_dispatch = " ".join(_DISPATCH_PROMPT.split()).lower()
-    assert "не опускай явно названный исходный набор данных" in normalized_dispatch
-    assert "значение роли остаётся условием" in _DISPATCH_PROMPT
-    assert "Worker не должен восстанавливать источник" in _DISPATCH_PROMPT
-    assert "обязательно замени" in _DISPATCH_PROMPT
-    assert "worker должен получить «таблица X»" in " ".join(_DISPATCH_PROMPT.split())
-    assert "не проси текущий worker повторно" in " ".join(_DISPATCH_PROMPT.split()).lower()
-    assert "только новые факты текущей операции" in _DISPATCH_PROMPT
-    assert "cycle_history" in _DISPATCH_PROMPT
-    assert "Для `answer_only` не выбирай result keys" in _COORDINATE_PROMPT
-    assert "Главный приоритет — правильный текстовый ответ" in _COORDINATE_PROMPT
-    assert "Считай шаг выполненным только если" in _COORDINATE_PROMPT
-    assert "при сомнении" in _COORDINATE_PROMPT
-    assert "Не повторяй в answer отрицательные ограничения" in _COORDINATE_PROMPT
-    assert "молча соблюдай такие запреты" in _COORDINATE_PROMPT
-    assert "При требовании «только» верни ровно" in _COORDINATE_PROMPT
-    assert "без\nвступления, заключения" in _COORDINATE_PROMPT
-    assert "`answer`: всегда строка" in _COORDINATE_PROMPT
-    assert "сериализуй" in _COORDINATE_PROMPT
-    assert "cycle_history" in _COORDINATE_PROMPT
-    assert "`original_task` также является допустимым источником" in (
-        _COORDINATE_PROMPT
-    )
-    assert "не является добавлением нового факта" in _COORDINATE_PROMPT
-    assert "явно связывает каждое возвращаемое значение" in _COORDINATE_PROMPT
-    assert "без такого названия не считается самодостаточным" in (
-        _COORDINATE_PROMPT
-    )
-    assert "только самодостаточный" in _AGGREGATE_PROMPT
-    assert "coordinator_result" in _AGGREGATE_PROMPT
-    assert "worker_results" not in _AGGREGATE_PROMPT
+    assert "original_task" in _DOWNSTREAM_DISPATCH_PROMPT
+    assert "показ или экспорт" in _DOWNSTREAM_DISPATCH_PROMPT
+    assert "неоднозначному значению роль не назначай" in _DOWNSTREAM_DISPATCH_PROMPT
+    assert "копируй\n  посимвольно" in _DOWNSTREAM_DISPATCH_PROMPT
+    assert "downstream dispatcher" in _DOWNSTREAM_DISPATCH_PROMPT
+    normalized_dispatch = " ".join(_DOWNSTREAM_DISPATCH_PROMPT.split()).lower()
+    assert "не заменяй её операцией прошлого или соседнего step" in normalized_dispatch
+    assert "не проси повторно получать или проверять" in normalized_dispatch
+    assert "цели предыдущего и следующего steps отсутствуют" in normalized_dispatch
+    assert "cycle_history" in _DOWNSTREAM_DISPATCH_PROMPT
+    assert "не формулируй пользовательский ответ" in _UPSTREAM_EVIDENCE_PROMPT
+    assert "cycle_history" in _UPSTREAM_EVIDENCE_PROMPT
+    assert "goal_satisfied=true" in _UPSTREAM_EVIDENCE_PROMPT
+    assert "Не смешивай evidence разных объектов" in _UPSTREAM_EVIDENCE_PROMPT
+    assert "unresolved_requirements" in _UPSTREAM_EVIDENCE_PROMPT
+    assert "не занимайся его оформлением" in _UPSTREAM_EVIDENCE_PROMPT
+    assert "снизу вверх" in _UPSTREAM_EVIDENCE_PROMPT
+    assert "сформируй окончательный ответ" in _UPSTREAM_ANSWER_PROMPT
+    assert "только\nпо `original_task`" in _UPSTREAM_ANSWER_PROMPT
+    assert "не переоценивай доказательства" in _UPSTREAM_ANSWER_PROMPT
+    assert "Если пользователь потребовал «только»" in _UPSTREAM_ANSWER_PROMPT
+    assert "имя=<значение>" in _UPSTREAM_ANSWER_PROMPT
+    assert "знак `=` дословно" in _UPSTREAM_ANSWER_PROMPT
+    assert "worker_results" not in _UPSTREAM_ANSWER_PROMPT
+    assert len(_UPSTREAM_EVIDENCE_PROMPT) < 2400
+    assert len(_UPSTREAM_ANSWER_PROMPT) < 1800
 
-    coordinate_schema = _coordination_result_tool_schema()["function"][
+    upstream_schema = _upstream_evidence_tool_schema()["function"][
         "parameters"
     ]
-    answer_schema = coordinate_schema["properties"]["answer"]
-    assert "идентификаторы и входные условия из original_task" in (
-        answer_schema["description"]
-    )
+    assert upstream_schema["required"] == [
+        "confirmed_facts",
+        "unresolved_requirements",
+    ]
+    upstream_answer_schema = _upstream_answer_tool_schema()["function"][
+        "parameters"
+    ]
+    assert upstream_answer_schema["required"] == ["answer"]
 
     plan_schema = _plan_tool_schema()["function"]["parameters"]
     goal_schema = plan_schema["properties"]["steps"]["items"]["properties"][
         "goal"
     ]
     assert "самостоятельно проверяемый результат" in goal_schema["description"]
-    assert "атрибутов одной найденной записи" in goal_schema["description"]
-    assert "новой операции с данными" in goal_schema["description"]
+    assert "Несколько чтений остаются одним шагом" in goal_schema["description"]
+    assert "аргумента из предыдущего результата" in goal_schema["description"]
+    assert "По умолчанию один шаг" in plan_schema["properties"]["steps"][
+        "description"
+    ]
     dispatch_schema = _dispatch_tool_schema()["function"]["parameters"]
     task_schema = dispatch_schema["properties"]["task"]
     assert "ровно с одной операцией" in task_schema["description"]
@@ -216,21 +230,21 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
                     "dispatch-2",
                 ),
             ],
-            "submit_coordination_result": [
+            "submit_upstream_evidence": [
                 _tool_message(
-                    "submit_coordination_result",
+                    "submit_upstream_evidence",
                     {
-                        "answer": "Имя t_example проверено.",
-                        "display_result_keys": ["step-2:result-1"],
+                        "confirmed_facts": ["Имя t_example проверено."],
+                        "unresolved_requirements": [],
                     },
-                    "coordinate-1",
+                    "upstream-1",
                 )
             ],
-            "finish_coordination": [
+            "finish_upstream_answer": [
                 _tool_message(
-                    "finish_coordination",
+                    "finish_upstream_answer",
                     {"answer": "Имя t_example проверено."},
-                    "finish-1",
+                    "downstream-1",
                 )
             ],
         }
@@ -328,18 +342,19 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
     assert first_history[0]["observation"]["important_facts"] == [
         "Имя: t_example."
     ]
-    coordinate = _payload(model, "submit_coordination_result")
-    assert coordinate["worker_results"][0]["status"] == "completed"
-    assert coordinate["worker_results"][0]["cycle_history"] == first_history
-    assert coordinate["worker_results"][1]["available_results"] == [
-        {"result_key": "step-2:result-1", "tool_name": "inspect"}
-    ]
-    aggregate = _payload(model, "finish_coordination")
-    assert aggregate == {
-        "coordinator_result": {
-            "answer": "Имя t_example проверено.",
-            "display_result_keys": ["step-2:result-1"],
-        }
+    upstream = _payload(model, "submit_upstream_evidence")
+    assert upstream["worker_results"][0]["status"] == "completed"
+    assert upstream["worker_results"][0]["cycle_history"] == first_history
+    assert "available_results" not in upstream["worker_results"][1]
+    assert "saved_results" not in upstream["worker_results"][1]
+    upstream_answer = _payload(model, "finish_upstream_answer")
+    assert upstream_answer == {
+        "original_task": "Найди имя и проверь его.",
+        "context": "Общий фон",
+        "upstream_evidence": {
+            "confirmed_facts": ["Имя t_example проверено."],
+            "unresolved_requirements": [],
+        },
     }
     assert "Coordinator planned worker_steps=2 plan=" in caplog.text
     assert '"step": 1' in caplog.text
@@ -348,12 +363,11 @@ def test_coordinator_llms_plan_dispatch_dependencies_and_select_results(caplog):
     assert '"step": 2' in caplog.text
     assert '"goal": "Проверить найденное имя"' in caplog.text
     assert '"presentation": "full_results"' in caplog.text
-    assert "Coordinator result before aggregate:" in caplog.text
-    assert "Coordinator aggregate result:" in caplog.text
-    assert caplog.text.count("Имя t_example проверено.") >= 2
+    assert "Upstream coordinator evidence:" in caplog.text
+    assert "Upstream coordinator answer:" in caplog.text
 
 
-def test_coordinator_rejects_unknown_result_key_and_cleans_refs():
+def test_coordinator_selects_full_results_without_llm_display_keys():
     from agents.coordinator import coordinator_chat
 
     model = _CoordinatorModel(
@@ -368,15 +382,25 @@ def test_coordinator_rejects_unknown_result_key_and_cleans_refs():
             "dispatch_worker": [
                 _tool_message(
                     "dispatch_worker",
-                    {"task": "Получи факт."},
+                    {"task": "Получи факт без точного фильтра."},
                     "dispatch-1",
                 )
             ],
-            "submit_coordination_result": [
+            "submit_upstream_evidence": [
                 _tool_message(
-                    "submit_coordination_result",
-                    {"answer": "Факт получен.", "display_result_keys": ["unknown"]},
-                    "coordinate-1",
+                    "submit_upstream_evidence",
+                    {
+                        "confirmed_facts": ["Факт получен."],
+                        "unresolved_requirements": [],
+                    },
+                    "upstream-1",
+                )
+            ],
+            "finish_upstream_answer": [
+                _tool_message(
+                    "finish_upstream_answer",
+                    {"answer": "Факт получен."},
+                    "downstream-1",
                 )
             ],
         }
@@ -392,16 +416,20 @@ def test_coordinator_rejects_unknown_result_key_and_cleans_refs():
                 answer="Факт получен.",
                 result_refs=[WorkerResultRef(ref="ref-result", name="lookup")],
             ),
-        ),
+        ) as worker,
         patch("agents.coordinator.discard_worker_result_refs") as discard,
     ):
-        with pytest.raises(CoordinatorResponseError):
-            coordinator_chat("Получи факт.")
+        result = coordinator_chat("Получи факт.")
 
-    discard.assert_called_once_with(["ref-result"])
+    assert result == CoordinatorAnswer(
+        answer="Факт получен.",
+        display_refs=["ref-result"],
+    )
+    worker.assert_called_once_with("Получи факт.")
+    discard.assert_not_called()
 
 
-def test_coordinator_aggregates_unsatisfied_worker_without_internal_error():
+def test_upstream_answer_reports_unresolved_evidence_without_internal_error():
     from agents.coordinator import coordinator_chat
 
     model = _CoordinatorModel(
@@ -420,29 +448,29 @@ def test_coordinator_aggregates_unsatisfied_worker_without_internal_error():
                     "dispatch-1",
                 )
             ],
-            "submit_coordination_result": [
+            "submit_upstream_evidence": [
                 _tool_message(
-                    "submit_coordination_result",
+                    "submit_upstream_evidence",
                     {
-                        "answer": (
+                        "confirmed_facts": [],
+                        "unresolved_requirements": [
                             "Не удалось подтвердить факт: tool вернул данные "
                             "не по той сущности."
-                        ),
-                        "display_result_keys": [],
+                        ],
                     },
-                    "coordinate-1",
+                    "upstream-1",
                 )
             ],
-            "finish_coordination": [
+            "finish_upstream_answer": [
                 _tool_message(
-                    "finish_coordination",
+                    "finish_upstream_answer",
                     {
                         "answer": (
                             "Не удалось подтвердить факт: tool вернул данные "
                             "не по той сущности."
                         )
                     },
-                    "finish-1",
+                    "downstream-1",
                 )
             ],
         }
@@ -472,8 +500,8 @@ def test_coordinator_aggregates_unsatisfied_worker_without_internal_error():
         ),
         display_refs=[],
     )
-    coordinate = _payload(model, "submit_coordination_result")
-    assert coordinate["worker_results"] == [
+    upstream = _payload(model, "submit_upstream_evidence")
+    assert upstream["worker_results"] == [
         {
             "step": 1,
             "status": "failed",
@@ -483,14 +511,12 @@ def test_coordinator_aggregates_unsatisfied_worker_without_internal_error():
             "cycle_history": [],
             "goal_satisfied": False,
             "mismatches": ["Tool вернул данные не по той сущности."],
-            "available_results": [],
-            "saved_results": [],
         }
     ]
     discard.assert_called_once_with(["ref-failed"])
 
 
-def test_coordinator_normalizes_structured_aggregate_answer_without_repair():
+def test_upstream_answer_normalizes_structured_output_without_repair():
     from agents.coordinator import coordinator_chat
 
     model = _CoordinatorModel(
@@ -509,21 +535,21 @@ def test_coordinator_normalizes_structured_aggregate_answer_without_repair():
                     "dispatch-1",
                 )
             ],
-            "submit_coordination_result": [
+            "submit_upstream_evidence": [
                 _tool_message(
-                    "submit_coordination_result",
+                    "submit_upstream_evidence",
                     {
-                        "answer": [{"value": 42}],
-                        "display_result_keys": [],
+                        "confirmed_facts": ["Значение равно 42."],
+                        "unresolved_requirements": [],
                     },
-                    "coordinate-structured",
+                    "upstream-structured",
                 ),
             ],
-            "finish_coordination": [
+            "finish_upstream_answer": [
                 _tool_message(
-                    "finish_coordination",
+                    "finish_upstream_answer",
                     {"answer": '[{"value":42}]'},
-                    "finish-structured",
+                    "downstream-structured",
                 )
             ],
         }
@@ -541,12 +567,12 @@ def test_coordinator_normalizes_structured_aggregate_answer_without_repair():
         result = coordinator_chat("Верни JSON-массив со значением 42.")
 
     assert result == CoordinatorAnswer(answer='[{"value":42}]', display_refs=[])
-    finish_messages = [
+    upstream_answer_messages = [
         messages
         for name, messages in model.messages
-        if name == "finish_coordination"
+        if name == "finish_upstream_answer"
     ]
-    assert len(finish_messages) == 1
+    assert len(upstream_answer_messages) == 1
 
 
 def test_coordinator_empty_task_does_not_call_llm():
@@ -593,18 +619,21 @@ def test_coordinator_repairs_plan_that_exceeds_worker_limit():
                     "dispatch-1",
                 )
             ],
-            "submit_coordination_result": [
+            "submit_upstream_evidence": [
                 _tool_message(
-                    "submit_coordination_result",
-                    {"answer": "Все проверки выполнены.", "display_result_keys": []},
-                    "coordinate-1",
+                    "submit_upstream_evidence",
+                    {
+                        "confirmed_facts": ["Все проверки выполнены."],
+                        "unresolved_requirements": [],
+                    },
+                    "upstream-1",
                 )
             ],
-            "finish_coordination": [
+            "finish_upstream_answer": [
                 _tool_message(
-                    "finish_coordination",
+                    "finish_upstream_answer",
                     {"answer": "Все проверки выполнены."},
-                    "finish-1",
+                    "downstream-1",
                 )
             ],
         }
@@ -658,18 +687,21 @@ def test_coordinator_repairs_missing_dispatch_native_call():
                     "dispatch-repaired",
                 ),
             ],
-            "submit_coordination_result": [
+            "submit_upstream_evidence": [
                 _tool_message(
-                    "submit_coordination_result",
-                    {"answer": "Факт получен.", "display_result_keys": []},
-                    "coordinate-1",
+                    "submit_upstream_evidence",
+                    {
+                        "confirmed_facts": ["Факт получен."],
+                        "unresolved_requirements": [],
+                    },
+                    "upstream-1",
                 )
             ],
-            "finish_coordination": [
+            "finish_upstream_answer": [
                 _tool_message(
-                    "finish_coordination",
+                    "finish_upstream_answer",
                     {"answer": "Факт получен."},
-                    "finish-1",
+                    "downstream-1",
                 )
             ],
         }
