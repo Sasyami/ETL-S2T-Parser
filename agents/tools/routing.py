@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -20,6 +19,8 @@ SkillName = Literal[
     "S2T-строки",
     "Neo4j",
     "Excel и описания",
+    "Сравнение",
+    "Объяснение",
 ]
 
 SKILL_CATALOG: Dict[str, str] = {
@@ -28,236 +29,185 @@ SKILL_CATALOG: Dict[str, str] = {
     "Excel и описания": (
         "Файлы, листы, заголовки, ячейки и семантические описания."
     ),
+    "Сравнение": (
+        "Сопоставление нескольких независимых объектов по одинаковому набору "
+        "фактов без выдуманной связи или направления между ними."
+    ),
+    "Объяснение": (
+        "Объяснение правил, выражений и метаданных по подтверждённым фактам "
+        "с явным указанием недостающих данных."
+    ),
 }
 
 
 _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     "show_plan": {
-        "use_when": "Нужно явно показать уже выполненные и следующие шаги сложной задачи.",
-        "not_for": "Одношаговый вопрос, чтение данных или финальный ответ.",
-        "fallback_only": False,
+        "use_when": "Нужно явно показать выполненные и следующие шаги многошаговой задачи.",
+        "not_for": "Чтение данных, одношаговый вопрос или финальный ответ.",
     },
     "search_excel_values": {
-        "use_when": (
-            "Буквальная подстрока в сохранённых значениях исходных "
-            "Excel-ячеек таблицы data."
-        ),
-        "not_for": (
-            "S2T, SQL, каталоги, логические ETL-таблицы и внешние БД; не "
-            "выполняет запросы."
-        ),
-        "fallback_only": False,
+        "use_when": "Буквальная подстрока в сохранённых Excel-ячейках таблицы data.",
+        "not_for": "S2T, SQL, каталоги, логические ETL-таблицы или выполнение запросов.",
     },
     "get_excel_row": {
         "use_when": "Известны точные file_id, sheet_name и row_num сохранённой Excel-строки.",
         "not_for": "Поиск строки, S2T или логическая ETL-таблица.",
-        "fallback_only": False,
     },
     "list_column_catalog": {
         "use_when": (
-            "Точный структурный срез каталога колонок: "
-            "file/table/column/type/PK/not-null/source. Разные source/target "
-            "пары вызывай отдельно; последующая агрегация не заменяет tool. "
-            "Явный каталог обязательно покрывай. scope обязателен: "
-            "source_columns/target_columns — роль; all_tables — обе/неизвестная."
+            "Точный структурный срез source/target-каталога колонок по "
+            "file/table/column/type/PK/not-null; scope обязателен, разные роли "
+            "и пары запрашиваются отдельно."
         ),
-        "not_for": "Фрагмент имени, смысл описания, S2T-маппинг или lineage.",
-        "fallback_only": False,
+        "not_for": "Подстрока, смысл описания, S2T-маппинг или lineage.",
     },
     "search_column_catalog": {
         "use_when": (
-            "Нужен поиск подстроки в имени, типе или описании с точными фильтрами. "
-            "scope обязателен; all_tables — только обе стороны или неизвестная роль."
+            "Подстрока в имени, типе или описании колонок внутри scope и "
+            "точных структурных фильтров."
         ),
-        "not_for": "Смысловая близость или уже известные точные table/column.",
-        "fallback_only": False,
+        "not_for": "Смысловая близость или точные table/column.",
     },
     "semantic_search_descriptions": {
         "use_when": (
-            "Смысловой поиск по неизвестному точному имени. scope: files — "
-            "только файлы; tables — все логические таблицы; source_tables — "
-            "только исходные таблицы; target_tables — только целевые таблицы; "
-            "columns — все колонки; source_columns — только исходные колонки; "
-            "target_columns — только целевые колонки; all — только если домен "
-            "неизвестен. Для колонковых scope допустимы точные фильтры "
-            "подвыборки до cosine-ранжирования."
+            "Смысловой поиск объекта с неизвестным точным именем по descriptions; "
+            "scope ограничивает files/tables/columns и source/target, для колонок "
+            "доступны структурные фильтры подвыборки."
         ),
-        "not_for": (
-            "Точное имя объекта, поиск значений ячеек, S2T-маппинги или lineage."
-        ),
-        "fallback_only": False,
+        "not_for": "Точное имя, значения Excel-ячеек, S2T-маппинг или lineage.",
     },
     "list_s2t_transformations": {
         "use_when": (
-            "Известны точные роли source/target table или field в сохранённом "
-            "S2T либо нужны точные columns его строк. Точный маппинг задавай "
-            "отдельными source_table, source_field, target_table, target_field. "
-            "q принимает только одну буквальную подстроку; file_id не применяется."
+            "Точные source/target table или field и точные columns сохранённых "
+            "S2T-строк; роли задаются отдельными фильтрами, q принимает одну "
+            "буквальную подстроку, file_id не применяется."
         ),
         "not_for": (
-            "Неполное или неквалифицированное имя; поиск значения с "
-            "неизвестной ролью; агрегации."
+            "Неполное имя, неизвестная роль значения, агрегация или графовый путь."
         ),
-        "fallback_only": False,
     },
     "search_s2t_transformations": {
         "use_when": (
-            "Нужен поиск одной подстроки по S2T: роль значения неизвестна "
-            "либо таблица названа неполным или неквалифицированным именем, "
-            "даже если её роль source/target известна."
+            "Одна подстрока по всем S2T-полям, когда роль значения неизвестна "
+            "или имя таблицы неполное/неквалифицированное."
         ),
         "not_for": (
-            "Точные source/target table или field с известными ролями; "
-            "составная строка из нескольких точных условий; точные "
-            "возвращаемые columns; агрегации."
+            "Точные ролевые table/field, несколько условий, точные columns или агрегация."
         ),
-        "fallback_only": False,
     },
     "trace_transformation_path": {
         "use_when": (
-            "Нужен многошаговый сохранённый S2T-путь от точного полного имени: "
-            "правила, SQL, JOIN/FILTER и промежуточные таблицы. Tool сам "
-            "возвращает полный путь и подтверждение Neo4j; не добавляй отдельные "
-            "list/Neo4j tools для повторного получения тех же фактов. Если имя "
-            "дано фрагментом или без квалификатора, выбирай одновременно "
-            "search_s2t_transformations для разрешения точного имени."
+            "Многошаговый сохранённый S2T-путь от точного имени с rules, SQL, JOIN/FILTER и "
+            "промежуточными таблицами; для неполного имени добавь "
+            "search_s2t_transformations."
         ),
         "not_for": (
-            "Сравнение физических записей; неизвестное точное имя без "
-            "search_s2t_transformations; одна прямая S2T-строка."
+            "Одна S2T-строка, переданный SQL или сравнение физических данных."
         ),
-        "fallback_only": False,
     },
     "visualize_s2t_table_graph": {
-        "use_when": "Пользователь просит глобальный интерактивный граф всех S2T-таблиц.",
-        "not_for": "Конкретный SQL, один путь, таблица или колонка; file_id не применяется.",
-        "fallback_only": False,
+        "use_when": "Явно запрошен глобальный интерактивный граф всех S2T-таблиц.",
+        "not_for": "Конкретный SQL, путь, таблица или колонка.",
     },
     "run_sql": {
         "use_when": (
-            "Read-only срез, выражение или агрегация по публичным таблицам SQLite. "
-            "Сохранённый SQL можно получить как значение, но нельзя выполнять."
+            "Произвольный read-only срез, выражение или агрегация по публичным "
+            "таблицам SQLite, не покрытые точным специализированным tool."
         ),
         "not_for": (
-            "Точные S2T-строки; логические ETL-таблицы как физические; "
-            "выполнение transformation_rule; запрос к $$-именам; точный "
-            "каталог колонок."
+            "Точные S2T/каталожные строки, логические ETL-таблицы, выполнение "
+            "transformation_rule или запрос к $$-именам."
         ),
-        "fallback_only": True,
     },
     "query_saved_result": {
         "use_when": (
-            "Task содержит точный result_ref предыдущего worker и требует "
-            "новый read-only SQL-срез, фильтр, сортировку или агрегацию именно "
-            "по сохранённым строкам этого результата."
+            "Есть точный result_ref предыдущего worker и нужен read-only SQL-срез "
+            "сохранённых строк этого результата."
         ),
         "not_for": (
-            "Нет result_ref; нужно заново читать основную SQLite-базу; "
-            "сохранённый результат помечен truncated=true, а вывод требуется "
-            "по полному исходному набору."
+            "Нет result_ref, нужна основная SQLite-база или результат truncated."
         ),
-        "fallback_only": False,
     },
     "parse_sql_column_lineage": {
         "use_when": (
-            "Полный SQL уже явно передан в task, истории или подтверждённом "
-            "результате tool, и нужно происхождение выходных SELECT-колонок: "
-            "их expression и source_columns."
+            "Полный SQL уже явно передан и нужны expression и source_columns "
+            "выходных SELECT-колонок."
         ),
         "not_for": (
-            "Поиск или объяснение JOIN/ON, WHERE, GROUP BY, HAVING, ORDER BY, "
-            "ролей алиасов и других произвольных частей SQL; table.column без "
-            "SQL; чтение сохранённого SQL; интерактивная визуализация."
+            "SQL отсутствует, его нужно прочитать из хранилища, анализируются "
+            "JOIN/WHERE/GROUP BY или нужна визуализация."
         ),
-        "fallback_only": False,
     },
     "parse_sql_table_lineage": {
         "use_when": (
-            "Полный SQL уже явно передан в task, истории или подтверждённом "
-            "результате tool и нужны только исходные и целевая таблицы."
+            "Полный SQL уже явно передан и нужны только исходные и целевая таблицы."
         ),
         "not_for": (
-            "Получение сохранённого SQL, поиск additional objects, проверка "
-            "WHERE/JOIN/GROUP BY/DISTINCT или имя таблицы без SQL-текста."
+            "SQL отсутствует, нужен колонковый lineage или анализ условий SQL."
         ),
-        "fallback_only": False,
     },
     "visualize_sql_lineage": {
         "use_when": (
-            "Полный SQL-текст уже явно дан в task, истории или результате "
-            "другого выбранного tool, и пользователь просит его интерактивный "
-            "lineage-граф."
+            "Полный SQL уже явно дан и пользователь просит интерактивный lineage-граф."
         ),
         "not_for": (
-            "Имя таблицы или колонки без SQL; сохранённый S2T-путь или "
-            "transformation; получение SQL из хранилища."
+            "Имя без SQL, получение SQL из хранилища или сохранённый S2T-путь."
         ),
-        "fallback_only": False,
     },
     "run_cypher": {
-        "use_when": "Нестандартный read-only графовый обход, условия или агрегация в Neo4j.",
-        "not_for": "Готовый lineage/path tool, S2T-строки, SQL-текст или SQLite.",
-        "fallback_only": True,
+        "use_when": "Произвольный read-only Neo4j-обход или агрегация без готового graph tool.",
+        "not_for": "Готовый lineage/path, S2T, SQL-текст или SQLite.",
     },
     "trace_neo4j_lineage": {
-        "use_when": "Upstream/downstream точной именованной ETL-колонки на нужную глубину.",
-        "not_for": "Таблица без колонки, SQL-текст, правила или объяснимый S2T-путь.",
-        "fallback_only": False,
+        "use_when": "Upstream/downstream точной ETL-колонки на заданную глубину.",
+        "not_for": "Таблица без колонки, SQL, rules или объяснимый S2T-путь.",
     },
     "trace_neo4j_table_lineage": {
         "use_when": "Непосредственные upstream/downstream соседи точной ETL-таблицы.",
-        "not_for": "Длинный путь, колонка, SQL-текст или правила трансформации.",
-        "fallback_only": False,
+        "not_for": "Путь между таблицами, колонка, SQL или rules.",
     },
     "trace_neo4j_table_path": {
-        "use_when": "Направленный путь между двумя точными известными ETL-таблицами.",
-        "not_for": "Одна таблица, колонка, SQL-текст или неизвестные имена.",
-        "fallback_only": False,
+        "use_when": "Направленный Neo4j-путь между двумя точными ETL-таблицами.",
+        "not_for": (
+            "Сравнение независимых объектов, одна таблица, колонка, SQL, rules "
+            "или неизвестное имя."
+        ),
     },
     "list_files": {
-        "use_when": "Нужен каталог всех загруженных Excel-файлов и их file_id.",
+        "use_when": "Нужен список всех загруженных Excel-файлов и их file_id.",
         "not_for": "Один точный файл, ETL-таблицы, листы, строки или S2T.",
-        "fallback_only": False,
     },
     "resolve_file": {
-        "use_when": "Дано точное имя загруженного файла, но нужен его file_id.",
-        "not_for": "Частичное имя, уже известный file_id или глобальный S2T.",
-        "fallback_only": False,
+        "use_when": "Дано полное имя загруженного файла, но нужен его file_id.",
+        "not_for": "Частичное имя, известный file_id или глобальный S2T.",
     },
     "get_file_description": {
-        "use_when": "Нужно сохранённое описание одного файла с известным file_id.",
-        "not_for": "Описание ETL-таблицы, semantic search или изменение описания.",
-        "fallback_only": False,
+        "use_when": "Нужно сохранённое описание файла с известным file_id.",
+        "not_for": "Описание ETL-таблицы, semantic search или изменение данных.",
     },
     "list_s2t_table_names": {
-        "use_when": "Глобальные множества source/target имён и union/intersection/difference.",
+        "use_when": "Глобальные множества source/target-таблиц и операции над ними.",
         "not_for": "Связи конкретной пары, counts, правила, путь или текстовый поиск.",
-        "fallback_only": False,
     },
     "summarize_s2t_tables": {
-        "use_when": "Групповые counts маппингов, полей, соседей и правил по source/target.",
-        "not_for": "Множества имён, точные строки, описания или многошаговый путь.",
-        "fallback_only": False,
+        "use_when": "Групповые counts маппингов, полей, соседей и rules по source/target.",
+        "not_for": "Множества имён, точные строки, описания или путь.",
     },
     "summarize_table_descriptions": {
-        "use_when": "Нужно описание одной логической таблицы с точным table_name.",
-        "not_for": "Неизвестное имя, смысловой поиск, S2T-маппинг или файл.",
-        "fallback_only": False,
+        "use_when": "Нужно каталожное описание логической таблицы с точным table_name.",
+        "not_for": "Неизвестное имя, semantic search, S2T-маппинг или файл.",
     },
     "list_sheets": {
-        "use_when": "Нужны имена и точное число Excel-листов известного file_id.",
+        "use_when": "Нужны имена и количество Excel-листов известного file_id.",
         "not_for": "Заголовки, колонки, строки, ETL-таблицы или S2T.",
-        "fallback_only": False,
     },
     "list_file_sheet_headers": {
-        "use_when": "Нужны сохранённые метаданные определения заголовков листов файла.",
+        "use_when": "Нужны сохранённые результаты определения заголовков листов файла.",
         "not_for": "Только имена листов, значения строк или повторное распознавание.",
-        "fallback_only": False,
     },
     "list_columns": {
-        "use_when": "Нужны распознанные физические колонки одного Excel-листа.",
-        "not_for": "Колонки логической ETL-таблицы, S2T или поиск значений.",
-        "fallback_only": False,
+        "use_when": "Нужны распознанные физические колонки конкретного Excel-листа.",
+        "not_for": "Колонки логической ETL-таблицы, S2T или значения ячеек.",
     },
 }
 
@@ -280,10 +230,8 @@ _TOOL_ROUTER_PROMPT = """
 Ты router read-only worker. По задаче, недавней истории и каталогам выбери
 необходимые tools, skills и schemas. Точные имена и назначение бери только из каталогов.
 
-Полностью покрой все операции с данными. Поля `use_when`, `not_for` и
-`fallback_only` являются контрактом выбора, а не справочным текстом. Tool с
-`fallback_only=true` выбирай только когда ни один готовый специализированный
-tool не покрывает операцию. Если результат одного tool нужен как
+Полностью покрой все операции с данными. Поля `use_when` и `not_for` являются
+контрактом выбора, а не справочным текстом. Если результат одного tool нужен как
 обязательный вход другого, выбери оба. Обязательный вход должен быть явно дан в
 задаче или истории либо получаться другим выбранным tool. Инструмент обработки
 переданного текста или объекта не заменяет инструмент, который сначала должен
@@ -352,8 +300,6 @@ def _named_catalog(catalog: Mapping[str, str]) -> List[Dict[str, str]]:
 def _validated_route(
     result: Any,
     available_tools: Sequence[BaseTool],
-    *,
-    user_query: str = "",
 ) -> ToolRoute:
     try:
         route = (
@@ -375,46 +321,6 @@ def _validated_route(
         raise ToolRoutingError(
             f"Tool-router выбрал неизвестные tools: {', '.join(unknown)}"
         )
-    normalized_query = str(user_query or "").casefold()
-    catalog_references = list(
-        re.finditer(r"\b(?:source_columns|target_columns)\b", normalized_query)
-    )
-    positive_catalog_reference = any(
-        not re.search(
-            r"(?:не\s+(?:читай|используй|запрашивай)|do\s+not\s+(?:read|use|query))\s*$",
-            normalized_query[max(0, match.start() - 50):match.start()],
-        )
-        for match in catalog_references
-    )
-    semantic_errors: List[str] = []
-    if (
-        positive_catalog_reference
-        and "list_column_catalog" in available_names
-        and "list_column_catalog" not in selected_tools
-    ):
-        semantic_errors.append(
-            "Task явно требует публичный source_columns/target_columns; "
-            "маршрут обязан включать list_column_catalog."
-        )
-    exact_s2t_role = re.search(
-        r"\b(?:source|target)_(?:table|field)\s*(?:=|:)\s*"
-        r"[A-Za-z0-9_$][A-Za-z0-9_.$]*",
-        str(user_query or ""),
-        flags=re.IGNORECASE,
-    )
-    if exact_s2t_role and "list_s2t_transformations" in available_names:
-        if "list_s2t_transformations" not in selected_tools:
-            semantic_errors.append(
-                "Task задаёт точный ролевой S2T-фильтр; маршрут обязан "
-                "включать list_s2t_transformations."
-            )
-        if "search_s2t_transformations" in selected_tools:
-            semantic_errors.append(
-                "Точный ролевой S2T-фильтр нельзя заменять подстрочным "
-                "search_s2t_transformations."
-            )
-    if semantic_errors:
-        raise ToolRoutingError(" ".join(semantic_errors))
     return ToolRoute(
         tools=selected_tools,
         skills=selected_skills,
@@ -488,7 +394,6 @@ def select_chat_route(
         return _validated_route(
             invoke_router(messages),
             available_tools,
-            user_query=clean_query,
         )
     except ToolRoutingError as first_error:
         logger.warning(
@@ -508,7 +413,6 @@ def select_chat_route(
             return _validated_route(
                 invoke_router(repair_messages),
                 available_tools,
-                user_query=clean_query,
             )
         except ToolRoutingError as repair_error:
             logger.warning(

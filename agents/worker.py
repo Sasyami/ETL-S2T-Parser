@@ -44,7 +44,7 @@ from .tools.routing import select_chat_route
 logger = logging.getLogger(__name__)
 
 WORKER_MAX_STEPS = 5
-WORKER_MAX_REROUTES = 2
+WORKER_MAX_REROUTES = 5
 WORKER_TOOL_MESSAGE_PREVIEW_CHARS = DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS
 _REROUTE_FEEDBACK_MAX_CHARS = 4000
 _DISPLAY_RESULTS: Dict[str, WorkerDisplayItem] = {}

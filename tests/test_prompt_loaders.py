@@ -65,6 +65,11 @@ def test_s2t_skill_includes_transformation_path_analysis_rules():
     assert "`UNION`/`UNION ALL` объединяет ветви" in text
     assert "входы одного выражения" in text
     assert "одну логическую трансформацию" in text
+    assert "source_table`, `source_field`, `target_table` и `target_field`" in text
+    assert "дополнительный фильтр является mismatch" in text
+    assert "Не зеркаль роли" in text
+    assert "фильтруемыми и возвращаемыми полями" in text
+    assert "повторно получать не требуется" in text
 
 
 def test_load_skills_can_select_one_section():
@@ -73,6 +78,9 @@ def test_load_skills_can_select_one_section():
     assert "## Neo4j" in text
     assert "trace_neo4j_lineage" in text
     assert "TABLE_TRANSFORMS_TO" in text
+    assert "оба конца и промежуточные узлы" in text
+    assert "транзитивный impact/downstream" in text
+    assert "ограничение глубины" in text
     assert "## S2T-строки" not in text
     assert "## Excel и описания" not in text
 
@@ -85,6 +93,27 @@ def test_load_skills_can_select_excel_section():
     assert "semantic_search_descriptions" in text
     assert "list_column_catalog" in text
     assert "## Neo4j" not in text
+
+
+def test_load_skills_can_select_comparison_and_explanation_independently():
+    comparison = load_skills(["Сравнение"])
+    explanation = load_skills(["Объяснение"])
+
+    assert "## Сравнение" in comparison
+    assert "один и тот же необходимый" in comparison
+    assert "не задаёт между ними source/target" in comparison
+    assert "Не ищи связь или путь" in comparison
+    assert "## Объяснение" not in comparison
+
+    assert "## Объяснение" in explanation
+    assert "отделяя найденный факт от его интерпретации" in explanation
+    assert "пробел или противоречие" in explanation
+    assert "## Сравнение" not in explanation
+
+    for text in (comparison, explanation):
+        assert "## S2T-строки" not in text
+        assert "## Neo4j" not in text
+        assert "## Excel и описания" not in text
 
 
 def test_load_schemas_selects_current_s2t_mappings_without_other_domains():

@@ -155,21 +155,6 @@ task. Проверяй точные сущности, роли, поля, зна
   это текущим mismatch. Одного неисправленного смыслового отличия достаточно для
   `goal_satisfied=false`.
 
-`source_table`, `source_field`, `target_table` и `target_field` — разные роли.
-Каждый ролевой фильтр tool call должен быть явно задан task или подтверждён
-prior_state. Любой дополнительный фильтр — придуманный: добавь mismatch и верни
-`goal_satisfied=false`, даже при 0 строк. Не зеркаль
-target-роль в source-роль и наоборот. Сопоставляй требуемую роль с фактически
-фильтруемыми и возвращаемыми полями. Факт из task повторно получать не требуется.
-
-Если task просит полный направленный путь, результат должен содержать оба конца
-и промежуточные узлы по порядку. Один полный путь достаточен, если пользователь
-не запросил все уникальные пути.
-
-Если task просит полный или транзитивный impact/downstream, один прямой переход
-до промежуточного узла недостаточен: обход должен достичь конечных узлов либо
-ответ обязан явно сохранить ограничение глубины.
-
 Результат внутреннего `analyze_known_facts` не является новым внешним фактом.
 Проверяй его `answer` только по фактам из task и выбранного системного контекста.
 
@@ -186,7 +171,7 @@ tool и который отсутствует в task и подтверждён�
 Установи `reroute_required=true` только когда оставшуюся задачу невозможно
 исправить новым вызовом ни одного `available_tools`. Если достаточно изменить
 аргументы текущего tool, reroute не нужен. При true кратко опиши недостающую
-возможность в `reroute_reason`, не выбирая конкретный tool.
+возможность в `reroute_reason`.
 
 {{PRIOR_STATE_RULE}}
 
@@ -217,12 +202,6 @@ Planner решил, что дополнительных инструментов
 Используй выжимку как навигацию по результатам, но точные значения и полный
 запрошенный вывод бери из реальных ToolMessage. Верни полноценный окончательный
 ответ, а не комментарий к выжимке.
-""".strip()
-
-_FIRST_TOOL_REPAIR_PROMPT = """
-Ты ещё не получил ни одного результата worker tool. Предыдущий обычный текст не
-выполняет task. Верни сейчас ровно один native call одного из доступных worker
-tools, сохрани смысл и точные значения task. Не пиши ответ или намерение словами.
 """.strip()
 
 _FINISH_ONLY_REPAIR_PROMPT = """
@@ -314,10 +293,7 @@ class Observation(BaseModel):
     )
     reroute_reason: Optional[str] = Field(
         default=None,
-        description=(
-            "Какая инструментальная возможность отсутствует в текущей палитре. "
-            "Не выбирай конкретный tool."
-        ),
+        description="Какая инструментальная возможность отсутствует в текущей палитре.",
     )
 
     @field_validator(
@@ -963,71 +939,6 @@ def build_agent_graph(
         if not isinstance(reply, AIMessage):
             reply = AIMessage(content=_message_content_text(reply))
 
-        if (
-            worker_finish
-            and bool(tool_list)
-            and state["tool_steps"] == 0
-            and not any(
-                call.get("name") in tool_names
-                for call in reply.tool_calls
-            )
-        ):
-            logger.warning(
-                "Worker planner omitted the required first data tool call; repairing"
-            )
-            repair_messages = [
-                *planner_messages,
-                HumanMessage(
-                    content=_FIRST_TOOL_REPAIR_PROMPT
-                ),
-            ]
-            repaired_reply = invoke_with_fallback(
-                selected_model,
-                repair_messages,
-                fallback_model=(
-                    first_data_model
-                    if selected_model is first_tool_model
-                    and first_tool_model is not first_data_model
-                    else None
-                ),
-            )
-            if not isinstance(repaired_reply, AIMessage):
-                repaired_reply = AIMessage(
-                    content=_message_content_text(repaired_reply)
-                )
-            if not any(
-                call.get("name") in tool_names
-                for call in repaired_reply.tool_calls
-            ):
-                reroute_reason = (
-                    "Planner дважды не сформировал обязательный первый "
-                    "data-tool вызов для текущей task."
-                )
-                reroute_observation = Observation(
-                    summary=reroute_reason,
-                    goal_satisfied=False,
-                    mismatches=[
-                        "До получения данных planner не вызвал ни один "
-                        "доступный data tool даже после repair-вызова."
-                    ],
-                    has_error=True,
-                    limitations=[
-                        "Текущий запуск worker завершён до выполнения data tool."
-                    ],
-                    reroute_required=True,
-                    reroute_reason=reroute_reason,
-                )
-                logger.warning(
-                    "Worker requests reroute after missing the first data "
-                    "tool twice: tools=%s",
-                    list(tool_names),
-                )
-                return {
-                    "planner_message": AIMessage(content=""),
-                    "observations": [reroute_observation],
-                }
-            reply = repaired_reply
-
         semantic_retry_required = (
             worker_finish
             and not finish_only
@@ -1071,40 +982,6 @@ def build_agent_graph(
                 repaired_reply = AIMessage(
                     content=_message_content_text(repaired_reply)
                 )
-            if (
-                not any(
-                    call.get("name") in tool_names
-                    for call in repaired_reply.tool_calls
-                )
-                or any(
-                    call.get("name") == _FINISH_WORKER_TOOL_NAME
-                    for call in repaired_reply.tool_calls
-                )
-            ):
-                reroute_reason = str(
-                    latest_observation.reroute_reason
-                    or (
-                        "Текущая палитра tools не позволила planner "
-                        "сформировать исправленный data-tool вызов после "
-                        "замечаний observer."
-                    )
-                ).strip()
-                reroute_observation = latest_observation.model_copy(
-                    update={
-                        "reroute_required": True,
-                        "reroute_reason": reroute_reason,
-                    }
-                )
-                logger.warning(
-                    "Worker requests reroute after failed semantic repair: "
-                    "tools=%s mismatches=%s",
-                    list(tool_names),
-                    latest_observation.mismatches,
-                )
-                return {
-                    "planner_message": AIMessage(content=""),
-                    "observations": [reroute_observation],
-                }
             reply = repaired_reply
 
         if finish_only and worker_finish and reply.tool_calls and not any(
@@ -1464,7 +1341,17 @@ def build_agent_graph(
     def route_after_observer(
         state: AgentGraphState,
     ) -> Literal["planner", "finish"]:
-        del state
+        latest_observation = (
+            (state.get("observations") or [])[-1]
+            if state.get("observations")
+            else None
+        )
+        if (
+            worker_finish
+            and latest_observation is not None
+            and latest_observation.reroute_required
+        ):
+            return "finish"
         if worker_finish and not tool_list:
             return "finish"
         return "planner"

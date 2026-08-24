@@ -143,8 +143,6 @@ class _ToolChoiceFallbackModel:
         del messages
         if tool_choice == "lookup":
             self.forced_lookup_calls += 1
-            if self.forced_lookup_calls == 1:
-                return AIMessage(content="Сначала выполню lookup.")
             raise RuntimeError("malformed forced tool call")
 
         self.regular_calls += 1
@@ -578,25 +576,13 @@ def test_worker_accepts_plain_planner_finish_without_responder_call():
     assert len(model.messages) == 2
 
 
-def test_worker_repairs_plain_text_before_first_data_tool_call():
+def test_worker_accepts_plain_text_before_first_data_tool_call_without_repair():
     def lookup():
         return {"value": "confirmed"}
 
     model = _WorkerModel(
         [
             AIMessage(content="Сначала я выполню поиск."),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "lookup",
-                        "args": {},
-                        "id": "call-lookup",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            _finish_message("Подтверждено."),
         ]
     )
 
@@ -608,10 +594,11 @@ def test_worker_repairs_plain_text_before_first_data_tool_call():
         max_steps=2,
     )
 
-    assert result.answer == "Подтверждено."
-    assert [item.name for item in result.display_items] == ["lookup"]
-    repair_prompt = " ".join(str(model.messages[1][-1].content).split())
-    assert "Предыдущий обычный текст не выполняет task" in repair_prompt
+    assert result.answer == "Сначала я выполню поиск."
+    assert result.display_items == []
+    assert result.goal_satisfied is False
+    assert result.reroute_required is False
+    assert len(model.messages) == 1
 
 
 def test_worker_falls_back_when_forced_first_tool_call_transport_fails():
@@ -630,7 +617,7 @@ def test_worker_falls_back_when_forced_first_tool_call_transport_fails():
 
     assert result.answer == "Подтверждено через fallback."
     assert [item.name for item in result.display_items] == ["lookup"]
-    assert model.forced_lookup_calls == 2
+    assert model.forced_lookup_calls == 1
     assert model.regular_calls == 2
 
 
@@ -1136,8 +1123,6 @@ def test_worker_graph_returns_reroute_after_current_palette_cannot_repair():
                     }
                 ],
             ),
-            _finish_message("Текущего результата достаточно."),
-            _finish_message("Не могу исправить вызов текущими tools."),
         ],
         observer_responses=[
             Observation(
@@ -1167,9 +1152,54 @@ def test_worker_graph_returns_reroute_after_current_palette_cannot_repair():
     )
     assert result.goal_satisfied is False
     assert result.display_items == []
+    assert len(model.messages) == 1
     observer_payload = str(model.observer.messages[0][-1].content)
     assert '"available_tools"' in observer_payload
     assert '"name": "list_names"' in observer_payload
+
+
+def test_failed_semantic_repair_does_not_invent_reroute():
+    def lookup():
+        return {"value": "wrong"}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-lookup",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Текущего результата достаточно."),
+            _finish_message("Исправить результат текущим tool не удалось."),
+        ],
+        observer_responses=[
+            Observation(
+                summary="Получен неподходящий результат.",
+                goal_satisfied=False,
+                mismatches=["Нужное значение не подтверждено."],
+            ),
+        ],
+    )
+
+    result = run_worker_graph(
+        task="Получи нужное значение.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+    )
+
+    assert result.answer == "Исправить результат текущим tool не удалось."
+    assert result.goal_satisfied is False
+    assert result.reroute_required is False
+    assert result.reroute_reason is None
+    assert result.mismatches == ["Нужное значение не подтверждено."]
 
 
 def test_worker_loop_does_not_rewrite_llm_tool_arguments_in_python():
@@ -1529,28 +1559,3 @@ def test_public_worker_can_execute_repeated_reroute_palette():
         "previous_tool_palettes": [["list_s2t_table_names"]],
         "attempt": 1,
     }
-
-
-def test_worker_reroutes_when_first_data_tool_is_omitted_twice():
-    def lookup():
-        return {"value": 1}
-
-    model = _WorkerModel(
-        [
-            AIMessage(content="Сначала поясню действие."),
-            AIMessage(content="Теперь вызову инструмент."),
-        ]
-    )
-
-    result = run_worker_graph(
-        task="Получи значение через lookup",
-        system_prompt="Системный контекст",
-        model=model,
-        tools=(_as_tool(lookup),),
-        max_steps=1,
-    )
-
-    assert result.goal_satisfied is False
-    assert result.reroute_required is True
-    assert "дважды не сформировал" in str(result.reroute_reason)
-    assert "не вызвал ни один" in result.mismatches[0]

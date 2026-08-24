@@ -328,6 +328,13 @@ def test_router_skill_catalog_matches_lazy_runtime_sections():
     for skill_name in SKILL_CATALOG:
         assert f"## {skill_name}" in load_skills((skill_name,))
 
+    comparison_route = ToolRoute(
+        tools=[],
+        skills=["Сравнение", "Объяснение"],
+        schemas=[],
+    )
+    assert comparison_route.skills == ["Сравнение", "Объяснение"]
+
 
 def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     history = [
@@ -370,7 +377,6 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
             "name",
             "use_when",
             "not_for",
-            "fallback_only",
         }
         for item in payload["available_tools"]
     )
@@ -380,107 +386,82 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     run_sql_contract = contracts["run_sql"]
     assert "срез, выражение или агрегация" in run_sql_contract["use_when"]
     assert "публичным таблицам SQLite" in run_sql_contract["use_when"]
-    assert "нельзя выполнять" in run_sql_contract["use_when"]
-    assert "Точные S2T-строки" in run_sql_contract["not_for"]
+    assert "специализированным tool" in run_sql_contract["use_when"]
+    assert "Точные S2T/каталожные строки" in run_sql_contract["not_for"]
     assert "логические ETL-таблицы" in run_sql_contract["not_for"]
     assert "transformation_rule" in run_sql_contract["not_for"]
-    assert "$$-имена" in run_sql_contract["not_for"]
-    assert run_sql_contract["fallback_only"] is True
+    assert "$$-именам" in run_sql_contract["not_for"]
     excel_value_contract = contracts["search_excel_values"]
-    assert "Excel-ячеек" in excel_value_contract["use_when"]
+    assert "Excel-ячейк" in excel_value_contract["use_when"]
     assert "таблицы data" in excel_value_contract["use_when"]
     assert "логические ETL-таблицы" in excel_value_contract["not_for"]
-    assert "не выполняет запросы" in excel_value_contract["not_for"]
-    assert excel_value_contract["fallback_only"] is False
+    assert "выполнение запросов" in excel_value_contract["not_for"]
     s2t_list_contract = contracts["list_s2t_transformations"]
     assert "source/target table или field" in s2t_list_contract["use_when"]
-    assert "source_field" in s2t_list_contract["use_when"]
-    assert "target_field" in s2t_list_contract["use_when"]
     assert "точные columns" in s2t_list_contract["use_when"]
-    assert "одну буквальную подстроку" in s2t_list_contract["use_when"]
+    assert "одну" in s2t_list_contract["use_when"]
     assert "file_id не применяется" in s2t_list_contract["use_when"]
-    assert "Неполное или неквалифицированное имя" in (
-        s2t_list_contract["not_for"]
-    )
-    assert "неизвестной ролью" in s2t_list_contract["not_for"]
-    assert s2t_list_contract["fallback_only"] is False
+    assert "Неполное имя" in s2t_list_contract["not_for"]
+    assert "неизвестная роль" in s2t_list_contract["not_for"]
     s2t_search_contract = contracts["search_s2t_transformations"]
-    assert "одной подстроки" in s2t_search_contract["use_when"]
+    assert "Одна подстрока" in s2t_search_contract["use_when"]
     assert "роль значения неизвестна" in s2t_search_contract["use_when"]
-    assert "неполным или неквалифицированным именем" in (
-        s2t_search_contract["use_when"]
-    )
-    assert "Точные source/target table или field" in (
-        s2t_search_contract["not_for"]
-    )
-    assert "составная строка" in s2t_search_contract["not_for"]
-    assert s2t_search_contract["fallback_only"] is False
+    assert "неполное/неквалифицированное" in s2t_search_contract["use_when"]
+    assert "Точные ролевые table/field" in s2t_search_contract["not_for"]
+    assert "несколько условий" in s2t_search_contract["not_for"]
     path_contract = contracts["trace_transformation_path"]
-    assert "многошаговый сохранённый S2T-путь" in path_contract["use_when"]
+    assert "Многошаговый сохранённый S2T-путь" in path_contract["use_when"]
+    assert "точного имени" in path_contract["use_when"]
     assert "JOIN/FILTER" in path_contract["use_when"]
-    assert "не добавляй отдельные" in path_contract["use_when"]
-    assert "list/Neo4j tools" in path_contract["use_when"]
-    assert "одновременно" in path_contract["use_when"]
     assert "search_s2t_transformations" in path_contract["use_when"]
-    assert "Сравнение физических записей" in path_contract["not_for"]
-    assert path_contract["fallback_only"] is False
+    assert "сравнение физических данных" in path_contract["not_for"]
     table_names_description = contracts["list_s2t_table_names"]["use_when"]
-    assert "Глобальные множества source/target" in table_names_description
-    assert "union/intersection/difference" in table_names_description
+    assert "Глобальные множества source/target-таблиц" in table_names_description
+    assert "операции над ними" in table_names_description
     semantic_description = contracts["semantic_search_descriptions"]["use_when"]
-    assert "files — только файлы" in semantic_description
-    assert "tables — все логические таблицы" in semantic_description
-    assert "source_tables — только исходные" in semantic_description
-    assert "target_tables — только целевые" in semantic_description
-    assert "columns — все колонки" in semantic_description
-    assert "source_columns — только исходные" in semantic_description
-    assert "target_columns — только целевые" in semantic_description
-    assert "фильтры подвыборки" in semantic_description
+    assert "неизвестным точным именем" in semantic_description
+    assert "files/tables/columns" in semantic_description
+    assert "source/target" in semantic_description
+    assert "структурные фильтры подвыборки" in semantic_description
     list_columns_contract = contracts["list_column_catalog"]
-    assert "Точный структурный срез каталога колонок" in (
+    assert "Точный структурный срез source/target-каталога" in (
         list_columns_contract["use_when"]
     )
-    assert "file/table/column/type/PK/not-null/source" in (
-        list_columns_contract["use_when"]
-    )
-    assert "пары вызывай отдельно" in list_columns_contract["use_when"]
-    assert "обязательно" in list_columns_contract["use_when"]
+    assert "file/table/column/type/PK/not-null" in list_columns_contract["use_when"]
     assert "scope обязателен" in list_columns_contract["use_when"]
-    assert "all_tables" in list_columns_contract["use_when"]
-    assert "последующая агрегация" in list_columns_contract[
-        "use_when"
-    ].casefold()
-    assert "Фрагмент имени" in list_columns_contract["not_for"]
+    assert "разные роли" in list_columns_contract["use_when"]
+    assert "Подстрока" in list_columns_contract["not_for"]
     search_columns_contract = contracts["search_column_catalog"]
-    assert "поиск подстроки" in search_columns_contract["use_when"]
-    assert "точными фильтрами" in search_columns_contract["use_when"]
+    assert "Подстрока" in search_columns_contract["use_when"]
+    assert "точных структурных фильтров" in search_columns_contract["use_when"]
     assert "Смысловая близость" in search_columns_contract["not_for"]
     sql_graph_contract = contracts["visualize_sql_lineage"]
-    assert "Полный SQL-текст уже явно дан" in sql_graph_contract["use_when"]
+    assert "Полный SQL уже явно дан" in sql_graph_contract["use_when"]
     assert "интерактивный lineage-граф" in sql_graph_contract["use_when"]
-    assert "Имя таблицы или колонки без SQL" in sql_graph_contract["not_for"]
+    assert "Имя без SQL" in sql_graph_contract["not_for"]
     assert "получение SQL из хранилища" in sql_graph_contract["not_for"]
-    assert sql_graph_contract["fallback_only"] is False
     parse_column_contract = contracts["parse_sql_column_lineage"]
+    assert "Полный SQL уже явно передан" in parse_column_contract["use_when"]
     assert "выходных SELECT-колонок" in parse_column_contract["use_when"]
     assert "expression и source_columns" in parse_column_contract["use_when"]
-    assert "JOIN/ON" in parse_column_contract["not_for"]
+    assert "SQL отсутствует" in parse_column_contract["not_for"]
+    assert "хранилища" in parse_column_contract["not_for"]
     assert "WHERE" in parse_column_contract["not_for"]
-    assert "чтение сохранённого SQL" in parse_column_contract["not_for"]
     parse_table_contract = contracts["parse_sql_table_lineage"]
     assert "Полный SQL уже явно передан" in parse_table_contract["use_when"]
-    assert "поиск additional objects" in parse_table_contract["not_for"]
-    assert "WHERE/JOIN/GROUP BY/DISTINCT" in parse_table_contract["not_for"]
+    assert "только исходные и целевая таблицы" in parse_table_contract["use_when"]
+    assert "SQL отсутствует" in parse_table_contract["not_for"]
+    assert "колонковый lineage" in parse_table_contract["not_for"]
     column_lineage_description = contracts["trace_neo4j_lineage"]["use_when"]
-    assert "точной именованной ETL-колонки" in column_lineage_description
-    assert "нужную глубину" in column_lineage_description
+    assert "точной ETL-колонки" in column_lineage_description
+    assert "заданную глубину" in column_lineage_description
     global_graph_description = contracts["visualize_s2t_table_graph"]["use_when"]
     assert "глобальный" in global_graph_description
     assert "Конкретный SQL" in contracts["visualize_s2t_table_graph"]["not_for"]
     assert sum(
         len(item["use_when"]) + len(item["not_for"])
         for item in payload["available_tools"]
-    ) < 7000
+    ) < 4500
     assert payload["available_skills"] == [
         {"name": name, "description": description}
         for name, description in SKILL_CATALOG.items()
@@ -504,8 +485,6 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "Не придумывай входы" in router_prompt
     assert "похожий вид результата" in router_prompt
     assert "являются контрактом выбора" in router_prompt
-    assert "fallback_only=true" in router_prompt
-    assert "готовый специализированный" in router_prompt
     assert "Schemas, skills и tools выбирай независимо" in router_prompt
     assert "может быть пустым независимо от остальных" in router_prompt
     assert "Оставляй `tools=[]`" in router_prompt
@@ -630,19 +609,14 @@ def test_chat_tool_router_repairs_invalid_structured_result_with_one_more_llm_ca
     assert "Не добавляй description" in str(repair_messages[-1].content)
 
 
-def test_chat_tool_router_repairs_missing_explicit_column_catalog():
+def test_chat_tool_router_does_not_override_missing_explicit_column_catalog():
     model = _SequenceToolRouterModel(
         [
             ToolRoute(
                 tools=["run_sql", "list_s2t_transformations"],
                 skills=["S2T-строки"],
                 schemas=["SQLite ETL"],
-            ),
-            ToolRoute(
-                tools=["list_column_catalog", "list_s2t_transformations"],
-                skills=["S2T-строки"],
-                schemas=["SQLite ETL"],
-            ),
+            )
         ]
     )
 
@@ -652,29 +626,18 @@ def test_chat_tool_router_repairs_missing_explicit_column_catalog():
         available_tools=get_tools(),
     )
 
-    assert route.tools == [
-        "list_column_catalog",
-        "list_s2t_transformations",
-    ]
-    assert len(model.calls) == 2
-    assert "маршрут обязан включать list_column_catalog" in str(
-        model.calls[1][0][-1].content
-    )
+    assert route.tools == ["run_sql", "list_s2t_transformations"]
+    assert len(model.calls) == 1
 
 
-def test_chat_tool_router_repairs_all_route_errors_in_one_attempt():
+def test_chat_tool_router_does_not_override_exact_s2t_selection():
     model = _SequenceToolRouterModel(
         [
             ToolRoute(
                 tools=["search_s2t_transformations"],
                 skills=["S2T-строки"],
                 schemas=["SQLite ETL"],
-            ),
-            ToolRoute(
-                tools=["list_column_catalog", "list_s2t_transformations"],
-                skills=["S2T-строки"],
-                schemas=["SQLite ETL"],
-            ),
+            )
         ]
     )
 
@@ -687,15 +650,8 @@ def test_chat_tool_router_repairs_all_route_errors_in_one_attempt():
         available_tools=get_tools(),
     )
 
-    assert route.tools == [
-        "list_column_catalog",
-        "list_s2t_transformations",
-    ]
-    assert len(model.calls) == 2
-    repair_prompt = str(model.calls[1][0][-1].content)
-    assert "маршрут обязан включать list_column_catalog" in repair_prompt
-    assert "маршрут обязан включать list_s2t_transformations" in repair_prompt
-    assert "нельзя заменять подстрочным" in repair_prompt
+    assert route.tools == ["search_s2t_transformations"]
+    assert len(model.calls) == 1
 
 
 def test_chat_tool_router_does_not_override_valid_llm_selection():
@@ -969,30 +925,19 @@ def test_observer_prompt_requires_semantic_task_comparison():
     assert "Не пиши Markdown" in _OBSERVER_PROMPT
     assert "goal_satisfied=false" in _OBSERVER_PROMPT
     assert "`mismatches`" in _OBSERVER_PROMPT
-    assert "target_table" in _OBSERVER_PROMPT
-    assert "source_table" in _OBSERVER_PROMPT
+    assert "target_table" not in _OBSERVER_PROMPT
+    assert "source_table" not in _OBSERVER_PROMPT
     assert "сам по себе не подтверждает" in _OBSERVER_PROMPT
-    assert "фильтруемыми и возвращаемыми полями" in _OBSERVER_PROMPT
-    assert "source_field" in _OBSERVER_PROMPT
+    assert "фильтруемыми и возвращаемыми полями" not in _OBSERVER_PROMPT
+    assert "source_field" not in _OBSERVER_PROMPT
     assert "все ещё не исправленные ошибки" in _OBSERVER_PROMPT
     assert "факт, значение, фильтр или операция отсутствует" in (
         normalized_observer_prompt
     )
-    assert "повторно получать не требуется" in normalized_observer_prompt
-    assert "каждый ролевой фильтр tool call должен быть явно задан task" in (
-        normalized_observer_prompt.lower()
-    )
-    assert "любой дополнительный фильтр — придуманный" in (
-        normalized_observer_prompt.lower()
-    )
-    assert "не зеркаль target-роль в source-роль и наоборот" in (
-        normalized_observer_prompt.lower()
-    )
-    assert "промежуточные узлы" in _OBSERVER_PROMPT
-    assert "один полный путь достаточен" in normalized_observer_prompt.lower()
-    assert "полный или транзитивный impact/downstream" in _OBSERVER_PROMPT
-    assert "один прямой переход" in _OBSERVER_PROMPT
-    assert "ограничение глубины" in _OBSERVER_PROMPT
+    assert "повторно получать не требуется" not in normalized_observer_prompt
+    assert "ролевой фильтр" not in normalized_observer_prompt.lower()
+    assert "промежуточные узлы" not in _OBSERVER_PROMPT
+    assert "impact/downstream" not in _OBSERVER_PROMPT
     assert "Последний tool call не" in _OBSERVER_PROMPT
     assert "совокупность подтверждённых фактов" in _OBSERVER_PROMPT
     assert "переноси их до явного подтверждения" in (
@@ -1277,8 +1222,7 @@ def test_tool_router_prompt_is_generic_and_catalog_driven():
     assert "Оставляй `tools=[]`" in _TOOL_ROUTER_PROMPT
     assert "Полностью покрой все операции с данными" in _TOOL_ROUTER_PROMPT
     assert "получить этот текст или объект из хранилища" in _TOOL_ROUTER_PROMPT
-    assert "являются контрактом выбора" in _TOOL_ROUTER_PROMPT
-    assert "fallback_only=true" in _TOOL_ROUTER_PROMPT
+    assert "контрактом выбора" in _TOOL_ROUTER_PROMPT
     for domain_detail in (
         "trace_neo4j_table_lineage",
         "run_cypher",
