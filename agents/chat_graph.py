@@ -3,7 +3,8 @@
 Architecture:
 
     planner (native tool calling)
-        ├─ tool_calls -> ToolNode -> observer (structured output) -> planner
+        ├─ data tool -> ToolNode -> observer (structured output) -> planner
+        ├─ analyze -> analyzer LLM -> observer -> planner
         ├─ worker finish_worker call -> END
         └─ legacy no tool_calls -> responder -> END
 
@@ -52,14 +53,20 @@ _S2T_GRAPH_DATA_URL = re.compile(
     r"^/exports/s2t-graphs/[A-Za-z0-9_.-]+\.json$"
 )
 _OBSERVATION_SUMMARY_MAX_CHARS = 1200
+_OBSERVATION_PROBLEM_MAX_CHARS = 1200
 _OBSERVATION_FACT_MAX_CHARS = 300
 _OBSERVATION_FACTS_MAX_COUNT = 8
-_OBSERVATION_MISMATCHES_MAX_COUNT = 8
 _OBSERVATION_LIMITATIONS_MAX_COUNT = 4
+_ANALYSIS_SUMMARY_MAX_CHARS = 1600
+_ANALYSIS_FACT_MAX_CHARS = 400
+_ANALYSIS_FACTS_MAX_COUNT = 10
+_ANALYSIS_LIMITATIONS_MAX_COUNT = 4
 _PLANNER_HANDOFF_MAX_CHARS = 12000
 DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS = 6000
 _FINISH_WORKER_TOOL_NAME = "finish_worker"
+_ANALYZE_TOOL_NAME = "analyze"
 _ANALYZE_KNOWN_FACTS_TOOL_NAME = "analyze_known_facts"
+_OBSERVER_MAX_RETRIES = 5
 
 
 @tool(parse_docstring=True)
@@ -105,6 +112,13 @@ task или подтверждённых результатов предыдущ
 нет, этот tool не подходит. После ошибки исправь действие по фактическому
 результату либо честно укажи ограничение. Полные результаты не копируй в answer:
 внешний coordinator сам решит, что показывать отдельно.
+После появления успешного полного результата worker делает доступным внутреннее
+действие `analyze`. Если task требует интерпретации, вызови его с ID нужных
+полных результатов из системного каталога. До получения источника `analyze`
+недоступен; не повторяй data tool только ради анализа сохранённого результата.
+Если observer сообщил, что исходные данные получены, но производный вывод ещё
+не выполнен, обязательно вызови `analyze` для соответствующих tool_result_ids.
+До успешного анализа не вызывай `finish_worker`.
 Если task требует вернуть «только» конкретные поля, значения или элементы,
 answer должен содержать ровно их: без вступления, заключения, подтверждения,
 интерпретации и дополнительных пояснений.
@@ -112,8 +126,8 @@ answer должен содержать ровно их: без вступлен�
 Если structured observation содержит `goal_satisfied=false`, совокупных
 подтверждённых фактов ещё недостаточно для task: не вызывай finish_worker и не
 возвращай обычный финальный текст.
-Прочитай отдельный блок «Что выполнено неправильно», исправь каждый указанный
-пункт и вызови подходящий worker tool. Завершай работу только когда observer
+Прочитай отдельный блок «Что выполнено неправильно», исправь описанную проблему
+и вызови подходящий worker tool. Завершай работу только когда observer
 вернул `goal_satisfied=true` либо лимит data-tool шагов уже исчерпан.
 
 """.strip()
@@ -136,23 +150,34 @@ _OBSERVER_PROMPT = """
 и не дублируй поля схемы обычным текстом.
 
 Сопоставь исходную `user_request` с `prior_state`, аргументами текущего tool call
-и его фактическим результатом. Успешный статус tool сам по себе не подтверждает
-task. Проверяй точные сущности, роли, поля, значения, условия, ограничения и
-запрошенную операцию; разные написания идентификаторов не считай синонимами.
+и его фактическим результатом. `candidate_analysis` — вывод отдельного analyzer,
+а `analysis_sources` — выбранные полные результаты, доступные для display.
+Критикуй вывод по этим источникам и не выполняй анализ заново.
+Успешный статус сам по себе не подтверждает task. Проверяй точные сущности,
+роли, значения, условия, ограничения и операцию.
+
+Если task требует производного вывода, которого нет как явного факта в
+результатах data tools, этот вывод должен быть получен через
+`candidate_analysis`. При `candidate_analysis=null` не выполняй интерпретацию
+сам и не ставь `goal_satisfied=true`: укажи в `problem`, что исходные данные
+получены, но требуемый анализ ещё не выполнен. Простой перенос явно возвращённых
+значений, строк или списков не является производным выводом и отдельного
+`candidate_analysis` не требует.
 
 Правила результата:
 - `goal_satisfied=true`, только если совокупность подтверждённых фактов из
   `prior_state` и текущего результата закрывает всю task. Последний tool call не
   обязан один повторять уже подтверждённые части;
-- при `goal_satisfied=false` `mismatches` — все ещё не исправленные ошибки из
-  prior_state и текущего результата. Переноси их до явного подтверждения
-  исправления; удаляй только исправленные ошибки, не дублируй. При true список пуст;
+- при `goal_satisfied=false` `problem` — одна краткая консолидированная строка
+  обо всех незакрытых требованиях task из prior_state и текущего результата.
+  Не разбивай её на список, не повторяй одну причину через её следствия и
+  обновляй строку после исправления части требований. При true верни null;
 - `summary` — компактная накопительная выжимка подтверждённых фактов, нужных для
   ответа. Не превращай ошибки, ограничения и предположения в факты;
 - `important_facts` содержит только подтверждённые факты для следующего шага,
   `limitations` — текущие ограничения и неоднозначности;
 - если обязательный факт, значение, фильтр или операция отсутствует, явно назови
-  это текущим mismatch. Одного неисправленного смыслового отличия достаточно для
+  это в `problem`. Одного неисправленного смыслового отличия достаточно для
   `goal_satisfied=false`.
 
 Результат внутреннего `analyze_known_facts` не является новым внешним фактом.
@@ -165,18 +190,43 @@ task. Проверяй точные сущности, роли, поля, зна
 
 Объект анализа, который planner сам составил только ради обязательного аргумента
 tool и который отсутствует в task и подтверждённых результатах, не подтверждает
-исходную операцию. Отметь это как mismatch; если доступная палитра не умеет
+исходную операцию. Отрази это в `problem`; если доступная палитра не умеет
 прочитать требуемый сохранённый объект, запроси reroute.
 
 Установи `reroute_required=true` только когда оставшуюся задачу невозможно
 исправить новым вызовом ни одного `available_tools`. Если достаточно изменить
-аргументы текущего tool, reroute не нужен. При true кратко опиши недостающую
-возможность в `reroute_reason`.
+аргументы текущего tool, reroute не нужен. При true включи недостающую
+инструментальную возможность в ту же строку `problem`; отдельного поля причины
+нет.
 
 {{PRIOR_STATE_RULE}}
 
 Не выбирай следующий tool и не формулируй пользовательский ответ. Верни только
 structured output Observation без Markdown.
+""".strip()
+
+_ANALYZER_PROMPT = """
+Ты analyzer выбранных результатов read-only tools. Примени runtime skills к
+полному содержимому `source_results` и выполни `analysis_instruction`. Верни
+только structured output WorkerAnalysis.
+
+Твоя роль — извлечь и интерпретировать факты, а не оценивать завершённость task:
+- `summary` — самодостаточный результат анализа текущего tool exchange;
+- `facts` — подтверждённые результатом факты и корректные выводы из них;
+- `limitations` — ошибки, неполнота результата и то, что он не доказывает.
+
+Сохраняй точные объекты, роли, выражения и условия. Не вызывай tools, не выбирай
+следующий шаг, не выставляй goal_satisfied/reroute и не оформляй финальный ответ.
+Не считай аргументы task найденными фактами. При ошибке или отсутствии нужных
+данных зафиксируй ограничение вместо выдуманного анализа.
+""".strip()
+
+_ANALYZER_REPAIR_PROMPT = """
+Предыдущий ответ analyzer не соответствует WorkerAnalysis. Data-tool уже
+выполнен: не вызывай и не имитируй его повторно. Исправь только structured
+output с полями summary, facts и limitations.
+
+Ошибка: {validation_error}
 """.strip()
 
 _LEGACY_RESPONDER_PROMPT = """
@@ -213,9 +263,10 @@ _FINISH_ONLY_REPAIR_PROMPT = """
 _UNSATISFIED_REPAIR_PROMPT = """
 Последний structured observer вернул `goal_satisfied=false`. Предыдущая попытка
 завершить worker запрещена: совокупность подтверждённых фактов ещё не закрывает
-task. Исправь каждый оставшийся пункт из отдельного блока «Что выполнено
-неправильно» и верни сейчас
-native call одного из доступных data tools. Используй точный источник,
+task. Исправь описанную в отдельном блоке «Что выполнено неправильно» проблему и
+верни сейчас native call одного из доступных worker tools. Если не хватает
+интерпретации уже сохранённого результата, вызови `analyze` с его ID; иначе
+используй точный источник,
 сущности, роли, поля, условия и операцию из исходной task. Не заменяй
 одноимённые роли близкими, не проверяй заново уже подтверждённые входные факты
 и не повторяй тот же семантически неверный вызов. Не вызывай finish_worker и не
@@ -256,14 +307,13 @@ class Observation(BaseModel):
             "выполнение всей исходной task без смысловых подмен."
         ),
     )
-    mismatches: List[str] = Field(
-        default_factory=list,
+    problem: Optional[str] = Field(
+        default=None,
         description=(
-            "Все ещё не исправленные конкретные несоответствия исходной task: "
-            "как выявленные текущим результатом, так и перенесённые из "
-            "prior_state, если текущий результат явно их не устранил. "
-            "Исправленные несоответствия удаляются. Пусто только при "
-            "goal_satisfied=true."
+            "Одна краткая консолидированная строка обо всех незакрытых "
+            "требованиях исходной task из текущего результата и prior_state. "
+            "Не перечисляй одну причину и её следствия как разные проблемы. "
+            "Null только при goal_satisfied=true."
         ),
     )
     has_error: bool = Field(
@@ -291,13 +341,8 @@ class Observation(BaseModel):
             "несоответствие невозможно."
         ),
     )
-    reroute_reason: Optional[str] = Field(
-        default=None,
-        description="Какая инструментальная возможность отсутствует в текущей палитре.",
-    )
 
     @field_validator(
-        "mismatches",
         "important_facts",
         "limitations",
         mode="before",
@@ -314,25 +359,60 @@ class Observation(BaseModel):
             if (clean_item := str(item or "").strip())
         ]
 
+    @field_validator("problem", mode="before")
+    @classmethod
+    def _normalize_problem(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        clean_value = str(value).strip()
+        return clean_value or None
+
     @model_validator(mode="after")
-    def _mismatches_match_goal_status(self) -> "Observation":
-        if self.goal_satisfied and self.mismatches:
+    def _problem_matches_goal_status(self) -> "Observation":
+        if self.goal_satisfied and self.problem is not None:
             raise ValueError(
-                "mismatches must be empty when goal_satisfied is true"
+                "problem must be null when goal_satisfied is true"
             )
-        if not self.goal_satisfied and not self.mismatches:
+        if not self.goal_satisfied and self.problem is None:
             raise ValueError(
-                "mismatches must describe why goal_satisfied is false"
+                "problem must describe why goal_satisfied is false"
             )
         if self.goal_satisfied and self.reroute_required:
             raise ValueError(
                 "reroute_required must be false when goal_satisfied is true"
             )
-        if self.reroute_required and not str(self.reroute_reason or "").strip():
-            raise ValueError(
-                "reroute_reason is required when reroute_required is true"
-            )
         return self
+
+
+class WorkerAnalysis(BaseModel):
+    """Structured interpretation produced before the observer critique."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1)
+    facts: List[str] = Field(default_factory=list)
+    limitations: List[str] = Field(default_factory=list)
+
+    @field_validator("summary")
+    @classmethod
+    def _summary_must_not_be_blank(cls, value: str) -> str:
+        clean_value = str(value or "").strip()
+        if not clean_value:
+            raise ValueError("analysis summary must not be blank")
+        return clean_value
+
+    @field_validator("facts", "limitations", mode="before")
+    @classmethod
+    def _clean_analysis_items(cls, values: Any) -> List[str]:
+        if values is None:
+            return []
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        return [
+            clean_item
+            for item in values
+            if (clean_item := str(item or "").strip())
+        ]
 
 
 class WorkerCycleTrace(BaseModel):
@@ -344,6 +424,7 @@ class WorkerCycleTrace(BaseModel):
     routing_attempt: int = Field(default=1, ge=1)
     tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
     tool_results: List[Dict[str, Any]] = Field(default_factory=list)
+    analysis: Optional[WorkerAnalysis] = None
     observation: Observation
 
 
@@ -351,6 +432,8 @@ class AgentGraphState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     system_prompt: str
     planner_message: Optional[AIMessage]
+    analysis: Optional[WorkerAnalysis]
+    analysis_sources: List[Dict[str, Any]]
     observations: List[Observation]
     cycle_history: List[WorkerCycleTrace]
     tool_steps: int
@@ -445,12 +528,11 @@ def _compact_observation(observation: Observation) -> Observation:
             _OBSERVATION_SUMMARY_MAX_CHARS,
         ),
         goal_satisfied=observation.goal_satisfied,
-        mismatches=[
-            _clip_text(item, _OBSERVATION_FACT_MAX_CHARS)
-            for item in observation.mismatches[
-                :_OBSERVATION_MISMATCHES_MAX_COUNT
-            ]
-        ],
+        problem=(
+            _clip_text(observation.problem, _OBSERVATION_PROBLEM_MAX_CHARS)
+            if observation.problem is not None
+            else None
+        ),
         has_error=observation.has_error,
         important_facts=[
             _clip_text(item, _OBSERVATION_FACT_MAX_CHARS)
@@ -465,11 +547,20 @@ def _compact_observation(observation: Observation) -> Observation:
             ]
         ],
         reroute_required=observation.reroute_required,
-        reroute_reason=(
-            _clip_text(observation.reroute_reason, _OBSERVATION_FACT_MAX_CHARS)
-            if observation.reroute_reason
-            else None
-        ),
+    )
+
+
+def _compact_worker_analysis(analysis: WorkerAnalysis) -> WorkerAnalysis:
+    return WorkerAnalysis(
+        summary=_clip_text(analysis.summary, _ANALYSIS_SUMMARY_MAX_CHARS),
+        facts=[
+            _clip_text(item, _ANALYSIS_FACT_MAX_CHARS)
+            for item in analysis.facts[:_ANALYSIS_FACTS_MAX_COUNT]
+        ],
+        limitations=[
+            _clip_text(item, _ANALYSIS_FACT_MAX_CHARS)
+            for item in analysis.limitations[:_ANALYSIS_LIMITATIONS_MAX_COUNT]
+        ],
     )
 
 
@@ -506,9 +597,8 @@ class WorkerRunResult(BaseModel):
     display_items: List[WorkerDisplayItem] = Field(default_factory=list)
     cycle_history: List[WorkerCycleTrace] = Field(default_factory=list)
     goal_satisfied: bool = Field(default=True, exclude=True)
-    mismatches: List[str] = Field(default_factory=list, exclude=True)
+    problem: Optional[str] = Field(default=None, exclude=True)
     reroute_required: bool = Field(default=False, exclude=True)
-    reroute_reason: Optional[str] = Field(default=None, exclude=True)
 
 
 class WorkerResponseError(RuntimeError):
@@ -533,6 +623,44 @@ def _finish_worker_tool_schema() -> Dict[str, Any]:
                     },
                 },
                 "required": ["answer"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _analyze_tool_schema() -> Dict[str, Any]:
+    """Return the native schema for the worker's internal analysis action."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _ANALYZE_TOOL_NAME,
+            "description": (
+                "Проанализировать выбранные полные результаты уже выполненных "
+                "data tools отдельным structured analyzer LLM."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_result_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "description": (
+                            "Точные ID результатов из доступного системного "
+                            "каталога без изменения."
+                        ),
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "Что именно нужно установить или объяснить по "
+                            "выбранным результатам."
+                        ),
+                    },
+                },
+                "required": ["tool_result_ids", "instruction"],
                 "additionalProperties": False,
             },
         },
@@ -574,9 +702,9 @@ def _runtime_context(
                     "ещё не подтверждена; не завершай worker."
                 )
                 observation_parts.append(
-                    "Что выполнено неправильно:\n- "
-                    + "\n- ".join(observation.mismatches)
-                    + "\nИсправь каждый пункт следующим data-tool вызовом."
+                    "Что выполнено неправильно:\n"
+                    + str(observation.problem or "")
+                    + "\nИсправь проблему следующим worker-tool вызовом."
                 )
             else:
                 observation_parts.append(
@@ -736,6 +864,41 @@ def _tool_message_has_error(message: ToolMessage) -> bool:
     return isinstance(payload, dict) and bool(payload.get("error"))
 
 
+def _available_analysis_results(
+    results: Mapping[str, ToolMessage],
+) -> List[Dict[str, str]]:
+    """List retained successful data results selectable by internal analyze."""
+    return [
+        {
+            "tool_result_id": str(result_id),
+            "tool_name": str(message.name or "unknown_tool"),
+        }
+        for result_id, message in results.items()
+        if not _tool_message_has_error(message)
+        and message.name not in {
+            _ANALYZE_TOOL_NAME,
+            _ANALYZE_KNOWN_FACTS_TOOL_NAME,
+        }
+    ]
+
+
+def _tool_calls_by_id(
+    messages: Sequence[BaseMessage],
+) -> Dict[str, Dict[str, Any]]:
+    calls: Dict[str, Dict[str, Any]] = {}
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+        for call in message.tool_calls:
+            call_id = str(call.get("id") or "").strip()
+            if call_id:
+                calls[call_id] = {
+                    "name": str(call.get("name") or "unknown_tool"),
+                    "args": call.get("args", {}),
+                }
+    return calls
+
+
 def _visualization_urls(messages: Sequence[BaseMessage]) -> List[str]:
     urls: List[str] = []
     for message in messages:
@@ -788,10 +951,10 @@ def _fallback_observation(
         return Observation(
             summary=str(raw_output),
             goal_satisfied=False,
-            mismatches=[
+            problem=(
                 "Observer не вернул валидный structured output, поэтому "
                 "соответствие результата исходной task не подтверждено."
-            ],
+            ),
             limitations=[f"Ошибка observer: {type(error).__name__}"],
         )
 
@@ -809,10 +972,10 @@ def _fallback_observation(
         ),
         has_error=True,
         goal_satisfied=False,
-        mismatches=[
+        problem=(
             "Observer не смог проверить соответствие tool-вызова исходной "
             "task; результат нельзя считать подтверждённым."
-        ],
+        ),
         important_facts=[],
         limitations=[f"Ошибка observer: {type(error).__name__}"],
     )
@@ -826,12 +989,17 @@ def build_agent_graph(
     tool_message_preview_chars: Optional[int] = None,
     worker_finish: bool = False,
 ):
-    """Build the planner -> tools -> observer -> planner graph."""
+    """Build planner -> tools/analyzer -> observer -> planner."""
     tool_list = _normalize_tools(tools)
     tool_names = tuple(tool.name for tool in tool_list)
+    retained_tool_results = (
+        raw_tool_results if raw_tool_results is not None else {}
+    )
+    analyze_available = worker_finish
+    analyze_schema = _analyze_tool_schema()
     finish_schema = _finish_worker_tool_schema()
     planner_model = (
-        model.bind_tools([*tool_list, finish_schema])
+        model.bind_tools([*tool_list, analyze_schema, finish_schema])
         if worker_finish
         else (model.bind_tools(tool_list) if tool_list else model)
     )
@@ -859,12 +1027,21 @@ def build_agent_graph(
         except TypeError:
             finish_model = model.bind_tools([finish_schema])
     observer_model = model.with_structured_output(Observation)
-    if hasattr(observer_model, "with_retry"):
-        observer_model = observer_model.with_retry(
-            retry_if_exception_type=(ValidationError,),
-            wait_exponential_jitter=False,
-            stop_after_attempt=2,
-        )
+    analyzer_model: Any = None
+
+    def get_analyzer_model() -> Any:
+        nonlocal analyzer_model
+        if not analyze_available:
+            raise RuntimeError("analyze вызван вне worker graph")
+        if analyzer_model is None:
+            analyzer_model = model.with_structured_output(WorkerAnalysis)
+            if hasattr(analyzer_model, "with_retry"):
+                analyzer_model = analyzer_model.with_retry(
+                    retry_if_exception_type=(ValidationError,),
+                    wait_exponential_jitter=False,
+                    stop_after_attempt=2,
+                )
+        return analyzer_model
     tool_node = ToolNode(tool_list, handle_tool_errors=True)
 
     def invoke_with_fallback(
@@ -908,11 +1085,35 @@ def build_agent_graph(
             selected_model = first_tool_model
         else:
             selected_model = planner_model
+        analysis_result_catalog = _available_analysis_results(
+            retained_tool_results
+        )
+        planner_tool_names = [*tool_names]
+        if analyze_available and analysis_result_catalog:
+            planner_tool_names.append(_ANALYZE_TOOL_NAME)
         planner_messages = _planner_messages(
             state,
-            tool_names,
+            planner_tool_names,
             worker_finish=worker_finish,
         )
+        if analyze_available and analysis_result_catalog:
+            catalog_text = json.dumps(
+                analysis_result_catalog,
+                ensure_ascii=False,
+                default=str,
+            )
+            first_message = planner_messages[0]
+            planner_messages[0] = first_message.model_copy(
+                update={
+                    "content": (
+                        f"{_message_content_text(first_message.content)}\n\n"
+                        "Доступные для внутреннего `analyze` полные результаты "
+                        "data tools:\n"
+                        f"{catalog_text}\n"
+                        "Передай нужные tool_result_ids без изменения."
+                    )
+                }
+            )
 
         selected_fallback = (
             first_data_model
@@ -946,7 +1147,7 @@ def build_agent_graph(
             and latest_observation.goal_satisfied is False
             and (
                 not any(
-                    call.get("name") in tool_names
+                    call.get("name") in planner_tool_names
                     for call in reply.tool_calls
                 )
                 or any(
@@ -1027,9 +1228,21 @@ def build_agent_graph(
         if planner_message is None or not planner_message.tool_calls:
             raise RuntimeError("Planner не выбрал инструмент.")
 
+        analyze_calls = [
+            call
+            for call in planner_message.tool_calls
+            if call.get("name") == _ANALYZE_TOOL_NAME
+        ]
+        if analyze_calls and len(planner_message.tool_calls) != 1:
+            raise WorkerResponseError(
+                "analyze должен вызываться отдельно от остальных tools"
+            )
+
         return {
             "messages": [planner_message],
             "planner_message": None,
+            "analysis": None,
+            "analysis_sources": [],
         }
 
     def execute_tools(state: AgentGraphState) -> Dict[str, Any]:
@@ -1069,8 +1282,7 @@ def build_agent_graph(
 
                 message = persist_sqlite_tool_message(message)
 
-            if raw_tool_results is not None:
-                raw_tool_results[message.tool_call_id] = message
+            retained_tool_results[message.tool_call_id] = message
 
             if tool_message_preview_chars is None:
                 tool_messages.append(message)
@@ -1102,6 +1314,164 @@ def build_agent_graph(
         return {
             "messages": tool_messages,
             "tool_steps": state["tool_steps"] + len(last_message.tool_calls),
+        }
+
+    def analyzer(state: AgentGraphState) -> Dict[str, Any]:
+        active_analyzer_model = get_analyzer_model()
+
+        analyze_message = state["messages"][-1]
+        if (
+            not isinstance(analyze_message, AIMessage)
+            or len(analyze_message.tool_calls) != 1
+            or analyze_message.tool_calls[0].get("name") != _ANALYZE_TOOL_NAME
+        ):
+            raise RuntimeError("Analyzer вызван без одиночного analyze tool call")
+
+        analyze_call = analyze_message.tool_calls[0]
+        analyze_args = analyze_call.get("args") or {}
+        requested_ids = list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in (analyze_args.get("tool_result_ids") or [])
+                if str(item or "").strip()
+            )
+        )
+        instruction = str(analyze_args.get("instruction") or "").strip()
+        calls_by_id = _tool_calls_by_id(state["messages"][:-1])
+        available_results = {
+            item["tool_result_id"]: retained_tool_results[
+                item["tool_result_id"]
+            ]
+            for item in _available_analysis_results(retained_tool_results)
+        }
+        missing_ids = [
+            result_id
+            for result_id in requested_ids
+            if result_id not in available_results
+        ]
+        analysis_sources = [
+            {
+                "tool_result_id": result_id,
+                "tool_call": calls_by_id.get(
+                    result_id,
+                    {
+                        "name": str(
+                            available_results[result_id].name
+                            or "unknown_tool"
+                        ),
+                        "args": {},
+                    },
+                ),
+                "tool_result": _tool_message_payload(
+                    available_results[result_id]
+                ),
+            }
+            for result_id in requested_ids
+            if result_id in available_results
+        ]
+
+        analysis_error = None
+        if not requested_ids:
+            analysis_error = "analyze не получил ни одного tool_result_id."
+        elif missing_ids:
+            analysis_error = (
+                "Полные результаты недоступны для анализа: "
+                + ", ".join(missing_ids)
+            )
+        elif not instruction:
+            analysis_error = "analyze не получил непустую instruction."
+
+        payload = {
+            "user_request": _last_user_query(state["messages"]),
+            "analysis_instruction": instruction,
+            "source_results": analysis_sources,
+        }
+        analyzer_messages: List[BaseMessage] = [
+            SystemMessage(
+                content="\n\n".join(
+                    part
+                    for part in (
+                        state["system_prompt"].strip(),
+                        _ANALYZER_PROMPT,
+                    )
+                    if part
+                )
+            ),
+            HumanMessage(
+                content=json.dumps(payload, ensure_ascii=False, default=str)
+            ),
+        ]
+
+        def parse_analysis(result: Any) -> WorkerAnalysis:
+            return (
+                result
+                if isinstance(result, WorkerAnalysis)
+                else WorkerAnalysis.model_validate(result)
+            )
+
+        analyzer_failed = False
+        if analysis_error is not None:
+            analyzer_failed = True
+            analysis = WorkerAnalysis(
+                summary="Анализ не выполнен: нет выбранного полного результата.",
+                limitations=[analysis_error],
+            )
+        else:
+            try:
+                analysis = parse_analysis(
+                    active_analyzer_model.invoke(analyzer_messages)
+                )
+            except Exception as first_error:
+                logger.warning(
+                    "Structured analyzer output rejected; repeating analyzer "
+                    "without repeating data tools: %s",
+                    first_error,
+                )
+                repair_messages: List[BaseMessage] = [
+                    *analyzer_messages,
+                    HumanMessage(
+                        content=_ANALYZER_REPAIR_PROMPT.replace(
+                            "{validation_error}",
+                            f"{type(first_error).__name__}: {first_error}",
+                        )
+                    ),
+                ]
+                try:
+                    analysis = parse_analysis(
+                        active_analyzer_model.invoke(repair_messages)
+                    )
+                except Exception as repair_error:
+                    analyzer_failed = True
+                    logger.exception(
+                        "Structured analyzer repair failed; preserving raw "
+                        "tool results for observer critique"
+                    )
+                    analysis = WorkerAnalysis(
+                        summary=(
+                            "Analyzer не вернул валидный structured результат."
+                        ),
+                        limitations=[
+                            "Ошибка analyzer: "
+                            f"{type(repair_error).__name__}"
+                        ],
+                    )
+
+        analysis = _compact_worker_analysis(analysis)
+        logger.info(
+            "Analyzer result: %s",
+            analysis.model_dump_json()[:3000],
+        )
+        analysis_message = ToolMessage(
+            content=analysis.model_dump_json(),
+            tool_call_id=str(analyze_call.get("id") or "analyze"),
+            name=_ANALYZE_TOOL_NAME,
+            status="error" if analyzer_failed else "success",
+        )
+        return {
+            "messages": [analysis_message],
+            "analysis": analysis,
+            "analysis_sources": analysis_sources,
+            "tool_steps": state["tool_steps"] + 1,
         }
 
     def observer(state: AgentGraphState) -> Dict[str, Any]:
@@ -1154,6 +1524,12 @@ def build_agent_graph(
                 _tool_message_payload(message) for message in tool_results
             ],
             "candidate_answer": candidate_answer,
+            "candidate_analysis": (
+                state["analysis"].model_dump()
+                if state.get("analysis") is not None
+                else None
+            ),
+            "analysis_sources": list(state.get("analysis_sources") or []),
         }
 
         prior_state_rule = (
@@ -1163,8 +1539,8 @@ def build_agent_graph(
             "изолированно. Уже подтверждённые части task не должны повторно "
             "присутствовать в текущем результате. Верни обновлённую "
             "самодостаточную выжимку, сохранив только подтверждённые факты, "
-            "ещё нужные для исходной task; прошлые mismatches не считай "
-            "фактами и не повторяй после их исправления."
+            "ещё нужные для исходной task; прошлую problem не считай фактом "
+            "и обновляй после исправления части требований."
             if worker_finish
             else ""
         )
@@ -1202,38 +1578,48 @@ def build_agent_graph(
                 return Observation.model_validate(observation_payload)
             return observation
 
-        try:
-            observation = parse_observation(
-                observer_model.invoke(observer_messages)
-            )
-        except Exception as first_error:
-            logger.warning(
-                "Structured observer output rejected; repeating observer "
-                "without repeating data tools: %s",
-                first_error,
-            )
-            repair_messages: List[BaseMessage] = [
-                *observer_messages,
-                HumanMessage(
-                    content=_OBSERVER_REPAIR_PROMPT.replace(
-                        "{validation_error}",
-                        f"{type(first_error).__name__}: {first_error}",
-                    )
-                ),
-            ]
+        observation: Optional[Observation] = None
+        observer_error: Optional[Exception] = None
+        attempt_messages = observer_messages
+        total_attempts = _OBSERVER_MAX_RETRIES + 1
+        for attempt_index in range(total_attempts):
             try:
                 observation = parse_observation(
-                    observer_model.invoke(repair_messages)
+                    observer_model.invoke(attempt_messages)
                 )
-            except Exception as repair_error:
-                logger.exception(
-                    "Structured observer repair failed; stopping worker "
-                    "without repeating data tools"
+                break
+            except Exception as error:
+                observer_error = error
+                if attempt_index >= _OBSERVER_MAX_RETRIES:
+                    break
+                logger.warning(
+                    "Structured observer output rejected on attempt %s/%s; "
+                    "repeating observer without repeating data tools: %s",
+                    attempt_index + 1,
+                    total_attempts,
+                    error,
                 )
-                raise WorkerResponseError(
-                    "Observer дважды не вернул валидный structured output; "
-                    "data tool повторно не вызван."
-                ) from repair_error
+                attempt_messages = [
+                    *observer_messages,
+                    HumanMessage(
+                        content=_OBSERVER_REPAIR_PROMPT.replace(
+                            "{validation_error}",
+                            f"{type(error).__name__}: {error}",
+                        )
+                    ),
+                ]
+
+        if observation is None:
+            logger.exception(
+                "Structured observer repair failed after %s attempts; "
+                "stopping worker without repeating data tools",
+                total_attempts,
+                exc_info=observer_error,
+            )
+            raise WorkerResponseError(
+                "Observer не вернул валидный structured output после "
+                f"{total_attempts} попыток; data tool повторно не вызван."
+            ) from observer_error
 
         observation = _compact_observation(observation)
         logger.info(
@@ -1267,6 +1653,7 @@ def build_agent_graph(
                         _tool_message_payload(message)
                         for message in tool_results
                     ],
+                    analysis=state.get("analysis"),
                     observation=observation,
                 ),
             ]
@@ -1338,6 +1725,19 @@ def build_agent_graph(
             return "prepare_tool"
         return "responder"
 
+    def route_after_prepare(
+        state: AgentGraphState,
+    ) -> Literal["tools", "analyzer"]:
+        message = state["messages"][-1]
+        if (
+            analyze_available
+            and isinstance(message, AIMessage)
+            and len(message.tool_calls) == 1
+            and message.tool_calls[0].get("name") == _ANALYZE_TOOL_NAME
+        ):
+            return "analyzer"
+        return "tools"
+
     def route_after_observer(
         state: AgentGraphState,
     ) -> Literal["planner", "finish"]:
@@ -1360,6 +1760,8 @@ def build_agent_graph(
     graph.add_node("planner", planner)
     graph.add_node("prepare_tool", prepare_tool_call)
     graph.add_node("tools", execute_tools)
+    if analyze_available:
+        graph.add_node("analyzer", analyzer)
     graph.add_node("observer", observer)
     graph.add_node("responder", responder)
 
@@ -1374,8 +1776,20 @@ def build_agent_graph(
             "finish": END,
         },
     )
-    graph.add_edge("prepare_tool", "tools")
+    if analyze_available:
+        graph.add_conditional_edges(
+            "prepare_tool",
+            route_after_prepare,
+            {
+                "tools": "tools",
+                "analyzer": "analyzer",
+            },
+        )
+    else:
+        graph.add_edge("prepare_tool", "tools")
     graph.add_edge("tools", "observer")
+    if analyze_available:
+        graph.add_edge("analyzer", "observer")
     graph.add_conditional_edges(
         "observer",
         route_after_observer,
@@ -1419,6 +1833,8 @@ def run_agent_graph(
         "messages": initial_messages,
         "system_prompt": system_prompt,
         "planner_message": None,
+        "analysis": None,
+        "analysis_sources": [],
         "observations": [],
         "cycle_history": [],
         "tool_steps": 0,
@@ -1491,7 +1907,7 @@ def run_worker_graph(
             answer="Подзадача воркера не должна быть пустой.",
             display_items=[],
             goal_satisfied=False,
-            mismatches=["Worker получил пустую task."],
+            problem="Worker получил пустую task.",
         )
 
     bounded_steps = max(1, int(max_steps))
@@ -1510,6 +1926,8 @@ def run_worker_graph(
         "messages": [HumanMessage(content=clean_task)],
         "system_prompt": system_prompt,
         "planner_message": None,
+        "analysis": None,
+        "analysis_sources": [],
         "observations": [],
         "cycle_history": [],
         "tool_steps": 0,
@@ -1540,22 +1958,18 @@ def run_worker_graph(
         else None
     )
     if latest_observation is not None and latest_observation.reroute_required:
-        reroute_reason = str(
-            latest_observation.reroute_reason
-            or "Текущей палитры tools недостаточно для выполнения task."
-        ).strip()
+        reroute_problem = str(latest_observation.problem or "").strip()
         logger.info(
-            "Worker graph finished with reroute request: reason=%s",
-            reroute_reason,
+            "Worker graph finished with reroute request: problem=%s",
+            reroute_problem,
         )
         return WorkerRunResult(
-            answer=reroute_reason,
+            answer=reroute_problem,
             display_items=[],
             cycle_history=list(final_state.get("cycle_history") or []),
             goal_satisfied=False,
-            mismatches=list(latest_observation.mismatches),
+            problem=reroute_problem,
             reroute_required=True,
-            reroute_reason=reroute_reason,
         )
 
     planner_message = final_state.get("planner_message")
@@ -1585,16 +1999,19 @@ def run_worker_graph(
         message
         for message in raw_tool_results.values()
         if not _tool_message_has_error(message)
-        and message.name != _ANALYZE_KNOWN_FACTS_TOOL_NAME
+        and message.name not in {
+            _ANALYZE_TOOL_NAME,
+            _ANALYZE_KNOWN_FACTS_TOOL_NAME,
+        }
     ]
     goal_satisfied = bool(
         latest_observation is not None
         and latest_observation.goal_satisfied
     )
-    mismatches = (
-        list(latest_observation.mismatches)
+    problem = (
+        latest_observation.problem
         if latest_observation is not None
-        else ["Worker завершился без structured observation результата."]
+        else "Worker завершился без structured observation результата."
     )
     answer = payload.answer
 
@@ -1615,5 +2032,5 @@ def run_worker_graph(
         display_items=display_items,
         cycle_history=list(final_state.get("cycle_history") or []),
         goal_satisfied=goal_satisfied,
-        mismatches=mismatches,
+        problem=problem,
     )

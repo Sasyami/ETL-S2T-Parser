@@ -66,7 +66,7 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
             tools=["list_s2t_transformations"],
             skills=["S2T-строки"],
             schemas=["S2T-маппинг"],
-            reroute_reason="Нужен точный S2T-фильтр.",
+            problem="Нужен точный S2T-фильтр.",
         )
         record_worker_observation(
             worker_task="Выполни SELECT 1",
@@ -75,12 +75,16 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
             observation={
                 "summary": "Получено значение 1.",
                 "goal_satisfied": True,
-                "mismatches": [],
+                "problem": None,
                 "has_error": False,
                 "important_facts": ["Значение равно 1."],
                 "limitations": [],
                 "reroute_required": False,
-                "reroute_reason": None,
+            },
+            analysis={
+                "summary": "Единица подтверждена анализом.",
+                "facts": ["Значение равно 1."],
+                "limitations": [],
             },
         )
         record_upstream_evidence(
@@ -109,13 +113,13 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     assert route.tools == ["run_sql"]
     assert route.skills == []
     assert route.schemas == ["SQLite ETL"]
-    assert route.reroute_reason is None
+    assert route.problem is None
     reroute = metrics.worker_routes[1]
     assert reroute.routing_attempt == 2
     assert reroute.tools == ["list_s2t_transformations"]
     assert reroute.skills == ["S2T-строки"]
     assert reroute.schemas == ["S2T-маппинг"]
-    assert reroute.reroute_reason == "Нужен точный S2T-фильтр."
+    assert reroute.problem == "Нужен точный S2T-фильтр."
     assert len(metrics.observations) == 1
     observation = metrics.observations[0]
     assert observation.worker_task == "Выполни SELECT 1"
@@ -124,6 +128,11 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     assert observation.summary == "Получено значение 1."
     assert observation.goal_satisfied is True
     assert observation.important_facts == ["Значение равно 1."]
+    assert observation.analysis == {
+        "summary": "Единица подтверждена анализом.",
+        "facts": ["Значение равно 1."],
+        "limitations": [],
+    }
     assert metrics.upstream_evidence == {
         "confirmed_facts": ["Значение равно 1."],
         "unresolved_requirements": [],

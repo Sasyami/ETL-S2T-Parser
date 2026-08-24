@@ -1,6 +1,7 @@
 """Decorated LangChain tools and their explicit registries."""
 
 from .common import PROJECT_ROOT
+from .additional_objects import list_additional_objects, search_additional_objects
 from .context import (
     SCHEMA_CATALOG,
     get_sqlite_schema_cheatsheet,
@@ -100,6 +101,7 @@ __all__ = [
     "get_tools_for_names",
     "get_write_tools",
     "list_columns",
+    "list_additional_objects",
     "list_column_catalog",
     "list_file_sheet_headers",
     "list_files",
@@ -126,6 +128,7 @@ __all__ = [
     "persist_sqlite_tool_message",
     "saved_result_store_scope",
     "search_s2t_transformations",
+    "search_additional_objects",
     "search_column_catalog",
     "search_excel_values",
     "semantic_search_descriptions",

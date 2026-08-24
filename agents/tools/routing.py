@@ -4,27 +4,24 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from .context import SCHEMA_CATALOG, SchemaName
+from .context import SCHEMA_CATALOG
 
 logger = logging.getLogger(__name__)
 
 
-SkillName = Literal[
-    "S2T-строки",
-    "Neo4j",
-    "Excel и описания",
-    "Сравнение",
-    "Объяснение",
-]
-
 SKILL_CATALOG: Dict[str, str] = {
     "S2T-строки": "Общие ETL-строки, S2T-маппинги, additional objects, правила и агрегации s2t_transformations.",
+    "Анализ трансформаций": (
+        "Анализ уже полученного transformation_rule или SQL: выражения, "
+        "NULL, JOIN/WHERE, дедупликация, агрегация и изменение строк. Не "
+        "заменяет tool для получения самого правила."
+    ),
     "Neo4j": "Графовый lineage именованных ETL-таблиц и колонок.",
     "Excel и описания": (
         "Файлы, листы, заголовки, ячейки и семантические описания."
@@ -40,6 +37,14 @@ SKILL_CATALOG: Dict[str, str] = {
 }
 
 
+GENERAL_FALLBACK_TOOL_NAMES = (
+    "run_sql",
+    "run_cypher",
+    "search_excel_values",
+    "semantic_search_descriptions",
+)
+
+
 _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     "show_plan": {
         "use_when": "Нужно явно показать выполненные и следующие шаги многошаговой задачи.",
@@ -52,6 +57,14 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     "get_excel_row": {
         "use_when": "Известны точные file_id, sheet_name и row_num сохранённой Excel-строки.",
         "not_for": "Поиск строки, S2T или логическая ETL-таблица.",
+    },
+    "list_additional_objects": {
+        "use_when": "Точный список Additional objects по file/name/id/sheet/row с полным SQL.",
+        "not_for": "Подстрока, S2T-строки или выполнение SQL объекта.",
+    },
+    "search_additional_objects": {
+        "use_when": "Подстрока в name или SQL Additional objects, опционально внутри file_id.",
+        "not_for": "Точные фильтры, выполнение SQL или общий S2T-поиск.",
     },
     "list_column_catalog": {
         "use_when": (
@@ -222,21 +235,28 @@ class ToolRoute(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tools: List[str]
-    skills: List[SkillName]
-    schemas: List[SchemaName]
+    skills: List[str]
+    schemas: List[str]
 
 
 _TOOL_ROUTER_PROMPT = """
 Ты router read-only worker. По задаче, недавней истории и каталогам выбери
 необходимые tools, skills и schemas. Точные имена и назначение бери только из каталогов.
 
-Полностью покрой все операции с данными. Поля `use_when` и `not_for` являются
-контрактом выбора, а не справочным текстом. Если результат одного tool нужен как
-обязательный вход другого, выбери оба. Обязательный вход должен быть явно дан в
-задаче или истории либо получаться другим выбранным tool. Инструмент обработки
-переданного текста или объекта не заменяет инструмент, который сначала должен
-получить этот текст или объект из хранилища. Не придумывай входы из названий
-сущностей и не считай похожий вид результата достаточным основанием для выбора.
+Ты выбираешь доступную planner палитру, а не единственный будущий вызов. Полностью
+покрой все операции с данными. `use_when` и `not_for` описывают основное назначение
+и границы tools, но не требуют минимальной или взаимоисключающей палитры. Если
+роль, точность имени, источник данных или следующий шаг неоднозначны, включи все
+уместные read-only tools, которые могут понадобиться для разрешения этой
+неоднозначности. Полнота палитры важнее исключения правдоподобного инструмента;
+не добавляй только явно нерелевантные tools или весь каталог без основания.
+
+Если результат одного tool нужен как обязательный вход другого, выбери оба.
+Обязательный вход должен быть явно дан в задаче или истории либо получаться
+другим выбранным tool. Инструмент обработки переданного текста или объекта не
+заменяет инструмент, который сначала должен получить этот текст или объект из
+хранилища. Не придумывай входы из названий сущностей и не считай похожий вид
+результата достаточным основанием для выбора.
 Schemas — это фактическая структура данных и настроенные маппинги, которые
 могут понадобиться planner для корректного вызова tools или анализа известных
 фактов. Выбирай schema только если её структура или маппинги нужны самой задаче.
@@ -245,12 +265,13 @@ schema или skill. Каждый из списков `tools`, `skills` и `sche
 пустым независимо от остальных. Оставляй `tools=[]`, если новые вызовы данных
 не нужны и для ответа достаточно переданных фактов, выбранного skill или schema.
 
-Не добавляй взаимозаменяемые дубли и tools для оформления уже полученных фактов.
-Если новые данные и контекст не нужны, оставь все три списка пустыми.
+Tools для оформления уже полученных фактов не нужны. Если новые данные и контекст
+не нужны, оставь все три списка пустыми.
 
-При наличии `reroute_context` учти причину неуспеха. Палитру можно повторить,
-если исправить нужно вызов или аргументы; меняй её только при нехватке нужной
-возможности.
+`reroute_context` появляется только после вывода observer, что текущей палитрой
+нельзя исправить `problem`. Поэтому сохрани все tools последней
+`previous_tool_palettes` и обязательно добавь минимум один новый tool, который
+даёт недостающие данные. Одинаковая или сокращённая палитра невалидна.
 
 Не отвечай пользователю и не вызывай tools. Заполни только поля `tools`,
 `skills` и `schemas` structured-схемы.
@@ -300,6 +321,7 @@ def _named_catalog(catalog: Mapping[str, str]) -> List[Dict[str, str]]:
 def _validated_route(
     result: Any,
     available_tools: Sequence[BaseTool],
+    reroute_context: Optional[Mapping[str, Any]] = None,
 ) -> ToolRoute:
     try:
         route = (
@@ -321,11 +343,81 @@ def _validated_route(
         raise ToolRoutingError(
             f"Tool-router выбрал неизвестные tools: {', '.join(unknown)}"
         )
+    unknown_skills = [
+        name for name in selected_skills if name not in SKILL_CATALOG
+    ]
+    if unknown_skills:
+        raise ToolRoutingError(
+            "Tool-router выбрал неизвестные skills: "
+            + ", ".join(unknown_skills)
+        )
+    unknown_schemas = [
+        name for name in selected_schemas if name not in SCHEMA_CATALOG
+    ]
+    if unknown_schemas:
+        raise ToolRoutingError(
+            "Tool-router выбрал неизвестные schemas: "
+            + ", ".join(unknown_schemas)
+        )
+    if reroute_context is not None:
+        previous_palettes = list(
+            reroute_context.get("previous_tool_palettes") or []
+        )
+        if not previous_palettes:
+            raise ToolRoutingError(
+                "Tool-router получил reroute без предыдущей палитры"
+            )
+        previous_tools = {
+            str(name).strip()
+            for name in previous_palettes[-1]
+            if str(name).strip()
+        }
+        selected_set = set(selected_tools)
+        removed = sorted(previous_tools - selected_set)
+        if removed:
+            raise ToolRoutingError(
+                "Tool-router при reroute удалил tools прошлой палитры: "
+                + ", ".join(removed)
+            )
+        if not selected_set - previous_tools:
+            raise ToolRoutingError(
+                "Tool-router при reroute не добавил новый tool для problem"
+            )
     return ToolRoute(
         tools=selected_tools,
         skills=selected_skills,
         schemas=selected_schemas,
     )
+
+
+def _general_fallback_route(
+    available_tools: Sequence[BaseTool],
+    reroute_context: Optional[Mapping[str, Any]] = None,
+) -> ToolRoute:
+    """Return a bounded read-only palette after two invalid router outputs."""
+    available_names = {tool.name for tool in available_tools}
+    selected_tools: List[str] = []
+    if reroute_context is not None:
+        previous_palettes = list(
+            reroute_context.get("previous_tool_palettes") or []
+        )
+        if previous_palettes:
+            selected_tools.extend(
+                str(name).strip()
+                for name in previous_palettes[-1]
+                if str(name).strip() in available_names
+            )
+    selected_tools.extend(
+        name
+        for name in GENERAL_FALLBACK_TOOL_NAMES
+        if name in available_names
+    )
+    selected_tools = list(dict.fromkeys(selected_tools))
+    if not selected_tools:
+        raise ToolRoutingError(
+            "Tool-router не выбрал маршрут, а общие fallback tools недоступны"
+        )
+    return ToolRoute(tools=selected_tools, skills=[], schemas=[])
 
 
 def select_chat_route(
@@ -394,6 +486,7 @@ def select_chat_route(
         return _validated_route(
             invoke_router(messages),
             available_tools,
+            reroute_context,
         )
     except ToolRoutingError as first_error:
         logger.warning(
@@ -413,16 +506,26 @@ def select_chat_route(
             return _validated_route(
                 invoke_router(repair_messages),
                 available_tools,
+                reroute_context,
             )
         except ToolRoutingError as repair_error:
             logger.warning(
                 "Tool-router structured repair rejected: %s",
                 repair_error,
             )
-            raise
+            fallback_route = _general_fallback_route(
+                available_tools,
+                reroute_context,
+            )
+            logger.warning(
+                "Tool-router uses general read-only fallback: tools=%s",
+                fallback_route.tools,
+            )
+            return fallback_route
 
 
 __all__ = [
+    "GENERAL_FALLBACK_TOOL_NAMES",
     "SCHEMA_CATALOG",
     "SKILL_CATALOG",
     "ToolRoute",

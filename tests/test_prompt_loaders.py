@@ -1,4 +1,4 @@
-from agents.tools import load_schemas, load_skills
+from agents.tools import load_chat_agent_context, load_schemas, load_skills
 
 
 def test_load_skills(tmp_path):
@@ -8,6 +8,13 @@ def test_load_skills(tmp_path):
     # Override the file path? The helper uses relative path. For test, we can mock open.
     # Simpler: test that the function returns empty string when file missing
     assert isinstance(load_skills(), str)  # May be empty if file not found
+
+
+def test_chat_agent_context_keeps_general_anti_invention_rules_out_of_queries():
+    text = load_chat_agent_context()
+
+    assert "Не выдумывай ID, файлы, листы, колонки, таблицы и строки" in text
+    assert "`{PLACEHOLDER}`" in text
 
 
 def test_load_skills_contains_tool_orchestration_and_domain_context():
@@ -61,15 +68,31 @@ def test_s2t_skill_includes_transformation_path_analysis_rules():
     assert "Отсутствие подтверждения Neo4j не отменяет факты SQLite" in text
     assert "source_table.source_field → target_table.target_field" in text
     assert "перенеси её дословно" in text
-    assert "`WHEN` внутри `CASE` выбирает значение" in text
-    assert "`UNION`/`UNION ALL` объединяет ветви" in text
-    assert "входы одного выражения" in text
-    assert "одну логическую трансформацию" in text
+    assert "вызови `analyze`" in text
+    assert "сам\n  по себе analyzer не запускает" in text
+    assert "## Анализ трансформаций" not in text
     assert "source_table`, `source_field`, `target_table` и `target_field`" in text
     assert "дополнительный фильтр является mismatch" in text
     assert "Не зеркаль роли" in text
     assert "фильтруемыми и возвращаемыми полями" in text
     assert "повторно получать не требуется" in text
+
+
+def test_transformation_analysis_skill_is_independent_and_sql_precise():
+    text = load_skills(["Анализ трансформаций"])
+
+    assert "## Анализ трансформаций" in text
+    assert "При вызове `analyze`" in text
+    assert "фактическому" in text
+    assert "`transformation_rule` или SQL" in text
+    assert "`WHERE 1=1` ничего" in text
+    assert "`LEFT JOIN`" in text
+    assert "не удаляет строку левой таблицы" in text
+    assert "`UNION ALL`" in text
+    assert "NULL-защита подтверждена" in text
+    assert "одинаковые дубли исходных строк" in text
+    assert "## S2T-строки" not in text
+    assert "## Neo4j" not in text
 
 
 def test_load_skills_can_select_one_section():

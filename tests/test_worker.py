@@ -7,10 +7,12 @@ from langchain_core.tools import StructuredTool
 
 from agents.chat_graph import (
     Observation,
+    WorkerAnalysis,
     WorkerCycleTrace,
     WorkerDisplayItem,
     WorkerResponseError,
     WorkerRunResult,
+    _analyze_tool_schema,
     run_worker_graph,
 )
 from agents.tools import get_tools, load_schemas, load_skills
@@ -57,7 +59,23 @@ def test_worker_prompt_does_not_require_full_table_in_text():
     assert "без вступления, заключения" in _WORKER_PLANNER_PROMPT
     assert "Палитра worker никогда не пуста" in _WORKER_PLANNER_PROMPT
     assert "внутренний `analyze_known_facts`" in _WORKER_PLANNER_PROMPT
+    assert "внутреннее\nдействие `analyze`" in _WORKER_PLANNER_PROMPT
     assert "scrollable" not in _WORKER_PLANNER_PROMPT
+
+
+def test_analyze_is_a_strict_internal_worker_action():
+    schema = _analyze_tool_schema()["function"]
+
+    assert schema["name"] == "analyze"
+    assert schema["parameters"]["required"] == [
+        "tool_result_ids",
+        "instruction",
+    ]
+    assert schema["parameters"]["additionalProperties"] is False
+    assert schema["parameters"]["properties"]["tool_result_ids"][
+        "minItems"
+    ] == 1
+    assert "analyze" not in {tool.name for tool in get_tools()}
 
 
 class _ObserverModel:
@@ -82,20 +100,49 @@ class _ObserverModel:
         )
 
 
+class _AnalyzerModel:
+    def __init__(self, responses=None):
+        self.messages = []
+        self.responses = list(responses or [])
+
+    def invoke(self, messages):
+        self.messages.append(messages)
+        response = (
+            self.responses.pop(0)
+            if self.responses
+            else WorkerAnalysis(summary="Результат проанализирован.")
+        )
+        return (
+            response
+            if isinstance(response, WorkerAnalysis)
+            else WorkerAnalysis.model_validate(response)
+        )
+
+
 class _WorkerModel:
-    def __init__(self, responses, *, observer_responses=None):
+    def __init__(
+        self,
+        responses,
+        *,
+        observer_responses=None,
+        analyzer_responses=None,
+    ):
         self.responses = list(responses)
         self.bound_tools = []
         self.messages = []
         self.observer = _ObserverModel(observer_responses)
+        self.analyzer = _AnalyzerModel(analyzer_responses)
 
     def bind_tools(self, tools):
         self.bound_tools = list(tools)
         return self
 
     def with_structured_output(self, schema):
-        assert schema is Observation
-        return self.observer
+        if schema is Observation:
+            return self.observer
+        if schema is WorkerAnalysis:
+            return self.analyzer
+        raise AssertionError(f"Unexpected structured schema: {schema}")
 
     def invoke(self, messages, **kwargs):
         del kwargs
@@ -187,7 +234,7 @@ def test_worker_repairs_observer_without_repeating_data_tool():
             {
                 "summary": "Невалидная отрицательная observation.",
                 "goal_satisfied": False,
-                "mismatches": [],
+                "problem": None,
             },
             Observation(
                 summary="Значение 42 подтверждено.",
@@ -213,7 +260,7 @@ def test_worker_repairs_observer_without_repeating_data_tool():
     assert "не требуй его повторного" in repair_messages[-1].content
 
 
-def test_worker_stops_after_second_invalid_observer_without_repeating_tool():
+def test_worker_stops_after_five_observer_retries_without_repeating_tool():
     tool_calls = []
 
     def lookup():
@@ -223,7 +270,7 @@ def test_worker_stops_after_second_invalid_observer_without_repeating_tool():
     invalid_observation = {
         "summary": "Невалидная отрицательная observation.",
         "goal_satisfied": False,
-        "mismatches": [],
+        "problem": None,
     }
     model = _WorkerModel(
         [
@@ -239,10 +286,10 @@ def test_worker_stops_after_second_invalid_observer_without_repeating_tool():
                 ],
             ),
         ],
-        observer_responses=[invalid_observation, invalid_observation],
+        observer_responses=[invalid_observation] * 6,
     )
 
-    with pytest.raises(WorkerResponseError, match="Observer дважды"):
+    with pytest.raises(WorkerResponseError, match="после 6 попыток"):
         run_worker_graph(
             task="Получи значение.",
             system_prompt="Системный контекст",
@@ -252,7 +299,7 @@ def test_worker_stops_after_second_invalid_observer_without_repeating_tool():
         )
 
     assert tool_calls == ["lookup"]
-    assert len(model.observer.messages) == 2
+    assert len(model.observer.messages) == 6
 
 
 def test_worker_without_tools_is_observed_before_returning_answer():
@@ -294,7 +341,7 @@ def test_worker_without_tools_is_observed_before_returning_answer():
 
     assert result.answer == candidate_answer
     assert result.goal_satisfied is True
-    assert result.mismatches == []
+    assert result.problem is None
     assert result.display_items == []
     assert len(result.cycle_history) == 1
     cycle = result.cycle_history[0]
@@ -316,6 +363,139 @@ def test_worker_without_tools_is_observed_before_returning_answer():
     observer_system = str(model.observer.messages[0][0].content)
     assert "не является новым внешним фактом" in observer_system
     assert observer_payload["candidate_answer"] == ""
+
+
+def test_analyze_runs_only_when_called_and_receives_selected_full_result():
+    full_marker = "FULL_DISPLAY_RESULT_MARKER"
+
+    def lookup_rule():
+        return {
+            "transformation_rule": (
+                "SELECT target_id FROM source_table LEFT JOIN dictionary "
+                "ON dictionary.id = source_table.id "
+                + ("x" * 200)
+                + full_marker
+            )
+        }
+
+    def lookup_other():
+        return {"value": "SECOND_RESULT"}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_rule",
+                        "args": {},
+                        "id": "result-rule-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup_other",
+                        "args": {},
+                        "id": "result-other-2",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "analyze",
+                        "args": {
+                            "tool_result_ids": ["result-rule-1"],
+                            "instruction": "Определи семантику LEFT JOIN.",
+                        },
+                        "id": "analysis-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("LEFT JOIN сохраняет строки левой стороны."),
+        ],
+        observer_responses=[
+            Observation(
+                summary="Полное правило найдено, но ещё не интерпретировано.",
+                goal_satisfied=False,
+                problem="Не выполнен анализ семантики LEFT JOIN.",
+            ),
+            Observation(
+                summary="Правило и дополнительное значение найдены.",
+                goal_satisfied=False,
+                problem="Не выполнен анализ семантики LEFT JOIN.",
+            ),
+            Observation(
+                summary="LEFT JOIN сохраняет строки левой стороны.",
+                goal_satisfied=True,
+                important_facts=[
+                    "Условие ON ограничивает совпадения справа."
+                ],
+            ),
+        ],
+        analyzer_responses=[
+            WorkerAnalysis(
+                summary="LEFT JOIN сохраняет строки левой стороны.",
+                facts=["Условие ON ограничивает совпадения справа."],
+            )
+        ],
+    )
+
+    result = run_worker_graph(
+        task="Найди правило и объясни семантику LEFT JOIN.",
+        system_prompt="Системный контекст и навык анализа.",
+        model=model,
+        tools=(_as_tool(lookup_rule), _as_tool(lookup_other)),
+        max_steps=4,
+        tool_message_preview_chars=60,
+    )
+
+    assert result.answer == "LEFT JOIN сохраняет строки левой стороны."
+    assert len(model.analyzer.messages) == 1
+    analyzer_payload = json.loads(model.analyzer.messages[0][-1].content)
+    assert analyzer_payload["analysis_instruction"] == (
+        "Определи семантику LEFT JOIN."
+    )
+    assert full_marker in str(analyzer_payload["source_results"])
+    assert [cycle.analysis is not None for cycle in result.cycle_history] == [
+        False,
+        False,
+        True,
+    ]
+    assert full_marker not in str(result.cycle_history[0].tool_results)
+    assert full_marker in result.display_items[0].content
+
+    first_observer_payload = json.loads(model.observer.messages[0][-1].content)
+    analysis_observer_payload = json.loads(
+        model.observer.messages[2][-1].content
+    )
+    assert first_observer_payload["candidate_analysis"] is None
+    assert first_observer_payload["analysis_sources"] == []
+    assert full_marker in str(analysis_observer_payload["analysis_sources"])
+    assert "SECOND_RESULT" not in str(
+        analysis_observer_payload["analysis_sources"]
+    )
+    assert analysis_observer_payload["candidate_analysis"]["facts"] == [
+        "Условие ON ограничивает совпадения справа."
+    ]
+    first_planner_system = str(model.messages[0][0].content)
+    analysis_planner_system = str(model.messages[2][0].content)
+    assert "Доступные worker tools:\nlookup_rule, lookup_other" in (
+        first_planner_system
+    )
+    assert "Доступные worker tools:\nlookup_rule, lookup_other, analyze" in (
+        analysis_planner_system
+    )
+    assert "result-rule-1" in analysis_planner_system
+    assert "result-other-2" in analysis_planner_system
+    assert "полные результаты data tools" in analysis_planner_system
 
 
 def test_worker_keeps_text_preview_and_returns_full_successful_result():
@@ -658,7 +838,7 @@ def test_worker_planner_keeps_only_latest_tool_exchange():
             Observation(
                 summary="Получен только первый результат.",
                 goal_satisfied=False,
-                mismatches=["Второй результат ещё не получен."],
+                problem="Второй результат ещё не получен.",
             ),
             Observation(
                 summary="Получены оба результата.",
@@ -699,12 +879,12 @@ def test_worker_planner_keeps_only_latest_cumulative_observation():
     first = Observation(
         summary="Первый результат неполон.",
         goal_satisfied=False,
-        mismatches=["Не найден источник."],
+        problem="Не найден источник.",
     )
     latest = Observation(
         summary="Источник найден, правило ещё отсутствует.",
         goal_satisfied=False,
-        mismatches=["Не найдено правило преобразования."],
+        problem="Не найдено правило преобразования.",
         important_facts=["Источник: source_contracts."],
     )
 
@@ -761,7 +941,7 @@ def test_worker_observer_evaluates_current_result_with_prior_state():
             Observation(
                 summary="Источник: source_contracts.",
                 goal_satisfied=False,
-                mismatches=["Правило преобразования ещё не подтверждено."],
+                problem="Правило преобразования ещё не подтверждено.",
                 important_facts=["Источник: source_contracts."],
             ),
             Observation(
@@ -909,7 +1089,7 @@ def test_worker_returns_unsatisfied_status_after_step_limit():
             Observation(
                 summary="Результат пуст.",
                 goal_satisfied=False,
-                mismatches=["Task ожидала значение, но tool вернул пустой результат."],
+                problem="Task ожидала значение, но tool вернул пустой результат.",
             )
         ],
     )
@@ -923,9 +1103,9 @@ def test_worker_returns_unsatisfied_status_after_step_limit():
     )
 
     assert result.goal_satisfied is False
-    assert result.mismatches == [
+    assert result.problem == (
         "Task ожидала значение, но tool вернул пустой результат."
-    ]
+    )
 
 
 def test_worker_llm_handles_tool_error_without_backend_branch():
@@ -1013,7 +1193,7 @@ def test_worker_llm_can_correct_its_tool_call_after_observation():
             Observation(
                 summary="Получена агрегация по source_table вместо target_table.",
                 goal_satisfied=False,
-                mismatches=["Task требует агрегацию по target_table."],
+                problem="Task требует агрегацию по target_table.",
             ),
             Observation(
                 summary="Получена требуемая агрегация по target_table.",
@@ -1074,9 +1254,7 @@ def test_worker_cannot_finish_after_observer_reports_semantic_mismatch():
             Observation(
                 summary="Tool получил значение поля source_table.",
                 goal_satisfied=False,
-                mismatches=[
-                    "Task просит target_table, но tool получил source_table."
-                ],
+                problem="Task просит target_table, но tool получил source_table.",
             ),
             Observation(
                 summary="Tool получил требуемое поле target_table.",
@@ -1128,12 +1306,12 @@ def test_worker_graph_returns_reroute_after_current_palette_cannot_repair():
             Observation(
                 summary="Получен только список имён без агрегирования.",
                 goal_satisfied=False,
-                mismatches=[
+                problem=(
                     "Task требует сравнить количества строк, но текущий tool "
-                    "возвращает только имена."
-                ],
+                    "возвращает только имена; нужна возможность произвольной "
+                    "агрегации данных."
+                ),
                 reroute_required=True,
-                reroute_reason="Нужен tool для произвольной агрегации данных.",
             ),
         ],
     )
@@ -1147,8 +1325,9 @@ def test_worker_graph_returns_reroute_after_current_palette_cannot_repair():
     )
 
     assert result.reroute_required is True
-    assert result.reroute_reason == (
-        "Нужен tool для произвольной агрегации данных."
+    assert result.problem == (
+        "Task требует сравнить количества строк, но текущий tool возвращает "
+        "только имена; нужна возможность произвольной агрегации данных."
     )
     assert result.goal_satisfied is False
     assert result.display_items == []
@@ -1182,7 +1361,7 @@ def test_failed_semantic_repair_does_not_invent_reroute():
             Observation(
                 summary="Получен неподходящий результат.",
                 goal_satisfied=False,
-                mismatches=["Нужное значение не подтверждено."],
+                problem="Нужное значение не подтверждено.",
             ),
         ],
     )
@@ -1198,8 +1377,7 @@ def test_failed_semantic_repair_does_not_invent_reroute():
     assert result.answer == "Исправить результат текущим tool не удалось."
     assert result.goal_satisfied is False
     assert result.reroute_required is False
-    assert result.reroute_reason is None
-    assert result.mismatches == ["Нужное значение не подтверждено."]
+    assert result.problem == "Нужное значение не подтверждено."
 
 
 def test_worker_loop_does_not_rewrite_llm_tool_arguments_in_python():
@@ -1246,7 +1424,7 @@ def test_worker_loop_does_not_rewrite_llm_tool_arguments_in_python():
             Observation(
                 summary="Подсчитаны строки target_tables, а не source_table S2T.",
                 goal_satisfied=False,
-                mismatches=["Запрос выполнен не по s2t_transformations."],
+                problem="Запрос выполнен не по s2t_transformations.",
             ),
             Observation(
                 summary="Подсчитаны distinct непустые source_table S2T.",
@@ -1301,13 +1479,13 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
                 observation=Observation(
                     summary="Файлы получены.",
                     goal_satisfied=False,
-                    mismatches=["Нужна дополнительная проверка."],
+                    problem="Нужна дополнительная проверка.",
                     important_facts=["Найдено 3 файла."],
                 ),
             )
         ],
         goal_satisfied=False,
-        mismatches=["Нужна дополнительная проверка."],
+        problem="Нужна дополнительная проверка.",
     )
     route = ToolRoute(
         tools=["list_files"],
@@ -1331,7 +1509,7 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
     assert isinstance(result, WorkerAnswer)
     assert result.answer == graph_result.answer
     assert result.goal_satisfied is False
-    assert result.mismatches == graph_result.mismatches
+    assert result.problem == graph_result.problem
     assert result.cycle_history == graph_result.cycle_history
     assert len(result.result_refs) == 1
     assert result.result_refs[0].name == "list_files"
@@ -1354,7 +1532,7 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
         tools=["list_files"],
         skills=["Excel и описания"],
         schemas=["Excel-маппинги"],
-        reroute_reason=None,
+        problem=None,
     )
     observation_recorder.assert_called_once()
     observation_call = observation_recorder.call_args.kwargs
@@ -1362,9 +1540,9 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
     assert observation_call["cycle"] == 1
     assert observation_call["routing_attempt"] == 1
     assert observation_call["observation"]["goal_satisfied"] is False
-    assert observation_call["observation"]["mismatches"] == [
+    assert observation_call["observation"]["problem"] == (
         "Нужна дополнительная проверка."
-    ]
+    )
     assert "Worker route:" in caplog.text
     assert "Worker observation:" in caplog.text
     assert '"goal_satisfied": false' in caplog.text
@@ -1415,14 +1593,14 @@ def test_public_worker_reroutes_original_task_after_observer_request():
 
     routes = [
         ToolRoute(
-            tools=["list_s2t_table_names"],
+            tools=["list_s2t_transformations"],
             skills=["S2T-строки"],
             schemas=[],
         ),
         ToolRoute(
-            tools=["run_sql"],
+            tools=["list_s2t_transformations", "trace_transformation_path"],
             skills=[],
-            schemas=["SQLite ETL"],
+            schemas=["S2T-маппинг"],
         ),
     ]
     graph_results = [
@@ -1432,31 +1610,27 @@ def test_public_worker_reroutes_original_task_after_observer_request():
                 WorkerCycleTrace(
                     cycle=1,
                     tool_calls=[
-                        {"name": "list_s2t_table_names", "args": {}}
+                        {"name": "list_s2t_transformations", "args": {}}
                     ],
                     tool_results=[],
                     observation=Observation(
                         summary="Агрегирование не выполнено.",
                         goal_satisfied=False,
-                        mismatches=[
-                            "Текущий tool не выполняет агрегирование."
-                        ],
+                        problem="Текущий tool не строит многошаговый путь с rules.",
                         reroute_required=True,
-                        reroute_reason="Нужна произвольная SQL-агрегация.",
                     ),
                 )
             ],
             goal_satisfied=False,
-            mismatches=["Текущий tool не выполняет агрегирование."],
+            problem="Текущий tool не строит многошаговый путь с rules.",
             reroute_required=True,
-            reroute_reason="Нужна произвольная SQL-агрегация.",
         ),
         WorkerRunResult(
             answer="Максимум: t_example, 55 строк.",
             cycle_history=[
                 WorkerCycleTrace(
                     cycle=1,
-                    tool_calls=[{"name": "run_sql", "args": {}}],
+                    tool_calls=[{"name": "trace_transformation_path", "args": {}}],
                     tool_results=[],
                     observation=Observation(
                         summary="Максимум найден.",
@@ -1495,22 +1669,26 @@ def test_public_worker_reroutes_original_task_after_observer_request():
     )
     reroute_context = router.call_args_list[1].kwargs["reroute_context"]
     assert reroute_context == {
-        "reason": "Нужна произвольная SQL-агрегация.",
-        "mismatches": ["Текущий tool не выполняет агрегирование."],
-        "previous_tool_palettes": [["list_s2t_table_names"]],
+        "problem": "Текущий tool не строит многошаговый путь с rules.",
+        "previous_tool_palettes": [["list_s2t_transformations"]],
         "attempt": 1,
     }
-    assert [
+    selected_tool_names = [
         [tool.name for tool in item.kwargs["tools"]]
         for item in run_graph.call_args_list
-    ] == [["list_s2t_table_names"], ["run_sql"]]
+    ]
+    assert selected_tool_names[0] == ["list_s2t_transformations"]
+    assert set(selected_tool_names[1]) == {
+        "list_s2t_transformations",
+        "trace_transformation_path",
+    }
 
 
 def test_public_worker_can_execute_repeated_reroute_palette():
     from agents.worker import worker_chat
 
     repeated_route = ToolRoute(
-        tools=["list_s2t_table_names"],
+        tools=["list_s2t_transformations"],
         skills=["S2T-строки"],
         schemas=[],
     )
@@ -1518,9 +1696,8 @@ def test_public_worker_can_execute_repeated_reroute_palette():
         WorkerRunResult(
             answer="Нужно исправить запрос.",
             goal_satisfied=False,
-            mismatches=["SQL не учитывает нужный фильтр."],
+            problem="SQL не учитывает нужный фильтр.",
             reroute_required=True,
-            reroute_reason="Повтори SQL с правильным фильтром.",
         ),
         WorkerRunResult(
             answer="Максимум: t_example, 55 строк.",
@@ -1547,15 +1724,13 @@ def test_public_worker_can_execute_repeated_reroute_palette():
     assert [
         [tool.name for tool in item.kwargs["tools"]]
         for item in run_graph.call_args_list
-    ] == [["list_s2t_table_names"], ["list_s2t_table_names"]]
+    ] == [["list_s2t_transformations"], ["list_s2t_transformations"]]
     second_system_prompt = run_graph.call_args_list[1].kwargs["system_prompt"]
     assert "<reroute_feedback>" in second_system_prompt
-    assert "Повтори SQL с правильным фильтром." in second_system_prompt
     assert "SQL не учитывает нужный фильтр." in second_system_prompt
-    assert "палитра может совпадать с предыдущей" in second_system_prompt
+    assert "с помощью расширенной палитры" in second_system_prompt
     assert router.call_args_list[1].kwargs["reroute_context"] == {
-        "reason": "Повтори SQL с правильным фильтром.",
-        "mismatches": ["SQL не учитывает нужный фильтр."],
-        "previous_tool_palettes": [["list_s2t_table_names"]],
+        "problem": "SQL не учитывает нужный фильтр.",
+        "previous_tool_palettes": [["list_s2t_transformations"]],
         "attempt": 1,
     }

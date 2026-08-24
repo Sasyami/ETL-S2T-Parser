@@ -174,7 +174,7 @@ class CoordinatorWorkerRun(TypedDict):
     result_refs: List[CoordinatorResultRef]
     saved_results: List[Dict[str, Any]]
     goal_satisfied: bool
-    mismatches: List[str]
+    problem: Optional[str]
 
 
 class CoordinatorGraphState(TypedDict):
@@ -295,10 +295,13 @@ _UPSTREAM_EVIDENCE_PROMPT = f"""
   противоречат друг другу или потеряны.
 
 Каждый worker result содержит `goal`, `task`, краткий `answer`, ordered
-`cycle_history`, `goal_satisfied` и `mismatches`. Подтверждённым считай только
+`cycle_history`, `goal_satisfied` и `problem`. Подтверждённым считай только
 факт из шага с `goal_satisfied=true`, который поддержан его финальной
 structured observation и фактическим tool preview. Ошибочный промежуточный
 вызов, намерение worker и неподтверждённый текст answer фактами не являются.
+Если cycle содержит `analysis`, используй его только когда итоговая observation
+этого цикла имеет `goal_satisfied=true`; сам analyzer не заменяет подтверждение
+observer и выбранные им исходные tool results.
 
 Используй `original_task` только для точных названий объектов, ролей,
 идентификаторов и входных условий. Не превращай утверждение из task в найденный
@@ -308,7 +311,7 @@ structured observation и фактическим tool preview. Ошибочны�
 угадывай: перенеси требование в unresolved_requirements.
 
 Проверь покрытие всей original_task. Если worker имеет goal_satisfied=false,
-перенеси все его актуальные mismatches в unresolved_requirements и не продолжай
+перенеси его актуальную problem в unresolved_requirements и не продолжай
 зависимое вычисление мысленно. Не добавляй result refs, UI-решения, формат
 ответа, вступление или вывод для пользователя.
 """.strip()
@@ -331,13 +334,15 @@ _UPSTREAM_ANSWER_PROMPT = f"""
 `unresolved_requirements` кратко отрази как неподтверждённое требование, не
 додумывая ответ.
 
-Сохрани точные идентификаторы, роли, значения, связи и порядок. Имена и входные
-условия можно дословно брать из original_task для подписывания подтверждённых
-фактов, но нельзя считать их результатами проверки. Соблюдай запрошенный формат.
+Сохрани точные идентификаторы, роли, значения, связи и порядок. Ответ должен
+быть самодостаточным: подпиши каждый результат точным объектом и ролью из
+original_task, даже если этот идентификатор был входным условием, а не найденным
+фактом. Входные условия нельзя выдавать за результаты проверки. Соблюдай
+запрошенный формат — он приоритетнее любого собственного оформления.
 Если пользователь потребовал «только» конкретные элементы, не добавляй
 вступление, заключение или описание внутренних действий. Если задан буквальный
-шаблон вида `имя=<значение>`, сохрани имя и знак `=` дословно. JSON, список,
-число или объект сериализуй в строку поля `answer`.
+шаблон вида `имя=<значение>`, сохрани имя и знак `=` дословно: не заменяй такой
+шаблон JSON. Поле `answer` всегда является строкой.
 
 Не упоминай upstream/downstream coordinator, workers, tools, observations,
 result refs и внутреннюю схему.
@@ -697,13 +702,13 @@ def build_coordinator_graph(
             failed_refs = [item.ref for item in worker_result.result_refs]
             if failed_refs:
                 discard_worker_result_refs(failed_refs)
-            mismatch_text = "; ".join(worker_result.mismatches) or (
-                "worker не указал конкретные несоответствия"
+            problem_text = str(worker_result.problem or "").strip() or (
+                "worker не указал конкретную проблему"
             )
             logger.warning(
                 "Worker step=%s did not satisfy task; stopping plan: %s",
                 step_index + 1,
-                mismatch_text,
+                problem_text,
             )
             failed_run: CoordinatorWorkerRun = {
                 "step": step_index + 1,
@@ -720,7 +725,7 @@ def build_coordinator_graph(
                     for item in worker_result.saved_results
                 ],
                 "goal_satisfied": False,
-                "mismatches": list(worker_result.mismatches),
+                "problem": worker_result.problem,
             }
             return {
                 "worker_runs": [*state["worker_runs"], failed_run],
@@ -754,7 +759,7 @@ def build_coordinator_graph(
                 for item in worker_result.saved_results
             ],
             "goal_satisfied": worker_result.goal_satisfied,
-            "mismatches": list(worker_result.mismatches),
+            "problem": worker_result.problem,
         }
         return {
             "worker_runs": [*state["worker_runs"], run],
@@ -774,7 +779,7 @@ def build_coordinator_graph(
                 "answer": run["answer"],
                 "cycle_history": list(run["cycle_history"]),
                 "goal_satisfied": run["goal_satisfied"],
-                "mismatches": list(run["mismatches"]),
+                "problem": run["problem"],
             }
             for run in state["worker_runs"]
         ]

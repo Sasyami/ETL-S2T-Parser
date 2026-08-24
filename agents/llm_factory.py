@@ -14,7 +14,7 @@ load_dotenv()
 DEFAULT_LLM_PROVIDER = "gigachat"
 SUPPORTED_LLM_PROVIDERS = ("gigachat", "openrouter", "ollama")
 
-DEFAULT_GIGACHAT_BASE_URL = "https://gigachat.devices.sberbank.ru/api/v1"
+DEFAULT_GIGACHAT_BASE_URL = "https://api.giga.chat/v1"
 DEFAULT_GIGACHAT_MODEL = "GigaChat"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "openrouter/free"

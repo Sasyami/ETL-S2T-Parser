@@ -9,6 +9,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -51,6 +52,10 @@ class ModeResult:
     total_tokens: int = 0
     cache_read_tokens: int = 0
     http_500: int = 0
+    presentation_warnings: int = 0
+    efficiency_warnings: int = 0
+    warning_details: list[dict[str, str]] = field(default_factory=list)
+    scenario_warnings: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _slug(value: str) -> str:
@@ -128,6 +133,32 @@ def _parse_transcript(result: ModeResult) -> None:
     result.total_tokens = sum(int(row[2]) for row in token_rows)
     result.cache_read_tokens = sum(int(row[3]) for row in token_rows)
     result.http_500 = len(re.findall(r"^### Ответ — HTTP 500$", text, re.MULTILINE))
+    warning_rows = re.findall(
+        r"^<!-- LIVE_WARNING (\{.+\}) -->$",
+        text,
+        re.MULTILINE,
+    )
+    for raw_warning in warning_rows:
+        try:
+            warning = json.loads(raw_warning)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(warning, dict):
+            continue
+        category = str(warning.get("category") or "warning").strip().lower()
+        scenario = str(warning.get("scenario") or "unknown").strip()
+        message = str(warning.get("message") or "").strip()
+        detail = {
+            "category": category,
+            "scenario": scenario,
+            "message": message,
+        }
+        result.warning_details.append(detail)
+        result.scenario_warnings.setdefault(scenario, []).append(category)
+        if category == "presentation":
+            result.presentation_warnings += 1
+        elif category == "efficiency":
+            result.efficiency_warnings += 1
     for tools_line in re.findall(r"^tools: (.+)$", text, re.MULTILINE):
         clean = tools_line.strip()
         if clean and clean != "Нет":
@@ -145,6 +176,19 @@ def _status_mark(status: str | None) -> str:
     }.get(status or "", "—")
 
 
+def _scenario_mark(result: ModeResult, scenario: str) -> str:
+    mark = _status_mark(result.scenario_statuses.get(scenario))
+    categories = result.scenario_warnings.get(scenario, [])
+    suffixes = []
+    presentation_count = categories.count("presentation")
+    efficiency_count = categories.count("efficiency")
+    if presentation_count:
+        suffixes.append(f"⚠P×{presentation_count}")
+    if efficiency_count:
+        suffixes.append(f"⚠E×{efficiency_count}")
+    return " ".join((mark, *suffixes))
+
+
 def _comparison_report(
     *,
     provider: str,
@@ -158,15 +202,17 @@ def _comparison_report(
         "Запросы выполнялись последовательно через реальный HTTP `/chat`, "
         "без mock и параллельных LLM-вызовов.",
         "",
-        "| Режим | Passed | Failed | Skipped | HTTP 500 | Agent, с | "
+        "| Режим | Passed | Critical failures | Skipped | HTTP 500 | "
+        "Presentation warnings | Efficiency warnings | Agent, с | "
         "LLM calls | Tool calls | Total tokens |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for result in results:
         lines.append(
             f"| {result.mode} | {result.passed} | "
             f"{result.failed + result.errors} | {result.skipped} | "
-            f"{result.http_500} | {result.agent_seconds:.3f} | "
+            f"{result.http_500} | {result.presentation_warnings} | "
+            f"{result.efficiency_warnings} | {result.agent_seconds:.3f} | "
             f"{result.llm_calls} | {result.tool_calls} | "
             f"{result.total_tokens} |"
         )
@@ -195,10 +241,35 @@ def _comparison_report(
             lines.append(
                 f"| {label} | "
                 + " | ".join(
-                    _status_mark(result.scenario_statuses.get(name))
+                    _scenario_mark(result, name)
                     for result in results
                 )
                 + " |"
+            )
+
+    warning_details = [
+        (result.mode, detail)
+        for result in results
+        for detail in result.warning_details
+    ]
+    if warning_details:
+        lines.extend(
+            [
+                "",
+                "## Некритичные предупреждения",
+                "",
+                "`P` — presentation, `E` — efficiency. Они не переводят "
+                "сценарий в failed.",
+                "",
+                "| Режим | Сценарий | Категория | Детали |",
+                "|---|---|---|---|",
+            ]
+        )
+        for mode, detail in warning_details:
+            clean_message = detail["message"].replace("|", "\\|")
+            lines.append(
+                f"| {mode} | {detail['scenario']} | "
+                f"{detail['category']} | {clean_message} |"
             )
 
     lines.extend(["", "## Артефакты", ""])

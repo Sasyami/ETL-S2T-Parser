@@ -105,6 +105,105 @@ def test_run_sql_returns_sqlite_error_message():
     }
 
 
+def test_list_additional_objects_uses_exact_filters_and_preserves_duplicates():
+    from agents.tools import list_additional_objects
+
+    conn = get_db_connection()
+    conn.executemany(
+        "INSERT INTO files (file_id, filename, upload_time) VALUES (?, ?, ?)",
+        [
+            (10, "one.xlsx", "2026-01-01"),
+            (11, "two.xlsx", "2026-01-02"),
+        ],
+    )
+    long_sql = "SELECT order_id, payload FROM raw.orders " + "-- full sql\n" * 50
+    conn.executemany(
+        """
+        INSERT INTO additional_objects
+        (id, file_id, sheet_name, row_num, name, sql)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (100, 10, "Additional objects", 7, "mart.orders", long_sql),
+            (101, 10, "Additional objects", 8, "mart.orders", long_sql),
+            (102, 11, "Additional objects", 9, "mart.other", "SELECT 1"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = list_additional_objects.invoke(
+        {"file_id": 10, "name": " MART.ORDERS ", "limit": 10}
+    )
+
+    assert result["filters"] == {"file_id": 10, "name": "MART.ORDERS"}
+    assert result["total_matches"] == 2
+    assert result["returned_rows"] == 2
+    assert result["truncated"] is False
+    assert [row["additional_object_id"] for row in result["rows"]] == [100, 101]
+    assert all(row["filename"] == "one.xlsx" for row in result["rows"])
+    assert all(row["sql"] == long_sql for row in result["rows"])
+
+
+def test_search_additional_objects_searches_full_sql_inside_file():
+    from agents.tools import search_additional_objects
+
+    conn = get_db_connection()
+    conn.executemany(
+        "INSERT INTO files (file_id, filename, upload_time) VALUES (?, ?, ?)",
+        [
+            (20, "one.xlsx", "2026-01-01"),
+            (21, "two.xlsx", "2026-01-02"),
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO additional_objects
+        (id, file_id, sheet_name, row_num, name, sql)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                200,
+                20,
+                "Additional objects",
+                3,
+                "mart.payments",
+                "SELECT * FROM raw.payments LEFT JOIN raw.clients ON true",
+            ),
+            (
+                201,
+                21,
+                "Additional objects",
+                4,
+                "mart.orders",
+                "SELECT * FROM raw.orders LEFT JOIN raw.clients ON true",
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = search_additional_objects.invoke(
+        {
+            "needle": "left join",
+            "file_id": 20,
+            "search_in": "sql",
+            "limit": 10,
+        }
+    )
+
+    assert result["query"] == "left join"
+    assert result["file_id"] == 20
+    assert result["searched_columns"] == ["sql"]
+    assert result["total_matches"] == 1
+    assert result["rows"][0]["additional_object_id"] == 200
+    assert "LEFT JOIN" in result["rows"][0]["sql"]
+    assert search_additional_objects.invoke({"needle": " "})["error"] == (
+        "needle must be non-empty"
+    )
+
+
 def test_run_sql_rejects_write_queries():
     from agents.tools import run_sql
 

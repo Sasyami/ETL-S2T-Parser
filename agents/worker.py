@@ -70,7 +70,7 @@ class WorkerAnswer(BaseModel):
     saved_results: List[SavedResultDescriptor] = Field(default_factory=list)
     cycle_history: List[WorkerCycleTrace] = Field(default_factory=list)
     goal_satisfied: bool = True
-    mismatches: List[str] = Field(default_factory=list)
+    problem: str | None = None
 
 
 def _store_display_items(items: Sequence[WorkerDisplayItem]) -> List[WorkerResultRef]:
@@ -102,12 +102,7 @@ def discard_worker_result_refs(refs: Sequence[str]) -> None:
 
 def _planner_reroute_feedback(context: Dict[str, Any]) -> str:
     payload = {
-        "reason": str(context.get("reason") or "").strip(),
-        "mismatches": [
-            str(item).strip()
-            for item in context.get("mismatches", [])
-            if str(item).strip()
-        ],
+        "problem": str(context.get("problem") or "").strip(),
     }
     serialized = json.dumps(payload, ensure_ascii=False)
     if len(serialized) > _REROUTE_FEEDBACK_MAX_CHARS:
@@ -115,8 +110,8 @@ def _planner_reroute_feedback(context: Dict[str, Any]) -> str:
     return (
         "Повторный запуск worker после неуспешной попытки. Ниже только "
         "диагностическая выжимка предыдущего запуска, а не новая task. "
-        "Учти её при первом следующем вызове data tool и исправь перечисленные "
-        "ошибки. Доступная палитра может совпадать с предыдущей.\n"
+        "Учти её при первом следующем вызове data tool и исправь описанную "
+        "проблему с помощью расширенной палитры.\n"
         f"<reroute_feedback>{serialized}</reroute_feedback>"
     )
 
@@ -129,7 +124,7 @@ def worker_chat(task: str) -> WorkerAnswer:
             answer="Подзадача воркера не должна быть пустой.",
             result_refs=[],
             goal_satisfied=False,
-            mismatches=["Worker получил пустую task."],
+            problem="Worker получил пустую task.",
         )
 
     record_worker_task(clean_task)
@@ -177,10 +172,10 @@ def worker_chat(task: str) -> WorkerAnswer:
         worker_tools = ensure_worker_tools(selected_tools)
         selected_skills = load_skills(tuple(route.skills))
         selected_schemas = load_schemas(tuple(route.schemas))
-        reroute_reason = (
-            str(reroute_context.get("reason") or "").strip()
+        reroute_problem = (
+            str(reroute_context.get("problem") or "").strip()
             if reroute_context is not None
-            else None
+            else ""
         )
         record_worker_route(
             worker_task=clean_task,
@@ -188,7 +183,7 @@ def worker_chat(task: str) -> WorkerAnswer:
             tools=[tool.name for tool in worker_tools],
             skills=list(route.skills),
             schemas=list(route.schemas),
-            reroute_reason=reroute_reason,
+            problem=reroute_problem or None,
         )
 
         logger.info(
@@ -201,7 +196,7 @@ def worker_chat(task: str) -> WorkerAnswer:
                     "worker_tools": [tool.name for tool in worker_tools],
                     "skills": list(route.skills),
                     "schemas": list(route.schemas),
-                    "reroute_reason": reroute_reason,
+                    "problem": reroute_problem or None,
                 },
                 ensure_ascii=False,
             )[:8000],
@@ -244,6 +239,11 @@ def worker_chat(task: str) -> WorkerAnswer:
                 cycle=cycle.cycle,
                 routing_attempt=cycle.routing_attempt,
                 observation=observation_payload,
+                analysis=(
+                    cycle.analysis.model_dump()
+                    if cycle.analysis is not None
+                    else None
+                ),
             )
             logger.info(
                 "Worker observation: %s",
@@ -252,6 +252,11 @@ def worker_chat(task: str) -> WorkerAnswer:
                         "task": clean_task,
                         "cycle": cycle.cycle,
                         "routing_attempt": cycle.routing_attempt,
+                        "analysis": (
+                            cycle.analysis.model_dump()
+                            if cycle.analysis is not None
+                            else None
+                        ),
                         "observation": observation_payload,
                     },
                     ensure_ascii=False,
@@ -264,36 +269,31 @@ def worker_chat(task: str) -> WorkerAnswer:
                 saved_results=newly_saved_results(),
                 cycle_history=cycle_history,
                 goal_satisfied=graph_result.goal_satisfied,
-                mismatches=graph_result.mismatches,
+                problem=graph_result.problem,
             )
 
-        reroute_reason = str(
-            graph_result.reroute_reason
-            or "Текущей палитры tools недостаточно для выполнения task."
-        ).strip()
         if reroute_count >= WORKER_MAX_REROUTES:
             return WorkerAnswer(
-                answer=reroute_reason,
+                answer=str(graph_result.problem or ""),
                 result_refs=[],
                 saved_results=newly_saved_results(),
                 cycle_history=cycle_history,
                 goal_satisfied=False,
-                mismatches=list(graph_result.mismatches),
+                problem=graph_result.problem,
             )
 
         reroute_count += 1
         reroute_context = {
-            "reason": reroute_reason,
-            "mismatches": list(graph_result.mismatches),
+            "problem": str(graph_result.problem or ""),
             "previous_tool_palettes": [
                 list(item) for item in attempted_palettes
             ],
             "attempt": reroute_count,
         }
         logger.info(
-            "Worker returns to tool-router: attempt=%s reason=%s",
+            "Worker returns to tool-router: attempt=%s problem=%s",
             reroute_count,
-            reroute_reason,
+            graph_result.problem,
         )
 
 

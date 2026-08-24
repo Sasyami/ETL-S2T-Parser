@@ -167,6 +167,8 @@ def test_coordinator_prompts_are_generic_not_domain_contracts():
     assert "Если пользователь потребовал «только»" in _UPSTREAM_ANSWER_PROMPT
     assert "имя=<значение>" in _UPSTREAM_ANSWER_PROMPT
     assert "знак `=` дословно" in _UPSTREAM_ANSWER_PROMPT
+    assert "Ответ должен\nбыть самодостаточным" in _UPSTREAM_ANSWER_PROMPT
+    assert "не заменяй такой\nшаблон JSON" in _UPSTREAM_ANSWER_PROMPT
     assert "worker_results" not in _UPSTREAM_ANSWER_PROMPT
     assert len(_UPSTREAM_EVIDENCE_PROMPT) < 2400
     assert len(_UPSTREAM_ANSWER_PROMPT) < 1800
@@ -486,7 +488,7 @@ def test_upstream_answer_reports_unresolved_evidence_without_internal_error():
                 answer="Факт не подтверждён.",
                 result_refs=[WorkerResultRef(ref="ref-failed", name="lookup")],
                 goal_satisfied=False,
-                mismatches=["Tool вернул данные не по той сущности."],
+                problem="Tool вернул данные не по той сущности.",
             ),
         ),
         patch("agents.coordinator.discard_worker_result_refs") as discard,
@@ -510,7 +512,7 @@ def test_upstream_answer_reports_unresolved_evidence_without_internal_error():
             "answer": "Факт не подтверждён.",
             "cycle_history": [],
             "goal_satisfied": False,
-            "mismatches": ["Tool вернул данные не по той сущности."],
+            "problem": "Tool вернул данные не по той сущности.",
         }
     ]
     discard.assert_called_once_with(["ref-failed"])

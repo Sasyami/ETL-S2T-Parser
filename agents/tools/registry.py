@@ -4,6 +4,7 @@ from typing import Dict, Iterable, Tuple
 
 from langchain_core.tools import BaseTool
 
+from .additional_objects import list_additional_objects, search_additional_objects
 from .files import (
     get_file_description,
     list_files,
@@ -48,6 +49,8 @@ READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     search_excel_values,
     get_excel_row,
     semantic_search_descriptions,
+    list_additional_objects,
+    search_additional_objects,
     list_column_catalog,
     search_column_catalog,
     visualize_s2t_table_graph,

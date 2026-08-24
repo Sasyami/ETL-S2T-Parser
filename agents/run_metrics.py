@@ -61,12 +61,12 @@ class ObservationMetric(BaseModel):
     routing_attempt: int
     summary: str
     goal_satisfied: bool
-    mismatches: List[str] = Field(default_factory=list)
+    problem: Optional[str] = None
     has_error: bool = False
     important_facts: List[str] = Field(default_factory=list)
     limitations: List[str] = Field(default_factory=list)
     reroute_required: bool = False
-    reroute_reason: Optional[str] = None
+    analysis: Optional[Dict[str, Any]] = None
 
 
 class WorkerRouteMetric(BaseModel):
@@ -79,7 +79,7 @@ class WorkerRouteMetric(BaseModel):
     tools: List[str] = Field(default_factory=list)
     skills: List[str] = Field(default_factory=list)
     schemas: List[str] = Field(default_factory=list)
-    reroute_reason: Optional[str] = None
+    problem: Optional[str] = None
 
 
 class AgentRunMetrics(BaseModel):
@@ -415,7 +415,7 @@ def record_worker_route(
     tools: List[str],
     skills: List[str],
     schemas: List[str],
-    reroute_reason: Optional[str] = None,
+    problem: Optional[str] = None,
 ) -> None:
     """Retain an already selected router palette for live diagnostics."""
     if collector := _ACTIVE_RUN.get():
@@ -425,7 +425,7 @@ def record_worker_route(
             tools=[str(item) for item in tools],
             skills=[str(item) for item in skills],
             schemas=[str(item) for item in schemas],
-            reroute_reason=_clip(reroute_reason) or None,
+            problem=_clip(problem) or None,
         )
         with collector.lock:
             collector.worker_routes.append(metric)
@@ -437,6 +437,7 @@ def record_worker_observation(
     cycle: int,
     routing_attempt: int,
     observation: Mapping[str, Any],
+    analysis: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Retain a bounded structured observation for live-run diagnostics."""
     if collector := _ACTIVE_RUN.get():
@@ -446,9 +447,7 @@ def record_worker_observation(
             routing_attempt=max(1, int(routing_attempt)),
             summary=_clip(observation.get("summary")),
             goal_satisfied=bool(observation.get("goal_satisfied")),
-            mismatches=[
-                _clip(item) for item in observation.get("mismatches", [])
-            ],
+            problem=_clip(observation.get("problem")) or None,
             has_error=bool(observation.get("has_error")),
             important_facts=[
                 _clip(item)
@@ -458,8 +457,19 @@ def record_worker_observation(
                 _clip(item) for item in observation.get("limitations", [])
             ],
             reroute_required=bool(observation.get("reroute_required")),
-            reroute_reason=(
-                _clip(observation.get("reroute_reason")) or None
+            analysis=(
+                {
+                    "summary": _clip(analysis.get("summary")),
+                    "facts": [
+                        _clip(item) for item in analysis.get("facts", [])
+                    ],
+                    "limitations": [
+                        _clip(item)
+                        for item in analysis.get("limitations", [])
+                    ],
+                }
+                if analysis is not None
+                else None
             ),
         )
         with collector.lock:

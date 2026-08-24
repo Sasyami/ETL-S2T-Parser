@@ -81,7 +81,7 @@ flowchart TD
 - coordinator создаёт семантический план и последовательно материализует зависимые подзадачи;
 - worker получает только самодостаточную строку задачи, внутри сам выбирает tools и runtime skills;
 - planner видит исходную задачу, последний обмен с инструментом и накопительную observer-выжимку;
-- observer возвращает structured-поля `goal_satisfied`, `mismatches`, факты, ограничения и запрос на reroute;
+- observer возвращает structured-поля `goal_satisfied`, единую строку `problem`, факты, ограничения и запрос на reroute;
 - полные результаты инструментов не копируются в историю worker: там остаётся ограниченный preview;
 - coordinator получает краткий ответ worker и непрозрачные ссылки на полные результаты;
 - табличные результаты SQLite-tools дополнительно материализуются во временной базе одного coordinator-запуска; зависимый worker получает `result_ref` и схему relation `result`, после чего может выполнить по ней read-only SQL через `query_saved_result`;
@@ -164,7 +164,7 @@ uv run python app.py
 LLM_PROVIDER=gigachat
 GIGACHAT_API_KEY=your_key
 GIGACHAT_MODEL=GigaChat
-GIGACHAT_API_URL=https://gigachat.devices.sberbank.ru/api/v1
+GIGACHAT_API_URL=https://api.giga.chat/v1
 GIGACHAT_SCOPE=GIGACHAT_API_PERS
 GIGACHAT_VERIFY_SSL=false
 GIGACHAT_TIMEOUT=120
@@ -262,7 +262,12 @@ $env:LIVE_AGENT_TRANSCRIPT_PATH = ".test_runs/live-agent.md"
 pytest tests/test_live_agent_scenarios.py -q
 ```
 
-Десять сценариев проверяют обычный диалог, SQLite-count, ссылку на историю, scrollable-результаты, зависимые workers, точные S2T-пары, Neo4j-пути и переход SQLite → Neo4j. Помимо правильности ответа проверяются необходимые tools/displays, время, число LLM-вызовов и токены.
+Live-сценарии проверяют обычный диалог, SQLite-count, ссылку на историю,
+scrollable-результаты, зависимые workers, точные S2T-пары, Neo4j-пути и переход
+SQLite → Neo4j. Неверные или неполные факты, отсутствие требуемого источника и
+инфраструктурные ошибки делают сценарий failed. Отклонения display/UI
+записываются как presentation warnings, а превышения времени, LLM-вызовов,
+tools и токенов — как efficiency warnings; сами по себе они сценарий не роняют.
 
 Для последовательного сравнения режимов:
 
