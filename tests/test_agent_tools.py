@@ -367,6 +367,13 @@ def test_previous_result_is_lazy_and_scoped_to_coordinator_run():
         )
         assert resolved["source_tool"] == "run_sql"
         assert resolved["result"]["rows"][0]["target_table"] == "t_example"
+        batched = read_previous_result.invoke(
+            {"result_ids": [reference.result_id]}
+        )
+        assert batched["results"][0]["source_tool"] == "run_sql"
+        assert batched["results"][0]["result"]["rows"][0][
+            "target_table"
+        ] == "t_example"
 
         bound_tools = bind_saved_result_schemas(get_tools(), task)
         bound_names = {item.name for item in bound_tools}

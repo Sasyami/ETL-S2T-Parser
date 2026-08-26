@@ -38,6 +38,44 @@ SCHEMA_CATALOG: Dict[str, str] = {
 }
 
 
+_DOWNSTREAM_TABLE_DESCRIPTIONS: Dict[str, str] = {
+    "files": "загруженные Excel-файлы и их сохранённые описания",
+    "file_sheet_headers": "листы файлов и распознанные заголовки",
+    "source_tables": "исходные логические таблицы и бизнес-описания таблиц",
+    "target_tables": "целевые логические таблицы и бизнес-описания таблиц",
+    "source_columns": "исходные колонки, их таблицы, типы и описания полей",
+    "target_columns": "целевые колонки, их таблицы, типы и описания полей",
+    "additional_objects": "Additional objects с точным именем и полным SQL",
+    "pxf_to_a": "соответствия external, materialized и replica-таблиц",
+    "s2t_transformations": "точные source→target таблицы, поля и текст правила",
+    "data": "сырые значения ячеек Excel с координатами происхождения",
+}
+
+
+def get_downstream_table_context() -> str:
+    """Return exact storage table names with compact planning descriptions."""
+    from storage.database import USER_FACING_TABLES
+
+    configured = set(_DOWNSTREAM_TABLE_DESCRIPTIONS)
+    actual = set(USER_FACING_TABLES)
+    if configured != actual:
+        raise RuntimeError(
+            "Downstream table descriptions are out of sync: "
+            f"missing={sorted(actual - configured)}, "
+            f"extra={sorted(configured - actual)}"
+        )
+    return "\n".join(
+        [
+            "Реальные таблицы хранилища (справка, не список шагов; "
+            "наличие таблицы не требует её чтения):"
+        ]
+        + [
+            f"- `{name}` — {_DOWNSTREAM_TABLE_DESCRIPTIONS[name]}."
+            for name in USER_FACING_TABLES
+        ]
+    )
+
+
 def _prompt_text(filename: str) -> str:
     try:
         return (PROMPTS_DIR / filename).read_text(encoding="utf-8")

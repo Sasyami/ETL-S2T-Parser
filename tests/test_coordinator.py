@@ -9,8 +9,10 @@ from agents.contracts import (
     EvidenceArtifact,
     EvidenceFact,
     PreviousResultReference,
+    WORKER_PREVIOUS_RESULTS_MARKER,
     WORKER_STABLE_CONTEXT_MARKER,
     WorkerOutcome,
+    parse_worker_request,
 )
 from agents.coordinator import CoordinatorAnswer
 from agents.tools.saved_results import SavedResultColumn, SavedResultDescriptor
@@ -377,6 +379,7 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     from agents.coordinator import (
         _DOWNSTREAM_PLAN_PROMPT,
         _DOWNSTREAM_PLAN_REPAIR_PROMPT,
+        _DOWNSTREAM_TABLE_CONTEXT,
         _UPSTREAM_ANALYSIS_CONTEXT,
         _UPSTREAM_ANSWER_PROMPT,
         _UPSTREAM_DATA_DECISION_PROMPT,
@@ -386,11 +389,7 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     )
 
     combined = "\n".join(
-        (
-            _DOWNSTREAM_PLAN_PROMPT,
-            _UPSTREAM_DATA_DECISION_PROMPT,
-            _UPSTREAM_ANSWER_PROMPT,
-        )
+        (_UPSTREAM_DATA_DECISION_PROMPT, _UPSTREAM_ANSWER_PROMPT)
     )
     for domain_detail in (
         "target_table",
@@ -402,48 +401,63 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     ):
         assert domain_detail not in combined
 
-    assert len(_DOWNSTREAM_PLAN_PROMPT) < 1700
+    assert len(_DOWNSTREAM_PLAN_PROMPT) < 3000
+    assert len(_DOWNSTREAM_PLAN_PROMPT) - len(_DOWNSTREAM_TABLE_CONTEXT) < 2200
     assert len(_UPSTREAM_DATA_DECISION_PROMPT) < 1300
     assert len(_UPSTREAM_ANSWER_PROMPT) < 2300
     assert len(_UPSTREAM_ANALYSIS_CONTEXT) < 1800
     assert "`depends_on`" not in _DOWNSTREAM_PLAN_PROMPT
     assert "needs_from_previous" not in _DOWNSTREAM_PLAN_PROMPT
     assert "required_evidence" not in _DOWNSTREAM_PLAN_PROMPT
-    assert "не выбирай tools или skills здесь" in (
+    assert "не выбирай tools/skills" in (
         _DOWNSTREAM_PLAN_PROMPT.lower().replace("\n", " ")
     )
-    assert "только необходимые чтения исходных фактов" in _DOWNSTREAM_PLAN_PROMPT
-    assert "всё\nэто выполняет upstream" in _DOWNSTREAM_PLAN_PROMPT
-    assert "сравнение, оценку, объяснение, вывод" in _DOWNSTREAM_PLAN_PROMPT
-    assert "Роли `source`/`target`, направление связи и тип каждой сущности" in (
+    assert "прямо необходимых фактов" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Каждый step обязан быть незаменимым" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Наличие\nтаблицы в справочнике не является причиной" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "файл, таблица\nили колонка/поле" in _DOWNSTREAM_PLAN_PROMPT
-    assert "общим либо неоднозначным\nобозначением" in _DOWNSTREAM_PLAN_PROMPT
-    assert "Явно указанные идентификаторы уже являются входами" in (
+    assert "первым\nstep получи из каталога его технические имена" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "несколько таких входов, сохрани\nих вместе в одной task" in (
+    assert "S2T-поиск по подстроке лексический, не семантический" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "Не ссылайся на\n«найденный» объект, предыдущий step" in (
+    assert "это делает upstream" in _DOWNSTREAM_PLAN_PROMPT
+    assert "сравнения, оценки, объяснения, вывода" in _DOWNSTREAM_PLAN_PROMPT
+    assert "роли source/target, тип сущности, направление, scope" in (
+        _DOWNSTREAM_PLAN_PROMPT.lower()
+    )
+    assert "Не превращай бизнес-термин в придуманное имя" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "Внешние знаки\nпредложения `:`, `;`, `,`, `.`, `?`, `!`" in (
+    assert "не пиши task как\nвызов функции" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "внутренние\n`.`, `_` и парные `::` сохраняются" in (
+    assert "смысл поля ищется сразу в каталогах\nколонок" in (
+        _DOWNSTREAM_PLAN_PROMPT.lower()
+    )
+    assert "лениво прочитать принятые результаты прошлых workers" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "заключай точный идентификатор в\nобратные кавычки" in (
-        _DOWNSTREAM_PLAN_PROMPT
-    )
-    assert "несколько входов одной операции сохраняй в одной task" in (
-        _DOWNSTREAM_PLAN_REPAIR_PROMPT
-    )
-    assert "Разделяй только независимые\nчтения" in (
-        _DOWNSTREAM_PLAN_REPAIR_PROMPT
-    )
+    assert "справка, не список шагов" in _DOWNSTREAM_TABLE_CONTEXT
+    assert "наличие таблицы не требует её чтения" in _DOWNSTREAM_TABLE_CONTEXT
+    for table_name in (
+        "files",
+        "file_sheet_headers",
+        "source_tables",
+        "target_tables",
+        "source_columns",
+        "target_columns",
+        "additional_objects",
+        "pxf_to_a",
+        "s2t_transformations",
+        "data",
+    ):
+        assert f"`{table_name}`" in _DOWNSTREAM_TABLE_CONTEXT
+    assert "бизнес-описания таблиц" in _DOWNSTREAM_TABLE_CONTEXT
+    assert "текст правила" in _DOWNSTREAM_TABLE_CONTEXT
+    assert "только реальные таблицы\nхранилища" in _DOWNSTREAM_PLAN_REPAIR_PROMPT
     assert "скопируй `original_task`" not in _DOWNSTREAM_PLAN_PROMPT
     plan_schema_text = str(_plan_tool_schema())
     assert "По умолчанию один шаг" not in plan_schema_text
@@ -452,6 +466,9 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "По умолчанию один шаг" not in worker_plan_schema_text
     assert "decision=\"pass\"" in _UPSTREAM_DATA_DECISION_PROMPT
     assert "decision=\"reroute\"" in _UPSTREAM_DATA_DECISION_PROMPT
+    assert "не предлагай имена таблиц, колонок" in (
+        _UPSTREAM_DATA_DECISION_PROMPT
+    )
     assert "Не формируй пользовательский ответ" in (
         _UPSTREAM_DATA_DECISION_PROMPT
     )
@@ -722,8 +739,19 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
     context_suffix = WORKER_STABLE_CONTEXT_MARKER + "Общий фон"
     assert worker.call_args_list[0].args[0] == "Найди точное имя." + context_suffix
     second_task = worker.call_args_list[1].args[0]
-    assert second_task == "Проверь найденное имя." + context_suffix
-    assert "previous_results" not in second_task
+    second_parts = parse_worker_request(second_task)
+    assert second_parts.current_task == "Проверь найденное имя."
+    assert second_parts.stable_context == "Общий фон"
+    assert [
+        item.model_dump(mode="json")
+        for item in (second_parts.previous_results or [])
+    ] == [
+        {
+            "result_id": "result-first",
+            "description": "lookup: точное имя t_example.",
+        }
+    ]
+    assert WORKER_PREVIOUS_RESULTS_MARKER in second_task
     discard.assert_not_called()
 
     upstream = _payload(model, "submit_upstream_answer")
@@ -825,7 +853,7 @@ def test_upstream_selects_only_requested_display_and_discards_other_refs():
     ]
 
 
-def test_coordinator_does_not_pass_results_between_workers():
+def test_coordinator_passes_lazy_result_references_between_workers():
     from agents.coordinator import coordinator_chat
 
     model = _CoordinatorModel(
@@ -910,17 +938,19 @@ def test_coordinator_does_not_pass_results_between_workers():
         result = coordinator_chat("Получи два факта и проверь второй.")
 
     assert result.answer == "Проверка завершена."
-    first_task, second_task, third_task = [
-        call.args[0] for call in worker.call_args_list
+    first_parts, second_parts, third_parts = [
+        parse_worker_request(call.args[0]) for call in worker.call_args_list
     ]
-    assert first_task == "Получи первый факт."
-    assert second_task == "Получи второй факт."
-    assert third_task == "Проверь второй факт."
-    assert all("previous_results" not in task for task in (
-        first_task,
-        second_task,
-        third_task,
-    ))
+    assert first_parts.current_task == "Получи первый факт."
+    assert first_parts.previous_results is None
+    assert second_parts.current_task == "Получи второй факт."
+    assert [
+        item.result_id for item in (second_parts.previous_results or [])
+    ] == ["result-first"]
+    assert third_parts.current_task == "Проверь второй факт."
+    assert [
+        item.result_id for item in (third_parts.previous_results or [])
+    ] == ["result-first", "result-second"]
 
 
 def test_upstream_receives_partial_worker_evidence():

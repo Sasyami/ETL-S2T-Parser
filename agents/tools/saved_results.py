@@ -581,25 +581,43 @@ def bind_saved_result_schemas(
 
 
 @tool(parse_docstring=True)
-def read_previous_result(result_id: str) -> Dict[str, Any]:
-    """Прочитать принятый результат предыдущего worker по его result_id.
+def read_previous_result(
+    result_id: Optional[str] = None,
+    result_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Прочитать один или несколько результатов прошлых workers по ID.
 
-    Используй только точный `result_id` из блока `previous_results`, когда
-    краткого description недостаточно для текущей task. Инструмент не читает
-    новые внешние данные и не выполняет анализ: он лениво возвращает ровно тот
-    успешный tool result, который был принят observer-ом прошлого worker в
-    текущем coordinator-запуске. Идентификаторы из другого запуска недоступны.
+    Используй только точные ID из блока `previous_results`, когда краткого
+    description недостаточно для текущей task. Если нужны несколько результатов,
+    передай их одним вызовом в `result_ids`. Инструмент не читает новые внешние
+    данные и лениво возвращает только принятые tool results текущего запуска.
 
     Args:
-        result_id: Точный непрозрачный идентификатор из previous_results.
+        result_id: Один точный непрозрачный ID; legacy-вариант одиночного чтения.
+        result_ids: Несколько точных ID для одного пакетного чтения.
     """
     store = get_active_saved_result_store()
+    selected_ids = list(
+        dict.fromkeys(
+            clean_id
+            for item in ([result_id] if result_id is not None else [])
+            + list(result_ids or [])
+            if (clean_id := str(item or "").strip())
+        )
+    )
     if store is None:
         return {
             "error": "No active saved-result store",
-            "result_id": str(result_id or "").strip(),
+            "result_id": selected_ids[0] if len(selected_ids) == 1 else None,
+            "result_ids": selected_ids,
         }
-    return store.read_previous_result(result_id)
+    if not selected_ids:
+        return {"error": "At least one previous result ID is required"}
+    if len(selected_ids) == 1 and not result_ids:
+        return store.read_previous_result(selected_ids[0])
+    return {
+        "results": [store.read_previous_result(item) for item in selected_ids]
+    }
 
 
 @tool(parse_docstring=True)

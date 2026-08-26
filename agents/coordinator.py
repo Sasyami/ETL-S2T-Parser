@@ -27,6 +27,7 @@ from .contracts import (
     PlanStep,
     UpstreamDecision,
     UpstreamOutput,
+    WORKER_PREVIOUS_RESULTS_MARKER,
     WORKER_STABLE_CONTEXT_MARKER,
     WorkerOutcome,
     WorkerPlan,
@@ -38,7 +39,10 @@ from .run_metrics import (
     record_coordinator_plan,
     record_upstream_output,
 )
-from .tools.context import load_upstream_analysis_context
+from .tools.context import (
+    get_downstream_table_context,
+    load_upstream_analysis_context,
+)
 from .worker import discard_worker_display_refs, worker_chat
 from .tools.saved_results import saved_result_store_scope
 
@@ -51,6 +55,7 @@ _PLAN_TOOL_NAME = "submit_worker_plan"
 _UPSTREAM_ANSWER_TOOL_NAME = "submit_upstream_answer"
 _UPSTREAM_DATA_DECISION_TOOL_NAME = "submit_upstream_data_decision"
 _UPSTREAM_ANALYSIS_CONTEXT = load_upstream_analysis_context()
+_DOWNSTREAM_TABLE_CONTEXT = get_downstream_table_context()
 
 
 class CoordinatorAnswer(BaseModel):
@@ -86,33 +91,36 @@ class CoordinatorResponseError(RuntimeError):
 
 
 _DOWNSTREAM_PLAN_PROMPT = f"""
-Ты downstream planner coordinator. Верни один native call `{_PLAN_TOOL_NAME}`
-со списком `steps` от 1 до {COORDINATOR_MAX_WORKERS}. Каждый step содержит
-одну самодостаточную `task` на получение исходных данных одним worker.
+Ты downstream planner. Верни один native call `{_PLAN_TOOL_NAME}` с 1–{COORDINATOR_MAX_WORKERS}
+`steps`. Каждая task — чтение прямо необходимых фактов.
 
-Выдели из `original_task` только необходимые чтения исходных фактов. Сохрани в
-tasks точные объекты, роли, scope, фильтры и поля результата. Не переноси в
-worker-задачи сравнение, оценку, объяснение, вывод или оформление ответа — всё
-это выполняет upstream после получения evidence.
-Роли `source`/`target`, направление связи и тип каждой сущности — файл, таблица
-или колонка/поле — сохраняй явно; не заменяй их общим либо неоднозначным
-обозначением.
-Явно указанные идентификаторы уже являются входами: не создавай отдельные чтения,
-чтобы найти их повторно. Если одной операции нужны несколько таких входов, сохрани
-их вместе в одной task. Разделяй только независимые чтения, результаты которых
-upstream сможет объединить без передачи данных между workers.
+Каждый step обязан быть незаменимым: без него нельзя ответить на original_task.
+Удали не запрошенные проверки, обогащение, статистику, происхождение и физическую
+реализацию. Наличие
+таблицы в справочнике не является причиной читать её.
 
-Workers выполняются последовательно и не получают результаты друг друга,
-поэтому каждая task должна содержать все входы своего чтения. Не ссылайся на
-«найденный» объект, предыдущий step или результат другого worker. Границы
-идентификатора задают кавычки либо текст. Внешние знаки
-предложения `:`, `;`, `,`, `.`, `?`, `!` и скобки в имя не входят; внутренние
-`.`, `_` и парные `::` сохраняются. В task заключай точный идентификатор в
-обратные кавычки. Не выбирай tools или skills здесь и не придумывай evidence_id
-или факты. `context` используй только для разрешения ссылок и ограничений.
+Сохрани роли source/target, тип сущности, направление, scope и фильтры. Точные
+идентификаторы бери только из original_task/context, пиши в обратных кавычках без
+внешней пунктуации. Не превращай бизнес-термин в придуманное имя таблицы,
+колонки, схемы, функции или tool; неизвестное оставляй текстом поиска.
 
-В повторном цикле прошлые результаты недоступны. По `original_task` и одной
-строке `problem` построй полный исправленный план чтения заново.
+Смысл поля ищется сразу в каталогах
+колонок, смысл таблицы — в каталогах таблиц, правило — в S2T. Следующий worker
+может лениво прочитать принятые результаты прошлых workers по result_id. После
+семантического поиска сначала ищи S2T по именам полей: имя таблицы может быть
+псевдонимом.
+
+Соблюдай порядок зависимостей. Если объект задан только бизнес-смыслом, первым
+step получи из каталога его технические имена; лишь следующий step ищет эти
+имена в S2T. S2T-поиск по подстроке лексический, не семантический: не передавай
+ему русский бизнес-термин, придуманный перевод или предполагаемое имя.
+
+Не создавай отдельные tasks для сравнения, оценки, объяснения, вывода или
+оформления: это делает upstream. Не выбирай tools/skills и не пиши task как
+вызов функции. При reroute построй полный план по original_task и problem;
+прошлые результаты недоступны.
+
+{_DOWNSTREAM_TABLE_CONTEXT}
 """.strip()
 
 _DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
@@ -120,14 +128,10 @@ _DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
 Верни исправленный native call ровно один раз. Массив `steps` должен содержать
 от 1 до {COORDINATOR_MAX_WORKERS} элементов; каждый элемент должен иметь
 только одну непустую самодостаточную `task`.
-Совокупность tasks обязана сохранить каждый явно запрошенный исходный результат,
-точный идентификатор и условие из original task. Явные идентификаторы считай
-готовыми входами, а несколько входов одной операции сохраняй в одной task.
-Не ссылайся на предыдущий step, его результат или «найденный» объект: каждая task
-должна содержать точные значения всех своих входов. Разделяй только независимые
-чтения, не требующие передачи результатов между workers.
-Не добавляй шаг сравнения, оценки, объяснения, вывода или оформления ответа:
-производный анализ выполняет upstream. Не добавляй tools и факты.
+Сохрани запрошенные роли, объекты, фильтры и результаты. Не придумывай
+идентификаторы, функции, tools или требования. Используй только реальные таблицы
+хранилища из system prompt; неизвестные бизнес-объекты оставляй текстом поиска.
+Не добавляй анализ и оформление.
 
 Причина отклонения: {{validation_error}}
 """.strip()
@@ -143,6 +147,10 @@ _UPSTREAM_DATA_DECISION_PROMPT = f"""
 `problem` необязателен. При reroute он может кратко описать, каких именно данных
 не хватает новому downstream-плану. Не формируй пользовательский ответ и не
 выбирай display-results.
+
+В `problem` не предлагай имена таблиц, колонок, схем, технические синонимы или
+ожидаемые значения, которых нет в original_task/evidence. Описывай только
+недостающий факт или чтение; следующий downstream сам выберет реальный источник.
 
 Evidence содержит `evidence_id`, `tool_name`, точные `args`, фактический
 `preview`, `truncated` и безопасный `display_id`. Аргументы подтверждают область
@@ -524,6 +532,25 @@ def build_coordinator_graph(
         context = state["context"].strip()
         if context:
             worker_task += WORKER_STABLE_CONTEXT_MARKER + context
+        previous_results = [
+            reference
+            for run in state["worker_runs"]
+            for reference in run["outcome"].previous_results
+        ]
+        if previous_results:
+            worker_task += (
+                WORKER_PREVIOUS_RESULTS_MARKER
+                + "\n"
+                + json.dumps(
+                    {
+                        "previous_results": [
+                            item.model_dump(mode="json")
+                            for item in previous_results
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            )
         logger.info(
             "Coordinator dispatches planned worker step=%s task=%s",
             step_index + 1,

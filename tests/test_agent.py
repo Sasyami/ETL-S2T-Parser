@@ -448,15 +448,22 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "transformation_rule" in s2t_list_contract["use_when"]
     assert "transformation_rule без обхода" in s2t_list_contract["use_when"]
     assert "file_id не применяется" in s2t_list_contract["use_when"]
-    assert "Неполное имя" in s2t_list_contract["not_for"]
-    assert "имя/роль" in s2t_list_contract["not_for"]
-    assert "происхождение поля по цепочке" in s2t_list_contract["not_for"]
+    assert "Семантические кандидаты" in s2t_list_contract["not_for"]
+    assert "S2T-ролью/таблицей" in s2t_list_contract["not_for"]
+    assert "происхождение по цепочке" in s2t_list_contract["not_for"]
     s2t_search_contract = contracts["search_s2t_transformations"]
     assert "Одна подстрока" in s2t_search_contract["use_when"]
     assert "роль значения неизвестна" in s2t_search_contract["use_when"]
     assert "неполное/неквалифицированное" in s2t_search_contract["use_when"]
+    assert "semantic_search_descriptions" in s2t_search_contract["use_when"]
+    assert "последовательный перебор" in s2t_list_contract["not_for"]
     assert "Точная полная source→target-пара" in s2t_search_contract["not_for"]
     assert "несколько условий" in s2t_search_contract["not_for"]
+    rules_contract = contracts["get_s2t_rules_by_ids"]
+    assert "transformation_id явно есть" in rules_contract["use_when"]
+    assert "просьба получить точные rules не создаёт" in rules_contract[
+        "not_for"
+    ]
     path_contract = contracts["trace_transformation_path"]
     assert "точной пары table+column" in path_contract["use_when"]
     assert "target-пары" in path_contract["use_when"]
@@ -534,7 +541,7 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "`not_for` — жёсткий запрет" in router_prompt
     assert "необходимости" in router_prompt
     assert "обязательные входы" in router_prompt
-    assert "будет получен другим выбранным tool" in router_prompt
+    assert "будет получен выбранным tool" in router_prompt
     assert "Не придумывай входы" in router_prompt
     assert "взаимозаменяемые tools «на всякий случай»" in router_prompt
     assert "Tools, skills и schemas выбирай независимо" in router_prompt
@@ -1560,7 +1567,7 @@ def test_tool_router_prompt_is_generic_and_catalog_driven():
     assert "каждый список может быть пустым" in normalized_prompt
     assert "оставляй `tools=[]`" in normalized_prompt
     assert "покрой все разные операции" in normalized_prompt
-    assert "будет получен другим выбранным tool" in normalized_prompt
+    assert "будет получен выбранным tool" in normalized_prompt
     assert "`not_for` — жёсткий запрет" in normalized_prompt
     assert "Не добавляй взаимозаменяемые" in normalized_prompt
     assert len(_TOOL_ROUTER_PROMPT) < 1700
