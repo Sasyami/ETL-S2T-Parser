@@ -415,15 +415,23 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "только необходимые чтения исходных фактов" in _DOWNSTREAM_PLAN_PROMPT
     assert "всё\nэто выполняет upstream" in _DOWNSTREAM_PLAN_PROMPT
     assert "сравнение, оценку, объяснение, вывод" in _DOWNSTREAM_PLAN_PROMPT
-    assert "Роли `source`/`target`, направление связи и тип каждой сущности" in (
+    assert "Роли `source`/`target`, направление и тип сущности" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "файл, таблица\nили колонка/поле" in _DOWNSTREAM_PLAN_PROMPT
-    assert "общим либо неоднозначным\nобозначением" in _DOWNSTREAM_PLAN_PROMPT
-    assert "Явно указанные идентификаторы уже являются входами" in (
+    assert "файл, таблица или колонка/поле" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Точные идентификаторы бери только из `original_task`/`context`" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "несколько таких входов, сохрани\nих вместе в одной task" in (
+    assert "не выводи из бизнес-смысла" in _DOWNSTREAM_PLAN_PROMPT
+    assert "глобального семантического поиска" in _DOWNSTREAM_PLAN_PROMPT
+    assert "без\nвыдуманного фильтра" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Зависимые чтения кандидатов объедини в той же task" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "Явные идентификаторы считай готовыми входами" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "Несколько входов одной операции\nсохраняй в одной task" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
     assert "Не ссылайся на\n«найденный» объект, предыдущий step" in (
