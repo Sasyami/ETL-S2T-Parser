@@ -58,3 +58,18 @@ def test_semantic_judge_receives_only_user_visible_result():
         ],
     }
     assert "worker" not in model.structured.messages[1].content.lower()
+    judge_prompt = model.structured.messages[0].content
+    assert "только явные требования query" in judge_prompt
+    assert "фактического выполнения и измеренных результатов" in judge_prompt
+    assert "квалифицированную ссылку" in judge_prompt
+    assert "Возвращённый downstream и есть reverse lineage" in judge_prompt
+    assert "операция не запрошена" in judge_prompt
+    assert "перечисли» само по себе" in judge_prompt
+    assert "второго «обратного» направления нет" in judge_prompt
+    assert "upstream" not in judge_prompt
+    assert "не доказывает ошибку answer" in judge_prompt
+    assert "ровно\nодну, самую существенную критическую ошибку" in judge_prompt
+    assert "Не добавляй вторичные претензии" in judge_prompt
+    assert "которого нет в query" in judge_prompt
+    assert "транзитивные уровни до terminal targets" in judge_prompt
+    assert "означает status=failed" in judge_prompt
