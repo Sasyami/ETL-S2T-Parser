@@ -377,7 +377,6 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     from agents.coordinator import (
         _DOWNSTREAM_PLAN_PROMPT,
         _DOWNSTREAM_PLAN_REPAIR_PROMPT,
-        _DOWNSTREAM_TABLE_CONTEXT,
         _UPSTREAM_ANALYSIS_CONTEXT,
         _UPSTREAM_ANSWER_PROMPT,
         _UPSTREAM_DATA_DECISION_PROMPT,
@@ -387,7 +386,11 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     )
 
     combined = "\n".join(
-        (_UPSTREAM_DATA_DECISION_PROMPT, _UPSTREAM_ANSWER_PROMPT)
+        (
+            _DOWNSTREAM_PLAN_PROMPT,
+            _UPSTREAM_DATA_DECISION_PROMPT,
+            _UPSTREAM_ANSWER_PROMPT,
+        )
     )
     for domain_detail in (
         "target_table",
@@ -399,54 +402,47 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     ):
         assert domain_detail not in combined
 
-    assert len(_DOWNSTREAM_PLAN_PROMPT) < 2300
-    assert len(_DOWNSTREAM_PLAN_PROMPT) - len(_DOWNSTREAM_TABLE_CONTEXT) < 1150
+    assert len(_DOWNSTREAM_PLAN_PROMPT) < 1700
     assert len(_UPSTREAM_DATA_DECISION_PROMPT) < 1300
     assert len(_UPSTREAM_ANSWER_PROMPT) < 2300
     assert len(_UPSTREAM_ANALYSIS_CONTEXT) < 1800
     assert "`depends_on`" not in _DOWNSTREAM_PLAN_PROMPT
     assert "needs_from_previous" not in _DOWNSTREAM_PLAN_PROMPT
     assert "required_evidence" not in _DOWNSTREAM_PLAN_PROMPT
-    assert "не выбирай tools/skills" in (
+    assert "не выбирай tools или skills здесь" in (
         _DOWNSTREAM_PLAN_PROMPT.lower().replace("\n", " ")
     )
-    assert "прямо необходимых исходных фактов" in _DOWNSTREAM_PLAN_PROMPT
-    assert "это делает upstream по evidence" in _DOWNSTREAM_PLAN_PROMPT
-    assert "сравнения, оценки,\nобъяснения, вывода" in _DOWNSTREAM_PLAN_PROMPT
-    assert "роли source/target, тип сущности, направление, scope" in (
-        _DOWNSTREAM_PLAN_PROMPT.lower()
-    )
-    assert "Явные идентификаторы — готовые входы" in (
+    assert "только необходимые чтения исходных фактов" in _DOWNSTREAM_PLAN_PROMPT
+    assert "всё\nэто выполняет upstream" in _DOWNSTREAM_PLAN_PROMPT
+    assert "сравнение, оценку, объяснение, вывод" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Роли `source`/`target`, направление связи и тип каждой сущности" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "Не придумывай технические имена" in (
+    assert "файл, таблица\nили колонка/поле" in _DOWNSTREAM_PLAN_PROMPT
+    assert "общим либо неоднозначным\nобозначением" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Явно указанные идентификаторы уже являются входами" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "смысловой поиск кандидатов, затем чтение их S2T" in (
+    assert "несколько таких входов, сохрани\nих вместе в одной task" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "Зависимые чтения объедини в одной task" in (
+    assert "Не ссылайся на\n«найденный» объект, предыдущий step" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "Внешние знаки\nпредложения `:`, `;`, `,`, `.`, `?`, `!`" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "внутренние\n`.`, `_` и парные `::` сохраняются" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "заключай точный идентификатор в\nобратные кавычки" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "несколько входов одной операции сохраняй в одной task" in (
         _DOWNSTREAM_PLAN_REPAIR_PROMPT
     )
-    assert "это справка, не список задач" in _DOWNSTREAM_TABLE_CONTEXT
-    for table_name in (
-        "files",
-        "file_sheet_headers",
-        "source_tables",
-        "target_tables",
-        "source_columns",
-        "target_columns",
-        "additional_objects",
-        "pxf_to_a",
-        "s2t_transformations",
-        "data",
-    ):
-        assert f"`{table_name}`" in _DOWNSTREAM_TABLE_CONTEXT
-    assert "бизнес-описания" in _DOWNSTREAM_TABLE_CONTEXT
-    assert "текст правила трансформации" in _DOWNSTREAM_TABLE_CONTEXT
-    assert "полным SQL-текстом" in _DOWNSTREAM_TABLE_CONTEXT
-    assert "обратные кавычки без внешней пунктуации" in (
-        _DOWNSTREAM_PLAN_PROMPT
+    assert "Разделяй только независимые\nчтения" in (
+        _DOWNSTREAM_PLAN_REPAIR_PROMPT
     )
     assert "скопируй `original_task`" not in _DOWNSTREAM_PLAN_PROMPT
     plan_schema_text = str(_plan_tool_schema())

@@ -38,43 +38,6 @@ SCHEMA_CATALOG: Dict[str, str] = {
 }
 
 
-_DOWNSTREAM_TABLE_DESCRIPTIONS: Dict[str, str] = {
-    "files": "загруженные Excel-файлы, их имена, summary и description",
-    "file_sheet_headers": "листы файла и сохранённые результаты определения заголовков",
-    "source_tables": "исходные логические таблицы и их бизнес-описания",
-    "target_tables": "целевые логические таблицы и их бизнес-описания",
-    "source_columns": "исходные колонки: таблица, имя, тип, PK, not-null и описание",
-    "target_columns": "целевые колонки: таблица, имя, тип, PK, not-null и описание",
-    "additional_objects": "исходные Additional objects с именем и полным SQL-текстом",
-    "pxf_to_a": "сохранённые соответствия внешних, materialized и replica-таблиц",
-    "s2t_transformations": "точные source→target поля, таблицы и текст правила трансформации",
-    "data": "сырые значения ячеек Excel с file, sheet, row и column identifiers",
-}
-
-
-def get_downstream_table_context() -> str:
-    """Return a compact natural-language catalog for downstream planning."""
-    from storage.database import USER_FACING_TABLES
-
-    configured = set(_DOWNSTREAM_TABLE_DESCRIPTIONS)
-    actual = set(USER_FACING_TABLES)
-    if configured != actual:
-        missing = sorted(actual - configured)
-        extra = sorted(configured - actual)
-        raise RuntimeError(
-            "Downstream table descriptions are out of sync: "
-            f"missing={missing}, extra={extra}"
-        )
-    rows = [
-        "Внутренний каталог доступных данных (это справка, не список задач):"
-    ]
-    rows.extend(
-        f"- `{name}` — {_DOWNSTREAM_TABLE_DESCRIPTIONS[name]}."
-        for name in USER_FACING_TABLES
-    )
-    return "\n".join(rows)
-
-
 def _prompt_text(filename: str) -> str:
     try:
         return (PROMPTS_DIR / filename).read_text(encoding="utf-8")
