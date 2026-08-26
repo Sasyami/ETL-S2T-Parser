@@ -259,9 +259,14 @@ def worker_chat(
 
     while True:
         available_tools = bind_saved_result_schemas(get_tools(), worker_request)
+        routable_tools = tuple(
+            item
+            for item in available_tools
+            if item.name != _READ_PREVIOUS_RESULT_TOOL_NAME
+        )
         route_kwargs: Dict[str, Any] = {
             "model": chat_model,
-            "available_tools": available_tools,
+            "available_tools": routable_tools,
             "callbacks": callbacks,
         }
         if reroute_context is not None:
@@ -270,6 +275,11 @@ def worker_chat(
         palette = tuple(sorted(dict.fromkeys(route.tools)))
         attempted_palettes.append(palette)
         selected_names = set(route.tools)
+        if any(
+            item.name == _READ_PREVIOUS_RESULT_TOOL_NAME
+            for item in available_tools
+        ):
+            selected_names.add(_READ_PREVIOUS_RESULT_TOOL_NAME)
         selected_tools = tuple(
             item for item in available_tools if item.name in selected_names
         )

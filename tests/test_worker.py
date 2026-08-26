@@ -2674,6 +2674,56 @@ def test_public_worker_allows_empty_palette_and_returns_observation():
     ] == ["analyze_known_facts"]
 
 
+def test_public_worker_adds_previous_result_reader_outside_router():
+    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
+    from agents.tools.saved_results import saved_result_store_scope
+    from agents.worker import worker_chat
+
+    route = ToolRoute(
+        tools=["list_s2t_transformations"],
+        skills=[],
+        schemas=[],
+    )
+    graph_result = WorkerRunResult(
+        answer="Прошлый результат доступен.",
+        display_items=[],
+        goal_satisfied=True,
+    )
+
+    with saved_result_store_scope() as store:
+        reference = store.register_previous_result(
+            source_tool="semantic_search_descriptions",
+            source_tool_call_id="call-semantic",
+            content=json.dumps({"rows": [{"column_name": "c_debtlimit"}]}),
+            description="semantic_search_descriptions: найден кандидат колонки",
+        )
+        task = (
+            "Получи S2T для найденной колонки."
+            + WORKER_PREVIOUS_RESULTS_MARKER
+            + "\n"
+            + json.dumps(
+                {"previous_results": [reference.model_dump(mode="json")]},
+                ensure_ascii=False,
+            )
+        )
+        with (
+            patch("agents.worker.select_chat_route", return_value=route) as router,
+            patch(
+                "agents.worker.run_worker_graph",
+                return_value=graph_result,
+            ) as run_graph,
+        ):
+            result = worker_chat(task)
+
+    assert result.summary == "Прошлый результат доступен."
+    assert "read_previous_result" not in {
+        tool.name for tool in router.call_args.kwargs["available_tools"]
+    }
+    assert [
+        tool.name for tool in run_graph.call_args.kwargs["tools"]
+    ] == ["list_s2t_transformations", "read_previous_result"]
+
+
 def test_public_worker_reroutes_original_task_after_observer_request():
     from agents.worker import worker_chat
 
