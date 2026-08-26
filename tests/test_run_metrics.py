@@ -5,13 +5,13 @@ from agents.run_metrics import (
     capture_agent_run,
     consume_agent_run_metrics,
     get_run_metrics_callback,
+    llm_stage,
     record_coordinator_plan,
     record_display_tools,
     record_worker_observation,
     record_worker_route,
     record_worker_task,
-    record_upstream_answer,
-    record_upstream_evidence,
+    record_upstream_output,
 )
 
 
@@ -24,11 +24,12 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     with capture_agent_run(session_id):
         callback = get_run_metrics_callback()
         assert callback is not None
-        callback.on_chat_model_start(
-            {"id": ["langchain", "GigaChat"]},
-            [[]],
-            run_id=llm_run_id,
-        )
+        with llm_stage("supervisor"):
+            callback.on_chat_model_start(
+                {"id": ["langchain", "GigaChat"]},
+                [[]],
+                run_id=llm_run_id,
+            )
         callback.on_llm_end(
             SimpleNamespace(
                 llm_output={
@@ -51,7 +52,22 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
         callback.on_tool_end("result", run_id=tool_run_id)
         record_worker_task("Выполни SELECT 1")
         record_coordinator_plan(
-            [{"step": 1, "goal": "Получить единицу", "presentation": "answer_only"}]
+            [
+                {
+                    "cycle": 1,
+                    "step": 1,
+                    "task": "Получить единицу",
+                }
+            ]
+        )
+        record_coordinator_plan(
+            [
+                {
+                    "cycle": 2,
+                    "step": 1,
+                    "task": "Добрать проверку единицы",
+                }
+            ]
         )
         record_worker_route(
             worker_task="Выполни SELECT 1",
@@ -66,34 +82,32 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
             tools=["list_s2t_transformations"],
             skills=["S2T-строки"],
             schemas=["S2T-маппинг"],
-            problem="Нужен точный S2T-фильтр.",
+            gap="Нужен точный S2T-фильтр.",
         )
         record_worker_observation(
             worker_task="Выполни SELECT 1",
             cycle=1,
             routing_attempt=1,
             observation={
-                "summary": "Получено значение 1.",
-                "goal_satisfied": True,
-                "problem": None,
-                "has_error": False,
-                "important_facts": ["Значение равно 1."],
-                "limitations": [],
-                "reroute_required": False,
-            },
-            analysis={
-                "summary": "Единица подтверждена анализом.",
-                "facts": ["Значение равно 1."],
+                "status": "complete",
+                "gap": None,
+                "accepted_tool_call_ids": ["call-sql"],
+                "facts": [
+                    {
+                        "text": "Значение равно 1.",
+                        "evidence_ids": ["evidence-sql"],
+                    }
+                ],
                 "limitations": [],
             },
         )
-        record_upstream_evidence(
+        record_upstream_output(
             {
-                "confirmed_facts": ["Значение равно 1."],
-                "unresolved_requirements": [],
+                "answer": "Единица получена.",
+                "used_evidence_ids": ["evidence-sql"],
+                "display_evidence_ids": ["evidence-sql"],
             }
         )
-        record_upstream_answer("Единица получена.")
         record_display_tools(["run_sql"])
 
     metrics = consume_agent_run_metrics(session_id)
@@ -103,9 +117,24 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     assert metrics.total_tokens == 150
     assert metrics.cache_read_tokens == 20
     assert len(metrics.llm_calls) == 1
+    assert metrics.llm_calls[0].stage == "supervisor"
+    assert metrics.llm_stages[0].model_dump() == {
+        "stage": "supervisor",
+        "calls": 1,
+        "error_calls": 0,
+        "elapsed_seconds": metrics.llm_calls[0].elapsed_seconds,
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "total_tokens": 150,
+        "cache_read_tokens": 20,
+    }
     assert [item.name for item in metrics.tool_calls] == ["run_sql"]
     assert metrics.worker_tasks == ["Выполни SELECT 1"]
-    assert metrics.coordinator_plan[0]["goal"] == "Получить единицу"
+    assert metrics.coordinator_plan[0]["task"] == "Получить единицу"
+    assert [item["cycle"] for item in metrics.coordinator_plan] == [1, 2]
+    assert "depends_on" not in metrics.coordinator_plan[0]
+    assert "needs_from_previous" not in metrics.coordinator_plan[0]
+    assert "required_evidence" not in metrics.coordinator_plan[0]
     assert len(metrics.worker_routes) == 2
     route = metrics.worker_routes[0]
     assert route.worker_task == "Выполни SELECT 1"
@@ -113,31 +142,32 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     assert route.tools == ["run_sql"]
     assert route.skills == []
     assert route.schemas == ["SQLite ETL"]
-    assert route.problem is None
+    assert route.gap is None
     reroute = metrics.worker_routes[1]
     assert reroute.routing_attempt == 2
     assert reroute.tools == ["list_s2t_transformations"]
     assert reroute.skills == ["S2T-строки"]
     assert reroute.schemas == ["S2T-маппинг"]
-    assert reroute.problem == "Нужен точный S2T-фильтр."
+    assert reroute.gap == "Нужен точный S2T-фильтр."
     assert len(metrics.observations) == 1
     observation = metrics.observations[0]
     assert observation.worker_task == "Выполни SELECT 1"
     assert observation.cycle == 1
     assert observation.routing_attempt == 1
-    assert observation.summary == "Получено значение 1."
-    assert observation.goal_satisfied is True
-    assert observation.important_facts == ["Значение равно 1."]
-    assert observation.analysis == {
-        "summary": "Единица подтверждена анализом.",
-        "facts": ["Значение равно 1."],
-        "limitations": [],
+    assert observation.status == "complete"
+    assert observation.gap is None
+    assert observation.accepted_tool_call_ids == ["call-sql"]
+    assert observation.facts == [
+        {
+            "text": "Значение равно 1.",
+            "evidence_ids": ["evidence-sql"],
+        }
+    ]
+    assert metrics.upstream_output == {
+        "answer": "Единица получена.",
+        "used_evidence_ids": ["evidence-sql"],
+        "display_evidence_ids": ["evidence-sql"],
     }
-    assert metrics.upstream_evidence == {
-        "confirmed_facts": ["Значение равно 1."],
-        "unresolved_requirements": [],
-    }
-    assert metrics.upstream_answer == "Единица получена."
     assert metrics.display_tools == ["run_sql"]
     assert metrics.elapsed_seconds >= 0
     assert consume_agent_run_metrics(session_id) is None

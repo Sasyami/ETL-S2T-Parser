@@ -51,11 +51,13 @@ class ModeResult:
     output_tokens: int = 0
     total_tokens: int = 0
     cache_read_tokens: int = 0
+    stage_usage: dict[str, dict[str, int | float]] = field(default_factory=dict)
     http_500: int = 0
     presentation_warnings: int = 0
     efficiency_warnings: int = 0
     warning_details: list[dict[str, str]] = field(default_factory=list)
     scenario_warnings: dict[str, list[str]] = field(default_factory=dict)
+    semantic_statuses: dict[str, str] = field(default_factory=dict)
 
 
 def _slug(value: str) -> str:
@@ -132,6 +134,34 @@ def _parse_transcript(result: ModeResult) -> None:
     result.output_tokens = sum(int(row[1]) for row in token_rows)
     result.total_tokens = sum(int(row[2]) for row in token_rows)
     result.cache_read_tokens = sum(int(row[3]) for row in token_rows)
+    stage_rows = re.findall(
+        r"^stage_tokens\[([^\]]+)\]: calls=(\d+), errors=(\d+), "
+        r"input=(\d+), output=(\d+), total=(\d+), cache_read=(\d+), "
+        r"seconds=([0-9.]+)$",
+        text,
+        re.MULTILINE,
+    )
+    for row in stage_rows:
+        stage = row[0]
+        usage = result.stage_usage.setdefault(
+            stage,
+            {
+                "calls": 0,
+                "errors": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cache_read_tokens": 0,
+                "elapsed_seconds": 0.0,
+            },
+        )
+        usage["calls"] += int(row[1])
+        usage["errors"] += int(row[2])
+        usage["input_tokens"] += int(row[3])
+        usage["output_tokens"] += int(row[4])
+        usage["total_tokens"] += int(row[5])
+        usage["cache_read_tokens"] += int(row[6])
+        usage["elapsed_seconds"] += float(row[7])
     result.http_500 = len(re.findall(r"^### Ответ — HTTP 500$", text, re.MULTILINE))
     warning_rows = re.findall(
         r"^<!-- LIVE_WARNING (\{.+\}) -->$",
@@ -159,6 +189,23 @@ def _parse_transcript(result: ModeResult) -> None:
             result.presentation_warnings += 1
         elif category == "efficiency":
             result.efficiency_warnings += 1
+    semantic_rows = re.findall(
+        r"^<!-- LIVE_SEMANTIC (\{.+\}) -->$",
+        text,
+        re.MULTILINE,
+    )
+    for raw_status in semantic_rows:
+        try:
+            semantic_status = json.loads(raw_status)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(semantic_status, dict):
+            continue
+        scenario = str(semantic_status.get("scenario") or "unknown").strip()
+        status = str(
+            semantic_status.get("status") or "not_evaluated"
+        ).strip()
+        result.semantic_statuses[scenario] = status
     for tools_line in re.findall(r"^tools: (.+)$", text, re.MULTILINE):
         clean = tools_line.strip()
         if clean and clean != "Нет":
@@ -177,7 +224,17 @@ def _status_mark(status: str | None) -> str:
 
 
 def _scenario_mark(result: ModeResult, scenario: str) -> str:
-    mark = _status_mark(result.scenario_statuses.get(scenario))
+    technical_status = result.scenario_statuses.get(scenario)
+    semantic_status = result.semantic_statuses.get(scenario)
+    if technical_status == "passed":
+        mark = {
+            "passed": "✅",
+            "failed": "❌",
+            "judge_error": "💥",
+            "not_evaluated": "📝",
+        }.get(semantic_status or "not_evaluated", "📝")
+    else:
+        mark = _status_mark(technical_status)
     categories = result.scenario_warnings.get(scenario, [])
     suffixes = []
     presentation_count = categories.count("presentation")
@@ -196,26 +253,70 @@ def _comparison_report(
     results: Sequence[ModeResult],
     report_path: Path,
 ) -> None:
+    evaluated = any(
+        status not in {"", "not_evaluated"}
+        for result in results
+        for status in result.semantic_statuses.values()
+    )
+    semantic_note = (
+        "Содержательная корректность оценена LLM-as-judge: `✅` означает "
+        "semantic pass, `❌` — semantic либо technical failure, `💥` — ошибку "
+        "judge."
+        if evaluated
+        else (
+            "Содержательная корректность пока не оценивается автоматически: "
+            "`📝` означает, что ответ получен и сохранён для ручного разбора. "
+            "Позже этот статус сможет заменить LLM-as-judge."
+        )
+    )
     lines = [
         f"# Live agent benchmark: {provider} / {model}",
         "",
         "Запросы выполнялись последовательно через реальный HTTP `/chat`, "
         "без mock и параллельных LLM-вызовов.",
         "",
-        "| Режим | Passed | Critical failures | Skipped | HTTP 500 | "
-        "Presentation warnings | Efficiency warnings | Agent, с | "
-        "LLM calls | Tool calls | Total tokens |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        semantic_note,
+        "",
+        "| Режим | Pytest passed | Pytest failures | Semantic failures | "
+        "Skipped | HTTP 500 | Presentation warnings | Efficiency warnings | "
+        "Agent, с | LLM calls | Tool calls | Total tokens |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for result in results:
+        semantic_failures = sum(
+            status in {"failed", "judge_error"}
+            for status in result.semantic_statuses.values()
+        )
         lines.append(
             f"| {result.mode} | {result.passed} | "
-            f"{result.failed + result.errors} | {result.skipped} | "
+            f"{result.failed + result.errors} | {semantic_failures} | "
+            f"{result.skipped} | "
             f"{result.http_500} | {result.presentation_warnings} | "
             f"{result.efficiency_warnings} | {result.agent_seconds:.3f} | "
             f"{result.llm_calls} | {result.tool_calls} | "
             f"{result.total_tokens} |"
         )
+
+    if any(result.stage_usage for result in results):
+        lines.extend(
+            [
+                "",
+                "## Расход LLM по этапам",
+                "",
+                "| Режим | Этап | Calls | Errors | Input | Output | "
+                "Total | Cache read | LLM, с |",
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for result in results:
+            for stage, usage in result.stage_usage.items():
+                lines.append(
+                    f"| {result.mode} | {stage} | {usage['calls']} | "
+                    f"{usage['errors']} | {usage['input_tokens']} | "
+                    f"{usage['output_tokens']} | {usage['total_tokens']} | "
+                    f"{usage['cache_read_tokens']} | "
+                    f"{usage['elapsed_seconds']:.3f} |"
+                )
 
     scenario_names = sorted(
         {
@@ -290,6 +391,7 @@ def _run_mode(
     pytest_args: Sequence[str],
     output_dir: Path,
     run_label: str,
+    llm_judge: bool,
 ) -> ModeResult:
     transcript_path = output_dir / f"{run_label}_{mode}.md"
     junit_path = output_dir / f"{run_label}_{mode}.xml"
@@ -301,6 +403,7 @@ def _run_mode(
             "LIVE_AGENT_TRANSCRIPT_PATH": str(transcript_path),
             "LLM_PROVIDER": provider,
             "PYTHONUTF8": "1",
+            "LIVE_AGENT_LLM_JUDGE": "1" if llm_judge else "0",
         }
     )
     if model:
@@ -373,6 +476,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUTPUT_DIR,
     )
     parser.add_argument(
+        "--llm-judge",
+        action="store_true",
+        help=(
+            "Оценить answer и display-results каждого завершённого сценария "
+            "настроенной LLM."
+        ),
+    )
+    parser.add_argument(
         "--allow-failures",
         action="store_true",
         help="Вернуть код 0 после benchmark, даже если acceptance-тесты упали.",
@@ -404,6 +515,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pytest_args=args.pytest_arg,
             output_dir=output_dir,
             run_label=run_label,
+            llm_judge=args.llm_judge,
         )
         for mode in args.modes
     ]

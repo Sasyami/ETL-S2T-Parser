@@ -10,6 +10,8 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from ..contracts import parse_worker_request
+from ..run_metrics import llm_stage
 from .context import SCHEMA_CATALOG
 
 logger = logging.getLogger(__name__)
@@ -17,33 +19,35 @@ logger = logging.getLogger(__name__)
 
 SKILL_CATALOG: Dict[str, str] = {
     "S2T-строки": "Общие ETL-строки, S2T-маппинги, additional objects, правила и агрегации s2t_transformations.",
-    "Анализ трансформаций": (
-        "Анализ уже полученного transformation_rule или SQL: выражения, "
-        "NULL, JOIN/WHERE, дедупликация, агрегация и изменение строк. Не "
-        "заменяет tool для получения самого правила."
-    ),
     "Neo4j": "Графовый lineage именованных ETL-таблиц и колонок.",
     "Excel и описания": (
         "Файлы, листы, заголовки, ячейки и семантические описания."
     ),
     "Сравнение": (
-        "Сопоставление нескольких независимых объектов по одинаковому набору "
-        "фактов без выдуманной связи или направления между ними."
+        "Получение одинакового набора исходных фактов отдельно для нескольких "
+        "объектов без выдуманной связи или направления между ними."
     ),
     "Объяснение": (
-        "Объяснение правил, выражений и метаданных по подтверждённым фактам "
-        "с явным указанием недостающих данных."
+        "Получение точных правил, выражений, ролей и метаданных, необходимых "
+        "upstream coordinator для последующего объяснения."
     ),
 }
 
 
 GENERAL_FALLBACK_TOOL_NAMES = (
+    "trace_transformation_path",
+    "trace_neo4j_table_path",
+    "trace_neo4j_lineage",
+    "get_s2t_rules_by_ids",
+    "list_s2t_table_mapping",
     "run_sql",
+    "read_previous_result",
     "run_cypher",
     "search_excel_values",
     "semantic_search_descriptions",
+    "list_s2t_transformations",
+    "search_s2t_transformations",
 )
-
 
 _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     "show_plan": {
@@ -91,13 +95,24 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     },
     "list_s2t_transformations": {
         "use_when": (
-            "Точные source/target table или field и точные columns сохранённых "
-            "S2T-строк; роли задаются отдельными фильтрами, q принимает одну "
-            "буквальную подстроку, file_id не применяется."
+            "Прямая точная S2T-пара source_table.source_field → "
+            "target_table.target_field или transformation_rule без обхода; "
+            "роли — отдельные фильтры, file_id не применяется."
         ),
         "not_for": (
-            "Неполное имя, неизвестная роль значения, агрегация или графовый путь."
+            "Неполное имя/роль, агрегация либо происхождение поля по цепочке rules/SQL."
         ),
+    },
+    "list_s2t_table_mapping": {
+        "use_when": "Полный source_table → target_table mapping.",
+        "not_for": "Поля/поиск/путь.",
+    },
+    "get_s2t_rules_by_ids": {
+        "use_when": (
+            "После lineage известны transformation_id и нужны их точные "
+            "transformation_rule из SQLite."
+        ),
+        "not_for": "Поиск по имени, построение lineage или свободный SQL.",
     },
     "search_s2t_transformations": {
         "use_when": (
@@ -105,17 +120,17 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
             "или имя таблицы неполное/неквалифицированное."
         ),
         "not_for": (
-            "Точные ролевые table/field, несколько условий, точные columns или агрегация."
+            "Точная полная source→target-пара, несколько условий, columns или агрегация."
         ),
     },
     "trace_transformation_path": {
         "use_when": (
-            "Многошаговый сохранённый S2T-путь от точного имени с rules, SQL, JOIN/FILTER и "
-            "промежуточными таблицами; для неполного имени добавь "
-            "search_s2t_transformations."
+            "Многошаговый S2T-путь от точной пары table+column с rules/SQL. "
+            "Для известной target-пары путь строится upstream, для source-пары — "
+            "downstream; неизвестное точное имя сначала разрешает search."
         ),
         "not_for": (
-            "Одна S2T-строка, переданный SQL или сравнение физических данных."
+            "Одна точная source→target-пара или rule; сама стрелка не означает путь."
         ),
     },
     "visualize_s2t_table_graph": {
@@ -124,21 +139,32 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     },
     "run_sql": {
         "use_when": (
-            "Произвольный read-only срез, выражение или агрегация по публичным "
-            "таблицам SQLite, не покрытые точным специализированным tool."
+            "Read-only агрегация, дословный SELECT, JOIN/UNION/подзапрос/окно "
+            "или произвольное выражение."
         ),
         "not_for": (
-            "Точные S2T/каталожные строки, логические ETL-таблицы, выполнение "
-            "transformation_rule или запрос к $$-именам."
+            "Точные S2T/каталожные строки, логические ETL-таблицы, "
+            "transformation_rule, $$-именам."
         ),
     },
     "query_saved_result": {
         "use_when": (
-            "Есть точный result_ref предыдущего worker и нужен read-only SQL-срез "
-            "сохранённых строк этого результата."
+            "Текущая task требует read-only SQL-срез строк табличного результата "
+            "прошлого worker; schema и result_ref доступны в description tool."
         ),
         "not_for": (
-            "Нет result_ref, нужна основная SQLite-база или результат truncated."
+            "Предыдущий result даёт только значение фильтра для нового чтения, "
+            "нужна основная SQLite-база либо сохранённый result truncated."
+        ),
+    },
+    "read_previous_result": {
+        "use_when": (
+            "Для текущей task недостаточно краткого description принятого "
+            "результата прошлого worker и нужен его точный result по result_id."
+        ),
+        "not_for": (
+            "Новое чтение из SQLite/Neo4j/Excel, ответ уже следует из description "
+            "либо result_id отсутствует в previous_results."
         ),
     },
     "parse_sql_column_lineage": {
@@ -172,12 +198,14 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
         "not_for": "Готовый lineage/path, S2T, SQL-текст или SQLite.",
     },
     "trace_neo4j_lineage": {
-        "use_when": "Upstream/downstream точной ETL-колонки на заданную глубину.",
+        "use_when": "Upstream/downstream полной точной ссылки ETL-колонки на заданную глубину.",
         "not_for": "Таблица без колонки, SQL, rules или объяснимый S2T-путь.",
     },
     "trace_neo4j_table_lineage": {
         "use_when": "Непосредственные upstream/downstream соседи точной ETL-таблицы.",
-        "not_for": "Путь между таблицами, колонка, SQL или rules.",
+        "not_for": (
+            "Путь, именованная колонка, SQL или rules; для них используй профильный tool."
+        ),
     },
     "trace_neo4j_table_path": {
         "use_when": "Направленный Neo4j-путь между двумя точными ETL-таблицами.",
@@ -240,48 +268,42 @@ class ToolRoute(BaseModel):
 
 
 _TOOL_ROUTER_PROMPT = """
-Ты router read-only worker. По задаче, недавней истории и каталогам выбери
-необходимые tools, skills и schemas. Точные имена и назначение бери только из каталогов.
+Ты router read-only worker. По задаче и каталогам выбери необходимую planner
+палитру `tools`, `skills` и `schemas`. Используй только точные имена из каталогов.
 
-Ты выбираешь доступную planner палитру, а не единственный будущий вызов. Полностью
-покрой все операции с данными. `use_when` и `not_for` описывают основное назначение
-и границы tools, но не требуют минимальной или взаимоисключающей палитры. Если
-роль, точность имени, источник данных или следующий шаг неоднозначны, включи все
-уместные read-only tools, которые могут понадобиться для разрешения этой
-неоднозначности. Полнота палитры важнее исключения правдоподобного инструмента;
-не добавляй только явно нерелевантные tools или весь каталог без основания.
+`current_task` — единственная операция worker. `stable_context` задаёт только
+общие ограничения. `previous_results` содержит лишь непрозрачные result_id и
+краткие descriptions принятых результатов прошлых workers. Не выбирай tool
+только потому, что result_id упомянут в этом списке.
 
-Если результат одного tool нужен как обязательный вход другого, выбери оба.
-Обязательный вход должен быть явно дан в задаче или истории либо получаться
-другим выбранным tool. Инструмент обработки переданного текста или объекта не
-заменяет инструмент, который сначала должен получить этот текст или объект из
-хранилища. Не придумывай входы из названий сущностей и не считай похожий вид
-результата достаточным основанием для выбора.
-Schemas — это фактическая структура данных и настроенные маппинги, которые
-могут понадобиться planner для корректного вызова tools или анализа известных
-фактов. Выбирай schema только если её структура или маппинги нужны самой задаче.
-Schemas, skills и tools выбирай независимо: наличие tool не обязывает выбирать
-schema или skill. Каждый из списков `tools`, `skills` и `schemas` может быть
-пустым независимо от остальных. Оставляй `tools=[]`, если новые вызовы данных
-не нужны и для ответа достаточно переданных фактов, выбранного skill или schema.
+Для каждой отдельной операции с данными выбери tool, чей `use_when` совпадает.
+`not_for` — жёсткий запрет для указанной операции. Не добавляй взаимозаменяемые
+tools «на всякий случай», но покрой все разные операции и обязательные входы.
+Обработчик текста или объекта выбирай только если вход уже дан либо будет получен
+другим выбранным tool. Не придумывай входы.
 
-Tools для оформления уже полученных фактов не нужны. Если новые данные и контекст
-не нужны, оставь все три списка пустыми.
+Различай источник новой операции и входной аргумент: если description уже даёт
+значение для фильтра нового чтения, выбери tool источника нового чтения. Выбирай
+`read_previous_result`, только когда для task нужен точный прошлый result, а
+description недостаточно. `query_saved_result` подходит лишь для операции над
+строками сохранённого dataset с совместимой schema.
 
-`reroute_context` появляется только после вывода observer, что текущей палитрой
-нельзя исправить `problem`. Поэтому сохрани все tools последней
-`previous_tool_palettes` и обязательно добавь минимум один новый tool, который
-даёт недостающие данные. Одинаковая или сокращённая палитра невалидна.
+Tools, skills и schemas выбирай независимо и только по необходимости; каждый
+список может быть пустым. Для ответа по уже данным фактам оставляй `tools=[]`.
 
-Не отвечай пользователю и не вызывай tools. Заполни только поля `tools`,
-`skills` и `schemas` structured-схемы.
+При `reroute_context` сохрани последнюю палитру и добавь tool, закрывающий
+указанный `gap`; не сокращай и не повторяй палитру без изменения.
+
+Не отвечай и не вызывай tools. Верни только structured-поля `tools`, `skills`,
+`schemas`.
 """.strip()
 
 _TOOL_ROUTER_REPAIR_PROMPT = """
-Предыдущий structured output отклонён схемой router. Повторно выбери tools,
-skills и schemas по исходному payload и заполни только поля `tools`, `skills` и
-`schemas` переданной схемы. Не добавляй description, reason, пояснения или
-другие поля. Каждый из трёх списков может быть пустым независимо от остальных.
+Исправь только указанное нарушение structured-маршрута по исходному payload.
+Если имя отсутствует в каталоге, замени его одним существующим инструментом с
+тем же назначением. Не расширяй палитру из-за ошибки и не добавляй альтернативы
+«на всякий случай». Верни только `tools`, `skills`, `schemas`; списки могут быть
+пустыми.
 
 Ошибка валидации: {validation_error}
 """.strip()
@@ -381,7 +403,7 @@ def _validated_route(
             )
         if not selected_set - previous_tools:
             raise ToolRoutingError(
-                "Tool-router при reroute не добавил новый tool для problem"
+                "Tool-router при reroute не добавил новый tool для gap"
             )
     return ToolRoute(
         tools=selected_tools,
@@ -436,13 +458,24 @@ def select_chat_route(
     if not available_tools:
         raise ToolRoutingError("Tool-router не получил каталог tools")
 
+    request_parts = parse_worker_request(clean_query)
+    if not request_parts.current_task:
+        raise ToolRoutingError("Tool-router получил пустую текущую task")
+
     payload = {
-        "current_query": clean_query,
+        "current_task": request_parts.current_task,
         "recent_history": _history_payload(history),
         "available_tools": _tool_catalog(available_tools),
         "available_skills": _named_catalog(SKILL_CATALOG),
         "available_schemas": _named_catalog(SCHEMA_CATALOG),
     }
+    if request_parts.stable_context:
+        payload["stable_context"] = request_parts.stable_context
+    if request_parts.previous_results is not None:
+        payload["previous_results"] = [
+            item.model_dump(mode="json")
+            for item in request_parts.previous_results
+        ]
     if reroute_context:
         payload["reroute_context"] = dict(reroute_context)
     messages = [
@@ -472,11 +505,12 @@ def select_chat_route(
 
     def invoke_router(call_messages: Sequence[BaseMessage]) -> Any:
         try:
-            return (
-                structured_model.invoke(call_messages, config=config)
-                if config is not None
-                else structured_model.invoke(call_messages)
-            )
+            with llm_stage("router"):
+                return (
+                    structured_model.invoke(call_messages, config=config)
+                    if config is not None
+                    else structured_model.invoke(call_messages)
+                )
         except Exception as exc:
             raise ToolRoutingError(
                 f"Ошибка LLM tool-router: {type(exc).__name__}"

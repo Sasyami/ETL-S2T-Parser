@@ -16,6 +16,7 @@ from .observability import get_callback_handler, langfuse_trace_context
 from .run_metrics import (
     capture_agent_run,
     get_run_metrics_callback,
+    llm_stage,
     record_display_tools,
 )
 from .worker import resolve_worker_display_refs
@@ -176,11 +177,12 @@ def build_supervisor_graph(
 
     def invoke_supervisor(call_messages: Sequence[BaseMessage]) -> AIMessage:
         try:
-            result = (
-                supervisor_model.invoke(call_messages, config=model_config)
-                if model_config is not None
-                else supervisor_model.invoke(call_messages)
-            )
+            with llm_stage("supervisor"):
+                result = (
+                    supervisor_model.invoke(call_messages, config=model_config)
+                    if model_config is not None
+                    else supervisor_model.invoke(call_messages)
+                )
         except Exception as exc:
             raise RuntimeError(
                 f"Ошибка LLM supervisor: {type(exc).__name__}"

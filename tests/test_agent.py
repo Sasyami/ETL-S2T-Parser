@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 from typing import get_args
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +35,13 @@ def _as_tool(function, name=None):
         name=tool_name,
         description=f"Test tool {tool_name}",
     )
+
+
+def _available_fallback_tool_names():
+    available_names = {tool.name for tool in get_tools()}
+    return [
+        name for name in GENERAL_FALLBACK_TOOL_NAMES if name in available_names
+    ]
 
 
 @pytest.fixture
@@ -327,9 +335,34 @@ def test_chat_tool_router_validates_structured_selection():
     assert "enum" not in schema["properties"]["schemas"]["items"]
 
 
+def test_chat_tool_router_attributes_model_call_to_router_stage():
+    stages = []
+
+    def stage_scope(stage):
+        stages.append(stage)
+        return nullcontext()
+
+    model = _ToolRouterModel(
+        ToolRoute(tools=["list_files"], skills=[], schemas=[])
+    )
+    with patch(
+        "agents.tools.routing.llm_stage",
+        side_effect=stage_scope,
+    ):
+        _select_chat_route(
+            "Покажи файлы",
+            model=model,
+            available_tools=get_tools(),
+        )
+
+    assert stages == ["router"]
+
+
 def test_router_skill_catalog_matches_lazy_runtime_sections():
     for skill_name in SKILL_CATALOG:
         assert f"## {skill_name}" in load_skills((skill_name,))
+
+    assert "Анализ трансформаций" not in SKILL_CATALOG
 
     comparison_route = ToolRoute(
         tools=[],
@@ -338,12 +371,12 @@ def test_router_skill_catalog_matches_lazy_runtime_sections():
     )
     assert comparison_route.skills == ["Сравнение", "Объяснение"]
 
-    analysis_route = ToolRoute(
+    transformation_data_route = ToolRoute(
         tools=["list_s2t_transformations"],
-        skills=["S2T-строки", "Анализ трансформаций"],
+        skills=["S2T-строки"],
         schemas=["S2T-маппинг"],
     )
-    assert analysis_route.skills == ["S2T-строки", "Анализ трансформаций"]
+    assert transformation_data_route.skills == ["S2T-строки"]
 
 
 def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
@@ -371,14 +404,14 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert route.schemas == ["SQLite ETL"]
 
     payload = json.loads(model.messages[1].content)
-    assert payload["current_query"] == "Выполни этот запрос"
+    assert payload["current_task"] == "Выполни этот запрос"
     assert payload["recent_history"] == history
     assert {item["name"] for item in payload["available_tools"]} == {
         tool.name for tool in get_tools()
     }
     assert set(_TOOL_ROUTING_CONTRACTS) == {
         tool.name for tool in get_tools()
-    }
+    } | {"read_previous_result"}
     assert all(item["use_when"] for item in payload["available_tools"])
     assert all(item["not_for"] for item in payload["available_tools"])
     assert all(
@@ -395,10 +428,12 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     }
     assert "analyze" not in contracts
     run_sql_contract = contracts["run_sql"]
-    assert "срез, выражение или агрегация" in run_sql_contract["use_when"]
-    assert "публичным таблицам SQLite" in run_sql_contract["use_when"]
-    assert "специализированным tool" in run_sql_contract["use_when"]
-    assert "Точные S2T/каталожные строки" in run_sql_contract["not_for"]
+    assert "агрегация" in run_sql_contract["use_when"].casefold()
+    assert "JOIN" in run_sql_contract["use_when"]
+    assert "произвольное выражение" in run_sql_contract["use_when"]
+    assert "точные s2t/каталожные строки" in run_sql_contract[
+        "not_for"
+    ].casefold()
     assert "логические ETL-таблицы" in run_sql_contract["not_for"]
     assert "transformation_rule" in run_sql_contract["not_for"]
     assert "$$-именам" in run_sql_contract["not_for"]
@@ -408,24 +443,29 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "логические ETL-таблицы" in excel_value_contract["not_for"]
     assert "выполнение запросов" in excel_value_contract["not_for"]
     s2t_list_contract = contracts["list_s2t_transformations"]
-    assert "source/target table или field" in s2t_list_contract["use_when"]
-    assert "точные columns" in s2t_list_contract["use_when"]
-    assert "одну" in s2t_list_contract["use_when"]
+    assert "source_table.source_field" in s2t_list_contract["use_when"]
+    assert "target_table.target_field" in s2t_list_contract["use_when"]
+    assert "transformation_rule" in s2t_list_contract["use_when"]
+    assert "transformation_rule без обхода" in s2t_list_contract["use_when"]
     assert "file_id не применяется" in s2t_list_contract["use_when"]
     assert "Неполное имя" in s2t_list_contract["not_for"]
-    assert "неизвестная роль" in s2t_list_contract["not_for"]
+    assert "имя/роль" in s2t_list_contract["not_for"]
+    assert "происхождение поля по цепочке" in s2t_list_contract["not_for"]
     s2t_search_contract = contracts["search_s2t_transformations"]
     assert "Одна подстрока" in s2t_search_contract["use_when"]
     assert "роль значения неизвестна" in s2t_search_contract["use_when"]
     assert "неполное/неквалифицированное" in s2t_search_contract["use_when"]
-    assert "Точные ролевые table/field" in s2t_search_contract["not_for"]
+    assert "Точная полная source→target-пара" in s2t_search_contract["not_for"]
     assert "несколько условий" in s2t_search_contract["not_for"]
     path_contract = contracts["trace_transformation_path"]
-    assert "Многошаговый сохранённый S2T-путь" in path_contract["use_when"]
-    assert "точного имени" in path_contract["use_when"]
-    assert "JOIN/FILTER" in path_contract["use_when"]
-    assert "search_s2t_transformations" in path_contract["use_when"]
-    assert "сравнение физических данных" in path_contract["not_for"]
+    assert "точной пары table+column" in path_contract["use_when"]
+    assert "target-пары" in path_contract["use_when"]
+    assert "upstream" in path_contract["use_when"]
+    assert "source-пары" in path_contract["use_when"]
+    assert "downstream" in path_contract["use_when"]
+    assert "сначала разрешает search" in path_contract["use_when"]
+    assert "Одна точная source→target-пара" in path_contract["not_for"]
+    assert "сама стрелка не означает путь" in path_contract["not_for"]
     table_names_description = contracts["list_s2t_table_names"]["use_when"]
     assert "Глобальные множества source/target-таблиц" in table_names_description
     assert "операции над ними" in table_names_description
@@ -464,7 +504,7 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "SQL отсутствует" in parse_table_contract["not_for"]
     assert "колонковый lineage" in parse_table_contract["not_for"]
     column_lineage_description = contracts["trace_neo4j_lineage"]["use_when"]
-    assert "точной ETL-колонки" in column_lineage_description
+    assert "полной точной ссылки ETL-колонки" in column_lineage_description
     assert "заданную глубину" in column_lineage_description
     global_graph_description = contracts["visualize_s2t_table_graph"]["use_when"]
     assert "глобальный" in global_graph_description
@@ -472,7 +512,7 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert sum(
         len(item["use_when"]) + len(item["not_for"])
         for item in payload["available_tools"]
-    ) < 4500
+    ) < 4800
     assert payload["available_skills"] == [
         {"name": name, "description": description}
         for name, description in SKILL_CATALOG.items()
@@ -488,21 +528,19 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "физических заголовков" in SCHEMA_CATALOG["Excel-маппинги"]
     assert "произвольного run_cypher" in SCHEMA_CATALOG["Neo4j lineage"]
     router_prompt = " ".join(model.messages[0].content.split())
-    assert "необходимые tools, skills и schemas" in router_prompt
-    assert "назначение бери только из каталогов" in router_prompt
-    assert "Полностью покрой все операции с данными" in router_prompt
-    assert "обязательный вход другого" in router_prompt
-    assert "получить этот текст или объект из хранилища" in router_prompt
+    assert "необходимую planner палитру" in router_prompt
+    assert "точные имена из каталогов" in router_prompt
+    assert "Для каждой отдельной операции с данными" in router_prompt
+    assert "`not_for` — жёсткий запрет" in router_prompt
+    assert "необходимости" in router_prompt
+    assert "обязательные входы" in router_prompt
+    assert "будет получен другим выбранным tool" in router_prompt
     assert "Не придумывай входы" in router_prompt
-    assert "похожий вид результата" in router_prompt
-    assert "доступную planner палитру" in router_prompt
-    assert "не требуют минимальной" in router_prompt
-    assert "включи все уместные read-only tools" in router_prompt
-    assert "Полнота палитры важнее" in router_prompt
-    assert "весь каталог без основания" in router_prompt
-    assert "Schemas, skills и tools выбирай независимо" in router_prompt
-    assert "может быть пустым независимо от остальных" in router_prompt
-    assert "Оставляй `tools=[]`" in router_prompt
+    assert "взаимозаменяемые tools «на всякий случай»" in router_prompt
+    assert "Tools, skills и schemas выбирай независимо" in router_prompt
+    assert "каждый список может быть пустым" in router_prompt
+    assert "оставляй `tools=[]`" in router_prompt
+    assert len(model.messages[0].content) < 1700
     assert "COUNT, DISTINCT, GROUP BY" not in router_prompt
     assert "обязательно включай `run_sql`" not in router_prompt
     assert "самостоятельно составить и выполнить SQL" not in model.messages[0].content
@@ -518,7 +556,7 @@ def test_chat_tool_router_receives_explicit_reroute_context():
         }
     )
     reroute_context = {
-        "problem": "Нужен многошаговый S2T-путь с правилами.",
+        "gap": "Нужен многошаговый S2T-путь с правилами.",
         "previous_tool_palettes": [["list_s2t_transformations"]],
         "attempt": 1,
     }
@@ -535,15 +573,48 @@ def test_chat_tool_router_receives_explicit_reroute_context():
         "trace_transformation_path",
     ]
     payload = json.loads(model.messages[1].content)
-    assert payload["current_query"] == (
+    assert payload["current_task"] == (
         "Найди target_table с максимальным числом строк."
     )
     assert payload["reroute_context"] == reroute_context
     router_prompt = " ".join(model.messages[0].content.split())
-    assert "после вывода observer" in router_prompt.lower()
-    assert "сохрани все tools последней" in router_prompt.lower()
-    assert "обязательно добавь минимум один" in router_prompt.lower()
-    assert "одинаковая или сокращённая палитра невалидна" in router_prompt.lower()
+    assert "при `reroute_context`" in router_prompt.lower()
+    assert "сохрани последнюю палитру" in router_prompt.lower()
+    assert "добавь tool, закрывающий" in router_prompt.lower()
+    assert "не сокращай и не повторяй палитру" in router_prompt.lower()
+
+
+def test_chat_tool_router_separates_current_task_from_previous_results():
+    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
+
+    previous = {
+        "previous_results": [
+            {
+                "result_id": "result_previous",
+                "description": "run_sql: найдено filter_value=42.",
+            }
+        ]
+    }
+    model = _ToolRouterModel(
+        ToolRoute(tools=["run_sql"], skills=[], schemas=["SQLite ETL"])
+    )
+
+    route = _select_chat_route(
+        "Прочитай новый срез основной базы с filter_value прошлого шага."
+        + WORKER_PREVIOUS_RESULTS_MARKER
+        + " Служебный handoff:\n"
+        + json.dumps(previous, ensure_ascii=False),
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["run_sql"]
+    payload = json.loads(model.messages[-1].content)
+    assert payload["current_task"] == (
+        "Прочитай новый срез основной базы с filter_value прошлого шага."
+    )
+    assert payload["previous_results"] == previous["previous_results"]
+    assert "result_previous" not in payload["current_task"]
 
 
 def test_chat_tool_rerouter_repairs_unchanged_palette_by_adding_tool():
@@ -570,7 +641,7 @@ def test_chat_tool_rerouter_repairs_unchanged_palette_by_adding_tool():
         model=model,
         available_tools=get_tools(),
         reroute_context={
-            "problem": "Не найден многошаговый путь с rules.",
+            "gap": "Не найден многошаговый путь с rules.",
             "previous_tool_palettes": [["list_s2t_transformations"]],
             "attempt": 1,
         },
@@ -597,19 +668,159 @@ def test_chat_tool_rerouter_adds_general_fallback_after_failed_repair():
         model=model,
         available_tools=get_tools(),
         reroute_context={
-            "problem": "Текущая палитра не закрыла сравнение.",
+            "gap": "Текущая палитра не закрыла сравнение.",
             "previous_tool_palettes": [["list_s2t_transformations"]],
             "attempt": 1,
         },
     )
 
-    assert route.tools == [
-        "list_s2t_transformations",
-        *GENERAL_FALLBACK_TOOL_NAMES,
-    ]
+    assert route.tools == list(
+        dict.fromkeys(
+            ["list_s2t_transformations", *_available_fallback_tool_names()]
+        )
+    )
     assert route.skills == []
     assert route.schemas == []
     assert len(model.calls) == 2
+
+
+def test_chat_tool_router_does_not_override_semantic_route_by_keywords():
+    model = _SequenceToolRouterModel(
+        [
+            ToolRoute(
+                tools=["semantic_search_descriptions"],
+                skills=[],
+                schemas=[],
+            ),
+            ToolRoute(
+                tools=[
+                    "semantic_search_descriptions",
+                    "list_s2t_transformations",
+                ],
+                skills=[],
+                schemas=["S2T-маппинг"],
+            ),
+        ]
+    )
+
+    route = _select_chat_route(
+        "Найди по русскому бизнес-термину соответствующее S2T-правило.",
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["semantic_search_descriptions"]
+    assert len(model.calls) == 1
+
+
+def test_chat_tool_router_does_not_force_impact_tools_by_keywords():
+    model = _SequenceToolRouterModel(
+        [
+            ToolRoute(
+                tools=["trace_neo4j_lineage"],
+                skills=["Neo4j"],
+                schemas=["Neo4j lineage"],
+            ),
+            ToolRoute(
+                tools=[
+                    "trace_neo4j_lineage",
+                    "get_s2t_rules_by_ids",
+                ],
+                skills=["Neo4j"],
+                schemas=["Neo4j lineage", "S2T-маппинг"],
+            ),
+        ]
+    )
+
+    route = _select_chat_route(
+        "Выполни reverse lineage и перечисли downstream transformations.",
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["trace_neo4j_lineage"]
+    assert len(model.calls) == 1
+
+
+def test_chat_tool_router_does_not_force_path_tool_by_keywords():
+    model = _SequenceToolRouterModel(
+        [
+            ToolRoute(
+                tools=["run_cypher"],
+                skills=["Neo4j"],
+                schemas=["Neo4j lineage"],
+            ),
+            ToolRoute(
+                tools=["trace_neo4j_table_path"],
+                skills=["Neo4j"],
+                schemas=["Neo4j lineage"],
+            ),
+        ]
+    )
+
+    route = _select_chat_route(
+        "Найди в Neo4j все пути длины 3 от таблицы schema.source "
+        "до таблицы target::branch::1.",
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["run_cypher"]
+    assert len(model.calls) == 1
+
+
+def test_chat_tool_router_does_not_force_s2t_role_tool_by_keywords():
+    model = _SequenceToolRouterModel(
+        [
+            ToolRoute(
+                tools=["search_s2t_transformations"],
+                skills=["S2T-строки"],
+                schemas=["S2T-маппинг"],
+            ),
+            ToolRoute(
+                tools=["list_s2t_transformations"],
+                skills=["S2T-строки"],
+                schemas=["S2T-маппинг"],
+            ),
+        ]
+    )
+
+    route = _select_chat_route(
+        "Найди все S2T mappings, которые загружают "
+        "target::subquery::v1.del_dt.",
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["search_s2t_transformations"]
+    assert len(model.calls) == 1
+
+
+def test_chat_tool_router_does_not_force_mapping_tool_by_keywords():
+    model = _SequenceToolRouterModel(
+        [
+            ToolRoute(
+                tools=["list_s2t_transformations"],
+                skills=["S2T-строки"],
+                schemas=["S2T-маппинг"],
+            ),
+            ToolRoute(
+                tools=["list_s2t_table_mapping"],
+                skills=["S2T-строки"],
+                schemas=["S2T-маппинг"],
+            ),
+        ]
+    )
+
+    route = _select_chat_route(
+        "Покажи полный маппинг source_table -> target_table: "
+        "source column -> target column.",
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["list_s2t_transformations"]
+    assert len(model.calls) == 1
 
 
 def test_planner_requires_tool_call_for_an_unfinished_tool_step():
@@ -690,8 +901,10 @@ def test_chat_tool_router_repairs_invalid_structured_result_with_one_more_llm_ca
     assert model.structured_method == "function_calling"
     repair_messages, repair_config = model.calls[1]
     assert repair_config == {"callbacks": ["router-callback"]}
-    assert "structured output отклонён" in str(repair_messages[-1].content)
-    assert "Не добавляй description" in str(repair_messages[-1].content)
+    repair_prompt = str(repair_messages[-1].content)
+    assert "Исправь только указанное нарушение" in repair_prompt
+    assert "замени его одним существующим инструментом" in repair_prompt
+    assert "Не расширяй палитру" in repair_prompt
 
 
 def test_chat_tool_router_does_not_override_missing_explicit_column_catalog():
@@ -793,6 +1006,27 @@ def test_chat_tool_router_allows_empty_skills_and_schemas_with_tools():
     assert route.schemas == []
 
 
+def test_chat_tool_router_selects_run_sql_for_sqlite_aggregation():
+    model = _SequenceToolRouterModel(
+        [
+            ToolRoute(
+                tools=["run_sql"],
+                skills=["S2T-строки"],
+                schemas=["SQLite ETL"],
+            ),
+        ]
+    )
+
+    route = _select_chat_route(
+        "Посчитай агрегат одной SQLite-таблицы.",
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["run_sql"]
+    assert len(model.calls) == 1
+
+
 def test_chat_tool_router_allows_empty_tools_with_skill_or_schema_context():
     model = _SequenceToolRouterModel(
         [
@@ -839,7 +1073,7 @@ def test_chat_tool_router_uses_general_fallback_after_invalid_llm_repair():
         available_tools=get_tools(),
     )
 
-    assert route.tools == list(GENERAL_FALLBACK_TOOL_NAMES)
+    assert route.tools == _available_fallback_tool_names()
     assert route.skills == []
     assert route.schemas == []
     assert len(model.calls) == 2
@@ -871,7 +1105,7 @@ def test_chat_tool_router_falls_back_for_invalid_llm_plan():
             model=model,
             available_tools=get_tools(),
         )
-        assert fallback.tools == list(GENERAL_FALLBACK_TOOL_NAMES)
+        assert fallback.tools == _available_fallback_tool_names()
         assert fallback.skills == []
         assert fallback.schemas == []
 
@@ -884,7 +1118,7 @@ def test_chat_tool_router_falls_back_after_llm_failure():
         model=model,
         available_tools=get_tools(),
     )
-    assert fallback.tools == list(GENERAL_FALLBACK_TOOL_NAMES)
+    assert fallback.tools == _available_fallback_tool_names()
 
 
 def test_chat_tool_router_falls_back_for_invalid_structured_value():
@@ -896,7 +1130,7 @@ def test_chat_tool_router_falls_back_for_invalid_structured_value():
             model=model,
             available_tools=get_tools(),
         )
-        assert fallback.tools == list(GENERAL_FALLBACK_TOOL_NAMES)
+        assert fallback.tools == _available_fallback_tool_names()
 
 
 class _ObserverModel:
@@ -907,9 +1141,33 @@ class _ObserverModel:
         from agents.chat_graph import Observation
 
         self.messages.append(messages)
+        payload = next(
+            json.loads(message.content)
+            for message in messages
+            if str(getattr(message, "content", "")).lstrip().startswith("{")
+        )
+        accepted_results = [
+            result
+            for result in payload.get("tool_results", [])
+            if not result.get("is_error")
+            and result.get("name") != "analyze_known_facts"
+            and str(result.get("tool_call_id") or "")
+        ]
         return Observation(
-            summary="Инструмент вернул ok=true.",
-            goal_satisfied=True,
+            status="complete",
+            accepted_tool_call_ids=[
+                str(result["tool_call_id"]) for result in accepted_results
+            ],
+            facts=[
+                {
+                    "text": "Инструмент вернул ok=true.",
+                    "evidence_ids": [
+                        str(result["evidence_id"])
+                        for result in accepted_results
+                        if result.get("evidence_id")
+                    ],
+                }
+            ] if accepted_results else [],
         )
 
 
@@ -942,60 +1200,37 @@ class _ScriptedNativeModel:
         return self.responses.pop(0)
 
 
-def test_fallback_observation_uses_raw_model_output_as_summary():
-    from langchain_core.exceptions import OutputParserException
-    from langchain_core.messages import ToolMessage
-
-    from agents.chat_graph import _fallback_observation
-
-    observation = _fallback_observation(
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "ping",
-                    "args": {},
-                    "id": "call-1",
-                    "type": "tool_call",
-                }
-            ],
-        ),
-        [ToolMessage(content='{"ok": true}', tool_call_id="call-1", name="ping")],
-        OutputParserException("invalid output", llm_output="Сырой вывод observer"),
-    )
-
-    assert observation.summary == "Сырой вывод observer"
-    assert observation.goal_satisfied is False
-    assert observation.has_error is False
-    assert observation.important_facts == []
-    assert observation.problem
-    assert observation.limitations == ["Ошибка observer: OutputParserException"]
-
-
-def test_observation_requires_problem_for_failed_goal():
+def test_observation_requires_gap_for_non_complete_status():
     from agents.chat_graph import Observation
 
-    with pytest.raises(ValueError, match="problem must describe"):
+    with pytest.raises(ValueError, match="gap must describe"):
+        Observation(status="continue")
+    with pytest.raises(ValueError, match="gap must describe"):
         Observation(
-            summary="Tool вернул source_table.",
-            goal_satisfied=False,
-        )
-    with pytest.raises(ValueError, match="problem must describe"):
-        Observation(
-            summary="Tool вернул source_table.",
-            goal_satisfied=False,
-            problem="  ",
+            status="reroute",
+            gap="  ",
         )
 
     observation = Observation(
-        summary="Tool вернул source_table.",
-        goal_satisfied=False,
-        problem="Task просит target_table, а tool вернул source_table.",
+        status="continue",
+        gap="Task просит target_table, а tool вернул source_table.",
     )
 
-    assert observation.problem == (
+    assert observation.gap == (
         "Task просит target_table, а tool вернул source_table."
     )
+    assert set(Observation.model_json_schema()["required"]) == {"status"}
+
+
+def test_observation_normalizes_gigachat_string_null_gap():
+    from agents.chat_graph import Observation
+
+    observation = Observation(status="complete", gap="  NuLl  ")
+
+    assert observation.gap is None
+
+    with pytest.raises(ValueError, match="gap must describe"):
+        Observation(status="continue", gap="null")
 
 
 def test_observer_prompt_requires_semantic_task_comparison():
@@ -1007,50 +1242,61 @@ def test_observer_prompt_requires_semantic_task_comparison():
     )
 
     normalized_observer_prompt = " ".join(_OBSERVER_PROMPT.split())
-    assert len(_OBSERVER_PROMPT) < 3500
+    assert len(_OBSERVER_PROMPT) < 1900
     assert "structured output" in _OBSERVER_PROMPT
-    assert "Не пиши Markdown" in _OBSERVER_PROMPT
-    assert "goal_satisfied=false" in _OBSERVER_PROMPT
-    assert "`problem`" in _OBSERVER_PROMPT
+    assert "без Markdown" in _OBSERVER_PROMPT
+    for status in ("complete", "continue", "reroute"):
+        assert f"`{status}`" in _OBSERVER_PROMPT
+    assert Observation.model_json_schema()["properties"]["status"]["enum"] == [
+        "complete",
+        "continue",
+        "reroute",
+    ]
+    assert "`gap`" in _OBSERVER_PROMPT
     assert "как mismatch" not in _OBSERVER_PROMPT
     assert "target_table" not in _OBSERVER_PROMPT
     assert "source_table" not in _OBSERVER_PROMPT
-    assert "сам по себе не подтверждает" in _OBSERVER_PROMPT
     assert "фильтруемыми и возвращаемыми полями" not in _OBSERVER_PROMPT
     assert "source_field" not in _OBSERVER_PROMPT
-    assert "одна краткая консолидированная строка" in _OBSERVER_PROMPT
-    assert "факт, значение, фильтр или операция отсутствует" in (
-        normalized_observer_prompt
-    )
+    assert "одна консолидированная строка" in _OBSERVER_PROMPT
     assert "повторно получать не требуется" not in normalized_observer_prompt
     assert "ролевой фильтр" not in normalized_observer_prompt.lower()
     assert "промежуточные узлы" not in _OBSERVER_PROMPT
     assert "impact/downstream" not in _OBSERVER_PROMPT
-    assert "Последний tool call не" in _OBSERVER_PROMPT
-    assert "совокупность подтверждённых фактов" in _OBSERVER_PROMPT
-    assert "производного вывода" in normalized_observer_prompt
-    assert "`candidate_analysis=null`" in _OBSERVER_PROMPT
-    assert "не выполняй интерпретацию сам" in normalized_observer_prompt
-    assert "Простой перенос явно возвращённых" in normalized_observer_prompt
-    assert "не разбивай её на список" in normalized_observer_prompt.lower()
+    assert "производный анализ" in normalized_observer_prompt
+    assert "upstream сделает его" in normalized_observer_prompt
+    assert "не формулируй" in normalized_observer_prompt
     assert "не повторяй одну причину" in normalized_observer_prompt.lower()
-    problem_description = Observation.model_json_schema()["properties"][
-        "problem"
+    assert "accepted_tool_call_ids" in _OBSERVER_PROMPT
+    accepted_schema = Observation.model_json_schema()["properties"][
+        "accepted_tool_call_ids"
+    ]
+    assert accepted_schema["maxItems"] == 20
+    assert "семантически подтверждают" in accepted_schema["description"]
+    gap_description = Observation.model_json_schema()["properties"][
+        "gap"
     ]["description"]
-    assert "из текущего результата и prior_state" in problem_description
-    assert "Одна краткая консолидированная строка" in problem_description
-    assert "одну причину и её следствия" in problem_description
+    assert "из текущего результата и prior_state" in gap_description
+    assert "Одна краткая консолидированная строка" in gap_description
+    assert "одну причину и её следствия" in gap_description
+    facts_schema = Observation.model_json_schema()["properties"]["facts"]
+    assert "evidence_id" in facts_schema["description"]
     assert "Data tool уже выполнен" in _OBSERVER_REPAIR_PROMPT
     assert "не требуй его повторного" in _OBSERVER_REPAIR_PROMPT
     assert "тот же исходный user_request" in _OBSERVER_REPAIR_PROMPT
-    assert "невозможно\nисправить" in _OBSERVER_PROMPT
+    assert "ни один `available_tools` не закрывает gap" in _OBSERVER_PROMPT
     assert "planner сам составил" in _OBSERVER_PROMPT
-    assert "не подтверждает\nисходную операцию" in _OBSERVER_PROMPT
-    assert "не вызывай finish_worker" in _WORKER_PLANNER_PROMPT
-    assert "Что выполнено неправильно" in _WORKER_PLANNER_PROMPT
-    assert "обязательно вызови `analyze`" in _WORKER_PLANNER_PROMPT
-    assert "До успешного анализа не вызывай `finish_worker`" in (
-        _WORKER_PLANNER_PROMPT
+    assert "Нулевой результат подтверждает отсутствие данных только" in (
+        _OBSERVER_PROMPT
+    )
+    assert "не подтверждает исходную операцию" in _OBSERVER_PROMPT
+    normalized_worker_prompt = " ".join(_WORKER_PLANNER_PROMPT.split())
+    assert "при `continue` закрой `gap`" in normalized_worker_prompt
+    assert "действие `analyze`" not in _WORKER_PLANNER_PROMPT
+    assert "заверши работу через `finish_worker`" in normalized_worker_prompt
+    assert "Обычный текст запрещён" in normalized_worker_prompt
+    assert "`table.column` разделяй на `table_name` и `column_name`" in (
+        normalized_worker_prompt
     )
 
 
@@ -1286,7 +1532,7 @@ def test_error_payload_is_reported_to_planner_and_same_tool_can_retry():
         str(message.content) for message in model.observer.messages[0]
     )
     assert '"is_error": true' in observer_prompt
-    assert "Этот инструментальный шаг содержал ошибку" in second_planner_prompt
+    assert '"error": "temporary failure"' in second_planner_prompt
     assert "После ошибки скорректируй действие" in second_planner_prompt
 
 
@@ -1309,14 +1555,15 @@ def test_tool_router_prompt_is_generic_and_catalog_driven():
     from agents.tools.routing import _TOOL_ROUTER_PROMPT
 
     normalized_prompt = " ".join(_TOOL_ROUTER_PROMPT.split())
-    assert "назначение бери только из каталогов" in normalized_prompt
-    assert "необходимые tools, skills и schemas" in normalized_prompt
-    assert "может быть\nпустым независимо от остальных" in _TOOL_ROUTER_PROMPT
-    assert "Оставляй `tools=[]`" in normalized_prompt
-    assert "Полностью покрой все операции с данными" in normalized_prompt
-    assert "получить этот текст или объект из хранилища" in normalized_prompt
-    assert "не требуют минимальной или взаимоисключающей" in normalized_prompt
-    assert "Полнота палитры важнее" in normalized_prompt
+    assert "точные имена из каталогов" in normalized_prompt
+    assert "необходимую planner палитру" in normalized_prompt
+    assert "каждый список может быть пустым" in normalized_prompt
+    assert "оставляй `tools=[]`" in normalized_prompt
+    assert "покрой все разные операции" in normalized_prompt
+    assert "будет получен другим выбранным tool" in normalized_prompt
+    assert "`not_for` — жёсткий запрет" in normalized_prompt
+    assert "Не добавляй взаимозаменяемые" in normalized_prompt
+    assert len(_TOOL_ROUTER_PROMPT) < 1700
     for domain_detail in (
         "trace_neo4j_table_lineage",
         "run_cypher",
@@ -1338,9 +1585,7 @@ def test_worker_prompts_require_internal_analysis_tool_for_empty_route():
     assert "Палитра worker никогда не пуста" in _WORKER_PLANNER_PROMPT
     assert "`analyze_known_facts`" in _WORKER_PLANNER_PROMPT
     assert "внутреннего `analyze_known_facts`" in _OBSERVER_PROMPT
-    assert "Каждый из трёх списков может быть пустым" in (
-        _TOOL_ROUTER_REPAIR_PROMPT
-    )
+    assert "списки могут быть\nпустыми" in _TOOL_ROUTER_REPAIR_PROMPT
 
 
 def test_long_tool_output_reaches_planner_and_responder_with_handoff(caplog):

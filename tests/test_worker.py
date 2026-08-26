@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -6,17 +7,82 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
 from agents.chat_graph import (
-    Observation,
-    WorkerAnalysis,
+    Observation as ObservationContract,
     WorkerCycleTrace,
     WorkerDisplayItem,
     WorkerResponseError,
-    WorkerRunResult,
-    _analyze_tool_schema,
+    WorkerRunResult as WorkerRunResultContract,
     run_worker_graph,
 )
 from agents.tools import get_tools, load_schemas, load_skills
 from agents.tools.routing import ToolRoute
+
+
+def Observation(
+    *,
+    summary="",
+    goal_satisfied=True,
+    problem=None,
+    accepted_tool_call_ids=None,
+    important_facts=None,
+    limitations=None,
+    reroute_required=False,
+    status=None,
+    gap=None,
+    facts=None,
+):
+    """Build the new Observation contract from concise test fixtures."""
+    selected_status = status or (
+        "complete"
+        if goal_satisfied
+        else "reroute" if reroute_required else "continue"
+    )
+    selected_gap = gap if gap is not None else problem
+    selected_facts = facts
+    if selected_facts is None:
+        selected_facts = [
+            {"text": text, "evidence_ids": []}
+            for text in (important_facts or [])
+        ]
+        if not selected_facts and selected_status == "complete" and summary:
+            selected_facts = [{"text": summary, "evidence_ids": []}]
+    return ObservationContract(
+        status=selected_status,
+        gap=selected_gap,
+        accepted_tool_call_ids=list(accepted_tool_call_ids or []),
+        facts=selected_facts,
+        limitations=list(limitations or []),
+    )
+
+
+def WorkerRunResult(
+    *,
+    answer,
+    display_items=None,
+    cycle_history=None,
+    goal_satisfied=True,
+    problem=None,
+    reroute_required=False,
+    status=None,
+    gap=None,
+    facts=None,
+    accepted_tool_call_ids=None,
+):
+    selected_status = status or (
+        "complete"
+        if goal_satisfied or not reroute_required
+        else "reroute"
+    )
+    selected_gap = gap if gap is not None else problem
+    return WorkerRunResultContract(
+        answer=answer,
+        display_items=list(display_items or []),
+        cycle_history=list(cycle_history or []),
+        status=selected_status,
+        gap=selected_gap,
+        facts=list(facts or []),
+        accepted_tool_call_ids=list(accepted_tool_call_ids or []),
+    )
 
 
 def _as_tool(function, name=None):
@@ -28,8 +94,8 @@ def _as_tool(function, name=None):
     )
 
 
-def _finish_message(answer, *, extra_args=None):
-    args = {"answer": answer}
+def _finish_message(summary, *, extra_args=None):
+    args = {"summary": summary}
     args.update(extra_args or {})
     return AIMessage(
         content="",
@@ -48,75 +114,130 @@ def test_worker_prompt_does_not_require_full_table_in_text():
     from agents.chat_graph import _WORKER_PLANNER_PROMPT
 
     normalized_prompt = " ".join(_WORKER_PLANNER_PROMPT.split())
-    assert "Полные результаты не копируй" in normalized_prompt
+    assert "не копируй результаты" in normalized_prompt
+    assert "краткую внутреннюю отметку" in normalized_prompt
+    assert "не формулируй финальный ответ" in normalized_prompt
+    assert "для upstream coordinator" not in normalized_prompt
     assert "не переименовывай заданную операцию" in _WORKER_PLANNER_PROMPT
     assert "Не конструируй отсутствующий объект" in _WORKER_PLANNER_PROMPT
     assert "аргументы бери из" in _WORKER_PLANNER_PROMPT
-    assert "Если обязательного входа\nнет, этот tool не подходит" in (
-        _WORKER_PLANNER_PROMPT
+    assert "Если обязательного входа нет, этот tool не подходит" in (
+        normalized_prompt
     )
-    assert "answer должен содержать ровно их" in _WORKER_PLANNER_PROMPT
-    assert "без вступления, заключения" in _WORKER_PLANNER_PROMPT
     assert "Палитра worker никогда не пуста" in _WORKER_PLANNER_PROMPT
     assert "внутренний `analyze_known_facts`" in _WORKER_PLANNER_PROMPT
-    assert "внутреннее\nдействие `analyze`" in _WORKER_PLANNER_PROMPT
+    assert "действие `analyze`" not in _WORKER_PLANNER_PROMPT
+    assert "Обычный текст без tool_calls\nзапрещён" in _WORKER_PLANNER_PROMPT
+    assert "`finish_worker` разрешён на любом шаге" in _WORKER_PLANNER_PROMPT
     assert "scrollable" not in _WORKER_PLANNER_PROMPT
-
-
-def test_analyze_is_a_strict_internal_worker_action():
-    schema = _analyze_tool_schema()["function"]
-
-    assert schema["name"] == "analyze"
-    assert schema["parameters"]["required"] == [
-        "tool_result_ids",
-        "instruction",
-    ]
-    assert schema["parameters"]["additionalProperties"] is False
-    assert schema["parameters"]["properties"]["tool_result_ids"][
-        "minItems"
-    ] == 1
-    assert "analyze" not in {tool.name for tool in get_tools()}
 
 
 class _ObserverModel:
     def __init__(self, responses=None):
         self.messages = []
         self.responses = list(responses or [])
+        self.last_observation = None
 
     def invoke(self, messages):
         self.messages.append(messages)
+        payload = next(
+            json.loads(message.content)
+            for message in messages
+            if str(getattr(message, "content", "")).lstrip().startswith("{")
+        )
+        prior_ids = [
+            tool_call_id
+            for observation in payload.get("prior_state", [])
+            for tool_call_id in observation.get("accepted_tool_call_ids", [])
+        ]
+        current_ids = [
+            str(result.get("tool_call_id") or "")
+            for result in payload.get("tool_results", [])
+            if not result.get("is_error")
+            and result.get("name") != "analyze_known_facts"
+            and str(result.get("tool_call_id") or "")
+        ]
+        prior_facts = [
+            fact
+            for observation in payload.get("prior_state", [])
+            for fact in observation.get("facts", [])
+        ]
+        current_evidence_ids = [
+            str(result.get("evidence_id") or "")
+            for result in payload.get("tool_results", [])
+            if not result.get("is_error")
+            and result.get("name") != "analyze_known_facts"
+            and str(result.get("evidence_id") or "")
+        ]
         response = (
             self.responses.pop(0)
             if self.responses
             else Observation(
-                summary="Превью результата получено.",
-                goal_satisfied=True,
+                status="complete",
+                accepted_tool_call_ids=list(
+                    dict.fromkeys([*prior_ids, *current_ids])
+                ),
+                facts=[
+                    *prior_facts,
+                    *(
+                        [
+                            {
+                                "text": "Превью результата получено.",
+                                "evidence_ids": current_evidence_ids,
+                            }
+                        ]
+                        if current_evidence_ids
+                        else []
+                    ),
+                ],
             )
         )
-        return (
+        observation = (
             response
-            if isinstance(response, Observation)
-            else Observation.model_validate(response)
+            if isinstance(response, ObservationContract)
+            else ObservationContract.model_validate(response)
         )
-
-
-class _AnalyzerModel:
-    def __init__(self, responses=None):
-        self.messages = []
-        self.responses = list(responses or [])
-
-    def invoke(self, messages):
-        self.messages.append(messages)
-        response = (
-            self.responses.pop(0)
-            if self.responses
-            else WorkerAnalysis(summary="Результат проанализирован.")
+        if observation.status == "complete" and not observation.accepted_tool_call_ids:
+            observation = observation.model_copy(
+                update={
+                    "accepted_tool_call_ids": list(
+                        dict.fromkeys([*prior_ids, *current_ids])
+                    )
+                }
+            )
+        accepted_evidence_ids = list(
+            dict.fromkeys(
+                [
+                    str(result.get("evidence_id") or "")
+                    for result in payload.get("tool_results", [])
+                    if str(result.get("tool_call_id") or "")
+                    in observation.accepted_tool_call_ids
+                    and str(result.get("evidence_id") or "")
+                ]
+                + [
+                    evidence_id
+                    for fact in prior_facts
+                    for evidence_id in fact.get("evidence_ids", [])
+                ]
+            )
         )
-        return (
-            response
-            if isinstance(response, WorkerAnalysis)
-            else WorkerAnalysis.model_validate(response)
-        )
+        if accepted_evidence_ids and any(
+            not fact.evidence_ids for fact in observation.facts
+        ):
+            observation = observation.model_copy(
+                update={
+                    "facts": [
+                        fact.model_copy(
+                            update={"evidence_ids": accepted_evidence_ids}
+                        )
+                        if not fact.evidence_ids
+                        else fact
+                        for fact in observation.facts
+                    ]
+                }
+            )
+        self.last_observation = observation
+        return observation
 
 
 class _WorkerModel:
@@ -125,23 +246,21 @@ class _WorkerModel:
         responses,
         *,
         observer_responses=None,
-        analyzer_responses=None,
     ):
         self.responses = list(responses)
         self.bound_tools = []
         self.messages = []
         self.observer = _ObserverModel(observer_responses)
-        self.analyzer = _AnalyzerModel(analyzer_responses)
+        self.structured_methods = []
 
     def bind_tools(self, tools):
         self.bound_tools = list(tools)
         return self
 
-    def with_structured_output(self, schema):
-        if schema is Observation:
+    def with_structured_output(self, schema, method=None):
+        self.structured_methods.append((schema, method))
+        if schema is ObservationContract:
             return self.observer
-        if schema is WorkerAnalysis:
-            return self.analyzer
         raise AssertionError(f"Unexpected structured schema: {schema}")
 
     def invoke(self, messages, **kwargs):
@@ -174,9 +293,11 @@ class _ToolChoiceFallbackModel:
         del tools
         return _BoundToolChoiceModel(self, tool_choice)
 
-    def with_structured_output(self, schema):
-        assert schema is Observation
-        return self.observer
+    def with_structured_output(self, schema, method=None):
+        assert method == "function_calling"
+        if schema is ObservationContract:
+            return self.observer
+        raise AssertionError(f"Unexpected structured schema: {schema}")
 
     def invoke(self, messages, **kwargs):
         del kwargs
@@ -210,6 +331,11 @@ class _ToolChoiceFallbackModel:
 
 def test_worker_repairs_observer_without_repeating_data_tool():
     tool_calls = []
+    stages = []
+
+    def stage_scope(stage):
+        stages.append(stage)
+        return nullcontext()
 
     def lookup():
         tool_calls.append("lookup")
@@ -244,6 +370,65 @@ def test_worker_repairs_observer_without_repeating_data_tool():
         ],
     )
 
+    with patch("agents.chat_graph.llm_stage", side_effect=stage_scope):
+        result = run_worker_graph(
+            task="Получи значение.",
+            system_prompt="Системный контекст",
+            model=model,
+            tools=(_as_tool(lookup),),
+            max_steps=2,
+        )
+
+    assert result.answer == "Значение: 42."
+    assert tool_calls == ["lookup"]
+    assert len(model.observer.messages) == 2
+    repair_messages = model.observer.messages[1]
+    assert "Data tool уже выполнен" in repair_messages[-1].content
+    assert "не требуй его повторного" in repair_messages[-1].content
+    assert stages == [
+        "worker_planner",
+        "observer",
+        "observer",
+        "finish_worker",
+    ]
+
+
+def test_worker_rejects_unknown_accepted_tool_call_id_without_repeating_tool():
+    tool_calls = []
+
+    def lookup():
+        tool_calls.append("lookup")
+        return {"value": 42}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-lookup",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Значение: 42."),
+        ],
+        observer_responses=[
+            Observation(
+                summary="Значение получено.",
+                goal_satisfied=True,
+                accepted_tool_call_ids=["call-unknown"],
+            ),
+            Observation(
+                summary="Значение 42 подтверждено.",
+                goal_satisfied=True,
+                accepted_tool_call_ids=["call-lookup"],
+            ),
+        ],
+    )
+
     result = run_worker_graph(
         task="Получи значение.",
         system_prompt="Системный контекст",
@@ -252,15 +437,13 @@ def test_worker_repairs_observer_without_repeating_data_tool():
         max_steps=2,
     )
 
-    assert result.answer == "Значение: 42."
+    assert result.accepted_tool_call_ids == ["call-lookup"]
     assert tool_calls == ["lookup"]
     assert len(model.observer.messages) == 2
-    repair_messages = model.observer.messages[1]
-    assert "Data tool уже выполнен" in repair_messages[-1].content
-    assert "не требуй его повторного" in repair_messages[-1].content
+    assert "accepted_tool_call_ids" in model.observer.messages[1][-1].content
 
 
-def test_worker_stops_after_five_observer_retries_without_repeating_tool():
+def test_worker_raises_after_five_observer_retries_without_repeating_tool():
     tool_calls = []
 
     def lookup():
@@ -285,11 +468,12 @@ def test_worker_stops_after_five_observer_retries_without_repeating_tool():
                     }
                 ],
             ),
+            _finish_message("Значение 42 получено."),
         ],
         observer_responses=[invalid_observation] * 6,
     )
 
-    with pytest.raises(WorkerResponseError, match="после 6 попыток"):
+    with pytest.raises(WorkerResponseError, match="6 попыток"):
         run_worker_graph(
             task="Получи значение.",
             system_prompt="Системный контекст",
@@ -297,9 +481,844 @@ def test_worker_stops_after_five_observer_retries_without_repeating_tool():
             tools=(_as_tool(lookup),),
             max_steps=2,
         )
-
     assert tool_calls == ["lookup"]
     assert len(model.observer.messages) == 6
+
+
+def test_worker_rejects_complete_when_exact_lineage_scope_was_shortened():
+    calls = []
+
+    def trace_neo4j_lineage(
+        column_reference: str,
+        direction: str = "both",
+        max_depth: int = 1,
+    ):
+        calls.append(
+            {
+                "column_reference": column_reference,
+                "direction": direction,
+                "max_depth": max_depth,
+            }
+        )
+        return {
+            "rows": [] if max_depth == 1 else [{"target_table": "branch::1"}],
+            "max_depth": max_depth,
+        }
+
+    full_table = "s_grnplm_as_t_didsd_700_db_stg.a_000025_t_loanscontract"
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "trace_neo4j_lineage",
+                        "args": {
+                            "column_reference": (
+                                "a_000025_t_loanscontract.c_closedate"
+                            ),
+                            "direction": "downstream",
+                        },
+                        "id": "call-shortened",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "trace_neo4j_lineage",
+                        "args": {
+                            "column_reference": f"{full_table}.c_closedate",
+                            "direction": "downstream",
+                            "max_depth": 5,
+                        },
+                        "id": "call-exact",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Полный downstream lineage получен."),
+        ],
+        observer_responses=[
+            Observation(
+                status="continue",
+                gap=(
+                    f"Точный column_reference={full_table}.c_closedate и "
+                    "требуемая полнота ещё не подтверждены."
+                ),
+                accepted_tool_call_ids=[],
+            ),
+            Observation(
+                summary="Точный транзитивный lineage получен.",
+                goal_satisfied=True,
+                accepted_tool_call_ids=["call-exact"],
+            ),
+        ],
+    )
+
+    result = run_worker_graph(
+        task=(
+            "Выполни reverse lineage для "
+            f"{full_table}.c_closedate и перечисли все зависимые transformations."
+        ),
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(trace_neo4j_lineage),),
+        max_steps=3,
+    )
+
+    assert [item["column_reference"] for item in calls] == [
+        "a_000025_t_loanscontract.c_closedate",
+        f"{full_table}.c_closedate",
+    ]
+    assert result.status == "complete"
+    assert result.accepted_tool_call_ids == ["call-exact"]
+    assert [item.tool_call_id for item in result.display_items] == ["call-exact"]
+    first_observation = result.cycle_history[0].observation
+    assert first_observation.status == "continue"
+    assert full_table in str(first_observation.gap)
+    assert "column_reference" in str(first_observation.gap)
+
+
+def test_worker_keeps_valid_lineage_while_fetching_transformation_rules():
+    executed = []
+    reference = "schema.source_table.c_closedate"
+
+    def trace_neo4j_lineage(
+        column_reference: str,
+        direction: str = "both",
+        max_depth: int = 1,
+    ):
+        executed.append(("trace_neo4j_lineage", column_reference, max_depth))
+        return {
+            "rows": [
+                {
+                    "transformation_id": 118,
+                    "source_table": "branch::1",
+                    "target_table": "target_table",
+                }
+            ],
+            "column_reference": column_reference,
+            "direction": direction,
+            "max_depth": max_depth,
+        }
+
+    def run_sql(query: str):
+        executed.append(("run_sql", query))
+        if "WHERE transformation_id" in query:
+            return {
+                "error": "SQL query failed",
+                "error_message": "no such column: transformation_id",
+                "query": query,
+            }
+        return {
+            "rows": [
+                {
+                    "id": 118,
+                    "transformation_rule": "UNION ALL",
+                }
+            ]
+        }
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "trace_neo4j_lineage",
+                        "args": {
+                            "column_reference": reference,
+                            "direction": "downstream",
+                            "max_depth": 5,
+                        },
+                        "id": "call-lineage",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "run_sql",
+                        "args": {
+                            "query": (
+                                "SELECT transformation_rule "
+                                "FROM s2t_transformations "
+                                "WHERE transformation_id IN (118)"
+                            )
+                        },
+                        "id": "call-rules-wrong-column",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "run_sql",
+                        "args": {
+                            "query": (
+                                "SELECT id, transformation_rule "
+                                "FROM s2t_transformations WHERE id IN (118)"
+                            )
+                        },
+                        "id": "call-rules",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Lineage и зависимые правила получены."),
+        ],
+        observer_responses=[
+            Observation(
+                status="continue",
+                gap=(
+                    "Lineage получен, но фактические transformation rules "
+                    "для найденных записей ещё не прочитаны."
+                ),
+                accepted_tool_call_ids=["call-lineage"],
+                facts=[{"text": "Найдена transformation 118."}],
+            ),
+            Observation(
+                status="continue",
+                gap=(
+                    "Текущий SQL завершился ошибкой; повтори чтение правила "
+                    "по фактической схеме источника."
+                ),
+                accepted_tool_call_ids=["call-lineage"],
+                facts=[{"text": "Найдена transformation 118."}],
+            ),
+            Observation(
+                status="complete",
+                accepted_tool_call_ids=["call-lineage", "call-rules"],
+                facts=[
+                    {"text": "Transformation 118 использует UNION ALL."}
+                ],
+            ),
+        ],
+    )
+
+    result = run_worker_graph(
+        task=(
+            f"Выполни reverse lineage для {reference} и перечисли "
+            "downstream transformations."
+        ),
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(
+            _as_tool(trace_neo4j_lineage),
+            _as_tool(run_sql),
+        ),
+        max_steps=3,
+    )
+
+    assert result.status == "complete"
+    assert result.accepted_tool_call_ids == ["call-lineage", "call-rules"]
+    assert result.cycle_history[0].observation.status == "continue"
+    assert result.cycle_history[0].observation.accepted_tool_call_ids == [
+        "call-lineage"
+    ]
+    assert "transformation rules" in str(
+        result.cycle_history[0].observation.gap
+    )
+    assert result.cycle_history[1].observation.status == "continue"
+    assert result.cycle_history[1].observation.accepted_tool_call_ids == [
+        "call-lineage"
+    ]
+    assert "фактической схеме" in str(
+        result.cycle_history[1].observation.gap
+    )
+    assert [item[0] for item in executed] == [
+        "trace_neo4j_lineage",
+        "run_sql",
+        "run_sql",
+    ]
+
+
+def test_worker_fetches_lineage_rules_by_ids_without_free_sql():
+    executed = []
+    reference = "schema.source_table.c_closedate"
+
+    def trace_neo4j_lineage(
+        column_reference: str,
+        direction: str = "both",
+        max_depth: int = 1,
+    ):
+        executed.append(("trace_neo4j_lineage", column_reference, max_depth))
+        return {
+            "rows": [
+                {
+                    "transformation_id": 118,
+                    "source_table": "branch::1",
+                    "target_table": "target_table",
+                }
+            ],
+            "column_reference": column_reference,
+            "direction": direction,
+            "max_depth": max_depth,
+        }
+
+    def get_s2t_rules_by_ids(transformation_ids: list[int]):
+        executed.append(("get_s2t_rules_by_ids", transformation_ids))
+        return {
+            "rows": [
+                {
+                    "id": 118,
+                    "transformation_rule": "UNION ALL",
+                }
+            ],
+            "requested_ids": transformation_ids,
+            "missing_ids": [],
+        }
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "trace_neo4j_lineage",
+                        "args": {
+                            "column_reference": reference,
+                            "direction": "downstream",
+                            "max_depth": 5,
+                        },
+                        "id": "call-lineage",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_s2t_rules_by_ids",
+                        "args": {"transformation_ids": [118]},
+                        "id": "call-rules",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Lineage и зависимое правило получены."),
+        ],
+        observer_responses=[
+            Observation(
+                status="continue",
+                gap=(
+                    "Lineage получен, но правила найденных transformations "
+                    "ещё не прочитаны доступным tool."
+                ),
+                accepted_tool_call_ids=["call-lineage"],
+                facts=[{"text": "Найдена transformation 118."}],
+            ),
+            Observation(
+                summary="Lineage и правило подтверждены.",
+                goal_satisfied=True,
+                accepted_tool_call_ids=["call-lineage", "call-rules"],
+                facts=[
+                    {"text": "Transformation 118 использует UNION ALL."}
+                ],
+            ),
+        ],
+    )
+
+    result = run_worker_graph(
+        task=(
+            f"Выполни reverse lineage для {reference} и перечисли "
+            "downstream transformations."
+        ),
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(
+            _as_tool(trace_neo4j_lineage),
+            _as_tool(get_s2t_rules_by_ids),
+        ),
+        max_steps=2,
+    )
+
+    assert result.status == "complete"
+    assert result.accepted_tool_call_ids == ["call-lineage", "call-rules"]
+    assert result.cycle_history[0].observation.status == "continue"
+    assert "доступным tool" in str(
+        result.cycle_history[0].observation.gap
+    )
+    assert result.cycle_history[1].observation.status == "complete"
+    assert executed == [
+        ("trace_neo4j_lineage", reference, 5),
+        ("get_s2t_rules_by_ids", [118]),
+    ]
+
+
+def test_worker_rejects_empty_s2t_result_with_swapped_role_filter():
+    executed = []
+
+    def list_s2t_transformations(
+        source_table: str | None = None,
+        target_table: str | None = None,
+        source_field: str | None = None,
+        target_field: str | None = None,
+    ):
+        executed.append(
+            {
+                "source_table": source_table,
+                "target_table": target_table,
+                "source_field": source_field,
+                "target_field": target_field,
+            }
+        )
+        return {
+            "rows": []
+        }
+
+    def list_s2t_table_mapping(source_table: str, target_table: str):
+        executed.append(
+            {
+                "source_table": source_table,
+                "target_table": target_table,
+            }
+        )
+        return {
+            "rows": [
+                {
+                    "source_table": source_table,
+                    "source_field": "src_id",
+                    "target_table": target_table,
+                    "target_field": "optn_id",
+                }
+            ]
+        }
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_s2t_transformations",
+                        "args": {
+                            "source_table": "b3050000420005_paymentdetails",
+                            "target_field": "t_optn",
+                        },
+                        "id": "call-wrong-role",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_s2t_table_mapping",
+                        "args": {
+                            "source_table": "b3050000420005_paymentdetails",
+                            "target_table": "t_optn",
+                        },
+                        "id": "call-correct-role",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Полный mapping получен."),
+        ],
+        observer_responses=[
+            Observation(
+                status="continue",
+                gap=(
+                    "Пустой результат получен с перепутанной ролью; "
+                    "нужен точный target_table=t_optn."
+                ),
+                accepted_tool_call_ids=[],
+            ),
+            Observation(
+                goal_satisfied=True,
+                accepted_tool_call_ids=["call-correct-role"],
+            ),
+        ],
+    )
+
+    result = run_worker_graph(
+        task=(
+            "Покажи полный маппинг b3050000420005_paymentdetails -> "
+            "t_optn: source column -> target column."
+        ),
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(
+            _as_tool(list_s2t_transformations),
+            _as_tool(list_s2t_table_mapping),
+        ),
+        max_steps=2,
+    )
+
+    assert result.status == "complete"
+    assert result.accepted_tool_call_ids == ["call-correct-role"]
+    assert [item.tool_call_id for item in result.display_items] == [
+        "call-correct-role"
+    ]
+    assert result.cycle_history[0].observation.status == "continue"
+    assert "target_table=t_optn" in str(
+        result.cycle_history[0].observation.gap
+    )
+    assert executed == [
+        {
+            "source_table": "b3050000420005_paymentdetails",
+            "target_table": None,
+            "source_field": None,
+            "target_field": "t_optn",
+        },
+        {
+            "source_table": "b3050000420005_paymentdetails",
+            "target_table": "t_optn",
+        },
+    ]
+
+
+def test_worker_requires_target_roles_for_exact_loaded_field():
+    executed = []
+    target_table = "b700000025_agr_cred::subquery::v_agr_cred1"
+
+    def search_s2t_transformations(needle: str):
+        executed.append(("search_s2t_transformations", needle))
+        return {"rows": []}
+
+    def list_s2t_transformations(
+        target_table: str | None = None,
+        target_field: str | None = None,
+    ):
+        executed.append(
+            ("list_s2t_transformations", target_table, target_field)
+        )
+        return {
+            "rows": [
+                {
+                    "target_table": target_table,
+                    "target_field": target_field,
+                    "source_field": "ctl_action",
+                    "transformation_rule": "CASE ... END",
+                }
+            ]
+        }
+
+    full_reference = f"{target_table}.del_dt"
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_s2t_transformations",
+                        "args": {"needle": full_reference},
+                        "id": "call-search",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_s2t_transformations",
+                        "args": {
+                            "target_table": target_table,
+                            "target_field": "del_dt",
+                        },
+                        "id": "call-list",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Mappings получены."),
+        ],
+        observer_responses=[
+            Observation(
+                status="continue",
+                gap=(
+                    "Подстрочный поиск не подтвердил точные target_table и "
+                    "target_field исходной task."
+                ),
+                accepted_tool_call_ids=[],
+            ),
+            Observation(
+                goal_satisfied=True,
+                accepted_tool_call_ids=["call-list"],
+            ),
+        ],
+    )
+
+    result = run_worker_graph(
+        task=f"Найди все S2T mappings, которые загружают {full_reference}.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(
+            _as_tool(search_s2t_transformations),
+            _as_tool(list_s2t_transformations),
+        ),
+        max_steps=2,
+    )
+
+    assert result.status == "complete"
+    assert result.accepted_tool_call_ids == ["call-list"]
+    assert [item.tool_call_id for item in result.display_items] == ["call-list"]
+    assert executed == [
+        ("search_s2t_transformations", full_reference),
+        ("list_s2t_transformations", target_table, "del_dt"),
+    ]
+
+
+def test_worker_requires_dependent_value_in_current_tool_filter():
+    from agents.contracts import (
+        WORKER_PREVIOUS_RESULTS_MARKER,
+        parse_worker_request,
+    )
+
+    queries = []
+    selected_target = "t_rate_rule_param"
+
+    def run_sql(query: str):
+        queries.append(query)
+        return {
+            "rows": [
+                {
+                    "distinct_source_tables": (
+                        5 if selected_target in query else 236
+                    )
+                }
+            ]
+        }
+
+    wrong_query = (
+        "SELECT COUNT(DISTINCT source_table) AS distinct_source_tables "
+        "FROM s2t_transformations WHERE source_table IS NOT NULL"
+    )
+    correct_query = wrong_query + f" AND target_table = '{selected_target}'"
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "run_sql",
+                        "args": {"query": wrong_query},
+                        "id": "call-global-count",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "run_sql",
+                        "args": {"query": correct_query},
+                        "id": "call-filtered-count",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Зависимый count получен."),
+        ],
+        observer_responses=[
+            Observation(
+                status="continue",
+                gap=(
+                    f"Глобальный count не применяет target_table="
+                    f"{selected_target} из прошлого outcome."
+                ),
+                accepted_tool_call_ids=[],
+            ),
+            Observation(
+                goal_satisfied=True,
+                accepted_tool_call_ids=["call-filtered-count"],
+            ),
+        ],
+    )
+    previous_payload = {
+        "previous_results": [
+            {
+                "result_id": "result-first",
+                "description": (
+                    "run_sql: "
+                    "target_table с максимальным числом строк: "
+                    f"{selected_target}: 110"
+                ),
+            }
+        ]
+    }
+    task = (
+        "Используя target_table, полученную на предыдущем шаге, посчитай "
+        "число различных непустых source_table в s2t_transformations."
+        + WORKER_PREVIOUS_RESULTS_MARKER
+        + " Используй краткие описания прошлых результатов:\n"
+        + json.dumps(previous_payload, ensure_ascii=False)
+    )
+    request_parts = parse_worker_request(task)
+    assert request_parts.current_task.startswith("Используя target_table")
+    assert [
+        item.model_dump(mode="json")
+        for item in (request_parts.previous_results or [])
+    ] == previous_payload["previous_results"]
+
+    result = run_worker_graph(
+        task=task,
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(run_sql),),
+        max_steps=2,
+    )
+
+    assert result.status == "complete"
+    assert result.accepted_tool_call_ids == ["call-filtered-count"]
+    assert result.cycle_history[0].observation.status == "continue"
+    assert selected_target in str(result.cycle_history[0].observation.gap)
+    assert "schema.previous.table" not in str(
+        result.cycle_history[0].observation.gap
+    )
+    assert queries == [wrong_query, correct_query]
+
+
+def test_worker_reroutes_when_description_is_claimed_as_s2t_rule():
+    calls = []
+
+    def semantic_search_descriptions(query: str):
+        calls.append(query)
+        return {
+            "rows": [
+                {
+                    "column_name": "DEL_DT",
+                    "description": "Дата удаления",
+                }
+            ]
+        }
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "semantic_search_descriptions",
+                        "args": {"query": "дата удаления записи"},
+                        "id": "call-description",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ],
+        observer_responses=[
+            Observation(
+                status="reroute",
+                gap=(
+                    "Описание поля не подтверждает transformation_rule; "
+                    "нужен другой источник данных."
+                ),
+                accepted_tool_call_ids=[],
+            )
+        ],
+    )
+
+    result = run_worker_graph(
+        task=(
+            "Найди техническое поле для даты удаления записи и "
+            "соответствующее S2T-правило."
+        ),
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(semantic_search_descriptions),),
+        max_steps=2,
+    )
+
+    assert calls == ["дата удаления записи"]
+    assert result.status == "reroute"
+    assert "transformation_rule" in str(result.gap)
+    assert result.accepted_tool_call_ids == []
+    assert result.display_items == []
+
+
+def test_worker_uses_function_calling_for_observer_contracts():
+    def lookup():
+        return {"value": 42}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-lookup",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Значение: 42."),
+        ]
+    )
+
+    run_worker_graph(
+        task="Получи значение.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+    )
+
+    assert model.structured_methods == [
+        (ObservationContract, "function_calling"),
+    ]
+
+
+def test_structured_observer_trims_only_surrounding_call_name_spaces():
+    from agents.chat_graph import _with_structured_output
+
+    class _RawRunnable:
+        def invoke(self, messages, **kwargs):
+            del messages, kwargs
+            return {
+                "raw": AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": " Observation ",
+                            "args": {
+                                "status": "complete",
+                                "gap": None,
+                                "accepted_tool_call_ids": [],
+                                "facts": [],
+                                "limitations": [],
+                            },
+                            "id": "observation-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                "parsed": None,
+                "parsing_error": ValueError("unknown tool type"),
+            }
+
+    class _RawModel:
+        def with_structured_output(
+            self,
+            schema,
+            *,
+            method=None,
+            include_raw=False,
+        ):
+            assert schema is ObservationContract
+            assert method == "function_calling"
+            assert include_raw is True
+            return _RawRunnable()
+
+    observer = _with_structured_output(_RawModel(), ObservationContract)
+
+    result = observer.invoke([])
+
+    assert result == ObservationContract(status="complete")
 
 
 def test_worker_without_tools_is_observed_before_returning_answer():
@@ -340,8 +1359,8 @@ def test_worker_without_tools_is_observed_before_returning_answer():
     )
 
     assert result.answer == candidate_answer
-    assert result.goal_satisfied is True
-    assert result.problem is None
+    assert result.status == "complete"
+    assert result.gap is None
     assert result.display_items == []
     assert len(result.cycle_history) == 1
     cycle = result.cycle_history[0]
@@ -353,7 +1372,7 @@ def test_worker_without_tools_is_observed_before_returning_answer():
     ]
     assert len(cycle.tool_results) == 1
     assert cycle.tool_results[0]["name"] == "analyze_known_facts"
-    assert cycle.observation.goal_satisfied is True
+    assert cycle.observation.status == "complete"
     observer_payload = json.loads(model.observer.messages[0][-1].content)
     assert observer_payload["tool_calls"][0]["name"] == "analyze_known_facts"
     assert observer_payload["tool_results"][0]["name"] == "analyze_known_facts"
@@ -361,148 +1380,18 @@ def test_worker_without_tools_is_observed_before_returning_answer():
     assert "Доступные worker tools:\nanalyze_known_facts" in planner_system
     assert "Палитра worker никогда не пуста" in planner_system
     observer_system = str(model.observer.messages[0][0].content)
-    assert "не является новым внешним фактом" in observer_system
+    assert "не является новым evidence" in observer_system
     assert observer_payload["candidate_answer"] == ""
-
-
-def test_analyze_runs_only_when_called_and_receives_selected_full_result():
-    full_marker = "FULL_DISPLAY_RESULT_MARKER"
-
-    def lookup_rule():
-        return {
-            "transformation_rule": (
-                "SELECT target_id FROM source_table LEFT JOIN dictionary "
-                "ON dictionary.id = source_table.id "
-                + ("x" * 200)
-                + full_marker
-            )
-        }
-
-    def lookup_other():
-        return {"value": "SECOND_RESULT"}
-
-    model = _WorkerModel(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "lookup_rule",
-                        "args": {},
-                        "id": "result-rule-1",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "lookup_other",
-                        "args": {},
-                        "id": "result-other-2",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "analyze",
-                        "args": {
-                            "tool_result_ids": ["result-rule-1"],
-                            "instruction": "Определи семантику LEFT JOIN.",
-                        },
-                        "id": "analysis-1",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            _finish_message("LEFT JOIN сохраняет строки левой стороны."),
-        ],
-        observer_responses=[
-            Observation(
-                summary="Полное правило найдено, но ещё не интерпретировано.",
-                goal_satisfied=False,
-                problem="Не выполнен анализ семантики LEFT JOIN.",
-            ),
-            Observation(
-                summary="Правило и дополнительное значение найдены.",
-                goal_satisfied=False,
-                problem="Не выполнен анализ семантики LEFT JOIN.",
-            ),
-            Observation(
-                summary="LEFT JOIN сохраняет строки левой стороны.",
-                goal_satisfied=True,
-                important_facts=[
-                    "Условие ON ограничивает совпадения справа."
-                ],
-            ),
-        ],
-        analyzer_responses=[
-            WorkerAnalysis(
-                summary="LEFT JOIN сохраняет строки левой стороны.",
-                facts=["Условие ON ограничивает совпадения справа."],
-            )
-        ],
-    )
-
-    result = run_worker_graph(
-        task="Найди правило и объясни семантику LEFT JOIN.",
-        system_prompt="Системный контекст и навык анализа.",
-        model=model,
-        tools=(_as_tool(lookup_rule), _as_tool(lookup_other)),
-        max_steps=4,
-        tool_message_preview_chars=60,
-    )
-
-    assert result.answer == "LEFT JOIN сохраняет строки левой стороны."
-    assert len(model.analyzer.messages) == 1
-    analyzer_payload = json.loads(model.analyzer.messages[0][-1].content)
-    assert analyzer_payload["analysis_instruction"] == (
-        "Определи семантику LEFT JOIN."
-    )
-    assert full_marker in str(analyzer_payload["source_results"])
-    assert [cycle.analysis is not None for cycle in result.cycle_history] == [
-        False,
-        False,
-        True,
-    ]
-    assert full_marker not in str(result.cycle_history[0].tool_results)
-    assert full_marker in result.display_items[0].content
-
-    first_observer_payload = json.loads(model.observer.messages[0][-1].content)
-    analysis_observer_payload = json.loads(
-        model.observer.messages[2][-1].content
-    )
-    assert first_observer_payload["candidate_analysis"] is None
-    assert first_observer_payload["analysis_sources"] == []
-    assert full_marker in str(analysis_observer_payload["analysis_sources"])
-    assert "SECOND_RESULT" not in str(
-        analysis_observer_payload["analysis_sources"]
-    )
-    assert analysis_observer_payload["candidate_analysis"]["facts"] == [
-        "Условие ON ограничивает совпадения справа."
-    ]
-    first_planner_system = str(model.messages[0][0].content)
-    analysis_planner_system = str(model.messages[2][0].content)
-    assert "Доступные worker tools:\nlookup_rule, lookup_other" in (
-        first_planner_system
-    )
-    assert "Доступные worker tools:\nlookup_rule, lookup_other, analyze" in (
-        analysis_planner_system
-    )
-    assert "result-rule-1" in analysis_planner_system
-    assert "result-other-2" in analysis_planner_system
-    assert "полные результаты data tools" in analysis_planner_system
 
 
 def test_worker_keeps_text_preview_and_returns_full_successful_result():
     tail_marker = "FULL_RESULT_TAIL"
 
     def long_result():
-        return {"payload": ("x" * 200) + tail_marker}
+        return {
+            "payload": ("x" * 200) + tail_marker,
+            "truncated": True,
+        }
 
     model = _WorkerModel(
         [
@@ -535,6 +1424,7 @@ def test_worker_keeps_text_preview_and_returns_full_successful_result():
     assert len(result.display_items) == 1
     assert result.display_items[0].name == "long_result"
     assert tail_marker in result.display_items[0].content
+    assert result.display_items[0].truncated is True
     assert len(result.cycle_history) == 1
     cycle = result.cycle_history[0]
     assert cycle.cycle == 1
@@ -543,7 +1433,10 @@ def test_worker_keeps_text_preview_and_returns_full_successful_result():
     assert cycle.tool_results[0]["name"] == "long_result"
     assert len(cycle.tool_results[0]["content"]) <= 50
     assert tail_marker not in cycle.tool_results[0]["content"]
-    assert cycle.observation.summary == "Превью результата получено."
+    assert cycle.observation.facts[0].text == "Превью результата получено."
+    assert cycle.observation.facts[0].evidence_ids == [
+        cycle.tool_results[0]["evidence_id"]
+    ]
 
     llm_prompts = [*model.messages, *model.observer.messages]
     assert all(
@@ -709,8 +1602,8 @@ def test_worker_binds_referenced_saved_result_schema_into_selected_tool():
         ):
             result = worker_chat(task)
 
-    assert result.answer == "Найдено: 1."
-    assert result.saved_results == []
+    assert result.summary == "Найдено: 1."
+    assert result.datasets == []
     available_tools = router.call_args.kwargs["available_tools"]
     routed_tool = next(
         item for item in available_tools if item.name == "query_saved_result"
@@ -722,7 +1615,77 @@ def test_worker_binds_referenced_saved_result_schema_into_selected_tool():
     assert descriptor.result_ref in selected_tool.description
 
 
-def test_worker_accepts_plain_planner_finish_without_responder_call():
+def test_worker_exposes_only_saved_results_accepted_by_observer():
+    from agents.contracts import EvidenceFact
+    from agents.tools.saved_results import (
+        get_active_saved_result_store,
+        read_previous_result,
+        saved_result_store_scope,
+    )
+    from agents.worker import worker_chat
+
+    route = ToolRoute(tools=["run_sql"], skills=[], schemas=[])
+
+    def run_graph(**kwargs):
+        del kwargs
+        store = get_active_saved_result_store()
+        assert store is not None
+        store.save_payload(
+            source_tool="run_sql",
+            source_tool_call_id="call-wrong",
+            payload={"rows": [{"value": "wrong"}]},
+        )
+        store.save_payload(
+            source_tool="run_sql",
+            source_tool_call_id="call-correct",
+            payload={"rows": [{"value": "correct"}]},
+        )
+        return WorkerRunResult(
+            answer="Получен correct.",
+            goal_satisfied=True,
+            display_items=[
+                WorkerDisplayItem(
+                    name="run_sql",
+                    content=json.dumps({"rows": [{"value": "correct"}]}),
+                    evidence_id="evidence-correct",
+                    tool_call_id="call-correct",
+                    arguments={"query": "SELECT value FROM result"},
+                )
+            ],
+            facts=[
+                EvidenceFact(
+                    text="Получено значение correct.",
+                    evidence_ids=["evidence-correct"],
+                )
+            ],
+            accepted_tool_call_ids=["call-correct"],
+        )
+
+    with (
+        saved_result_store_scope(),
+        patch("agents.worker.select_chat_route", return_value=route),
+        patch("agents.worker.run_worker_graph", side_effect=run_graph),
+    ):
+        result = worker_chat("Получи корректное значение.")
+        assert len(result.previous_results) == 1
+        reference = result.previous_results[0]
+        assert set(reference.model_dump()) == {"result_id", "description"}
+        assert reference.description == (
+            'run_sql: args={"query":"SELECT value FROM result"}'
+        )
+        assert "correct" not in reference.description
+        resolved = read_previous_result.invoke(
+            {"result_id": reference.result_id}
+        )
+        assert resolved["result"]["rows"] == [{"value": "correct"}]
+
+    assert len(result.datasets) == 1
+    descriptor = result.datasets[0]
+    assert descriptor.source_tool_call_id == "call-correct"
+    assert "source_tool_call_id" not in descriptor.model_dump()
+
+
+def test_worker_repairs_plain_planner_finish_to_native_finish_call():
     def lookup():
         return {"value": "confirmed"}
 
@@ -740,6 +1703,7 @@ def test_worker_accepts_plain_planner_finish_without_responder_call():
                 ],
             ),
             AIMessage(content="Подтверждённое значение: confirmed."),
+            _finish_message("Подтверждённое значение: confirmed."),
         ]
     )
 
@@ -753,16 +1717,63 @@ def test_worker_accepts_plain_planner_finish_without_responder_call():
 
     assert result.answer == "Подтверждённое значение: confirmed."
     assert [item.name for item in result.display_items] == ["lookup"]
-    assert len(model.messages) == 2
+    assert len(model.messages) == 3
+    assert "Обычный текст planner недопустим" in str(
+        model.messages[2][-1].content
+    )
 
 
-def test_worker_accepts_plain_text_before_first_data_tool_call_without_repair():
+def test_worker_raises_when_plain_text_repair_still_has_no_native_call():
+    def lookup():
+        return {"value": "confirmed"}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-lookup",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Подтверждённое значение: confirmed."),
+            AIMessage(content="Подтверждённое значение: confirmed."),
+        ]
+    )
+
+    with pytest.raises(WorkerResponseError, match="native data-tool call"):
+        run_worker_graph(
+            task="Получи значение",
+            system_prompt="Системный контекст",
+            model=model,
+            tools=(_as_tool(lookup),),
+            max_steps=2,
+        )
+
+
+def test_worker_repairs_plain_text_before_first_data_tool_call():
     def lookup():
         return {"value": "confirmed"}
 
     model = _WorkerModel(
         [
             AIMessage(content="Сначала я выполню поиск."),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-lookup",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Значение получено."),
         ]
     )
 
@@ -774,14 +1785,36 @@ def test_worker_accepts_plain_text_before_first_data_tool_call_without_repair():
         max_steps=2,
     )
 
-    assert result.answer == "Сначала я выполню поиск."
+    assert result.answer == "Значение получено."
+    assert [item.name for item in result.display_items] == ["lookup"]
+    assert result.status == "complete"
+    assert len(model.messages) == 3
+    assert "Сначала я выполню поиск." not in str(model.messages[1])
+
+
+def test_worker_allows_native_finish_before_first_data_tool_call():
+    def lookup():
+        return {"value": "confirmed"}
+
+    model = _WorkerModel(
+        [_finish_message("Данных для проверки недостаточно.")]
+    )
+
+    result = run_worker_graph(
+        task="Получи значение",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+    )
+
+    assert result.answer == "Данных для проверки недостаточно."
     assert result.display_items == []
-    assert result.goal_satisfied is False
-    assert result.reroute_required is False
+    assert result.status == "complete"
     assert len(model.messages) == 1
 
 
-def test_worker_falls_back_when_forced_first_tool_call_transport_fails():
+def test_worker_does_not_force_one_tool_when_finish_is_also_allowed():
     def lookup():
         return {"value": "confirmed"}
 
@@ -797,7 +1830,7 @@ def test_worker_falls_back_when_forced_first_tool_call_transport_fails():
 
     assert result.answer == "Подтверждено через fallback."
     assert [item.name for item in result.display_items] == ["lookup"]
-    assert model.forced_lookup_calls == 1
+    assert model.forced_lookup_calls == 0
     assert model.regular_calls == 2
 
 
@@ -839,10 +1872,12 @@ def test_worker_planner_keeps_only_latest_tool_exchange():
                 summary="Получен только первый результат.",
                 goal_satisfied=False,
                 problem="Второй результат ещё не получен.",
+                accepted_tool_call_ids=["call-first"],
             ),
             Observation(
                 summary="Получены оба результата.",
                 goal_satisfied=True,
+                accepted_tool_call_ids=["call-first", "call-second"],
             ),
         ],
     )
@@ -891,11 +1926,11 @@ def test_worker_planner_keeps_only_latest_cumulative_observation():
     context = _runtime_context({"observations": [first, latest]})
 
     assert context is not None
-    assert "Выжимка observer для шага 2" in context
-    assert "Источник найден, правило ещё отсутствует." in context
+    assert "Observation для шага 2" in context
+    assert "Источник найден, правило ещё отсутствует." not in context
     assert "Не найдено правило преобразования." in context
     assert "Источник: source_contracts." in context
-    assert "Выжимка observer для шага 1" not in context
+    assert "Observation для шага 1" not in context
     assert "Первый результат неполон." not in context
     assert "Не найден источник." not in context
 
@@ -943,6 +1978,7 @@ def test_worker_observer_evaluates_current_result_with_prior_state():
                 goal_satisfied=False,
                 problem="Правило преобразования ещё не подтверждено.",
                 important_facts=["Источник: source_contracts."],
+                accepted_tool_call_ids=["call-source"],
             ),
             Observation(
                 summary=(
@@ -954,6 +1990,7 @@ def test_worker_observer_evaluates_current_result_with_prior_state():
                     "Источник: source_contracts.",
                     "Правило: source.c_closedate.",
                 ],
+                accepted_tool_call_ids=["call-source", "call-rule"],
             ),
         ],
     )
@@ -966,22 +2003,23 @@ def test_worker_observer_evaluates_current_result_with_prior_state():
         max_steps=3,
     )
 
-    assert result.goal_satisfied is True
+    assert result.status == "complete"
     assert calls == ["source", "rule"]
     assert len(model.observer.messages) == 2
     second_observer_prompt = model.observer.messages[1]
     second_payload = json.loads(second_observer_prompt[-1].content)
     assert len(second_payload["prior_state"]) == 1
-    assert second_payload["prior_state"][0]["summary"] == (
-        "Источник: source_contracts."
-    )
+    prior_fact = second_payload["prior_state"][0]["facts"][0]
+    assert prior_fact["text"] == "Источник: source_contracts."
+    assert len(prior_fact["evidence_ids"]) == 1
+    assert prior_fact["evidence_ids"][0].startswith("evidence_")
     observer_system_prompt = " ".join(
         str(second_observer_prompt[0].content).split()
     )
-    assert "Оцени выполнение task по совокупности prior_state" in (
+    assert "`prior_state` и `accepted_evidence` накоплены ранее" in (
         observer_system_prompt
     )
-    assert "не по последнему tool call изолированно" in observer_system_prompt
+    assert "не требуй их повторно" in observer_system_prompt
 
 
 def test_worker_rejects_legacy_display_selection_field():
@@ -1102,8 +2140,8 @@ def test_worker_returns_unsatisfied_status_after_step_limit():
         max_steps=1,
     )
 
-    assert result.goal_satisfied is False
-    assert result.problem == (
+    assert result.status == "complete"
+    assert result.gap == (
         "Task ожидала значение, но tool вернул пустой результат."
     )
 
@@ -1212,11 +2250,13 @@ def test_worker_llm_can_correct_its_tool_call_after_observation():
 
     assert result.answer == "Максимум: t_rate_rule_param, 55 строк."
     assert executed_queries == [wrong_sql, correct_sql]
-    assert [item.name for item in result.display_items] == ["run_sql", "run_sql"]
+    assert [item.name for item in result.display_items] == ["run_sql"]
+    assert result.display_items[0].tool_call_id == "call-correct"
+    assert result.display_items[0].arguments == {"query": correct_sql}
     assert "t_rate_rule_param" in result.display_items[0].content
 
 
-def test_worker_cannot_finish_after_observer_reports_semantic_mismatch():
+def test_worker_repairs_finish_attempt_after_observer_reports_semantic_mismatch():
     selected_fields = []
 
     def lookup(field_name: str):
@@ -1248,7 +2288,7 @@ def test_worker_cannot_finish_after_observer_reports_semantic_mismatch():
                     }
                 ],
             ),
-            _finish_message("Подтверждено поле target_table."),
+            _finish_message("Получено значение target_table."),
         ],
         observer_responses=[
             Observation(
@@ -1257,8 +2297,9 @@ def test_worker_cannot_finish_after_observer_reports_semantic_mismatch():
                 problem="Task просит target_table, но tool получил source_table.",
             ),
             Observation(
-                summary="Tool получил требуемое поле target_table.",
+                summary="Tool получил требуемое значение поля target_table.",
                 goal_satisfied=True,
+                accepted_tool_call_ids=["call-correct-role"],
             ),
         ],
     )
@@ -1271,17 +2312,16 @@ def test_worker_cannot_finish_after_observer_reports_semantic_mismatch():
         max_steps=2,
     )
 
-    assert result.answer == "Подтверждено поле target_table."
+    assert result.answer == "Получено значение target_table."
     assert selected_fields == ["source_table", "target_table"]
     assert len(model.observer.messages) == 2
-    repair_prompt = " ".join(str(model.messages[2][-1].content).split())
-    full_repair_context = " ".join(str(model.messages[2]).split())
-    assert "Предыдущая попытка завершить worker запрещена" in repair_prompt
-    assert "Что выполнено неправильно" in repair_prompt
-    assert (
-        "Task просит target_table, но tool получил source_table"
-        in full_repair_context
-    )
+    assert result.status == "complete"
+    assert result.gap is None
+    assert [item.tool_call_id for item in result.display_items] == [
+        "call-correct-role"
+    ]
+    repair_prompt = str(model.messages[2][-1].content)
+    assert "завершать worker сейчас запрещено" in repair_prompt
 
 
 def test_worker_graph_returns_reroute_after_current_palette_cannot_repair():
@@ -1324,12 +2364,11 @@ def test_worker_graph_returns_reroute_after_current_palette_cannot_repair():
         max_steps=3,
     )
 
-    assert result.reroute_required is True
-    assert result.problem == (
+    assert result.status == "reroute"
+    assert result.gap == (
         "Task требует сравнить количества строк, но текущий tool возвращает "
         "только имена; нужна возможность произвольной агрегации данных."
     )
-    assert result.goal_satisfied is False
     assert result.display_items == []
     assert len(model.messages) == 1
     observer_payload = str(model.observer.messages[0][-1].content)
@@ -1337,8 +2376,11 @@ def test_worker_graph_returns_reroute_after_current_palette_cannot_repair():
     assert '"name": "list_names"' in observer_payload
 
 
-def test_failed_semantic_repair_does_not_invent_reroute():
+def test_native_finish_after_semantic_mismatch_does_not_invent_reroute():
+    lookup_calls = []
+
     def lookup():
+        lookup_calls.append(True)
         return {"value": "wrong"}
 
     model = _WorkerModel(
@@ -1355,11 +2397,27 @@ def test_failed_semantic_repair_does_not_invent_reroute():
                 ],
             ),
             _finish_message("Текущего результата достаточно."),
-            _finish_message("Исправить результат текущим tool не удалось."),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-lookup-retry",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Нужное значение не подтверждено."),
         ],
         observer_responses=[
             Observation(
                 summary="Получен неподходящий результат.",
+                goal_satisfied=False,
+                problem="Нужное значение не подтверждено.",
+            ),
+            Observation(
+                summary="Повторно получен неподходящий результат.",
                 goal_satisfied=False,
                 problem="Нужное значение не подтверждено.",
             ),
@@ -1374,10 +2432,10 @@ def test_failed_semantic_repair_does_not_invent_reroute():
         max_steps=2,
     )
 
-    assert result.answer == "Исправить результат текущим tool не удалось."
-    assert result.goal_satisfied is False
-    assert result.reroute_required is False
-    assert result.problem == "Нужное значение не подтверждено."
+    assert result.answer == "Нужное значение не подтверждено."
+    assert result.status == "complete"
+    assert result.gap == "Нужное значение не подтверждено."
+    assert len(lookup_calls) == 2
 
 
 def test_worker_loop_does_not_rewrite_llm_tool_arguments_in_python():
@@ -1448,11 +2506,11 @@ def test_worker_loop_does_not_rewrite_llm_tool_arguments_in_python():
     assert executed_queries == [wrong_sql, correct_sql]
 
 
-def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
+def test_public_worker_contract_exposes_evidence_and_opaque_runtime_refs(
     caplog,
 ):
     from agents.worker import (
-        WorkerAnswer,
+        WorkerOutcome,
         resolve_worker_display_refs,
         worker_chat,
     )
@@ -1461,7 +2519,15 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
     graph_result = WorkerRunResult(
         answer="Готово.",
         display_items=[
-            WorkerDisplayItem(name="list_files", content=hidden_full_result)
+            WorkerDisplayItem(
+                name="list_files",
+                content=hidden_full_result,
+                evidence_id="evidence-files",
+                tool_call_id="call-files",
+                arguments={"limit": 3},
+                preview="ограниченное превью",
+                truncated=True,
+            )
         ],
         cycle_history=[
             WorkerCycleTrace(
@@ -1486,6 +2552,13 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
         ],
         goal_satisfied=False,
         problem="Нужна дополнительная проверка.",
+        facts=[
+            {
+                "text": "Найдено 3 файла.",
+                "evidence_ids": ["evidence-files"],
+            }
+        ],
+        accepted_tool_call_ids=["call-files"],
     )
     route = ToolRoute(
         tools=["list_files"],
@@ -1506,20 +2579,34 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
     ):
         result = worker_chat("  Покажи файлы  ")
 
-    assert isinstance(result, WorkerAnswer)
-    assert result.answer == graph_result.answer
-    assert result.goal_satisfied is False
-    assert result.problem == graph_result.problem
-    assert result.cycle_history == graph_result.cycle_history
-    assert len(result.result_refs) == 1
-    assert result.result_refs[0].name == "list_files"
+    assert isinstance(result, WorkerOutcome)
+    assert result.summary == (
+        "Готово.\n"
+        "Причина незавершённости: Нужна дополнительная проверка."
+    )
+    assert not hasattr(result, "gap")
+    assert result.facts[0].text == "Найдено 3 файла."
+    assert len(result.evidence) == 1
+    assert result.evidence[0].evidence_id == "evidence-files"
+    assert result.evidence[0].tool_name == "list_files"
+    assert result.evidence[0].compact_args == {"limit": 3}
+    assert result.evidence[0].preview == "ограниченное превью"
+    assert result.evidence[0].truncated is True
     assert hidden_full_result not in result.model_dump_json()
-    refs = [item.ref for item in result.result_refs]
+    assert "display_ref" not in result.model_dump_json()
+    refs = [
+        item.display_ref for item in result.evidence if item.display_ref
+    ]
     assert resolve_worker_display_refs(refs) == graph_result.display_items
     assert resolve_worker_display_refs(refs) == []
     assert router.call_args.args == ("Покажи файлы",)
     assert "history" not in router.call_args.kwargs
-    assert router.call_args.kwargs["available_tools"] == get_tools()
+    assert router.call_args.kwargs["available_tools"] == tuple(
+        tool
+        for tool in get_tools()
+        if tool.name not in {"read_previous_result", "query_saved_result"}
+    )
+    assert result.previous_results == []
     assert run_graph.call_args.kwargs["task"] == "Покажи файлы"
     assert "## Актуальная схема SQLite" not in run_graph.call_args.kwargs[
         "system_prompt"
@@ -1532,20 +2619,20 @@ def test_public_worker_contract_exposes_bounded_cycles_and_opaque_result_refs(
         tools=["list_files"],
         skills=["Excel и описания"],
         schemas=["Excel-маппинги"],
-        problem=None,
+        gap=None,
     )
     observation_recorder.assert_called_once()
     observation_call = observation_recorder.call_args.kwargs
     assert observation_call["worker_task"] == "Покажи файлы"
     assert observation_call["cycle"] == 1
     assert observation_call["routing_attempt"] == 1
-    assert observation_call["observation"]["goal_satisfied"] is False
-    assert observation_call["observation"]["problem"] == (
+    assert observation_call["observation"]["status"] == "continue"
+    assert observation_call["observation"]["gap"] == (
         "Нужна дополнительная проверка."
     )
     assert "Worker route:" in caplog.text
     assert "Worker observation:" in caplog.text
-    assert '"goal_satisfied": false' in caplog.text
+    assert '"status": "continue"' in caplog.text
 
 
 def test_public_worker_allows_empty_palette_and_returns_observation():
@@ -1579,10 +2666,9 @@ def test_public_worker_allows_empty_palette_and_returns_observation():
     ):
         result = worker_chat("Отформатируй уже известные пары")
 
-    assert result.answer == graph_result.answer
-    assert result.goal_satisfied is True
-    assert result.cycle_history[0].observation == observation
-    assert result.result_refs == []
+    assert result.summary == graph_result.answer
+    assert result.evidence == []
+    assert result.datasets == []
     assert [
         tool.name for tool in run_graph.call_args.kwargs["tools"]
     ] == ["analyze_known_facts"]
@@ -1655,10 +2741,7 @@ def test_public_worker_reroutes_original_task_after_observer_request():
     ):
         result = worker_chat("  Найди target_table с максимумом строк  ")
 
-    assert result.answer == "Максимум: t_example, 55 строк."
-    assert [cycle.cycle for cycle in result.cycle_history] == [1, 2]
-    assert [cycle.routing_attempt for cycle in result.cycle_history] == [1, 2]
-    assert result.goal_satisfied is True
+    assert result.summary == "Максимум: t_example, 55 строк."
     assert router.call_count == 2
     assert router.call_args_list[0].args == (
         "Найди target_table с максимумом строк",
@@ -1669,7 +2752,7 @@ def test_public_worker_reroutes_original_task_after_observer_request():
     )
     reroute_context = router.call_args_list[1].kwargs["reroute_context"]
     assert reroute_context == {
-        "problem": "Текущий tool не строит многошаговый путь с rules.",
+        "gap": "Текущий tool не строит многошаговый путь с rules.",
         "previous_tool_palettes": [["list_s2t_transformations"]],
         "attempt": 1,
     }
@@ -1717,8 +2800,7 @@ def test_public_worker_can_execute_repeated_reroute_palette():
     ):
         result = worker_chat("Найди target_table с максимумом строк")
 
-    assert result.goal_satisfied is True
-    assert result.answer == "Максимум: t_example, 55 строк."
+    assert result.summary == "Максимум: t_example, 55 строк."
     assert router.call_count == 2
     assert run_graph.call_count == 2
     assert [
@@ -1730,7 +2812,7 @@ def test_public_worker_can_execute_repeated_reroute_palette():
     assert "SQL не учитывает нужный фильтр." in second_system_prompt
     assert "с помощью расширенной палитры" in second_system_prompt
     assert router.call_args_list[1].kwargs["reroute_context"] == {
-        "problem": "SQL не учитывает нужный фильтр.",
+        "gap": "SQL не учитывает нужный фильтр.",
         "previous_tool_palettes": [["list_s2t_transformations"]],
         "attempt": 1,
     }

@@ -8,6 +8,7 @@ from .context import (
     load_chat_agent_context,
     load_schemas,
     load_skills,
+    load_upstream_analysis_context,
 )
 from .files import (
     get_file_description,
@@ -40,6 +41,8 @@ from .registry import (
     get_write_tools,
 )
 from .s2t import (
+    get_s2t_rules_by_ids,
+    list_s2t_table_mapping,
     list_s2t_table_names,
     list_s2t_transformations,
     search_s2t_transformations,
@@ -66,6 +69,7 @@ from .saved_results import (
     get_active_saved_result_store,
     persist_sqlite_tool_message,
     query_saved_result,
+    read_previous_result,
     saved_result_store_scope,
 )
 from .sql_lineage import (
@@ -96,6 +100,7 @@ __all__ = [
     "get_file_description",
     "get_excel_row",
     "get_sqlite_schema_cheatsheet",
+    "get_s2t_rules_by_ids",
     "get_tools",
     "get_tools_by_name",
     "get_tools_for_names",
@@ -105,6 +110,7 @@ __all__ = [
     "list_column_catalog",
     "list_file_sheet_headers",
     "list_files",
+    "list_s2t_table_mapping",
     "list_s2t_table_names",
     "list_s2t_transformations",
     "list_sheet_group_classifications",
@@ -112,6 +118,7 @@ __all__ = [
     "load_chat_agent_context",
     "load_schemas",
     "load_skills",
+    "load_upstream_analysis_context",
     "resolve_file",
     "parse_sql_column_lineage",
     "parse_sql_table_lineage",
@@ -120,6 +127,7 @@ __all__ = [
     "run_cypher",
     "run_sql",
     "query_saved_result",
+    "read_previous_result",
     "SavedResultColumn",
     "SavedResultDescriptor",
     "SavedResultStore",

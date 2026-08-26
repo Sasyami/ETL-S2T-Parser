@@ -8,9 +8,104 @@ from .common import clamped_int
 
 
 @tool(parse_docstring=True)
+def get_s2t_rules_by_ids(
+    transformation_ids: List[int],
+) -> Dict[str, Any]:
+    """Получить точные S2T-правила по transformation_id из lineage.
+
+    Используй после trace_neo4j_lineage, когда его результат уже содержит
+    transformation_id и для impact-ответа нужны соответствующие
+    transformation_rule. Передай найденные идентификаторы как список чисел без
+    SQL и без повторного поиска по именам. Neo4j transformation_id соответствует
+    первичному ключу s2t_transformations.id; tool выполняет это сопоставление сам.
+    Читает глобальную s2t_transformations без неявного file_id и возвращает
+    точные строки, отсутствующие id перечисляет отдельно.
+
+    Args:
+        transformation_ids: Непустой список числовых transformation_id,
+            дословно полученных из trace_neo4j_lineage; максимум 100 id.
+    """
+    clean_ids: List[int] = []
+    for value in transformation_ids or []:
+        try:
+            clean_value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if clean_value > 0 and clean_value not in clean_ids:
+            clean_ids.append(clean_value)
+        if len(clean_ids) >= 100:
+            break
+    if not clean_ids:
+        return {
+            "error": "transformation_ids must contain at least one positive id",
+            "requested_ids": [],
+            "missing_ids": [],
+            "rows": [],
+        }
+
+    from storage.database import (
+        S2T_TRANSFORMATION_COLUMNS,
+        get_db_connection,
+    )
+
+    columns = list(S2T_TRANSFORMATION_COLUMNS)
+    placeholders = ", ".join("?" for _ in clean_ids)
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(columns)} FROM s2t_transformations "
+            f"WHERE id IN ({placeholders})",
+            clean_ids,
+        ).fetchall()
+    rows_by_id = {int(row["id"]): dict(row) for row in rows}
+    ordered_rows = [rows_by_id[item] for item in clean_ids if item in rows_by_id]
+    return {
+        "columns": columns,
+        "rows": ordered_rows,
+        "requested_ids": clean_ids,
+        "missing_ids": [item for item in clean_ids if item not in rows_by_id],
+        "returned_rows": len(ordered_rows),
+    }
+
+
+@tool(parse_docstring=True)
+def list_s2t_table_mapping(
+    source_table: str,
+    target_table: str,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Получить полный S2T-маппинг между двумя точными таблицами.
+
+    Используй, когда task явно задаёт направление source_table → target_table
+    и просит перечислить их source/target columns или transformation rules.
+    Узкий контракт намеренно не принимает field-фильтры и q, поэтому имена
+    таблиц нельзя случайно передать в роли полей. Читает глобальную
+    s2t_transformations без неявного file_id и сохраняет исходные дубликаты.
+
+    Args:
+        source_table: Точное полное имя исходной S2T-таблицы.
+        target_table: Точное полное имя целевой S2T-таблицы.
+        limit: Максимальное число возвращаемых строк, от 1 до 100.
+    """
+    from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
+
+    clean_source_table = str(source_table or "").strip()
+    clean_target_table = str(target_table or "").strip()
+    if not clean_source_table or not clean_target_table:
+        return {
+            "error": "source_table and target_table must be non-empty",
+            "rows": [],
+        }
+    return db_list_s2t_transformations(
+        file_id=None,
+        limit=clamped_int(limit, 100, minimum=1, maximum=100),
+        source_table=clean_source_table,
+        target_table=clean_target_table,
+    )
+
+
+@tool(parse_docstring=True)
 def list_s2t_transformations(
     limit: int = 20,
-    q: Optional[str] = None,
     columns: Optional[List[str]] = None,
     target_table: Optional[str] = None,
     source_table: Optional[str] = None,
@@ -20,26 +115,30 @@ def list_s2t_transformations(
     """
     Получить строки S2T с точными ролевыми фильтрами и выбранными колонками.
 
-    Выбирай, если известны точные source/target table или field либо нужно
-    вернуть конкретные columns, например только transformation_rule. Для
-    точного маппинга передавай source_table, source_field, target_table и
-    target_field отдельными аргументами;
+    Выбирай, если известна точная полная пара
+    source_table.source_field → target_table.target_field, в том числе в
+    запросе «найди», «покажи», «объясни» или «проанализируй сохранённую
+    трансформацию». Этот tool сначала получает фактическую строку и
+    transformation_rule; требуемую интерпретацию затем выполняет внутренний
+    analyze. Также выбирай, если известны точные source/target table или field
+    либо нужно вернуть конкретные columns, например только transformation_rule. Для
+    точного маппинга обязательно передавай source_table, source_field,
+    target_table и target_field отдельными аргументами;
     неполное или неквалифицированное имя сначала разрешай через
-    search_s2t_transformations. Ролевые условия передавай отдельными аргументами, не строкой в q.
+    search_s2t_transformations. Ролевые условия передавай только отдельными
+    аргументами, не объединённой строкой.
     Если task явно называет target_table/target_field или
     source_table/source_field, передавай все названные ролевые фильтры; не
     заменяй их search_s2t_transformations и не опускай table-фильтр.
-    q — ровно одна буквальная подстрока, не объединяй в ней несколько полей,
-    значений или условий. Tool не принимает file_id: конкретный file_id из
-    запроса не переносится на глобальную s2t_transformations.
-    Без columns возвращает row_num и все поля S2T. q — дополнительный поиск
-    подстроки по значениям.
+    Подстрочный поиск этот tool не выполняет: для него используй
+    search_s2t_transformations. Tool не принимает file_id: конкретный file_id
+    из запроса не переносится на глобальную s2t_transformations.
+    Без columns возвращает row_num и все поля S2T.
     Читает глобальную s2t_transformations без file_id и сохраняет дубликаты.
     Не строит графовый путь и не выполняет агрегации.
 
     Args:
         limit: Максимальное число возвращаемых строк; фактически ограничивается 20.
-        q: Опциональная подстрока значения для фильтрации строк; не имя колонки.
         columns: Точные имена возвращаемых колонок; null означает все колонки.
         target_table: Опциональное точное имя целевой таблицы без имени поля и операторов.
         source_table: Опциональное точное имя исходной таблицы без имени поля и операторов.
@@ -52,7 +151,7 @@ def list_s2t_transformations(
     return db_list_s2t_transformations(
         file_id=None,
         limit=clean_limit,
-        q=q,
+        q=None,
         columns=columns,
         target_table=target_table,
         source_table=source_table,
@@ -76,7 +175,10 @@ def search_s2t_transformations(
     роли таблиц или полей либо нужны конкретные возвращаемые колонки, используй list_s2t_transformations
     и передай каждую роль отдельным аргументом. Использование точного
     target_table/target_field или source_table/source_field как needle
-    запрещено: это ролевые фильтры, а не подстрочный поиск. Это не
+    запрещено: это ролевые фильтры, а не подстрочный поиск. Полная точная
+    source_table.source_field → target_table.target_field всегда относится к
+    list_s2t_transformations, даже если пользователь просит объяснение правила.
+    Это не
     семантический поиск: needle
     проверяется как подстрока в target/source table, field, layer и
     transformation_rule. Читает глобальную s2t_transformations без file_id,

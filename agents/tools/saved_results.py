@@ -1,4 +1,4 @@
-"""Run-scoped SQLite storage for querying previous tool results."""
+"""Run-scoped lazy result storage with optional tabular SQLite views."""
 
 from __future__ import annotations
 
@@ -15,8 +15,13 @@ from uuid import uuid4
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool
-from pydantic import BaseModel, ConfigDict, Field
 
+from ..contracts import (
+    PreviousResultReference,
+    SavedResultColumn,
+    SavedResultDescriptor,
+    parse_worker_request,
+)
 from .common import clamped_int
 from .sql import _readonly_sql_authorizer, _validate_readonly_sql
 
@@ -31,10 +36,12 @@ SQLITE_RESULT_TOOL_NAMES = frozenset(
     {
         "get_excel_row",
         "get_file_description",
+        "get_s2t_rules_by_ids",
         "list_column_catalog",
         "list_columns",
         "list_file_sheet_headers",
         "list_files",
+        "list_s2t_table_mapping",
         "list_s2t_table_names",
         "list_s2t_transformations",
         "list_sheets",
@@ -49,28 +56,6 @@ SQLITE_RESULT_TOOL_NAMES = frozenset(
         "summarize_table_descriptions",
     }
 )
-
-
-class SavedResultColumn(BaseModel):
-    """One physical column exposed by a saved result relation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    sqlite_type: str
-
-
-class SavedResultDescriptor(BaseModel):
-    """Opaque reference and query schema for one saved tool result."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    result_ref: str
-    source_tool: str
-    row_count: int = Field(ge=0)
-    source_total: Optional[int] = Field(default=None, ge=0)
-    truncated: bool = False
-    columns: List[SavedResultColumn] = Field(default_factory=list)
 
 
 def _quote_identifier(value: str) -> str:
@@ -183,7 +168,7 @@ def _decode_tool_content(content: Any) -> Optional[Any]:
 
 
 class SavedResultStore:
-    """Temporary SQLite database containing relations from one chat run."""
+    """Run-scoped accepted results plus optional temporary SQLite relations."""
 
     def __init__(self) -> None:
         self._temp_dir = tempfile.TemporaryDirectory(
@@ -193,9 +178,16 @@ class SavedResultStore:
         self._lock = RLock()
         self._descriptors: Dict[str, SavedResultDescriptor] = {}
         self._tables: Dict[str, str] = {}
+        self._previous_results: Dict[str, Dict[str, Any]] = {}
+        self._result_datasets: Dict[str, str] = {}
         sqlite3.connect(self.path).close()
 
     def close(self) -> None:
+        with self._lock:
+            self._previous_results.clear()
+            self._result_datasets.clear()
+            self._descriptors.clear()
+            self._tables.clear()
         self._temp_dir.cleanup()
 
     def descriptors(self) -> List[SavedResultDescriptor]:
@@ -207,10 +199,78 @@ class SavedResultStore:
             item = self._descriptors.get(str(result_ref or "").strip())
             return item.model_copy(deep=True) if item is not None else None
 
+    def register_previous_result(
+        self,
+        *,
+        source_tool: str,
+        source_tool_call_id: str,
+        content: str,
+        description: str,
+        dataset_ref: Optional[str] = None,
+    ) -> PreviousResultReference:
+        """Store one accepted tool result behind an opaque run-scoped id."""
+        reference = PreviousResultReference(
+            result_id=f"result_{uuid4().hex}",
+            description=description,
+        )
+        clean_dataset_ref = str(dataset_ref or "").strip() or None
+        with self._lock:
+            if (
+                clean_dataset_ref is not None
+                and clean_dataset_ref not in self._descriptors
+            ):
+                raise ValueError(
+                    "previous result references an unknown saved dataset"
+                )
+            self._previous_results[reference.result_id] = {
+                "source_tool": str(source_tool or "unknown_tool"),
+                "source_tool_call_id": str(source_tool_call_id or "").strip(),
+                "content": str(content or ""),
+            }
+            if clean_dataset_ref is not None:
+                self._result_datasets[reference.result_id] = clean_dataset_ref
+        return reference
+
+    def read_previous_result(self, result_id: str) -> Dict[str, Any]:
+        """Resolve one accepted result inside the current coordinator run."""
+        clean_id = str(result_id or "").strip()
+        with self._lock:
+            stored = self._previous_results.get(clean_id)
+            payload = dict(stored) if stored is not None else None
+        if payload is None:
+            return {
+                "error": "Previous result not found in the current coordinator run",
+                "result_id": clean_id,
+            }
+        content = payload["content"]
+        decoded = _decode_tool_content(content)
+        return {
+            "result_id": clean_id,
+            "source_tool": payload["source_tool"],
+            "result": decoded if decoded is not None else content,
+        }
+
+    def descriptors_for_result_ids(
+        self,
+        result_ids: Sequence[str],
+    ) -> List[SavedResultDescriptor]:
+        """Return saved tabular datasets linked to accepted lazy results."""
+        with self._lock:
+            refs = [
+                self._result_datasets.get(str(result_id or "").strip())
+                for result_id in result_ids
+            ]
+            return [
+                self._descriptors[result_ref].model_copy(deep=True)
+                for result_ref in dict.fromkeys(refs)
+                if result_ref is not None and result_ref in self._descriptors
+            ]
+
     def save_payload(
         self,
         *,
         source_tool: str,
+        source_tool_call_id: Optional[str] = None,
         payload: Any,
     ) -> Optional[SavedResultDescriptor]:
         tabular = _tabular_payload(payload)
@@ -256,6 +316,9 @@ class SavedResultStore:
             descriptor = SavedResultDescriptor(
                 result_ref=result_ref,
                 source_tool=str(source_tool or "unknown_tool"),
+                source_tool_call_id=(
+                    str(source_tool_call_id or "").strip() or None
+                ),
                 row_count=len(rows),
                 source_total=tabular["source_total"],
                 truncated=bool(tabular["truncated"]),
@@ -416,6 +479,7 @@ def persist_sqlite_tool_message(message: ToolMessage) -> ToolMessage:
 
     descriptor = store.save_payload(
         source_tool=str(message.name or "unknown_tool"),
+        source_tool_call_id=str(message.tool_call_id or "").strip() or None,
         payload=payload,
     )
     if descriptor is None:
@@ -466,24 +530,39 @@ def bind_saved_result_schemas(
     tools: Sequence[BaseTool],
     task: str,
 ) -> tuple[BaseTool, ...]:
-    """Bind matching saved-result schemas into the SQL tool description."""
+    """Expose only applicable lazy-result tools and bind tabular schemas."""
+    available_tools = list(tools)
+    if all(item.name != "read_previous_result" for item in available_tools):
+        available_tools.append(read_previous_result)
     store = get_active_saved_result_store()
     if store is None:
-        return tuple(tools)
-    descriptors = store.descriptors()
-    if not descriptors:
-        return tuple(tools)
-
-    clean_task = str(task or "")
-    referenced = [
-        item for item in descriptors if item.result_ref in clean_task
+        return tuple(
+            item
+            for item in available_tools
+            if item.name not in {"read_previous_result", "query_saved_result"}
+        )
+    request_parts = parse_worker_request(task)
+    result_ids = [
+        item.result_id for item in (request_parts.previous_results or [])
     ]
-    visible = referenced or descriptors
-    catalog = _descriptor_catalog(visible)
+    descriptors = store.descriptors_for_result_ids(result_ids)
+    if not descriptors:
+        descriptors = [
+            item
+            for item in store.descriptors()
+            if item.result_ref in str(task or "")
+        ]
+    catalog = _descriptor_catalog(descriptors) if descriptors else ""
     bound: List[BaseTool] = []
-    for item in tools:
+    for item in available_tools:
+        if item.name == "read_previous_result":
+            if result_ids:
+                bound.append(item)
+            continue
         if item.name != "query_saved_result":
             bound.append(item)
+            continue
+        if not descriptors:
             continue
         bound.append(
             item.model_copy(
@@ -502,6 +581,28 @@ def bind_saved_result_schemas(
 
 
 @tool(parse_docstring=True)
+def read_previous_result(result_id: str) -> Dict[str, Any]:
+    """Прочитать принятый результат предыдущего worker по его result_id.
+
+    Используй только точный `result_id` из блока `previous_results`, когда
+    краткого description недостаточно для текущей task. Инструмент не читает
+    новые внешние данные и не выполняет анализ: он лениво возвращает ровно тот
+    успешный tool result, который был принят observer-ом прошлого worker в
+    текущем coordinator-запуске. Идентификаторы из другого запуска недоступны.
+
+    Args:
+        result_id: Точный непрозрачный идентификатор из previous_results.
+    """
+    store = get_active_saved_result_store()
+    if store is None:
+        return {
+            "error": "No active saved-result store",
+            "result_id": str(result_id or "").strip(),
+        }
+    return store.read_previous_result(result_id)
+
+
+@tool(parse_docstring=True)
 def query_saved_result(
     result_ref: str,
     query: str,
@@ -509,8 +610,9 @@ def query_saved_result(
 ) -> Dict[str, Any]:
     """Выполнить произвольный read-only SQL по сохранённому результату tool.
 
-    Используй только когда task содержит точный result_ref предыдущего worker.
-    Схема доступного результата передаётся вместе с description этого tool.
+    Используй только когда текущая task требует SQL-операцию над табличным
+    результатом предыдущего worker, а description этого tool содержит его точный
+    result_ref и схему.
     В SQL выбранный результат всегда называется `result`; другие таблицы и
     основная SQLite-база недоступны. Если schema помечена truncated=true, запрос
     анализирует только сохранённые строки preview и не доказывает свойства
@@ -546,5 +648,6 @@ __all__ = [
     "get_active_saved_result_store",
     "persist_sqlite_tool_message",
     "query_saved_result",
+    "read_previous_result",
     "saved_result_store_scope",
 ]

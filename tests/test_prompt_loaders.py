@@ -1,4 +1,9 @@
-from agents.tools import load_chat_agent_context, load_schemas, load_skills
+from agents.tools import (
+    load_chat_agent_context,
+    load_schemas,
+    load_skills,
+    load_upstream_analysis_context,
+)
 
 
 def test_load_skills(tmp_path):
@@ -46,6 +51,9 @@ def test_load_skills_contains_tool_orchestration_and_domain_context():
         assert semantic_scope in text
     assert "`all` — только без" in text
     assert "Атомарные контракты tools" in text
+    assert "Производный анализ, сравнение и объяснение выполняет upstream" in text
+    assert "## Анализ трансформаций" not in text
+    assert "`analyze`" not in text
     assert "Извлечение полезных колонок" not in text
     assert "update_file_description" not in text
 
@@ -60,16 +68,14 @@ def test_s2t_skill_routes_table_name_set_operations_to_domain_tool():
     assert "JOIN, EXISTS, NOT EXISTS" not in text
 
 
-def test_s2t_skill_includes_transformation_path_analysis_rules():
+def test_s2t_skill_only_prepares_transformation_data_for_upstream():
     text = load_skills(["S2T-строки"])
     assert "## S2T-строки" in text
     assert "Путь S2T-преобразования" not in text
-    assert "прямую трансформацию" in text
-    assert "Отсутствие подтверждения Neo4j не отменяет факты SQLite" in text
     assert "source_table.source_field → target_table.target_field" in text
-    assert "перенеси её дословно" in text
-    assert "вызови `analyze`" in text
-    assert "сам\n  по себе analyzer не запускает" in text
+    assert "сохрани его дословно" in text
+    assert "эти данные анализирует\n  upstream coordinator" in text
+    assert "`analyze`" not in text
     assert "## Анализ трансформаций" not in text
     assert "source_table`, `source_field`, `target_table` и `target_field`" in text
     assert "дополнительный фильтр является mismatch" in text
@@ -78,21 +84,20 @@ def test_s2t_skill_includes_transformation_path_analysis_rules():
     assert "повторно получать не требуется" in text
 
 
-def test_transformation_analysis_skill_is_independent_and_sql_precise():
-    text = load_skills(["Анализ трансформаций"])
+def test_upstream_analysis_context_is_independent_and_sql_precise():
+    text = load_upstream_analysis_context()
 
-    assert "## Анализ трансформаций" in text
-    assert "При вызове `analyze`" in text
-    assert "фактическому" in text
+    assert "Правила upstream-анализа" in text
+    assert "принятым evidence" in text
+    assert "фактический `transformation_rule` или SQL" in text
     assert "`transformation_rule` или SQL" in text
-    assert "`WHERE 1=1` ничего" in text
+    assert "`WHERE 1=1` не фильтрует" in text
     assert "`LEFT JOIN`" in text
-    assert "не удаляет строку левой таблицы" in text
+    assert "не удаляет левую" in text
     assert "`UNION ALL`" in text
-    assert "NULL-защита подтверждена" in text
-    assert "одинаковые дубли исходных строк" in text
-    assert "## S2T-строки" not in text
-    assert "## Neo4j" not in text
+    assert "Полные одинаковые строки" in text
+    assert len(text) < 1900
+    assert "`analyze`" not in text
 
 
 def test_load_skills_can_select_one_section():
@@ -121,16 +126,19 @@ def test_load_skills_can_select_excel_section():
 def test_load_skills_can_select_comparison_and_explanation_independently():
     comparison = load_skills(["Сравнение"])
     explanation = load_skills(["Объяснение"])
+    normalized_comparison = " ".join(comparison.split())
+    normalized_explanation = " ".join(explanation.split())
 
     assert "## Сравнение" in comparison
-    assert "один и тот же необходимый" in comparison
-    assert "не задаёт между ними source/target" in comparison
-    assert "Не ищи связь или путь" in comparison
+    assert "один и тот же необходимый" in normalized_comparison
+    assert "не задаёт между ними source/target" in normalized_comparison
+    assert "Не ищи связь или путь" in normalized_comparison
+    assert "Не формулируй общее и различия в worker" in normalized_comparison
     assert "## Объяснение" not in comparison
 
     assert "## Объяснение" in explanation
-    assert "отделяя найденный факт от его интерпретации" in explanation
-    assert "пробел или противоречие" in explanation
+    assert "получи точные выражения, правила, роли" in normalized_explanation
+    assert "без производного объяснения" in normalized_explanation
     assert "## Сравнение" not in explanation
 
     for text in (comparison, explanation):

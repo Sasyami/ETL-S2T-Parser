@@ -22,6 +22,8 @@ from .neo4j import (
     trace_neo4j_table_path,
 )
 from .s2t import (
+    get_s2t_rules_by_ids,
+    list_s2t_table_mapping,
     list_s2t_table_names,
     list_s2t_transformations,
     search_s2t_transformations,
@@ -67,6 +69,8 @@ READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     list_files,
     resolve_file,
     get_file_description,
+    get_s2t_rules_by_ids,
+    list_s2t_table_mapping,
     list_s2t_table_names,
     list_s2t_transformations,
     search_s2t_transformations,

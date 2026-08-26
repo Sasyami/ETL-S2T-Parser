@@ -62,34 +62,40 @@ flowchart TD
     S -->|нужны данные| C["Coordinator: план"]
     C --> M["Materialize следующую самодостаточную task"]
     M --> W["Worker"]
-    W --> R["LLM router: tools + skills"]
+    W --> R["LLM router: tools + skills + schemas"]
     R --> P["Planner"]
     P -->|tool call| T["Read-only tool"]
     T --> O["Structured observer"]
     O --> P
-    P -->|задача завершена| F["Краткий ответ + result refs"]
+    P -->|задача завершена| F["WorkerOutcome + lazy result_id refs"]
     F --> C
     C -->|есть следующий шаг| M
-    C -->|план завершён| G["Aggregator"]
-    G --> UI["Ответ + выбранные scrollable results"]
+    C -->|план завершён| G["Upstream coordinator"]
+    G -->|данных достаточно| UI["Ответ + выбранные scrollable results"]
+    G -->|только problem, максимум один раз| C
 ```
 
 Основные контракты:
 
 - supervisor отдельно формирует исполнимую `task` и устойчивый `context`;
 - неявного «активного файла» нет: файл берётся только из запроса, однозначной ссылки в истории или результата `list_files`/`resolve_file`;
-- coordinator создаёт семантический план и последовательно материализует зависимые подзадачи;
+- coordinator создаёт последовательность независимых самодостаточных worker-задач; workers выполняются последовательно, но результаты и `result_id` между ними не передаются;
 - worker получает только самодостаточную строку задачи, внутри сам выбирает tools и runtime skills;
 - planner видит исходную задачу, последний обмен с инструментом и накопительную observer-выжимку;
-- observer возвращает structured-поля `goal_satisfied`, единую строку `problem`, факты, ограничения и запрос на reroute;
+- один observer возвращает `status`, единую строку `gap`, принятые tool-call IDs, факты с provenance и ограничения; невалидная структура повторно запрашивается на том же tool result без повторного data-tool, а после исчерпания format-retries worker контролируемо блокируется;
 - полные результаты инструментов не копируются в историю worker: там остаётся ограниченный preview;
-- coordinator получает краткий ответ worker и непрозрачные ссылки на полные результаты;
-- табличные результаты SQLite-tools дополнительно материализуются во временной базе одного coordinator-запуска; зависимый worker получает `result_ref` и схему relation `result`, после чего может выполнить по ней read-only SQL через `query_saved_result`;
+- upstream получает только `original_task` и принятые evidence: `evidence_id`, tool name, args, preview, `truncated` и безопасный display ID; worker summary, facts, limitations и runtime refs туда не передаются;
+- принятые полные tool results сохраняются под run-scoped `result_id` и читаются через `read_previous_result` только когда краткого description недостаточно; табличные SQLite-результаты дополнительно материализуются во временной relation `result`, доступной через `query_saved_result`;
 - если tool вернул только preview, схема сохранённого результата содержит `truncated=true`, поэтому его нельзя использовать как полный исходный набор;
-- aggregator видит только общий context, краткие ответы и каталог ссылок, после чего выбирает результаты для UI;
+- upstream сначала линейно вызывает `submit_upstream_data_decision`: обязательное поле `decision` равно `pass` или `reroute`, а `problem` служит необязательным пояснением. `reroute` запускает чистый повтор чтения со сбросом результатов прошлого цикла; `pass` переводит управление к отдельному `submit_upstream_answer`. Только этот второй вызов выполняет производный SQL/S2T-анализ по исходной task и evidence, формирует обязательный `answer` и опционально выбирает evidence IDs для UI. Отдельного semantic reviewer/repair нет;
 - полные данные разрешаются по ссылкам только на границе HTTP-ответа.
 
-Worker завершается самим planner через `finish_worker(answer)` или обычным финальным текстом. Отдельного responder и дополнительного LLM-аудита завершения в worker-цикле нет.
+Worker завершается самим planner только через native `finish_worker(summary)`. Обычный финальный текст отклоняется; полноту исходных данных определяет тот же structured observer.
+
+Для impact по колонке `trace_neo4j_lineage` возвращает точные
+`transformation_id`, а `get_s2t_rules_by_ids` одним параметризованным чтением
+получает соответствующие S2T-правила. Planner не генерирует SQL для этого
+перехода между Neo4j и SQLite.
 
 Режим `single_agent` сохранён как базовая линия для live-сравнений:
 
@@ -253,6 +259,8 @@ pytest tests/ --cov=. --cov-config=.coveragerc
 
 Live-тесты используют реальный Flask `/chat`, текущую `excel_data.db`, выбранный provider и запущенный Neo4j для графовых сценариев. Supervisor, coordinator, workers, router, tools, observer и aggregator не подменяются. Запросы выполняются строго последовательно, без batching и параллельного pytest.
 
+Опциональный `--llm-judge` после каждого ответа отдельным LLM-вызовом оценивает только исходный запрос, публичный answer и display-results, записывает semantic verdict в transcript/comparison report и валидирует сценарий: `failed` или ошибка judge переводят pytest-тест в failed после выполнения его обычных проверок.
+
 ```powershell
 $env:RUN_LIVE_AGENT_SCENARIOS = "1"
 $env:LIVE_AGENT_MODE = "multiagent"
@@ -263,7 +271,7 @@ pytest tests/test_live_agent_scenarios.py -q
 ```
 
 Live-сценарии проверяют обычный диалог, SQLite-count, ссылку на историю,
-scrollable-результаты, зависимые workers, точные S2T-пары, Neo4j-пути и переход
+scrollable-результаты, последовательную передачу между workers, точные S2T-пары, Neo4j-пути и переход
 SQLite → Neo4j. Неверные или неполные факты, отсутствие требуемого источника и
 инфраструктурные ошибки делают сценарий failed. Отклонения display/UI
 записываются как presentation warnings, а превышения времени, LLM-вызовов,

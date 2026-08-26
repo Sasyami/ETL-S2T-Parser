@@ -4,14 +4,13 @@ Architecture:
 
     planner (native tool calling)
         ├─ data tool -> ToolNode -> observer (structured output) -> planner
-        ├─ analyze -> analyzer LLM -> observer -> planner
         ├─ worker finish_worker call -> END
         └─ legacy no tool_calls -> responder -> END
 
 The legacy chat mode keeps raw ToolMessage content in the graph. The isolated
 worker mode instead stores full tool results outside message history and puts a
 single bounded text preview into each ToolMessage. The same planner completes a
-worker with finish_worker(answer), without a separate responder call. A higher
+worker with finish_worker(summary), without a separate responder call. A higher
 level coordinator decides which complete results should be displayed.
 """
 
@@ -21,6 +20,7 @@ import json
 import logging
 import re
 from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Sequence, TypedDict
+from uuid import uuid4
 
 from langchain_core.messages import (
     AIMessage,
@@ -42,7 +42,13 @@ from pydantic import (
     model_validator,
 )
 
+from .contracts import (
+    EvidenceFact,
+    Observation,
+    parse_worker_request,
+)
 from .observability import get_callback_handler, langfuse_trace_context
+from .run_metrics import llm_stage
 
 logger = logging.getLogger(__name__)
 
@@ -52,19 +58,13 @@ _VISUALIZATION_URL = re.compile(
 _S2T_GRAPH_DATA_URL = re.compile(
     r"^/exports/s2t-graphs/[A-Za-z0-9_.-]+\.json$"
 )
-_OBSERVATION_SUMMARY_MAX_CHARS = 1200
-_OBSERVATION_PROBLEM_MAX_CHARS = 1200
+_OBSERVATION_GAP_MAX_CHARS = 1200
 _OBSERVATION_FACT_MAX_CHARS = 300
 _OBSERVATION_FACTS_MAX_COUNT = 8
 _OBSERVATION_LIMITATIONS_MAX_COUNT = 4
-_ANALYSIS_SUMMARY_MAX_CHARS = 1600
-_ANALYSIS_FACT_MAX_CHARS = 400
-_ANALYSIS_FACTS_MAX_COUNT = 10
-_ANALYSIS_LIMITATIONS_MAX_COUNT = 4
 _PLANNER_HANDOFF_MAX_CHARS = 12000
 DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS = 6000
 _FINISH_WORKER_TOOL_NAME = "finish_worker"
-_ANALYZE_TOOL_NAME = "analyze"
 _ANALYZE_KNOWN_FACTS_TOOL_NAME = "analyze_known_facts"
 _OBSERVER_MAX_RETRIES = 5
 
@@ -95,40 +95,35 @@ _WORKER_PLANNER_PROMPT = """
 Ты planner изолированного read-only worker. Доступные worker tools:
 {{AVAILABLE_TOOLS}}.
 
-До первого успешного результата обязательно вызови подходящий worker tool.
+Каждый твой ответ — ровно один или несколько native calls доступных worker
+tools либо один native call `finish_worker`. Обычный текст без tool_calls
+запрещён. `finish_worker` разрешён на любом шаге, в том числе до data tool.
 Палитра worker никогда не пуста: если router не выбрал внешний data tool,
 доступен внутренний `analyze_known_facts`. Передай ему готовый ответ, построенный
 только по точным фактам из task, skills и schemas. Этот tool не подтверждает
 новые данные, а создаёт обычный ToolMessage для проверки observer.
-На каждом следующем шаге оцени task,
+После каждого результата оцени task,
 последний tool exchange и накопленную выжимку observer, затем либо вызови
 следующий tool, либо заверши работу через finish_worker. Читай description и
 схему выбранного tool, сохраняй смысл,
-ограничения и точные значения task. Не придумывай факты и не повторяй успешный
-вызов без новой причины. Не считай производный результат готовым входным фактом
-и не переименовывай заданную операцию. Не конструируй отсутствующий объект
-анализа только для заполнения обязательного аргумента tool: аргументы бери из
-task или подтверждённых результатов предыдущих tools. Если обязательного входа
-нет, этот tool не подходит. После ошибки исправь действие по фактическому
-результату либо честно укажи ограничение. Полные результаты не копируй в answer:
-внешний coordinator сам решит, что показывать отдельно.
-После появления успешного полного результата worker делает доступным внутреннее
-действие `analyze`. Если task требует интерпретации, вызови его с ID нужных
-полных результатов из системного каталога. До получения источника `analyze`
-недоступен; не повторяй data tool только ради анализа сохранённого результата.
-Если observer сообщил, что исходные данные получены, но производный вывод ещё
-не выполнен, обязательно вызови `analyze` для соответствующих tool_result_ids.
-До успешного анализа не вызывай `finish_worker`.
-Если task требует вернуть «только» конкретные поля, значения или элементы,
-answer должен содержать ровно их: без вступления, заключения, подтверждения,
-интерпретации и дополнительных пояснений.
+ ограничения и точные значения task. Не придумывай факты и не повторяй успешный
+ вызов без новой причины. Не считай производный результат готовым входным фактом
+ и не переименовывай заданную операцию. Не конструируй отсутствующий объект
+ анализа только для заполнения обязательного аргумента tool: аргументы бери из
+ task или подтверждённых результатов предыдущих tools. Квалифицированное имя
+ `table.column` разделяй на `table_name` и `column_name`, если tool имеет такие
+ отдельные аргументы. Если обязательного входа нет, этот tool не подходит.
+ Перед data-tool call сопоставь его фактические
+ аргументы с каждым условием task: объектом, scope, фильтрами, вычислением,
+группировкой, порядком и правилом разрешения равенства. Не отправляй call,
+который теряет хотя бы одно условие. После ошибки исправь действие по фактическому
+результату либо честно укажи ограничение. В `finish_worker.summary` верни только
+краткую внутреннюю отметку о выполнении или оставшемся ограничении. Evidence
+сохраняется отдельно: не копируй результаты и не формулируй финальный ответ.
 
-Если structured observation содержит `goal_satisfied=false`, совокупных
-подтверждённых фактов ещё недостаточно для task: не вызывай finish_worker и не
-возвращай обычный финальный текст.
-Прочитай отдельный блок «Что выполнено неправильно», исправь описанную проблему
-и вызови подходящий worker tool. Завершай работу только когда observer
-вернул `goal_satisfied=true` либо лимит data-tool шагов уже исчерпан.
+Следуй `status` последней Observation: при `continue` закрой `gap` следующим
+worker-tool вызовом; при `complete` заверши работу через `finish_worker`;
+`reroute` завершит текущий graph программно. Обычный текст запрещён.
 
 """.strip()
 
@@ -145,88 +140,38 @@ ToolMessage.
 """.strip()
 
 _OBSERVER_PROMPT = """
-Ты observer многошагового worker. Верни только structured output Observation по
-переданной схеме. Не пиши Markdown, заголовки, пояснения до или после структуры
-и не дублируй поля схемы обычным текстом.
+Ты observer worker. Верни только structured output Observation по схеме, без Markdown
+и пояснений. Сверь `user_request`, `prior_state`, текущие tool call и
+result. Не выполняй производный анализ: upstream сделает его.
 
-Сопоставь исходную `user_request` с `prior_state`, аргументами текущего tool call
-и его фактическим результатом. `candidate_analysis` — вывод отдельного analyzer,
-а `analysis_sources` — выбранные полные результаты, доступные для display.
-Критикуй вывод по этим источникам и не выполняй анализ заново.
-Успешный статус сам по себе не подтверждает task. Проверяй точные сущности,
-роли, значения, условия, ограничения и операцию.
+Выбери ровно один `status`:
+- `complete` — принятые результаты содержат все исходные данные для task;
+- `continue` — остаётся `gap`, который можно закрыть текущей палитрой tools;
+- `reroute` — остаётся `gap`, но ни один available tool его не закрывает.
 
-Если task требует производного вывода, которого нет как явного факта в
-результатах data tools, этот вывод должен быть получен через
-`candidate_analysis`. При `candidate_analysis=null` не выполняй интерпретацию
-сам и не ставь `goal_satisfied=true`: укажи в `problem`, что исходные данные
-получены, но требуемый анализ ещё не выполнен. Простой перенос явно возвращённых
-значений, строк или списков не является производным выводом и отдельного
-`candidate_analysis` не требует.
+`gap` — одна консолидированная строка незакрытых требований; только при
+`complete` верни JSON null, не строку `"null"`. Не повторяй одну причину и её
+следствия.
 
-Правила результата:
-- `goal_satisfied=true`, только если совокупность подтверждённых фактов из
-  `prior_state` и текущего результата закрывает всю task. Последний tool call не
-  обязан один повторять уже подтверждённые части;
-- при `goal_satisfied=false` `problem` — одна краткая консолидированная строка
-  обо всех незакрытых требованиях task из prior_state и текущего результата.
-  Не разбивай её на список, не повторяй одну причину через её следствия и
-  обновляй строку после исправления части требований. При true верни null;
-- `summary` — компактная накопительная выжимка подтверждённых фактов, нужных для
-  ответа. Не превращай ошибки, ограничения и предположения в факты;
-- `important_facts` содержит только подтверждённые факты для следующего шага,
-  `limitations` — текущие ограничения и неоднозначности;
-- если обязательный факт, значение, фильтр или операция отсутствует, явно назови
-  это в `problem`. Одного неисправленного смыслового отличия достаточно для
-  `goal_satisfied=false`.
+`accepted_tool_call_ids` — накопительный список успешных tool results, которые
+подтверждают task. Исключай ошибочные, нерелевантные и заменённые результаты.
+В `facts` сохраняй только подтверждённые факты и их `evidence_ids`; ошибки,
+предположения и аргументы вызова фактами не являются. `limitations` содержит
+только ограничения. Результат внутреннего `analyze_known_facts` не является новым evidence.
 
-Результат внутреннего `analyze_known_facts` не является новым внешним фактом.
-Проверяй его `answer` только по фактам из task и выбранного системного контекста.
+Вызов не подтверждает task, если его аргументы потеряли или изменили объект,
+scope, фильтр либо операцию. Нулевой результат подтверждает отсутствие данных только
+при точных аргументах из task или принятого evidence. Объект, который
+planner сам составил, не подтверждает исходную операцию: верни `gap`.
+`previous_results` — только навигация до их чтения tool. `saved_result` —
+служебная ссылка; при `truncated=true` полнота набора не подтверждена.
 
-Служебный блок `saved_result` внутри ToolMessage содержит только result_ref,
-схему и полноту временно сохранённых строк. Не считай его отдельным бизнес-
-фактом и не включай result_ref в пользовательскую выжимку. Если
-`truncated=true`, сохранённые строки не подтверждают вывод о полном наборе.
-
-Объект анализа, который planner сам составил только ради обязательного аргумента
-tool и который отсутствует в task и подтверждённых результатах, не подтверждает
-исходную операцию. Отрази это в `problem`; если доступная палитра не умеет
-прочитать требуемый сохранённый объект, запроси reroute.
-
-Установи `reroute_required=true` только когда оставшуюся задачу невозможно
-исправить новым вызовом ни одного `available_tools`. Если достаточно изменить
-аргументы текущего tool, reroute не нужен. При true включи недостающую
-инструментальную возможность в ту же строку `problem`; отдельного поля причины
-нет.
+Выбирай `reroute`, только если ни один `available_tools` не закрывает gap. Если
+достаточно изменить аргументы текущего tool, выбери `continue`.
 
 {{PRIOR_STATE_RULE}}
 
-Не выбирай следующий tool и не формулируй пользовательский ответ. Верни только
-structured output Observation без Markdown.
-""".strip()
-
-_ANALYZER_PROMPT = """
-Ты analyzer выбранных результатов read-only tools. Примени runtime skills к
-полному содержимому `source_results` и выполни `analysis_instruction`. Верни
-только structured output WorkerAnalysis.
-
-Твоя роль — извлечь и интерпретировать факты, а не оценивать завершённость task:
-- `summary` — самодостаточный результат анализа текущего tool exchange;
-- `facts` — подтверждённые результатом факты и корректные выводы из них;
-- `limitations` — ошибки, неполнота результата и то, что он не доказывает.
-
-Сохраняй точные объекты, роли, выражения и условия. Не вызывай tools, не выбирай
-следующий шаг, не выставляй goal_satisfied/reroute и не оформляй финальный ответ.
-Не считай аргументы task найденными фактами. При ошибке или отсутствии нужных
-данных зафиксируй ограничение вместо выдуманного анализа.
-""".strip()
-
-_ANALYZER_REPAIR_PROMPT = """
-Предыдущий ответ analyzer не соответствует WorkerAnalysis. Data-tool уже
-выполнен: не вызывай и не имитируй его повторно. Исправь только structured
-output с полями summary, facts и limitations.
-
-Ошибка: {validation_error}
+Не выбирай следующий tool и не формулируй пользовательский ответ.
 """.strip()
 
 _LEGACY_RESPONDER_PROMPT = """
@@ -257,20 +202,20 @@ Planner решил, что дополнительных инструментов
 _FINISH_ONLY_REPAIR_PROMPT = """
 Лимит шагов исчерпан. Больше не вызывай data tools. По уже подтверждённым
 результатам верни один native call finish_worker. Если задача завершена не
-полностью, честно отрази это в answer.
+полностью, честно отрази это в summary.
 """.strip()
 
-_UNSATISFIED_REPAIR_PROMPT = """
-Последний structured observer вернул `goal_satisfied=false`. Предыдущая попытка
-завершить worker запрещена: совокупность подтверждённых фактов ещё не закрывает
-task. Исправь описанную в отдельном блоке «Что выполнено неправильно» проблему и
-верни сейчас native call одного из доступных worker tools. Если не хватает
-интерпретации уже сохранённого результата, вызови `analyze` с его ID; иначе
-используй точный источник,
-сущности, роли, поля, условия и операцию из исходной task. Не заменяй
-одноимённые роли близкими, не проверяй заново уже подтверждённые входные факты
-и не повторяй тот же семантически неверный вызов. Не вызывай finish_worker и не
-отвечай обычным текстом.
+_WORKER_NATIVE_CALL_REPAIR_PROMPT = """
+Обычный текст planner недопустим и отброшен. Верни ровно один native call:
+вызови подходящий доступный worker tool либо `finish_worker`. `finish_worker`
+разрешён даже до получения data-tool результата. Не повторяй отброшенный текст
+и не добавляй пояснения вне tool call.
+""".strip()
+
+_WORKER_CONTINUE_CALL_REPAIR_PROMPT = """
+Observer вернул status=continue: завершать worker сейчас запрещено. Вызови ровно
+один или несколько доступных data tools и закрой указанный gap. Сохрани точные
+значения task; не возвращай обычный текст и не вызывай finish_worker.
 """.strip()
 
 _OBSERVER_REPAIR_PROMPT = """
@@ -283,140 +228,13 @@ structured output Observation без Markdown и дополнительного 
 Ошибка structured output: {validation_error}
 """.strip()
 
-
 class ChatHistoryMessage(TypedDict):
     role: Literal["user", "assistant"]
     content: str
 
 
-class Observation(BaseModel):
-    """Structured cumulative reflection over a multi-step worker run."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    summary: str = Field(
-        description=(
-            "Самодостаточная накопительная выжимка подтверждённых фактов из "
-            "prior_state и текущего результата. Не добавляй неподтверждённые "
-            "факты."
-        )
-    )
-    goal_satisfied: bool = Field(
-        description=(
-            "Подтверждает ли совокупность prior_state и текущего результата "
-            "выполнение всей исходной task без смысловых подмен."
-        ),
-    )
-    problem: Optional[str] = Field(
-        default=None,
-        description=(
-            "Одна краткая консолидированная строка обо всех незакрытых "
-            "требованиях исходной task из текущего результата и prior_state. "
-            "Не перечисляй одну причину и её следствия как разные проблемы. "
-            "Null только при goal_satisfied=true."
-        ),
-    )
-    has_error: bool = Field(
-        default=False,
-        description="Есть ли в результате ошибка выполнения или некорректные данные.",
-    )
-    important_facts: List[str] = Field(
-        default_factory=list,
-        description=(
-            "Подтверждённые накопительные факты, важные для следующего шага "
-            "planner."
-        ),
-    )
-    limitations: List[str] = Field(
-        default_factory=list,
-        description=(
-            "Ограничения, неоднозначности и непроверенные предположения результата. "
-            "Не выбирай следующий инструмент."
-        ),
-    )
-    reroute_required: bool = Field(
-        default=False,
-        description=(
-            "Нужна ли новая палитра tools, потому что текущими tools исправить "
-            "несоответствие невозможно."
-        ),
-    )
-
-    @field_validator(
-        "important_facts",
-        "limitations",
-        mode="before",
-    )
-    @classmethod
-    def _remove_blank_list_items(cls, value: Any) -> List[str]:
-        if value is None:
-            return []
-        if not isinstance(value, list):
-            raise ValueError("observation list fields must be arrays")
-        return [
-            clean_item
-            for item in value
-            if (clean_item := str(item or "").strip())
-        ]
-
-    @field_validator("problem", mode="before")
-    @classmethod
-    def _normalize_problem(cls, value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        clean_value = str(value).strip()
-        return clean_value or None
-
-    @model_validator(mode="after")
-    def _problem_matches_goal_status(self) -> "Observation":
-        if self.goal_satisfied and self.problem is not None:
-            raise ValueError(
-                "problem must be null when goal_satisfied is true"
-            )
-        if not self.goal_satisfied and self.problem is None:
-            raise ValueError(
-                "problem must describe why goal_satisfied is false"
-            )
-        if self.goal_satisfied and self.reroute_required:
-            raise ValueError(
-                "reroute_required must be false when goal_satisfied is true"
-            )
-        return self
-
-
-class WorkerAnalysis(BaseModel):
-    """Structured interpretation produced before the observer critique."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    summary: str = Field(min_length=1)
-    facts: List[str] = Field(default_factory=list)
-    limitations: List[str] = Field(default_factory=list)
-
-    @field_validator("summary")
-    @classmethod
-    def _summary_must_not_be_blank(cls, value: str) -> str:
-        clean_value = str(value or "").strip()
-        if not clean_value:
-            raise ValueError("analysis summary must not be blank")
-        return clean_value
-
-    @field_validator("facts", "limitations", mode="before")
-    @classmethod
-    def _clean_analysis_items(cls, values: Any) -> List[str]:
-        if values is None:
-            return []
-        if not isinstance(values, (list, tuple)):
-            values = [values]
-        return [
-            clean_item
-            for item in values
-            if (clean_item := str(item or "").strip())
-        ]
-
-
 class WorkerCycleTrace(BaseModel):
-    """Bounded planner/tool/observer exchange exposed to the coordinator."""
+    """Bounded planner/tool/observer exchange retained for diagnostics."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -424,7 +242,6 @@ class WorkerCycleTrace(BaseModel):
     routing_attempt: int = Field(default=1, ge=1)
     tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
     tool_results: List[Dict[str, Any]] = Field(default_factory=list)
-    analysis: Optional[WorkerAnalysis] = None
     observation: Observation
 
 
@@ -432,12 +249,11 @@ class AgentGraphState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     system_prompt: str
     planner_message: Optional[AIMessage]
-    analysis: Optional[WorkerAnalysis]
-    analysis_sources: List[Dict[str, Any]]
     observations: List[Observation]
     cycle_history: List[WorkerCycleTrace]
     tool_steps: int
     max_steps: int
+    terminal_gap: Optional[str]
 
 
 def _message_content_text(content: Any) -> str:
@@ -502,6 +318,71 @@ def _normalize_tools(
     return tool_list
 
 
+def _with_structured_output(model: Any, schema: Any) -> Any:
+    """Prefer native calls and normalize only surrounding call-name spaces."""
+    try:
+        raw_model = model.with_structured_output(
+            schema,
+            method="function_calling",
+            include_raw=True,
+        )
+    except TypeError:
+        try:
+            return model.with_structured_output(
+                schema,
+                method="function_calling",
+            )
+        except TypeError:
+            return model.with_structured_output(schema)
+
+    class _NormalizedStructuredOutput:
+        def invoke(self, messages: Any, **kwargs: Any) -> Any:
+            result = raw_model.invoke(messages, **kwargs)
+            if not isinstance(result, Mapping):
+                return result
+            parsed = result.get("parsed")
+            if parsed is not None:
+                return parsed
+
+            raw_message = result.get("raw")
+            expected_name = str(
+                getattr(schema, "model_config", {}).get("title")
+                or getattr(schema, "__name__", "")
+            )
+            matching_calls = [
+                call
+                for call in getattr(raw_message, "tool_calls", []) or []
+                if str(call.get("name") or "").strip() == expected_name
+            ]
+            if len(matching_calls) == 1:
+                return schema.model_validate(
+                    matching_calls[0].get("args") or {}
+                )
+
+            parsing_error = result.get("parsing_error")
+            if isinstance(parsing_error, BaseException):
+                raise parsing_error
+            raise ValueError(
+                "Structured output did not contain exactly one expected call "
+                f"{expected_name}."
+            )
+
+    return _NormalizedStructuredOutput()
+
+
+def _split_worker_request(
+    value: Any,
+) -> tuple[str, Optional[List[Dict[str, Any]]]]:
+    """Expose only the current task and minimal previous result refs."""
+    parts = parse_worker_request(value)
+    previous_results = (
+        [item.model_dump(mode="json") for item in parts.previous_results]
+        if parts.previous_results is not None
+        else None
+    )
+    return parts.current_task, previous_results
+
+
 def _history_messages(
     history: Optional[List[ChatHistoryMessage]],
 ) -> List[BaseMessage]:
@@ -523,20 +404,19 @@ def _clip_text(value: Any, max_chars: int) -> str:
 
 def _compact_observation(observation: Observation) -> Observation:
     return Observation(
-        summary=_clip_text(
-            observation.summary,
-            _OBSERVATION_SUMMARY_MAX_CHARS,
-        ),
-        goal_satisfied=observation.goal_satisfied,
-        problem=(
-            _clip_text(observation.problem, _OBSERVATION_PROBLEM_MAX_CHARS)
-            if observation.problem is not None
+        status=observation.status,
+        gap=(
+            _clip_text(observation.gap, _OBSERVATION_GAP_MAX_CHARS)
+            if observation.gap is not None
             else None
         ),
-        has_error=observation.has_error,
-        important_facts=[
-            _clip_text(item, _OBSERVATION_FACT_MAX_CHARS)
-            for item in observation.important_facts[
+        accepted_tool_call_ids=list(observation.accepted_tool_call_ids),
+        facts=[
+            EvidenceFact(
+                text=_clip_text(item.text, _OBSERVATION_FACT_MAX_CHARS),
+                evidence_ids=list(item.evidence_ids),
+            )
+            for item in observation.facts[
                 :_OBSERVATION_FACTS_MAX_COUNT
             ]
         ],
@@ -546,21 +426,6 @@ def _compact_observation(observation: Observation) -> Observation:
                 :_OBSERVATION_LIMITATIONS_MAX_COUNT
             ]
         ],
-        reroute_required=observation.reroute_required,
-    )
-
-
-def _compact_worker_analysis(analysis: WorkerAnalysis) -> WorkerAnalysis:
-    return WorkerAnalysis(
-        summary=_clip_text(analysis.summary, _ANALYSIS_SUMMARY_MAX_CHARS),
-        facts=[
-            _clip_text(item, _ANALYSIS_FACT_MAX_CHARS)
-            for item in analysis.facts[:_ANALYSIS_FACTS_MAX_COUNT]
-        ],
-        limitations=[
-            _clip_text(item, _ANALYSIS_FACT_MAX_CHARS)
-            for item in analysis.limitations[:_ANALYSIS_LIMITATIONS_MAX_COUNT]
-        ],
     )
 
 
@@ -569,14 +434,14 @@ class WorkerFinishPayload(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    answer: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
 
-    @field_validator("answer")
+    @field_validator("summary")
     @classmethod
-    def _answer_must_not_be_blank(cls, value: str) -> str:
+    def _summary_must_not_be_blank(cls, value: str) -> str:
         clean_value = value.strip()
         if not clean_value:
-            raise ValueError("answer must not be blank")
+            raise ValueError("summary must not be blank")
         return clean_value
 
 class WorkerDisplayItem(BaseModel):
@@ -586,19 +451,45 @@ class WorkerDisplayItem(BaseModel):
 
     name: str
     content: str
+    evidence_id: str = Field(default="", exclude=True)
+    tool_call_id: str = Field(default="", exclude=True)
+    arguments: Dict[str, Any] = Field(default_factory=dict, exclude=True)
+    preview: str = Field(default="", exclude=True)
+    truncated: bool = Field(default=False, exclude=True)
 
 
 class WorkerRunResult(BaseModel):
-    """Internal graph result or top-level chat result with UI display data."""
+    """Internal worker-graph result before the public handoff is built."""
 
     model_config = ConfigDict(extra="forbid")
 
     answer: str
     display_items: List[WorkerDisplayItem] = Field(default_factory=list)
     cycle_history: List[WorkerCycleTrace] = Field(default_factory=list)
-    goal_satisfied: bool = Field(default=True, exclude=True)
-    problem: Optional[str] = Field(default=None, exclude=True)
-    reroute_required: bool = Field(default=False, exclude=True)
+    status: Literal["complete", "reroute"] = Field(
+        default="complete",
+        exclude=True,
+    )
+    gap: Optional[str] = Field(default=None, exclude=True)
+    facts: List[EvidenceFact] = Field(default_factory=list, exclude=True)
+    accepted_tool_call_ids: List[str] = Field(
+        default_factory=list,
+        exclude=True,
+    )
+
+    @field_validator("gap", mode="before")
+    @classmethod
+    def _normalize_result_gap(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        clean_value = str(value).strip()
+        return clean_value or None
+
+    @model_validator(mode="after")
+    def _validate_result_status(self) -> "WorkerRunResult":
+        if self.status == "reroute" and self.gap is None:
+            raise ValueError("reroute worker result must contain gap")
+        return self
 
 
 class WorkerResponseError(RuntimeError):
@@ -611,56 +502,21 @@ def _finish_worker_tool_schema() -> Dict[str, Any]:
         "function": {
             "name": _FINISH_WORKER_TOOL_NAME,
             "description": (
-                "Завершить подзадачу worker и вернуть краткий точный ответ. "
-                "Результаты tools для UI выбирает внешний coordinator."
+                "Завершить worker после complete и вернуть краткую "
+                "внутреннюю отметку. Evidence хранится отдельно."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "answer": {
+                    "summary": {
                         "type": "string",
-                        "description": "Краткий итог по подтверждённым данным.",
-                    },
-                },
-                "required": ["answer"],
-                "additionalProperties": False,
-            },
-        },
-    }
-
-
-def _analyze_tool_schema() -> Dict[str, Any]:
-    """Return the native schema for the worker's internal analysis action."""
-    return {
-        "type": "function",
-        "function": {
-            "name": _ANALYZE_TOOL_NAME,
-            "description": (
-                "Проанализировать выбранные полные результаты уже выполненных "
-                "data tools отдельным structured analyzer LLM."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "tool_result_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
                         "description": (
-                            "Точные ID результатов из доступного системного "
-                            "каталога без изменения."
-                        ),
-                    },
-                    "instruction": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": (
-                            "Что именно нужно установить или объяснить по "
-                            "выбранным результатам."
+                            "Краткая отметка о выполнении или ограничении без "
+                            "копирования результатов и производного анализа"
                         ),
                     },
                 },
-                "required": ["tool_result_ids", "instruction"],
+                "required": ["summary"],
                 "additionalProperties": False,
             },
         },
@@ -693,39 +549,35 @@ def _runtime_context(
             [(len(observations), observations[-1])] if observations else []
         )
         for index, observation in latest_observations:
-            observation_parts = [
-                f"Выжимка observer для шага {index}:\n{observation.summary}"
-            ]
-            if observation.goal_satisfied is False:
+            observation_parts = [f"Observation для шага {index}."]
+            if observation.status == "complete":
                 observation_parts.append(
-                    "Статус выполнения: goal_satisfied=false. Исходная task "
-                    "ещё не подтверждена; не завершай worker."
+                    "Статус: complete. Необходимые исходные данные получены; "
+                    "заверши worker через finish_worker."
                 )
+            elif observation.status == "continue":
                 observation_parts.append(
-                    "Что выполнено неправильно:\n"
-                    + str(observation.problem or "")
-                    + "\nИсправь проблему следующим worker-tool вызовом."
+                    "Статус: continue. Закрой gap следующим вызовом доступного "
+                    "worker tool:\n" + str(observation.gap or "")
                 )
             else:
                 observation_parts.append(
-                    "Статус выполнения: goal_satisfied=true. Результат "
-                    "подтверждает исходную task."
+                    "Статус: reroute. Текущая палитра не закрывает gap:\n"
+                    + str(observation.gap or "")
                 )
-            if observation.important_facts:
+            if observation.facts:
                 observation_parts.append(
-                    "Важные факты:\n- "
-                    + "\n- ".join(observation.important_facts)
+                    "Подтверждённые факты:\n- "
+                    + "\n- ".join(
+                        f"{fact.text} [evidence: "
+                        f"{', '.join(fact.evidence_ids) or 'нет'}]"
+                        for fact in observation.facts
+                    )
                 )
             if observation.limitations:
                 observation_parts.append(
                     "Ограничения и неоднозначности:\n- "
                     + "\n- ".join(observation.limitations)
-                )
-            if observation.has_error:
-                observation_parts.append(
-                    "Этот инструментальный шаг содержал ошибку. Реши, нужно ли "
-                    "исправить аргументы, выбрать другой инструмент или завершить "
-                    "работу с честным указанием ограничения."
                 )
             parts.append("\n".join(observation_parts))
 
@@ -864,39 +716,26 @@ def _tool_message_has_error(message: ToolMessage) -> bool:
     return isinstance(payload, dict) and bool(payload.get("error"))
 
 
-def _available_analysis_results(
-    results: Mapping[str, ToolMessage],
-) -> List[Dict[str, str]]:
-    """List retained successful data results selectable by internal analyze."""
-    return [
-        {
-            "tool_result_id": str(result_id),
-            "tool_name": str(message.name or "unknown_tool"),
-        }
-        for result_id, message in results.items()
-        if not _tool_message_has_error(message)
-        and message.name not in {
-            _ANALYZE_TOOL_NAME,
-            _ANALYZE_KNOWN_FACTS_TOOL_NAME,
-        }
-    ]
-
-
-def _tool_calls_by_id(
-    messages: Sequence[BaseMessage],
-) -> Dict[str, Dict[str, Any]]:
-    calls: Dict[str, Dict[str, Any]] = {}
-    for message in messages:
-        if not isinstance(message, AIMessage):
-            continue
-        for call in message.tool_calls:
-            call_id = str(call.get("id") or "").strip()
-            if call_id:
-                calls[call_id] = {
-                    "name": str(call.get("name") or "unknown_tool"),
-                    "args": call.get("args", {}),
-                }
-    return calls
+def _tool_result_truncated(message: ToolMessage) -> bool:
+    content = message.content
+    if isinstance(content, dict):
+        payload = content
+    else:
+        try:
+            payload = json.loads(_message_content_text(content))
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if not isinstance(payload, dict):
+        return False
+    saved_result = payload.get("saved_result")
+    return bool(
+        payload.get("truncated")
+        or payload.get("input_truncated")
+        or (
+            isinstance(saved_result, dict)
+            and saved_result.get("truncated")
+        )
+    )
 
 
 def _visualization_urls(messages: Sequence[BaseMessage]) -> List[str]:
@@ -941,82 +780,37 @@ def _s2t_graph_data_urls(messages: Sequence[BaseMessage]) -> List[str]:
     return urls
 
 
-def _fallback_observation(
-    tool_call_message: AIMessage,
-    tool_results: Sequence[ToolMessage],
-    error: Exception,
-) -> Observation:
-    raw_output = getattr(error, "llm_output", None)
-    if raw_output:
-        return Observation(
-            summary=str(raw_output),
-            goal_satisfied=False,
-            problem=(
-                "Observer не вернул валидный structured output, поэтому "
-                "соответствие результата исходной task не подтверждено."
-            ),
-            limitations=[f"Ошибка observer: {type(error).__name__}"],
-        )
-
-    names = [call.get("name", "unknown_tool") for call in tool_call_message.tool_calls]
-    result_preview = "\n".join(
-        f"{message.name or 'unknown_tool'}: {_message_content_text(message.content)[:1500]}"
-        for message in tool_results
-    )
-
-    return Observation(
-        summary=(
-            "Observer не смог получить текстовую выжимку. "
-            f"Выполнены инструменты: {', '.join(names)}. "
-            f"Сырой результат:\n{result_preview}"
-        ),
-        has_error=True,
-        goal_satisfied=False,
-        problem=(
-            "Observer не смог проверить соответствие tool-вызова исходной "
-            "task; результат нельзя считать подтверждённым."
-        ),
-        important_facts=[],
-        limitations=[f"Ошибка observer: {type(error).__name__}"],
-    )
-
-
 def build_agent_graph(
     model: Any,
     tools: Mapping[str, BaseTool] | Sequence[BaseTool],
     *,
     raw_tool_results: Optional[Dict[str, ToolMessage]] = None,
+    evidence_ids_by_tool_call: Optional[Dict[str, str]] = None,
     tool_message_preview_chars: Optional[int] = None,
     worker_finish: bool = False,
 ):
-    """Build planner -> tools/analyzer -> observer -> planner."""
+    """Build planner -> tools -> observer -> planner."""
     tool_list = _normalize_tools(tools)
     tool_names = tuple(tool.name for tool in tool_list)
     retained_tool_results = (
         raw_tool_results if raw_tool_results is not None else {}
     )
-    analyze_available = worker_finish
-    analyze_schema = _analyze_tool_schema()
+    evidence_ids = (
+        evidence_ids_by_tool_call
+        if evidence_ids_by_tool_call is not None
+        else {}
+    )
     finish_schema = _finish_worker_tool_schema()
     planner_model = (
-        model.bind_tools([*tool_list, analyze_schema, finish_schema])
+        model.bind_tools([*tool_list, finish_schema])
         if worker_finish
         else (model.bind_tools(tool_list) if tool_list else model)
     )
-    first_data_model = (
+    continuation_model = (
         model.bind_tools(tool_list)
         if worker_finish and tool_list
-        else None
+        else planner_model
     )
-    first_tool_model = first_data_model
-    if worker_finish and len(tool_list) == 1:
-        try:
-            first_tool_model = model.bind_tools(
-                tool_list,
-                tool_choice=tool_names[0],
-            )
-        except TypeError:
-            first_tool_model = first_data_model
     finish_model = None
     if worker_finish:
         try:
@@ -1026,41 +820,35 @@ def build_agent_graph(
             )
         except TypeError:
             finish_model = model.bind_tools([finish_schema])
-    observer_model = model.with_structured_output(Observation)
-    analyzer_model: Any = None
-
-    def get_analyzer_model() -> Any:
-        nonlocal analyzer_model
-        if not analyze_available:
-            raise RuntimeError("analyze вызван вне worker graph")
-        if analyzer_model is None:
-            analyzer_model = model.with_structured_output(WorkerAnalysis)
-            if hasattr(analyzer_model, "with_retry"):
-                analyzer_model = analyzer_model.with_retry(
-                    retry_if_exception_type=(ValidationError,),
-                    wait_exponential_jitter=False,
-                    stop_after_attempt=2,
-                )
-        return analyzer_model
+    observer_model = _with_structured_output(model, Observation)
     tool_node = ToolNode(tool_list, handle_tool_errors=True)
+
+    def evidence_payload(message: ToolMessage) -> Dict[str, Any]:
+        payload = _tool_message_payload(message)
+        evidence_id = evidence_ids.get(str(message.tool_call_id or ""))
+        if evidence_id is not None:
+            payload["evidence_id"] = evidence_id
+        return payload
 
     def invoke_with_fallback(
         primary_model: Any,
         messages: Sequence[BaseMessage],
         *,
+        stage: str,
         fallback_model: Optional[Any] = None,
     ) -> Any:
-        try:
-            return primary_model.invoke(messages)
-        except Exception:
-            if fallback_model is None or fallback_model is primary_model:
-                raise
-            logger.warning(
-                "Forced tool-choice LLM call failed; retrying with the regular "
-                "planner tool palette",
-                exc_info=True,
-            )
-            return fallback_model.invoke(messages)
+        with llm_stage(stage):
+            try:
+                return primary_model.invoke(messages)
+            except Exception:
+                if fallback_model is None or fallback_model is primary_model:
+                    raise
+                logger.warning(
+                    "Forced tool-choice LLM call failed; retrying with the "
+                    "regular planner tool palette",
+                    exc_info=True,
+                )
+                return fallback_model.invoke(messages)
 
     def planner(state: AgentGraphState) -> Dict[str, Any]:
         limit_reached = state["tool_steps"] >= state["max_steps"]
@@ -1074,114 +862,111 @@ def build_agent_graph(
             or (
                 worker_finish
                 and latest_observation is not None
-                and latest_observation.goal_satisfied
+                and latest_observation.status == "complete"
             )
+        )
+        must_continue = bool(
+            worker_finish
+            and not limit_reached
+            and latest_observation is not None
+            and latest_observation.status == "continue"
         )
         if finish_only and worker_finish:
             selected_model = finish_model
         elif finish_only:
             selected_model = model
-        elif state["tool_steps"] == 0 and first_tool_model is not None:
-            selected_model = first_tool_model
+        elif must_continue:
+            selected_model = continuation_model
         else:
             selected_model = planner_model
-        analysis_result_catalog = _available_analysis_results(
-            retained_tool_results
-        )
-        planner_tool_names = [*tool_names]
-        if analyze_available and analysis_result_catalog:
-            planner_tool_names.append(_ANALYZE_TOOL_NAME)
         planner_messages = _planner_messages(
             state,
-            planner_tool_names,
+            tool_names,
             worker_finish=worker_finish,
         )
-        if analyze_available and analysis_result_catalog:
-            catalog_text = json.dumps(
-                analysis_result_catalog,
-                ensure_ascii=False,
-                default=str,
-            )
-            first_message = planner_messages[0]
-            planner_messages[0] = first_message.model_copy(
-                update={
-                    "content": (
-                        f"{_message_content_text(first_message.content)}\n\n"
-                        "Доступные для внутреннего `analyze` полные результаты "
-                        "data tools:\n"
-                        f"{catalog_text}\n"
-                        "Передай нужные tool_result_ids без изменения."
-                    )
-                }
-            )
 
         selected_fallback = (
-            first_data_model
-            if selected_model is first_tool_model
-            and first_tool_model is not first_data_model
-            else (
-                planner_model
-                if worker_finish and selected_model is finish_model
-                else None
-            )
+            planner_model
+            if worker_finish and selected_model is finish_model
+            else None
+        )
+        planner_stage = (
+            "finish_worker"
+            if worker_finish and finish_only
+            else "worker_planner" if worker_finish else "legacy_planner"
         )
         try:
             reply = invoke_with_fallback(
                 selected_model,
                 planner_messages,
+                stage=planner_stage,
                 fallback_model=selected_fallback,
             )
         except Exception as exc:
             logger.exception("LLM error in planner")
-            # A plain message routes to the legacy responder or becomes the
-            # worker's honest final text without another LLM call.
+            # Legacy mode can hand this text to its responder. Worker mode
+            # rejects plain text below and requests one native call.
             reply = AIMessage(content=f"Planner error: {type(exc).__name__}")
 
         if not isinstance(reply, AIMessage):
             reply = AIMessage(content=_message_content_text(reply))
 
-        semantic_retry_required = (
-            worker_finish
-            and not finish_only
-            and latest_observation is not None
-            and latest_observation.goal_satisfied is False
-            and (
-                not any(
-                    call.get("name") in planner_tool_names
-                    for call in reply.tool_calls
-                )
-                or any(
-                    call.get("name") == _FINISH_WORKER_TOOL_NAME
-                    for call in reply.tool_calls
-                )
+        invalid_continue_finish = bool(
+            must_continue
+            and any(
+                call.get("name") == _FINISH_WORKER_TOOL_NAME
+                for call in reply.tool_calls
             )
         )
-        if semantic_retry_required:
+        if worker_finish and (
+            not reply.tool_calls
+            or invalid_continue_finish
+        ):
             logger.warning(
-                "Worker tried to finish after observer marked task "
-                "goal_satisfied=false; requesting a corrected data tool call"
+                "Worker planner returned %s; discarding it and requesting "
+                "one allowed native call",
+                (
+                    "finish_worker while observer requires continue"
+                    if invalid_continue_finish
+                    else "plain text"
+                ),
             )
-            retry_model = (
-                first_tool_model
-                if len(tool_list) == 1 and first_tool_model is not None
-                else first_data_model
-            )
+            continue_repair_prompt = _WORKER_CONTINUE_CALL_REPAIR_PROMPT
             repaired_reply = invoke_with_fallback(
-                retry_model,
+                selected_model,
                 [
                     *planner_messages,
-                    HumanMessage(content=_UNSATISFIED_REPAIR_PROMPT),
+                    HumanMessage(
+                        content=(
+                            continue_repair_prompt
+                            if must_continue
+                            else _WORKER_NATIVE_CALL_REPAIR_PROMPT
+                        )
+                    ),
                 ],
-                fallback_model=(
-                    first_data_model
-                    if retry_model is first_tool_model
-                    and first_tool_model is not first_data_model
-                    else None
-                ),
+                stage=planner_stage,
+                fallback_model=selected_fallback,
             )
             if not isinstance(repaired_reply, AIMessage):
                 repaired_reply = AIMessage(
                     content=_message_content_text(repaired_reply)
+                )
+            repaired_continue_finish = bool(
+                must_continue
+                and any(
+                    call.get("name") == _FINISH_WORKER_TOOL_NAME
+                    for call in repaired_reply.tool_calls
+                )
+            )
+            if (
+                not repaired_reply.tool_calls
+                or repaired_continue_finish
+            ):
+                repaired_reply = AIMessage(
+                    content=(
+                        "Worker planner после repair не вернул допустимый "
+                        "native data-tool call."
+                    )
                 )
             reply = repaired_reply
 
@@ -1199,6 +984,7 @@ def build_agent_graph(
                     *planner_messages,
                     HumanMessage(content=_FINISH_ONLY_REPAIR_PROMPT),
                 ],
+                stage="finish_worker",
                 fallback_model=planner_model,
             )
             if not isinstance(repaired_reply, AIMessage):
@@ -1209,8 +995,11 @@ def build_agent_graph(
                 call.get("name") == _FINISH_WORKER_TOOL_NAME
                 for call in repaired_reply.tool_calls
             ):
-                raise WorkerResponseError(
-                    "Worker после повторного LLM-вызова не завершил задачу."
+                repaired_reply = AIMessage(
+                    content=(
+                        "Worker после повторного LLM-вызова не завершил "
+                        "задачу native-вызовом."
+                    )
                 )
             reply = repaired_reply
 
@@ -1228,21 +1017,9 @@ def build_agent_graph(
         if planner_message is None or not planner_message.tool_calls:
             raise RuntimeError("Planner не выбрал инструмент.")
 
-        analyze_calls = [
-            call
-            for call in planner_message.tool_calls
-            if call.get("name") == _ANALYZE_TOOL_NAME
-        ]
-        if analyze_calls and len(planner_message.tool_calls) != 1:
-            raise WorkerResponseError(
-                "analyze должен вызываться отдельно от остальных tools"
-            )
-
         return {
             "messages": [planner_message],
             "planner_message": None,
-            "analysis": None,
-            "analysis_sources": [],
         }
 
     def execute_tools(state: AgentGraphState) -> Dict[str, Any]:
@@ -1282,6 +1059,18 @@ def build_agent_graph(
 
                 message = persist_sqlite_tool_message(message)
 
+            tool_call_id = str(message.tool_call_id or "").strip()
+            if (
+                tool_call_id
+                and not _tool_message_has_error(message)
+                and str(message.name or "")
+                != _ANALYZE_KNOWN_FACTS_TOOL_NAME
+            ):
+                evidence_ids.setdefault(
+                    tool_call_id,
+                    f"evidence_{uuid4().hex}",
+                )
+
             retained_tool_results[message.tool_call_id] = message
 
             if tool_message_preview_chars is None:
@@ -1301,7 +1090,7 @@ def build_agent_graph(
             "Tool step result: %s",
             json.dumps(
                 [
-                    _tool_message_payload(message)
+                    evidence_payload(message)
                     if isinstance(message, ToolMessage)
                     else str(message)
                     for message in tool_messages
@@ -1314,164 +1103,6 @@ def build_agent_graph(
         return {
             "messages": tool_messages,
             "tool_steps": state["tool_steps"] + len(last_message.tool_calls),
-        }
-
-    def analyzer(state: AgentGraphState) -> Dict[str, Any]:
-        active_analyzer_model = get_analyzer_model()
-
-        analyze_message = state["messages"][-1]
-        if (
-            not isinstance(analyze_message, AIMessage)
-            or len(analyze_message.tool_calls) != 1
-            or analyze_message.tool_calls[0].get("name") != _ANALYZE_TOOL_NAME
-        ):
-            raise RuntimeError("Analyzer вызван без одиночного analyze tool call")
-
-        analyze_call = analyze_message.tool_calls[0]
-        analyze_args = analyze_call.get("args") or {}
-        requested_ids = list(
-            dict.fromkeys(
-                str(item or "").strip()
-                for item in (analyze_args.get("tool_result_ids") or [])
-                if str(item or "").strip()
-            )
-        )
-        instruction = str(analyze_args.get("instruction") or "").strip()
-        calls_by_id = _tool_calls_by_id(state["messages"][:-1])
-        available_results = {
-            item["tool_result_id"]: retained_tool_results[
-                item["tool_result_id"]
-            ]
-            for item in _available_analysis_results(retained_tool_results)
-        }
-        missing_ids = [
-            result_id
-            for result_id in requested_ids
-            if result_id not in available_results
-        ]
-        analysis_sources = [
-            {
-                "tool_result_id": result_id,
-                "tool_call": calls_by_id.get(
-                    result_id,
-                    {
-                        "name": str(
-                            available_results[result_id].name
-                            or "unknown_tool"
-                        ),
-                        "args": {},
-                    },
-                ),
-                "tool_result": _tool_message_payload(
-                    available_results[result_id]
-                ),
-            }
-            for result_id in requested_ids
-            if result_id in available_results
-        ]
-
-        analysis_error = None
-        if not requested_ids:
-            analysis_error = "analyze не получил ни одного tool_result_id."
-        elif missing_ids:
-            analysis_error = (
-                "Полные результаты недоступны для анализа: "
-                + ", ".join(missing_ids)
-            )
-        elif not instruction:
-            analysis_error = "analyze не получил непустую instruction."
-
-        payload = {
-            "user_request": _last_user_query(state["messages"]),
-            "analysis_instruction": instruction,
-            "source_results": analysis_sources,
-        }
-        analyzer_messages: List[BaseMessage] = [
-            SystemMessage(
-                content="\n\n".join(
-                    part
-                    for part in (
-                        state["system_prompt"].strip(),
-                        _ANALYZER_PROMPT,
-                    )
-                    if part
-                )
-            ),
-            HumanMessage(
-                content=json.dumps(payload, ensure_ascii=False, default=str)
-            ),
-        ]
-
-        def parse_analysis(result: Any) -> WorkerAnalysis:
-            return (
-                result
-                if isinstance(result, WorkerAnalysis)
-                else WorkerAnalysis.model_validate(result)
-            )
-
-        analyzer_failed = False
-        if analysis_error is not None:
-            analyzer_failed = True
-            analysis = WorkerAnalysis(
-                summary="Анализ не выполнен: нет выбранного полного результата.",
-                limitations=[analysis_error],
-            )
-        else:
-            try:
-                analysis = parse_analysis(
-                    active_analyzer_model.invoke(analyzer_messages)
-                )
-            except Exception as first_error:
-                logger.warning(
-                    "Structured analyzer output rejected; repeating analyzer "
-                    "without repeating data tools: %s",
-                    first_error,
-                )
-                repair_messages: List[BaseMessage] = [
-                    *analyzer_messages,
-                    HumanMessage(
-                        content=_ANALYZER_REPAIR_PROMPT.replace(
-                            "{validation_error}",
-                            f"{type(first_error).__name__}: {first_error}",
-                        )
-                    ),
-                ]
-                try:
-                    analysis = parse_analysis(
-                        active_analyzer_model.invoke(repair_messages)
-                    )
-                except Exception as repair_error:
-                    analyzer_failed = True
-                    logger.exception(
-                        "Structured analyzer repair failed; preserving raw "
-                        "tool results for observer critique"
-                    )
-                    analysis = WorkerAnalysis(
-                        summary=(
-                            "Analyzer не вернул валидный structured результат."
-                        ),
-                        limitations=[
-                            "Ошибка analyzer: "
-                            f"{type(repair_error).__name__}"
-                        ],
-                    )
-
-        analysis = _compact_worker_analysis(analysis)
-        logger.info(
-            "Analyzer result: %s",
-            analysis.model_dump_json()[:3000],
-        )
-        analysis_message = ToolMessage(
-            content=analysis.model_dump_json(),
-            tool_call_id=str(analyze_call.get("id") or "analyze"),
-            name=_ANALYZE_TOOL_NAME,
-            status="error" if analyzer_failed else "success",
-        )
-        return {
-            "messages": [analysis_message],
-            "analysis": analysis,
-            "analysis_sources": analysis_sources,
-            "tool_steps": state["tool_steps"] + 1,
         }
 
     def observer(state: AgentGraphState) -> Dict[str, Any]:
@@ -1492,7 +1123,7 @@ def build_agent_graph(
             if len(finish_calls) == 1 and len(planner_message.tool_calls) == 1:
                 candidate_answer = _worker_finish_payload(
                     finish_calls[0]
-                ).answer
+                ).summary
             elif not planner_message.tool_calls:
                 candidate_answer = _message_text(planner_message)
             tool_call_message = AIMessage(content=candidate_answer)
@@ -1502,8 +1133,45 @@ def build_agent_graph(
                 state["messages"]
             )
 
+        prior_observation = (
+            (state.get("observations") or [])[-1]
+            if state.get("observations")
+            else None
+        )
+        prior_accepted_order = list(
+            prior_observation.accepted_tool_call_ids
+            if prior_observation is not None
+            else []
+        )
+        prior_accepted_ids = set(prior_accepted_order)
+        current_accepted_candidates = [
+            str(message.tool_call_id or "").strip()
+            for message in tool_results
+            if str(message.tool_call_id or "").strip()
+            and not _tool_message_has_error(message)
+            and str(message.name or "") != _ANALYZE_KNOWN_FACTS_TOOL_NAME
+        ]
+        allowed_ids = prior_accepted_ids | set(current_accepted_candidates)
+        prior_evidence = [
+            evidence_payload(
+                retained_tool_results[tool_call_id].model_copy(
+                    update={
+                        "content": _tool_message_preview(
+                            retained_tool_results[tool_call_id].content,
+                            1500,
+                        )
+                    }
+                )
+            )
+            for tool_call_id in prior_accepted_order
+            if tool_call_id in retained_tool_results
+        ]
+
+        current_user_request, previous_results = _split_worker_request(
+            _last_user_query(state["messages"])
+        )
         payload = {
-            "user_request": _last_user_query(state["messages"]),
+            "user_request": current_user_request,
             "available_tools": [
                 {
                     "name": tool.name,
@@ -1519,28 +1187,20 @@ def build_agent_graph(
                 if worker_finish
                 else []
             ),
+            "accepted_evidence": prior_evidence,
             "tool_calls": tool_call_message.tool_calls,
             "tool_results": [
-                _tool_message_payload(message) for message in tool_results
+                evidence_payload(message) for message in tool_results
             ],
             "candidate_answer": candidate_answer,
-            "candidate_analysis": (
-                state["analysis"].model_dump()
-                if state.get("analysis") is not None
-                else None
-            ),
-            "analysis_sources": list(state.get("analysis_sources") or []),
         }
+        if previous_results is not None:
+            payload["previous_results"] = previous_results
 
         prior_state_rule = (
-            "Поле prior_state содержит накопленные компактные observations "
-            "предыдущих циклов. Оцени выполнение task по совокупности "
-            "prior_state и текущего результата, а не по последнему tool call "
-            "изолированно. Уже подтверждённые части task не должны повторно "
-            "присутствовать в текущем результате. Верни обновлённую "
-            "самодостаточную выжимку, сохранив только подтверждённые факты, "
-            "ещё нужные для исходной task; прошлую problem не считай фактом "
-            "и обновляй после исправления части требований."
+            "`prior_state` и `accepted_evidence` накоплены ранее. Верни "
+            "накопительную Observation: сохрани принятые факты и IDs, не "
+            "требуй их повторно и обнови `gap` после текущего результата."
             if worker_finish
             else ""
         )
@@ -1564,19 +1224,52 @@ def build_agent_graph(
         ]
 
         def parse_observation(result: Any) -> Observation:
-            observation = (
+            parsed_observation = (
                 result
                 if isinstance(result, Observation)
                 else Observation.model_validate(result)
             )
-            if any(
-                _tool_message_has_error(message)
-                for message in tool_results
+            accepted_ids = set(parsed_observation.accepted_tool_call_ids)
+            invalid_ids = sorted(accepted_ids - allowed_ids)
+            if invalid_ids:
+                raise ValueError(
+                    "accepted_tool_call_ids содержит неизвестные, ошибочные "
+                    "или внутренние результаты: " + ", ".join(invalid_ids)
+                )
+            if (
+                parsed_observation.status == "complete"
+                and allowed_ids
+                and not accepted_ids
             ):
-                observation_payload = observation.model_dump()
-                observation_payload["has_error"] = True
-                return Observation.model_validate(observation_payload)
-            return observation
+                raise ValueError(
+                    "status=complete требует хотя бы один принятый "
+                    "внешний tool result в accepted_tool_call_ids"
+                )
+            accepted_evidence_ids = {
+                evidence_ids[tool_call_id]
+                for tool_call_id in accepted_ids
+                if tool_call_id in evidence_ids
+            }
+            fact_evidence_ids = {
+                evidence_id
+                for fact in parsed_observation.facts
+                for evidence_id in fact.evidence_ids
+            }
+            unknown_evidence_ids = sorted(
+                fact_evidence_ids - accepted_evidence_ids
+            )
+            if unknown_evidence_ids:
+                raise ValueError(
+                    "facts содержит неизвестные или непринятые evidence_ids: "
+                    + ", ".join(unknown_evidence_ids)
+                )
+            if accepted_evidence_ids and any(
+                not fact.evidence_ids for fact in parsed_observation.facts
+            ):
+                raise ValueError(
+                    "Каждый подтверждённый fact должен ссылаться на evidence_id"
+                )
+            return parsed_observation
 
         observation: Optional[Observation] = None
         observer_error: Optional[Exception] = None
@@ -1584,9 +1277,10 @@ def build_agent_graph(
         total_attempts = _OBSERVER_MAX_RETRIES + 1
         for attempt_index in range(total_attempts):
             try:
-                observation = parse_observation(
-                    observer_model.invoke(attempt_messages)
-                )
+                with llm_stage("observer"):
+                    observation = parse_observation(
+                        observer_model.invoke(attempt_messages)
+                    )
                 break
             except Exception as error:
                 observer_error = error
@@ -1610,16 +1304,17 @@ def build_agent_graph(
                 ]
 
         if observation is None:
-            logger.exception(
-                "Structured observer repair failed after %s attempts; "
-                "stopping worker without repeating data tools",
-                total_attempts,
-                exc_info=observer_error,
+            terminal_gap = (
+                "Observer не смог вернуть валидную структуру после "
+                f"{total_attempts} попыток; data tool не повторялся."
             )
-            raise WorkerResponseError(
-                "Observer не вернул валидный structured output после "
-                f"{total_attempts} попыток; data tool повторно не вызван."
-            ) from observer_error
+            logger.error(
+                "Structured observer repair failed after %s attempts; "
+                "failing worker contract without repeating data tools: %s",
+                total_attempts,
+                observer_error,
+            )
+            return {"terminal_gap": terminal_gap}
 
         observation = _compact_observation(observation)
         logger.info(
@@ -1650,10 +1345,9 @@ def build_agent_graph(
                         for call in tool_call_message.tool_calls
                     ],
                     tool_results=[
-                        _tool_message_payload(message)
+                        evidence_payload(message)
                         for message in tool_results
                     ],
-                    analysis=state.get("analysis"),
                     observation=observation,
                 ),
             ]
@@ -1690,7 +1384,8 @@ def build_agent_graph(
         messages.extend(state["messages"])
 
         try:
-            reply = model.invoke(messages)
+            with llm_stage("legacy_responder"):
+                reply = model.invoke(messages)
             if not isinstance(reply, AIMessage):
                 reply = AIMessage(content=_message_content_text(reply))
         except Exception as exc:
@@ -1725,22 +1420,11 @@ def build_agent_graph(
             return "prepare_tool"
         return "responder"
 
-    def route_after_prepare(
-        state: AgentGraphState,
-    ) -> Literal["tools", "analyzer"]:
-        message = state["messages"][-1]
-        if (
-            analyze_available
-            and isinstance(message, AIMessage)
-            and len(message.tool_calls) == 1
-            and message.tool_calls[0].get("name") == _ANALYZE_TOOL_NAME
-        ):
-            return "analyzer"
-        return "tools"
-
     def route_after_observer(
         state: AgentGraphState,
-    ) -> Literal["planner", "finish"]:
+    ) -> Literal["planner", "responder", "finish"]:
+        if state.get("terminal_gap"):
+            return "finish" if worker_finish else "responder"
         latest_observation = (
             (state.get("observations") or [])[-1]
             if state.get("observations")
@@ -1749,7 +1433,7 @@ def build_agent_graph(
         if (
             worker_finish
             and latest_observation is not None
-            and latest_observation.reroute_required
+            and latest_observation.status == "reroute"
         ):
             return "finish"
         if worker_finish and not tool_list:
@@ -1760,8 +1444,6 @@ def build_agent_graph(
     graph.add_node("planner", planner)
     graph.add_node("prepare_tool", prepare_tool_call)
     graph.add_node("tools", execute_tools)
-    if analyze_available:
-        graph.add_node("analyzer", analyzer)
     graph.add_node("observer", observer)
     graph.add_node("responder", responder)
 
@@ -1776,25 +1458,14 @@ def build_agent_graph(
             "finish": END,
         },
     )
-    if analyze_available:
-        graph.add_conditional_edges(
-            "prepare_tool",
-            route_after_prepare,
-            {
-                "tools": "tools",
-                "analyzer": "analyzer",
-            },
-        )
-    else:
-        graph.add_edge("prepare_tool", "tools")
+    graph.add_edge("prepare_tool", "tools")
     graph.add_edge("tools", "observer")
-    if analyze_available:
-        graph.add_edge("analyzer", "observer")
     graph.add_conditional_edges(
         "observer",
         route_after_observer,
         {
             "planner": "planner",
+            "responder": "responder",
             "finish": END,
         },
     )
@@ -1833,12 +1504,11 @@ def run_agent_graph(
         "messages": initial_messages,
         "system_prompt": system_prompt,
         "planner_message": None,
-        "analysis": None,
-        "analysis_sources": [],
         "observations": [],
         "cycle_history": [],
         "tool_steps": 0,
         "max_steps": bounded_steps,
+        "terminal_gap": None,
     }
 
     config: Dict[str, Any] = {
@@ -1903,21 +1573,18 @@ def run_worker_graph(
     """Run the internal worker graph and retain its selected UI results locally."""
     clean_task = str(task or "").strip()
     if not clean_task:
-        return WorkerRunResult(
-            answer="Подзадача воркера не должна быть пустой.",
-            display_items=[],
-            goal_satisfied=False,
-            problem="Worker получил пустую task.",
-        )
+        raise WorkerResponseError("Worker получил пустую task.")
 
     bounded_steps = max(1, int(max_steps))
     preview_chars = max(1, int(tool_message_preview_chars))
     raw_tool_results: Dict[str, ToolMessage] = {}
+    evidence_ids_by_tool_call: Dict[str, str] = {}
     worker_tools = ensure_worker_tools(tools)
     graph = build_agent_graph(
         model,
         worker_tools,
         raw_tool_results=raw_tool_results,
+        evidence_ids_by_tool_call=evidence_ids_by_tool_call,
         tool_message_preview_chars=preview_chars,
         worker_finish=True,
     )
@@ -1926,12 +1593,11 @@ def run_worker_graph(
         "messages": [HumanMessage(content=clean_task)],
         "system_prompt": system_prompt,
         "planner_message": None,
-        "analysis": None,
-        "analysis_sources": [],
         "observations": [],
         "cycle_history": [],
         "tool_steps": 0,
         "max_steps": bounded_steps,
+        "terminal_gap": None,
     }
     config: Dict[str, Any] = {
         "recursion_limit": bounded_steps * 4 + 8,
@@ -1957,26 +1623,76 @@ def run_worker_graph(
         if final_state.get("observations")
         else None
     )
-    if latest_observation is not None and latest_observation.reroute_required:
-        reroute_problem = str(latest_observation.problem or "").strip()
+    if latest_observation is not None and latest_observation.status == "reroute":
+        reroute_gap = str(latest_observation.gap or "").strip()
         logger.info(
-            "Worker graph finished with reroute request: problem=%s",
-            reroute_problem,
+            "Worker graph finished with reroute request: gap=%s",
+            reroute_gap,
         )
         return WorkerRunResult(
-            answer=reroute_problem,
+            answer=reroute_gap,
             display_items=[],
             cycle_history=list(final_state.get("cycle_history") or []),
-            goal_satisfied=False,
-            problem=reroute_problem,
-            reroute_required=True,
+            status="reroute",
+            gap=reroute_gap,
+            facts=list(latest_observation.facts),
+            accepted_tool_call_ids=(
+                list(latest_observation.accepted_tool_call_ids)
+                if latest_observation is not None
+                else []
+            ),
         )
+
+    accepted_tool_call_ids = (
+        list(latest_observation.accepted_tool_call_ids)
+        if latest_observation is not None
+        else []
+    )
+    accepted_id_set = set(accepted_tool_call_ids)
+    successful_messages = [
+        message
+        for message in raw_tool_results.values()
+        if message.tool_call_id in accepted_id_set
+        and not _tool_message_has_error(message)
+        and message.name != _ANALYZE_KNOWN_FACTS_TOOL_NAME
+    ]
+    tool_arguments: Dict[str, Dict[str, Any]] = {}
+    for message in final_state.get("messages") or []:
+        if not isinstance(message, AIMessage):
+            continue
+        for call in message.tool_calls:
+            call_id = str(call.get("id") or "").strip()
+            if call_id:
+                tool_arguments[call_id] = dict(call.get("args") or {})
+
+    display_items: List[WorkerDisplayItem] = []
+    for message in successful_messages:
+        full_content = _tool_content_text(message.content)
+        display_items.append(
+            WorkerDisplayItem(
+                name=str(message.name or "unknown_tool"),
+                content=full_content,
+                evidence_id=evidence_ids_by_tool_call.get(
+                    str(message.tool_call_id or ""),
+                    "",
+                ),
+                tool_call_id=str(message.tool_call_id or ""),
+                arguments=tool_arguments.get(message.tool_call_id, {}),
+                preview=_tool_message_preview(message.content, preview_chars),
+                truncated=(
+                    len(full_content.strip()) > preview_chars
+                    or _tool_result_truncated(message)
+                ),
+            )
+        )
+
+    terminal_gap = str(final_state.get("terminal_gap") or "").strip()
+    if terminal_gap:
+        raise WorkerResponseError(terminal_gap)
 
     planner_message = final_state.get("planner_message")
     if planner_message is None:
-        raise WorkerResponseError(
-            "Воркер завершился без finish_worker"
-        )
+        raise WorkerResponseError("Воркер завершился без finish_worker.")
     finish_calls = [
         call
         for call in planner_message.tool_calls
@@ -1984,44 +1700,20 @@ def run_worker_graph(
     ]
     if len(finish_calls) == 1 and len(planner_message.tool_calls) == 1:
         payload = _worker_finish_payload(finish_calls[0])
-    elif not planner_message.tool_calls and _message_text(planner_message):
-        payload = WorkerFinishPayload(
-            answer=_message_text(planner_message),
-        )
-        logger.info(
-            "Worker planner returned plain final text without another LLM call"
-        )
     else:
-        raise WorkerResponseError(
-            "Воркер должен завершиться ровно одним вызовом finish_worker"
+        planner_contract_gap = (
+            _message_text(planner_message).strip()
+            or "Воркер должен завершиться ровно одним вызовом finish_worker."
         )
-    successful_messages = [
-        message
-        for message in raw_tool_results.values()
-        if not _tool_message_has_error(message)
-        and message.name not in {
-            _ANALYZE_TOOL_NAME,
-            _ANALYZE_KNOWN_FACTS_TOOL_NAME,
-        }
-    ]
-    goal_satisfied = bool(
-        latest_observation is not None
-        and latest_observation.goal_satisfied
-    )
-    problem = (
-        latest_observation.problem
+        raise WorkerResponseError(planner_contract_gap)
+    gap = (
+        latest_observation.gap
         if latest_observation is not None
-        else "Worker завершился без structured observation результата."
+        and latest_observation.status != "complete"
+        else None
     )
-    answer = payload.answer
+    answer = payload.summary
 
-    display_items = [
-        WorkerDisplayItem(
-            name=str(message.name or "unknown_tool"),
-            content=_tool_content_text(message.content),
-        )
-        for message in successful_messages
-    ]
     logger.info(
         "Worker final response (%d chars), display tools=%s",
         len(answer),
@@ -2031,6 +1723,12 @@ def run_worker_graph(
         answer=answer,
         display_items=display_items,
         cycle_history=list(final_state.get("cycle_history") or []),
-        goal_satisfied=goal_satisfied,
-        problem=problem,
+        status="complete",
+        gap=gap,
+        facts=(
+            list(latest_observation.facts)
+            if latest_observation is not None
+            else []
+        ),
+        accepted_tool_call_ids=accepted_tool_call_ids,
     )

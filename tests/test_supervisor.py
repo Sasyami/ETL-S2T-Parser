@@ -96,11 +96,18 @@ def test_supervisor_answers_directly_when_coordinator_is_not_needed():
     from agents.supervisor import supervisor_chat
 
     model = _SupervisorModel([AIMessage(content="Здравствуйте!")])
+    stages = []
+
+    def stage_scope(stage):
+        stages.append(stage)
+        return nullcontext()
+
     model_patch, callback_patch, trace_patch = _supervisor_patches(model)
     with (
         model_patch,
         callback_patch,
         trace_patch,
+        patch("agents.supervisor.llm_stage", side_effect=stage_scope),
         patch("agents.supervisor.coordinator_chat") as coordinator,
     ):
         result = supervisor_chat("Привет")
@@ -120,6 +127,7 @@ def test_supervisor_answers_directly_when_coordinator_is_not_needed():
     assert "пустая строка" in references_description
     assert "разовые объекты, ID, числа, результаты" in context_description
     assert parameters["additionalProperties"] is False
+    assert stages == ["supervisor"]
 
 
 def test_supervisor_delegates_whole_goal_and_returns_coordinator_result():

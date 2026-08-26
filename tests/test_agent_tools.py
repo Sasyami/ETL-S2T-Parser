@@ -324,6 +324,72 @@ def test_query_saved_result_is_scoped_and_read_only():
     assert missing_scope["error"] == "No active saved-result store"
 
 
+def test_previous_result_is_lazy_and_scoped_to_coordinator_run():
+    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
+    from agents.tools import get_tools
+    from agents.tools.saved_results import (
+        bind_saved_result_schemas,
+        read_previous_result,
+        saved_result_store_scope,
+    )
+
+    with saved_result_store_scope() as store:
+        descriptor = store.save_payload(
+            source_tool="run_sql",
+            source_tool_call_id="call-first",
+            payload={
+                "columns": ["target_table", "row_count"],
+                "rows": [{"target_table": "t_example", "row_count": 42}],
+            },
+        )
+        assert descriptor is not None
+        reference = store.register_previous_result(
+            source_tool="run_sql",
+            source_tool_call_id="call-first",
+            content=json.dumps(
+                {"rows": [{"target_table": "t_example", "row_count": 42}]}
+            ),
+            description="run_sql: t_example содержит 42 строки.",
+            dataset_ref=descriptor.result_ref,
+        )
+        handoff = {
+            "previous_results": [reference.model_dump(mode="json")]
+        }
+        task = (
+            "Проверь точный прошлый результат."
+            + WORKER_PREVIOUS_RESULTS_MARKER
+            + "\n"
+            + json.dumps(handoff, ensure_ascii=False)
+        )
+
+        resolved = read_previous_result.invoke(
+            {"result_id": reference.result_id}
+        )
+        assert resolved["source_tool"] == "run_sql"
+        assert resolved["result"]["rows"][0]["target_table"] == "t_example"
+
+        bound_tools = bind_saved_result_schemas(get_tools(), task)
+        bound_names = {item.name for item in bound_tools}
+        assert "read_previous_result" in bound_names
+        assert "query_saved_result" in bound_names
+        bound_query_tool = next(
+            item for item in bound_tools if item.name == "query_saved_result"
+        )
+        assert descriptor.result_ref in bound_query_tool.description
+        assert '"target_table" TEXT' in bound_query_tool.description
+
+        unrelated_tools = bind_saved_result_schemas(
+            get_tools(),
+            "Прочитай новые данные без прошлых результатов.",
+        )
+        unrelated_names = {item.name for item in unrelated_tools}
+        assert "read_previous_result" not in unrelated_names
+        assert "query_saved_result" not in unrelated_names
+
+    missing = read_previous_result.invoke({"result_id": reference.result_id})
+    assert missing["error"] == "No active saved-result store"
+
+
 def test_search_excel_values_and_restore_source_row():
     from agents.tools import get_excel_row, search_excel_values
 
@@ -944,13 +1010,10 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     assert "source_table + source_field" in path_description
     assert "target_table + target_field" in path_description
     assert "search_s2t_transformations" in path_description
-    assert "всегда возвращает готовые text_diagram" in path_description
-    assert "полную ссылку в table_name" in path_description
-    assert "WHEN внутри CASE выбирает значение" in path_description
-    assert "WHERE, HAVING" in path_description
-    assert "UNION и UNION ALL объединяют ветви" in path_description
-    assert "входы одного выражения" in path_description
-    assert "одну логическую трансформацию" in path_description
+    assert "text_diagram" in path_description
+    assert "table_name.column_name" in path_description
+    assert "Не составляй table_name из" in path_description
+    assert "Производный SQL-анализ" not in path_description
     s2t_list_description = tools["list_s2t_transformations"].description
     assert "точными ролевыми фильтрами" in s2t_list_description
     assert "например только transformation_rule" in s2t_list_description
@@ -985,7 +1048,6 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     ].args_schema.model_json_schema()
     assert set(list_s2t_schema["properties"]) == {
         "limit",
-        "q",
         "columns",
         "target_table",
         "source_table",
@@ -1015,10 +1077,9 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     assert set(plan_schema["properties"]) == {"done", "to_do"}
 
     lineage_schema = tools["trace_neo4j_lineage"].args_schema.model_json_schema()
-    assert lineage_schema["required"] == ["table_name"]
+    assert lineage_schema["required"] == ["column_reference"]
     assert set(lineage_schema["properties"]) == {
-        "table_name",
-        "column_name",
+        "column_reference",
         "file_id",
         "direction",
         "max_depth",
@@ -1517,8 +1578,7 @@ def test_trace_neo4j_lineage_uses_exact_names_and_scope(mock_read):
 
     result = trace_neo4j_lineage.invoke(
         {
-            "table_name": "a_source",
-            "column_name": "client_id",
+            "column_reference": "a_source.client_id",
             "file_id": 7,
             "direction": "downstream",
             "limit": 250,
@@ -1562,43 +1622,44 @@ def test_trace_neo4j_lineage_uses_exact_names_and_scope(mock_read):
 
 
 @patch("agents.tools.neo4j.execute_neo4j_read")
-def test_trace_neo4j_lineage_accepts_qualified_column_name(mock_read):
+def test_trace_neo4j_lineage_splits_qualified_column_reference(mock_read):
     from agents.tools import trace_neo4j_lineage
 
     mock_read.return_value = []
 
     result = trace_neo4j_lineage.invoke(
         {
-            "table_name": "t_bus_srv",
-            "column_name": "t_bus_srv.bus_srv_id",
+            "column_reference": "schema.layer.t_bus_srv.bus_srv_id",
             "direction": "upstream",
         }
     )
 
     parameters = mock_read.call_args.args[1]
-    assert parameters["states"][0]["table_name"] == "t_bus_srv"
+    assert parameters["states"][0]["table_name"] == "schema.layer.t_bus_srv"
     assert parameters["states"][0]["column_name"] == "bus_srv_id"
+    assert result["column_reference"] == "schema.layer.t_bus_srv.bus_srv_id"
     assert result["column_name"] == "bus_srv_id"
 
 
-def test_trace_neo4j_lineage_contract_requires_qualified_reference_split():
+def test_trace_neo4j_lineage_contract_keeps_qualified_reference_atomic():
     from agents.tools import trace_neo4j_lineage
 
     schema = trace_neo4j_lineage.args_schema.model_json_schema()
     properties = schema["properties"]
 
-    assert "по последней точке" in trace_neo4j_lineage.description
-    assert "не оставляй column_name" in trace_neo4j_lineage.description
-    assert "равным null" in trace_neo4j_lineage.description
-    assert "часть слева от последней точки" in properties["table_name"][
+    assert "одним атомарным аргументом" in trace_neo4j_lineage.description
+    assert "Дословно скопируй" in trace_neo4j_lineage.description
+    assert set(properties) == {
+        "column_reference",
+        "file_id",
+        "direction",
+        "max_depth",
+        "limit",
+    }
+    assert "Дословная полная ссылка" in properties["column_reference"][
         "description"
     ]
-    assert "часть справа от последней точки" in properties["column_name"][
-        "description"
-    ]
-    assert "Обязательно для любого колонкового lineage" in properties[
-        "column_name"
-    ]["description"]
+    assert "Не сокращай" in properties["column_reference"]["description"]
 
 
 @patch("agents.tools.neo4j.execute_neo4j_read")
@@ -1648,8 +1709,7 @@ def test_trace_neo4j_lineage_resolves_multilevel_wildcard(mock_read):
 
     result = trace_neo4j_lineage.invoke(
         {
-            "table_name": "source_table",
-            "column_name": "object_id",
+            "column_reference": "source_table.object_id",
             "direction": "downstream",
             "max_depth": 3,
         }
@@ -1680,8 +1740,7 @@ def test_trace_neo4j_lineage_allows_sqlglot_scope_depth(mock_read):
 
     result = trace_neo4j_lineage.invoke(
         {
-            "table_name": "source_table",
-            "column_name": "object_id",
+            "column_reference": "source_table.object_id",
             "direction": "downstream",
             "max_depth": 999,
         }
@@ -1692,14 +1751,14 @@ def test_trace_neo4j_lineage_allows_sqlglot_scope_depth(mock_read):
 
 
 @patch("agents.tools.neo4j.execute_neo4j_read")
-def test_trace_neo4j_lineage_rejects_empty_table_name(mock_read):
+def test_trace_neo4j_lineage_rejects_empty_column_reference(mock_read):
     from agents.tools import trace_neo4j_lineage
 
-    result = trace_neo4j_lineage.invoke({"table_name": "   "})
+    result = trace_neo4j_lineage.invoke({"column_reference": "   "})
 
     mock_read.assert_not_called()
     assert result == {
-        "error": "table_name must be non-empty",
+        "error": "column_reference must be non-empty",
         "rows": [],
     }
 
@@ -1860,13 +1919,29 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
 
     tools = get_tools_by_name()
 
+    column_catalog_description = " ".join(
+        tools["list_column_catalog"].description.split()
+    )
+    assert "``table.column`` всегда разделяй" in column_catalog_description
+    column_catalog_schema = tools[
+        "list_column_catalog"
+    ].args_schema.model_json_schema()
+    assert "без префикса table_name" in column_catalog_schema[
+        "properties"
+    ]["column_name"]["description"]
     assert "source/target table или field" in tools[
         "list_s2t_transformations"
     ].description
-    assert "source_table, source_field, target_table" in tools[
+    normalized_s2t_list_description = " ".join(
+        tools["list_s2t_transformations"].description.split()
+    )
+    assert "source_table, source_field, target_table" in (
+        normalized_s2t_list_description
+    )
+    assert "только отдельными" in tools[
         "list_s2t_transformations"
     ].description
-    assert "отдельными аргументами, не строкой в q" in tools[
+    assert "Подстрочный поиск этот tool не выполняет" in tools[
         "list_s2t_transformations"
     ].description
     assert "роль искомого значения неизвестна" in tools[
@@ -1881,7 +1956,7 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "используй list_s2t_transformations" in tools[
         "search_s2t_transformations"
     ].description
-    assert "точные S2T-строки" in tools["run_sql"].description
+    assert "точные s2t-строки" in tools["run_sql"].description.casefold()
     assert "это сценарий Neo4j" in tools["run_sql"].description
     assert "не должны содержать" in tools["run_sql"].description
     assert "фильтр по file_id" in tools["run_sql"].description
@@ -1912,8 +1987,12 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "trace_transformation_path" in tools[
         "trace_neo4j_lineage"
     ].description
-    assert "без префикса таблицы" in tools["trace_neo4j_lineage"].description
-    assert "без префикса" in tools["trace_transformation_path"].description
+    assert "одним атомарным аргументом" in tools[
+        "trace_neo4j_lineage"
+    ].description
+    assert "разделяй по последней точке" in tools[
+        "trace_transformation_path"
+    ].description
     assert "additional objects" in tools[
         "trace_transformation_path"
     ].description
@@ -1936,6 +2015,10 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "list_s2t_table_names" in tools["run_sql"].description
     assert "UNION ALL с сортировкой" in tools["run_sql"].description
     assert "не доказывает пересечение" in tools["run_sql"].description
+    assert "transformation_id из Neo4j соответствует" in tools[
+        "run_sql"
+    ].description
+    assert "s2t_transformations.id" in tools["run_sql"].description
     assert "не требует одной и той же строки" in tools[
         "list_s2t_table_names"
     ].description
@@ -2457,6 +2540,93 @@ def test_list_s2t_transformations_is_non_terminal_preview():
     ]
     assert "file_id" not in result
     assert "file" not in result
+
+
+def test_get_s2t_rules_by_ids_maps_lineage_ids_without_sql():
+    from agents.tools import get_s2t_rules_by_ids
+
+    conn = get_db_connection()
+    conn.executemany(
+        """INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field, transformation_rule)
+        VALUES (?, 61, 'S2T', ?, 'source', 'c_closedate',
+                'target', 'c_closedate', ?)""",
+        [
+            (118, 1, "UNION ALL"),
+            (297, 2, "branch.c_closedate"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = get_s2t_rules_by_ids.invoke(
+        {"transformation_ids": [297, 999, 118, 297]}
+    )
+
+    assert result["requested_ids"] == [297, 999, 118]
+    assert [row["id"] for row in result["rows"]] == [297, 118]
+    assert result["rows"][1]["transformation_rule"] == "UNION ALL"
+    assert result["missing_ids"] == [999]
+    assert result["returned_rows"] == 2
+
+
+def test_get_s2t_rules_by_ids_rejects_empty_input():
+    from agents.tools import get_s2t_rules_by_ids
+
+    result = get_s2t_rules_by_ids.invoke({"transformation_ids": []})
+
+    assert result["error"].startswith("transformation_ids must contain")
+    assert result["rows"] == []
+
+
+def test_list_s2t_table_mapping_keeps_table_roles_unambiguous():
+    from agents.tools import list_s2t_table_mapping
+
+    conn = get_db_connection()
+    conn.executemany(
+        """INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field, transformation_rule)
+        VALUES (?, 61, 'S2T', ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                231,
+                1,
+                "b3050000420005_paymentdetails",
+                "object_id_uid",
+                "t_optn",
+                "optn_id",
+                "source.object_id_uid",
+            ),
+            (
+                232,
+                2,
+                "b3050000420005_paymentdetails",
+                "other_id",
+                "t_other",
+                "other_id",
+                "source.other_id",
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = list_s2t_table_mapping.invoke(
+        {
+            "source_table": "b3050000420005_paymentdetails",
+            "target_table": "t_optn",
+        }
+    )
+
+    assert result["total"] == 1
+    assert result["filters"] == {
+        "target_table": "t_optn",
+        "source_table": "b3050000420005_paymentdetails",
+    }
+    assert result["rows"][0]["source_field"] == "object_id_uid"
+    assert result["rows"][0]["target_field"] == "optn_id"
 
 
 def test_list_s2t_transformations_selects_requested_columns():

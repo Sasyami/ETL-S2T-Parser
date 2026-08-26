@@ -8,7 +8,6 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
-
 from .common import PROJECT_ROOT, clamped_int
 
 logger = logging.getLogger(__name__)
@@ -17,7 +16,6 @@ SQL_EXPORT_DIR = PROJECT_ROOT / "exports" / "sql_exports"
 SQL_EXPORT_URL_PREFIX = "/exports/sql"
 MAX_INLINE_SQL_ROWS = 100
 SQL_FETCH_BATCH_SIZE = 1000
-
 
 def _write_sql_export_cursor(
     query: str,
@@ -118,8 +116,9 @@ def run_sql(
 ) -> Dict[str, Any]:
     """Выполнить составленный агентом или переданный read-only SQL по SQLite.
 
-    Используй только для срезов, выражений или агрегаций, которых нет в готовых
-    tools; точные S2T-строки по source_table/target_table и выбранным колонкам
+    Используй для read-only агрегаций, JOIN, UNION, подзапросов, оконных функций,
+    произвольных выражений и других срезов, которых нет в готовых tools.
+    Точные S2T-строки по source_table/target_table и выбранным колонкам
     получай через list_s2t_transformations.
     Для стандартных списков source/target, их пересечения, объединения и разности
     выбирай list_s2t_table_names, а не этот tool.
@@ -137,13 +136,18 @@ def run_sql(
 
     Таблица s2t_transformations глобальная: запросы к ней не должны содержать
     неявный фильтр по file_id или последней загрузке.
+    После trace_neo4j_lineage разрешено дочитать правила уже найденных связей:
+    поле transformation_id из Neo4j соответствует первичному ключу
+    s2t_transformations.id, а не столбцу с именем transformation_id. Используй
+    ``WHERE id IN (...)`` и возвращай как минимум id и transformation_rule.
     Непустой source_table означает непустое значение этой колонки, а не наличие
     физических строк в логической source-таблице. При подсчёте distinct
     source_table для target_table = X фильтруй s2t_transformations напрямую по
     target_table = X, source_table IS NOT NULL и TRIM(source_table) <> ''; не
     добавляй JOIN с source_tables, target_tables или data.
-    Не используй для lineage, путей, цепочек зависимостей и impact analysis:
-    это сценарий Neo4j. Не используй также для разбора переданного пользователем
+    Не используй для самостоятельного построения lineage, путей и цепочек:
+    это сценарий Neo4j. Допустимо только дополнить уже найденный impact текстами
+    правил по точным id. Не используй также для разбора переданного пользователем
     SQL-текста без выполнения: для этого предназначены parse_sql_column_lineage
     и parse_sql_table_lineage. Поддерживаются SELECT, WITH и EXPLAIN QUERY PLAN.
     Без CSV-экспорта возвращается не более MAX_INLINE_SQL_ROWS строк. При

@@ -18,11 +18,13 @@ SchemaName = Literal[
 SCHEMA_CATALOG: Dict[str, str] = {
     "SQLite ETL": (
         "Реальные колонки публичных SQLite-таблиц; нужна для составления "
-        "произвольного run_sql и проверки физической структуры хранения."
+        "произвольного run_sql (только read-only) и проверки физической "
+        "структуры хранения."
     ),
     "S2T-маппинг": (
         "Поля S2T-кортежа, source/target-роли, алиасы заголовков S2T-листа "
-        "и правила определения ETL-слоёв."
+        "и правила ETL-слоёв. Нужна для работы с сырой схемой/конфигурацией; "
+        "готовые S2T-tools имеют собственные контракты."
     ),
     "Excel-маппинги": (
         "Группы и алиасы Excel-листов, роли их физических заголовков и "
@@ -30,7 +32,8 @@ SCHEMA_CATALOG: Dict[str, str] = {
     ),
     "Neo4j lineage": (
         "Labels, свойства и направления связей ETLTable/ETLColumn в Neo4j; "
-        "нужна для произвольного run_cypher или ручного анализа графа."
+        "нужна для произвольного run_cypher или ручного анализа графа, но не "
+        "для готовых trace-tools."
     ),
 }
 
@@ -219,3 +222,8 @@ def load_skills(sections: Optional[Iterable[str]] = None) -> str:
 def load_chat_agent_context() -> str:
     """Загрузить runtime-контекст для Flask chat-agent."""
     return _prompt_text("chat_agent.md")
+
+
+def load_upstream_analysis_context() -> str:
+    """Загрузить постоянные правила анализа для upstream coordinator."""
+    return _prompt_text("upstream_analysis.md")

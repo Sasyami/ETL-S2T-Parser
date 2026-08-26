@@ -9,7 +9,7 @@ from neo4j.exceptions import ServiceUnavailable
 
 from graph_storage import Neo4jConfigurationError, execute_neo4j_read
 
-from .common import clamped_int, normalize_column_reference
+from .common import clamped_int
 
 logger = logging.getLogger(__name__)
 
@@ -576,8 +576,7 @@ def _resolve_column_lineage(
 
 @tool(parse_docstring=True)
 def trace_neo4j_lineage(
-    table_name: str,
-    column_name: Optional[str] = None,
+    column_reference: str,
     file_id: Optional[int] = None,
     direction: Literal["upstream", "downstream", "both"] = "both",
     max_depth: int = 1,
@@ -591,17 +590,17 @@ def trace_neo4j_lineage(
 
     Не используй для lineage всей таблицы без колонки: там нужен
     trace_neo4j_table_lineage. Используй для структуры графа и именованных
-    зависимостей колонок; если
-    пользователь просит правила преобразования, SQL, additional objects,
-    объяснимый сохранённый S2T-путь или его готовую схему, выбирай
-    trace_transformation_path: он также возвращает text_diagram.
+    зависимостей колонок. Если пользователь просит правила преобразования для
+    найденного impact, после lineage передай его transformation_id в
+    get_s2t_rules_by_ids. Для заранее известной точной S2T-пары, её объяснимого
+    пути или запроса на готовую схему используй trace_transformation_path: он
+    также возвращает text_diagram.
 
-    Перед вызовом обязательно нормализуй ссылку на именованную колонку. Раздели
-    ссылку ``table_name.column_name`` по последней точке: всю левую часть
-    передай в table_name, последнюю часть — в column_name. column_name должен
-    быть без префикса таблицы. Для колонкового lineage не оставляй column_name
-    равным null и не передавай полную ссылку целиком в table_name. Это правило
-    одинаково для простых и квалифицированных схемой имён таблиц.
+    Передай полную ссылку ``table_name.column_name`` одним атомарным аргументом
+    column_reference. Дословно скопируй её из task без сокращения схемы или имени
+    таблицы. Например,
+    ``schema.layer.a_000025_t_loanscontract.c_closedate`` целиком передаётся в
+    column_reference. Tool сам разделит ссылку по последней точке.
 
     Используй только когда пользователь просит lineage/upstream/downstream
     именованной таблицы или колонки в графе. Не используй для SQL-текста и
@@ -618,173 +617,79 @@ def trace_neo4j_lineage(
     одноимённые колонки.
     В публичных шагах такое ребро возвращается как source_field="*" и
     target_field="*" без отдельного boolean-признака.
-    Для произвольного графового запроса используй run_cypher, для объяснения
-    S2T-правил — trace_transformation_path. file_id допустим только при явном
-    файловом scope.
+    Для произвольного графового запроса используй run_cypher, для правил
+    найденного impact — get_s2t_rules_by_ids. SQL и additional objects этим
+    tool не разбираются. file_id допустим только при явном файловом scope.
     Пустой rows не отменяет факты SQLite.
 
     Args:
-        table_name: Точное имя логической ETL-таблицы; для ссылки
-            table_name.column_name это вся часть слева от последней точки,
-            никогда не полная ссылка вместе с колонкой.
-        column_name: Точное имя колонки без префикса; для ссылки
-            table_name.column_name это часть справа от последней точки.
-            Обязательно для любого колонкового lineage; null допустим только
-            когда пользователь запросил lineage всей таблицы.
+        column_reference: Дословная полная ссылка table_name.column_name из
+            task одним значением. Не сокращай квалифицированное имя таблицы и не
+            разделяй ссылку на несколько аргументов.
         file_id: Опциональный идентификатор файла для ограничения графа.
         direction: upstream, downstream или оба направления both.
         max_depth: Максимальная глубина пути именованной колонки, от 1 до 50.
         limit: Максимальное число найденных связей колонок, от 1 до 100.
     """
-    clean_table_name = str(table_name or "").strip()
-    if not clean_table_name:
+    clean_column_reference = str(column_reference or "").strip()
+    if not clean_column_reference:
         return {
-            "error": "table_name must be non-empty",
+            "error": "column_reference must be non-empty",
             "rows": [],
         }
-    clean_column_name = normalize_column_reference(
-        clean_table_name,
-        column_name,
-    )
-    if (
-        column_name is not None
-        and str(column_name).strip()
-        and not clean_column_name
-    ):
+    if "." not in clean_column_reference:
         return {
-            "error": "column_name must contain a column after table_name",
+            "error": "column_reference must be table_name.column_name",
+            "rows": [],
+        }
+    clean_table_name, clean_column_name = (
+        part.strip() for part in clean_column_reference.rsplit(".", 1)
+    )
+    if not clean_table_name or not clean_column_name:
+        return {
+            "error": "column_reference must be table_name.column_name",
             "rows": [],
         }
     clean_file_id = int(file_id) if file_id is not None else None
     clean_max_depth = clamped_int(max_depth, 1, 1, MAX_LINEAGE_DEPTH)
     clean_limit = clamped_int(limit, 50, 1, 100)
-    if clean_column_name is not None:
-        try:
-            result = _resolve_column_lineage(
-                table_name=clean_table_name,
-                column_name=clean_column_name,
-                file_id=clean_file_id,
-                direction=direction,
-                max_depth=clean_max_depth,
-                limit=clean_limit,
-            )
-        except (Neo4jConfigurationError, ServiceUnavailable) as exc:
-            result = {
-                **_neo4j_unavailable_result(exc),
-                "rows": [],
-                "paths": [],
-                "returned_rows": 0,
-                "returned_paths": 0,
-                "truncated": False,
-            }
-        except Exception:
-            logger.exception("Neo4j column lineage read failed")
-            result = {
-                "error": "Neo4j read failed",
-                "rows": [],
-                "paths": [],
-                "returned_rows": 0,
-                "returned_paths": 0,
-                "truncated": False,
-            }
-        result.update(
-            {
-                "table_name": clean_table_name,
-                "column_name": clean_column_name,
-                "file_id": clean_file_id,
-                "direction": direction,
-                "max_depth": clean_max_depth,
-                "limit": clean_limit,
-            }
+    try:
+        result = _resolve_column_lineage(
+            table_name=clean_table_name,
+            column_name=clean_column_name,
+            file_id=clean_file_id,
+            direction=direction,
+            max_depth=clean_max_depth,
+            limit=clean_limit,
         )
-        return result
-
-    if clean_max_depth != 1:
-        return {
-            "error": "column_name is required when max_depth is greater than 1",
+    except (Neo4jConfigurationError, ServiceUnavailable) as exc:
+        result = {
+            **_neo4j_unavailable_result(exc),
             "rows": [],
+            "paths": [],
+            "returned_rows": 0,
+            "returned_paths": 0,
+            "truncated": False,
+        }
+    except Exception:
+        logger.exception("Neo4j column lineage read failed")
+        result = {
+            "error": "Neo4j read failed",
+            "rows": [],
+            "paths": [],
+            "returned_rows": 0,
+            "returned_paths": 0,
+            "truncated": False,
+        }
+    result.update(
+        {
+            "column_reference": clean_column_reference,
             "table_name": clean_table_name,
-            "column_name": None,
+            "column_name": clean_column_name,
             "file_id": clean_file_id,
             "direction": direction,
             "max_depth": clean_max_depth,
             "limit": clean_limit,
-        }
-    result = _read_rows(
-        """
-        MATCH (source:ETLProjection:ETLColumn)
-              -[mapping:TRANSFORMS_TO]->
-              (target:ETLProjection:ETLColumn)
-        WHERE
-            ($file_id IS NULL OR mapping.file_id = $file_id)
-            AND (
-                (
-                    $column_name IS NULL
-                    AND (
-                        (
-                            $direction IN ['downstream', 'both']
-                            AND source.table_name = $table_name
-                        )
-                        OR (
-                            $direction IN ['upstream', 'both']
-                            AND target.table_name = $table_name
-                        )
-                    )
-                )
-                OR (
-                    $column_name IS NOT NULL
-                    AND (
-                        (
-                            $direction IN ['downstream', 'both']
-                            AND source.table_name = $table_name
-                            AND source.name = $column_name
-                        )
-                        OR (
-                            $direction IN ['upstream', 'both']
-                            AND target.table_name = $table_name
-                            AND target.name = $column_name
-                        )
-                    )
-                )
-            )
-        RETURN
-            mapping.file_id AS file_id,
-            mapping.transformation_id AS transformation_id,
-            source.table_name AS source_table,
-            mapping.source_layer AS source_layer,
-            source.name AS source_field,
-            target.table_name AS target_table,
-            mapping.target_layer AS target_layer,
-            target.name AS target_field,
-            CASE
-                WHEN source.table_name = $table_name
-                     AND (
-                         $column_name IS NULL
-                         OR source.name = $column_name
-                     )
-                THEN 'downstream'
-                ELSE 'upstream'
-            END AS match_direction
-        ORDER BY mapping.file_id, mapping.transformation_id
-        LIMIT $limit
-        """,
-        {
-            "table_name": clean_table_name,
-            "column_name": clean_column_name,
-            "file_id": clean_file_id,
-            "direction": direction,
-            "limit": clean_limit,
-        },
-    )
-    result.update(
-        {
-            "table_name": clean_table_name,
-            "column_name": clean_column_name,
-            "file_id": clean_file_id,
-            "direction": direction,
-            "max_depth": 1,
-            "limit": clean_limit,
-            "returned_rows": len(result["rows"]),
         }
     )
     return result
@@ -938,9 +843,10 @@ def trace_neo4j_table_lineage(
     самого узла ETLTable в текущей Neo4j-проекции, даже если у него нет подходящих
     рёбер. Поле connections группирует точные пары таблиц и
     содержит transformation_count/transformation_ids; rows сохраняет исходные
-    рёбра с sql_query. Для длинного пути используй run_cypher, для объяснения
-    правил — trace_transformation_path. file_id используй только при явном
-    ограничении пользователя. Пустой rows не доказывает отсутствие факта в SQLite.
+    рёбра с sql_query. Для пути между двумя известными таблицами используй
+    trace_neo4j_table_path, для произвольного графового среза — run_cypher, для
+    объяснения правил — trace_transformation_path. file_id используй только при
+    явном ограничении пользователя. Пустой rows не доказывает отсутствие факта в SQLite.
 
     Args:
         table_name: Точное имя исходной или целевой логической ETL-таблицы.

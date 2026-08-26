@@ -20,6 +20,10 @@ _ACTIVE_RUN: ContextVar[Optional["_RunCollector"]] = ContextVar(
     "agent_run_metrics",
     default=None,
 )
+_ACTIVE_LLM_STAGE: ContextVar[str] = ContextVar(
+    "agent_run_llm_stage",
+    default="unattributed",
+)
 _COMPLETED_RUNS: "OrderedDict[str, AgentRunMetrics]" = OrderedDict()
 _COMPLETED_RUNS_LOCK = Lock()
 
@@ -30,6 +34,7 @@ class LLMCallMetric(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     run_id: str
+    stage: str = "unattributed"
     model: str = ""
     elapsed_seconds: float = 0.0
     input_tokens: int = 0
@@ -37,6 +42,21 @@ class LLMCallMetric(BaseModel):
     total_tokens: int = 0
     cache_read_tokens: int = 0
     has_error: bool = False
+
+
+class LLMStageMetric(BaseModel):
+    """Aggregate provider usage for one semantic agent stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: str
+    calls: int = 0
+    error_calls: int = 0
+    elapsed_seconds: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cache_read_tokens: int = 0
 
 
 class ToolCallMetric(BaseModel):
@@ -59,14 +79,11 @@ class ObservationMetric(BaseModel):
     worker_task: str
     cycle: int
     routing_attempt: int
-    summary: str
-    goal_satisfied: bool
-    problem: Optional[str] = None
-    has_error: bool = False
-    important_facts: List[str] = Field(default_factory=list)
+    status: str
+    gap: Optional[str] = None
+    accepted_tool_call_ids: List[str] = Field(default_factory=list)
+    facts: List[Dict[str, Any]] = Field(default_factory=list)
     limitations: List[str] = Field(default_factory=list)
-    reroute_required: bool = False
-    analysis: Optional[Dict[str, Any]] = None
 
 
 class WorkerRouteMetric(BaseModel):
@@ -79,7 +96,7 @@ class WorkerRouteMetric(BaseModel):
     tools: List[str] = Field(default_factory=list)
     skills: List[str] = Field(default_factory=list)
     schemas: List[str] = Field(default_factory=list)
-    problem: Optional[str] = None
+    gap: Optional[str] = None
 
 
 class AgentRunMetrics(BaseModel):
@@ -90,13 +107,13 @@ class AgentRunMetrics(BaseModel):
     session_id: str
     elapsed_seconds: float
     llm_calls: List[LLMCallMetric] = Field(default_factory=list)
+    llm_stages: List[LLMStageMetric] = Field(default_factory=list)
     tool_calls: List[ToolCallMetric] = Field(default_factory=list)
     worker_tasks: List[str] = Field(default_factory=list)
     coordinator_plan: List[Dict[str, Any]] = Field(default_factory=list)
     worker_routes: List[WorkerRouteMetric] = Field(default_factory=list)
     observations: List[ObservationMetric] = Field(default_factory=list)
-    upstream_evidence: Optional[Dict[str, Any]] = None
-    upstream_answer: Optional[str] = None
+    upstream_output: Optional[Dict[str, Any]] = None
     display_tools: List[str] = Field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
@@ -166,6 +183,32 @@ def _usage_values(response: Any) -> tuple[int, int, int, int]:
     return input_tokens, output_tokens, total_tokens, cache_read_tokens
 
 
+def _stage_metrics(calls: List[LLMCallMetric]) -> List[LLMStageMetric]:
+    totals: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+    for call in calls:
+        item = totals.setdefault(
+            call.stage,
+            {
+                "stage": call.stage,
+                "calls": 0,
+                "error_calls": 0,
+                "elapsed_seconds": 0.0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cache_read_tokens": 0,
+            },
+        )
+        item["calls"] += 1
+        item["error_calls"] += int(call.has_error)
+        item["elapsed_seconds"] += call.elapsed_seconds
+        item["input_tokens"] += call.input_tokens
+        item["output_tokens"] += call.output_tokens
+        item["total_tokens"] += call.total_tokens
+        item["cache_read_tokens"] += call.cache_read_tokens
+    return [LLMStageMetric.model_validate(item) for item in totals.values()]
+
+
 class _RunCollector:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
@@ -177,12 +220,11 @@ class _RunCollector:
         self.coordinator_plan: List[Dict[str, Any]] = []
         self.worker_routes: List[WorkerRouteMetric] = []
         self.observations: List[ObservationMetric] = []
-        self.upstream_evidence: Optional[Dict[str, Any]] = None
-        self.upstream_answer: Optional[str] = None
+        self.upstream_output: Optional[Dict[str, Any]] = None
         self.display_tools: List[str] = []
         self.error: Optional[str] = None
 
-    def start_llm(self, run_id: Any, serialized: Any) -> None:
+    def start_llm(self, run_id: Any, serialized: Any, *, stage: str) -> None:
         key = str(run_id)
         model = ""
         if isinstance(serialized, Mapping):
@@ -200,17 +242,30 @@ class _RunCollector:
                 key,
                 {
                     "run_id": key,
+                    "stage": stage,
                     "model": model,
                     "started_at": perf_counter(),
                 },
             )
 
-    def finish_llm(self, run_id: Any, response: Any, *, error: bool) -> None:
+    def finish_llm(
+        self,
+        run_id: Any,
+        response: Any,
+        *,
+        error: bool,
+        stage: str,
+    ) -> None:
         key = str(run_id)
         with self.lock:
             item = self.llm_calls.setdefault(
                 key,
-                {"run_id": key, "model": "", "started_at": perf_counter()},
+                {
+                    "run_id": key,
+                    "stage": stage,
+                    "model": "",
+                    "started_at": perf_counter(),
+                },
             )
             item["elapsed_seconds"] = max(
                 0.0,
@@ -279,17 +334,17 @@ class _RunCollector:
                 session_id=self.session_id,
                 elapsed_seconds=max(0.0, perf_counter() - self.started_at),
                 llm_calls=llm_calls,
+                llm_stages=_stage_metrics(llm_calls),
                 tool_calls=tool_calls,
                 worker_tasks=list(self.worker_tasks),
                 coordinator_plan=[dict(item) for item in self.coordinator_plan],
                 worker_routes=list(self.worker_routes),
                 observations=list(self.observations),
-                upstream_evidence=(
-                    dict(self.upstream_evidence)
-                    if self.upstream_evidence is not None
+                upstream_output=(
+                    dict(self.upstream_output)
+                    if self.upstream_output is not None
                     else None
                 ),
-                upstream_answer=self.upstream_answer,
                 display_tools=list(self.display_tools),
                 input_tokens=sum(item.input_tokens for item in llm_calls),
                 output_tokens=sum(item.output_tokens for item in llm_calls),
@@ -310,7 +365,11 @@ class _RunMetricsCallback(BaseCallbackHandler):
     ) -> None:
         del messages, kwargs
         if collector := _ACTIVE_RUN.get():
-            collector.start_llm(run_id, serialized)
+            collector.start_llm(
+                run_id,
+                serialized,
+                stage=_ACTIVE_LLM_STAGE.get(),
+            )
 
     def on_llm_start(
         self,
@@ -322,17 +381,31 @@ class _RunMetricsCallback(BaseCallbackHandler):
     ) -> None:
         del prompts, kwargs
         if collector := _ACTIVE_RUN.get():
-            collector.start_llm(run_id, serialized)
+            collector.start_llm(
+                run_id,
+                serialized,
+                stage=_ACTIVE_LLM_STAGE.get(),
+            )
 
     def on_llm_end(self, response: Any, *, run_id: Any, **kwargs: Any) -> None:
         del kwargs
         if collector := _ACTIVE_RUN.get():
-            collector.finish_llm(run_id, response, error=False)
+            collector.finish_llm(
+                run_id,
+                response,
+                error=False,
+                stage=_ACTIVE_LLM_STAGE.get(),
+            )
 
     def on_llm_error(self, error: BaseException, *, run_id: Any, **kwargs: Any) -> None:
         del error, kwargs
         if collector := _ACTIVE_RUN.get():
-            collector.finish_llm(run_id, None, error=True)
+            collector.finish_llm(
+                run_id,
+                None,
+                error=True,
+                stage=_ACTIVE_LLM_STAGE.get(),
+            )
 
     def on_tool_start(
         self,
@@ -364,6 +437,17 @@ class _RunMetricsCallback(BaseCallbackHandler):
 
 
 _CALLBACK = _RunMetricsCallback()
+
+
+@contextmanager
+def llm_stage(stage: str) -> Iterator[None]:
+    """Attribute every real model request in this scope to one agent stage."""
+    clean_stage = str(stage or "").strip() or "unattributed"
+    token = _ACTIVE_LLM_STAGE.set(clean_stage)
+    try:
+        yield
+    finally:
+        _ACTIVE_LLM_STAGE.reset(token)
 
 
 @contextmanager
@@ -403,9 +487,10 @@ def record_worker_task(task: str) -> None:
 
 
 def record_coordinator_plan(steps: List[Dict[str, Any]]) -> None:
+    """Append one downstream cycle plan to the run trace."""
     if collector := _ACTIVE_RUN.get():
         with collector.lock:
-            collector.coordinator_plan = [dict(item) for item in steps]
+            collector.coordinator_plan.extend(dict(item) for item in steps)
 
 
 def record_worker_route(
@@ -415,7 +500,7 @@ def record_worker_route(
     tools: List[str],
     skills: List[str],
     schemas: List[str],
-    problem: Optional[str] = None,
+    gap: Optional[str] = None,
 ) -> None:
     """Retain an already selected router palette for live diagnostics."""
     if collector := _ACTIVE_RUN.get():
@@ -425,7 +510,7 @@ def record_worker_route(
             tools=[str(item) for item in tools],
             skills=[str(item) for item in skills],
             schemas=[str(item) for item in schemas],
-            problem=_clip(problem) or None,
+            gap=_clip(gap) or None,
         )
         with collector.lock:
             collector.worker_routes.append(metric)
@@ -437,7 +522,6 @@ def record_worker_observation(
     cycle: int,
     routing_attempt: int,
     observation: Mapping[str, Any],
-    analysis: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Retain a bounded structured observation for live-run diagnostics."""
     if collector := _ACTIVE_RUN.get():
@@ -445,58 +529,46 @@ def record_worker_observation(
             worker_task=_clip(worker_task),
             cycle=max(1, int(cycle)),
             routing_attempt=max(1, int(routing_attempt)),
-            summary=_clip(observation.get("summary")),
-            goal_satisfied=bool(observation.get("goal_satisfied")),
-            problem=_clip(observation.get("problem")) or None,
-            has_error=bool(observation.get("has_error")),
-            important_facts=[
+            status=_clip(observation.get("status")),
+            gap=_clip(observation.get("gap")) or None,
+            accepted_tool_call_ids=[
                 _clip(item)
-                for item in observation.get("important_facts", [])
+                for item in observation.get("accepted_tool_call_ids", [])
+            ],
+            facts=[
+                {
+                    "text": _clip(item.get("text")),
+                    "evidence_ids": [
+                        _clip(evidence_id)
+                        for evidence_id in item.get("evidence_ids", [])
+                    ],
+                }
+                for item in observation.get("facts", [])
+                if isinstance(item, Mapping)
             ],
             limitations=[
                 _clip(item) for item in observation.get("limitations", [])
             ],
-            reroute_required=bool(observation.get("reroute_required")),
-            analysis=(
-                {
-                    "summary": _clip(analysis.get("summary")),
-                    "facts": [
-                        _clip(item) for item in analysis.get("facts", [])
-                    ],
-                    "limitations": [
-                        _clip(item)
-                        for item in analysis.get("limitations", [])
-                    ],
-                }
-                if analysis is not None
-                else None
-            ),
         )
         with collector.lock:
             collector.observations.append(metric)
 
 
-def record_upstream_evidence(result: Mapping[str, Any]) -> None:
-    """Retain verified upstream evidence before downstream presentation."""
+def record_upstream_output(result: Mapping[str, Any]) -> None:
+    """Retain the final upstream answer and evidence selections."""
     if collector := _ACTIVE_RUN.get():
         payload = {
-            "confirmed_facts": [
-                _clip(item) for item in result.get("confirmed_facts", [])
+            "answer": _clip(result.get("answer")),
+            "used_evidence_ids": [
+                _clip(item) for item in result.get("used_evidence_ids", [])
             ],
-            "unresolved_requirements": [
+            "display_evidence_ids": [
                 _clip(item)
-                for item in result.get("unresolved_requirements", [])
+                for item in result.get("display_evidence_ids", [])
             ],
         }
         with collector.lock:
-            collector.upstream_evidence = payload
-
-
-def record_upstream_answer(answer: str) -> None:
-    """Retain the final answer produced by downstream presentation."""
-    if collector := _ACTIVE_RUN.get():
-        with collector.lock:
-            collector.upstream_answer = _clip(answer)
+            collector.upstream_output = payload
 
 
 def record_display_tools(names: List[str]) -> None:
@@ -514,14 +586,15 @@ def consume_agent_run_metrics(session_id: str) -> Optional[AgentRunMetrics]:
 __all__ = [
     "AgentRunMetrics",
     "LLMCallMetric",
+    "LLMStageMetric",
     "ObservationMetric",
     "ToolCallMetric",
     "WorkerRouteMetric",
     "capture_agent_run",
     "consume_agent_run_metrics",
     "get_run_metrics_callback",
-    "record_upstream_answer",
-    "record_upstream_evidence",
+    "llm_stage",
+    "record_upstream_output",
     "record_coordinator_plan",
     "record_display_tools",
     "record_worker_observation",
