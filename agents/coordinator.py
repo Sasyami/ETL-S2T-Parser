@@ -27,7 +27,6 @@ from .contracts import (
     PlanStep,
     UpstreamDecision,
     UpstreamOutput,
-    WORKER_PREVIOUS_RESULTS_MARKER,
     WORKER_STABLE_CONTEXT_MARKER,
     WorkerOutcome,
     WorkerPlan,
@@ -525,25 +524,6 @@ def build_coordinator_graph(
         context = state["context"].strip()
         if context:
             worker_task += WORKER_STABLE_CONTEXT_MARKER + context
-        previous_results = [
-            reference
-            for run in state["worker_runs"]
-            for reference in run["outcome"].previous_results
-        ]
-        if previous_results:
-            worker_task += (
-                WORKER_PREVIOUS_RESULTS_MARKER
-                + "\n"
-                + json.dumps(
-                    {
-                        "previous_results": [
-                            item.model_dump(mode="json")
-                            for item in previous_results
-                        ]
-                    },
-                    ensure_ascii=False,
-                )
-            )
         logger.info(
             "Coordinator dispatches planned worker step=%s task=%s",
             step_index + 1,

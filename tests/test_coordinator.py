@@ -9,10 +9,8 @@ from agents.contracts import (
     EvidenceArtifact,
     EvidenceFact,
     PreviousResultReference,
-    WORKER_PREVIOUS_RESULTS_MARKER,
     WORKER_STABLE_CONTEXT_MARKER,
     WorkerOutcome,
-    parse_worker_request,
 )
 from agents.coordinator import CoordinatorAnswer
 from agents.tools.saved_results import SavedResultColumn, SavedResultDescriptor
@@ -724,19 +722,8 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
     context_suffix = WORKER_STABLE_CONTEXT_MARKER + "Общий фон"
     assert worker.call_args_list[0].args[0] == "Найди точное имя." + context_suffix
     second_task = worker.call_args_list[1].args[0]
-    second_parts = parse_worker_request(second_task)
-    assert second_parts.current_task == "Проверь найденное имя."
-    assert second_parts.stable_context == "Общий фон"
-    assert [
-        item.model_dump(mode="json")
-        for item in (second_parts.previous_results or [])
-    ] == [
-        {
-            "result_id": "result-first",
-            "description": "lookup: точное имя t_example.",
-        }
-    ]
-    assert WORKER_PREVIOUS_RESULTS_MARKER in second_task
+    assert second_task == "Проверь найденное имя." + context_suffix
+    assert "previous_results" not in second_task
     discard.assert_not_called()
 
     upstream = _payload(model, "submit_upstream_answer")
@@ -838,7 +825,7 @@ def test_upstream_selects_only_requested_display_and_discards_other_refs():
     ]
 
 
-def test_coordinator_passes_lazy_result_references_between_workers():
+def test_coordinator_does_not_pass_results_between_workers():
     from agents.coordinator import coordinator_chat
 
     model = _CoordinatorModel(
@@ -923,19 +910,17 @@ def test_coordinator_passes_lazy_result_references_between_workers():
         result = coordinator_chat("Получи два факта и проверь второй.")
 
     assert result.answer == "Проверка завершена."
-    first_parts, second_parts, third_parts = [
-        parse_worker_request(call.args[0]) for call in worker.call_args_list
+    first_task, second_task, third_task = [
+        call.args[0] for call in worker.call_args_list
     ]
-    assert first_parts.current_task == "Получи первый факт."
-    assert first_parts.previous_results is None
-    assert second_parts.current_task == "Получи второй факт."
-    assert [
-        item.result_id for item in (second_parts.previous_results or [])
-    ] == ["result-first"]
-    assert third_parts.current_task == "Проверь второй факт."
-    assert [
-        item.result_id for item in (third_parts.previous_results or [])
-    ] == ["result-first", "result-second"]
+    assert first_task == "Получи первый факт."
+    assert second_task == "Получи второй факт."
+    assert third_task == "Проверь второй факт."
+    assert all("previous_results" not in task for task in (
+        first_task,
+        second_task,
+        third_task,
+    ))
 
 
 def test_upstream_receives_partial_worker_evidence():
