@@ -429,7 +429,13 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "Не ссылайся на\n«найденный» объект, предыдущий step" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "пунктуацию, отделяющую последующий текст" in (
+    assert "Внешние знаки\nпредложения `:`, `;`, `,`, `.`, `?`, `!`" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "внутренние\n`.`, `_` и парные `::` сохраняются" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "заключай точный идентификатор в\nобратные кавычки" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
     assert "несколько входов одной операции сохраняй в одной task" in (
