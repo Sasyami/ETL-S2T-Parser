@@ -543,13 +543,13 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     router_prompt = " ".join(model.messages[0].content.split())
     assert "необходимую planner палитру" in router_prompt
     assert "точные имена из каталогов" in router_prompt
-    assert "Для каждой отдельной операции с данными" in router_prompt
-    assert "`not_for` — жёсткий запрет" in router_prompt
+    assert "Для каждой операции выбери все tools" in router_prompt
+    assert "`not_for` — запрет" in router_prompt
     assert "необходимости" in router_prompt
     assert "обязательные входы" in router_prompt
     assert "будет получен выбранным tool" in router_prompt
     assert "Не придумывай входы" in router_prompt
-    assert "взаимозаменяемые tools «на всякий случай»" in router_prompt
+    assert "полнота палитры важнее компактности" in router_prompt
     assert "Tools, skills и schemas выбирай независимо" in router_prompt
     assert "каждый список может быть пустым" in router_prompt
     assert "оставляй `tools=[]`" in router_prompt
@@ -1572,10 +1572,11 @@ def test_tool_router_prompt_is_generic_and_catalog_driven():
     assert "необходимую planner палитру" in normalized_prompt
     assert "каждый список может быть пустым" in normalized_prompt
     assert "оставляй `tools=[]`" in normalized_prompt
-    assert "покрой все разные операции" in normalized_prompt
+    assert "Покрой все разные операции" in normalized_prompt
     assert "будет получен выбранным tool" in normalized_prompt
-    assert "`not_for` — жёсткий запрет" in normalized_prompt
-    assert "Не добавляй взаимозаменяемые" in normalized_prompt
+    assert "`not_for` — запрет" in normalized_prompt
+    assert "полнота палитры важнее компактности" in normalized_prompt
+    assert "не добавляй явно нерелевантные tools" in normalized_prompt
     assert len(_TOOL_ROUTER_PROMPT) < 1700
     for domain_detail in (
         "trace_neo4j_table_lineage",
