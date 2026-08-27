@@ -96,7 +96,11 @@ def test_upstream_analysis_context_is_independent_and_sql_precise():
     assert "не удаляет левую" in text
     assert "`UNION ALL`" in text
     assert "Полные одинаковые строки" in text
-    assert len(text) < 1900
+    assert "Технические поля хранилища" in text
+    assert "не переименовывай" in text
+    assert "без прямого подтверждения в evidence" in text
+    assert "`{PLACEHOLDER}`" in text
+    assert len(text) < 3000
     assert "`analyze`" not in text
 
 

@@ -281,4 +281,11 @@ def load_chat_agent_context() -> str:
 
 def load_upstream_analysis_context() -> str:
     """Загрузить постоянные правила анализа для upstream coordinator."""
-    return _prompt_text("upstream_analysis.md")
+    return "\n\n".join(
+        part
+        for part in (
+            _prompt_text("upstream_analysis.md").strip(),
+            _prompt_text("technical_fields.md").strip(),
+        )
+        if part
+    )

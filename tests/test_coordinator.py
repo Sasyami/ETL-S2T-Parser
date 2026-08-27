@@ -414,7 +414,7 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert _DOWNSTREAM_TABLE_CONTEXT in _DOWNSTREAM_PLAN_PROMPT
     assert len(_UPSTREAM_DATA_DECISION_PROMPT) < 1300
     assert len(_UPSTREAM_ANSWER_PROMPT) < 2300
-    assert len(_UPSTREAM_ANALYSIS_CONTEXT) < 1800
+    assert len(_UPSTREAM_ANALYSIS_CONTEXT) < 3000
     assert "`depends_on`" not in _DOWNSTREAM_PLAN_PROMPT
     assert "needs_from_previous" not in _DOWNSTREAM_PLAN_PROMPT
     assert "required_evidence" not in _DOWNSTREAM_PLAN_PROMPT
@@ -542,6 +542,9 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "observations" not in combined
     assert "Правила upstream-анализа" in _UPSTREAM_ANALYSIS_CONTEXT
     assert "`LEFT JOIN`" in _UPSTREAM_ANALYSIS_CONTEXT
+    assert "Технические поля хранилища" in _UPSTREAM_ANALYSIS_CONTEXT
+    assert "не переименовывай" in _UPSTREAM_ANALYSIS_CONTEXT
+    assert "`{PLACEHOLDER}`" in _UPSTREAM_ANALYSIS_CONTEXT
     assert "`analyze`" not in _UPSTREAM_ANALYSIS_CONTEXT
 
     answer_schema = _upstream_answer_tool_schema()["function"]["parameters"]
