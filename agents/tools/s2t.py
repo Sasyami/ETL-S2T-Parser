@@ -164,39 +164,67 @@ def list_s2t_transformations(
 
 @tool(parse_docstring=True)
 def search_s2t_transformations(
-    needle: str,
+    needle: Optional[str] = None,
+    needles: Optional[List[str]] = None,
     limit: int = 20,
 ) -> Dict[str, Any]:
     """
-    Найти строки S2T по одной подстроке сразу во всех полях.
+    Найти строки S2T по одной или нескольким подстрокам во всех полях.
 
     Выбирай, когда роль искомого значения неизвестна либо известная таблица
     названа неполным или неквалифицированным именем. Во втором случае сначала
     разреши по результату точное полное source_table/target_table, затем передай
-    его специализированному tool следующего шага. Также выбирай для набора полей
-    из semantic_search_descriptions: найди S2T по общему различающему фрагменту,
-    прежде чем применять точные ролевые фильтры. Если уже известны точные
-    роли таблиц или полей либо нужны конкретные возвращаемые колонки, используй list_s2t_transformations
-    и передай каждую роль отдельным аргументом. Использование точного
+    его специализированному tool следующего шага. Для набора технических полей
+    из semantic_search_descriptions или прошлого табличного результата передай
+    все различающиеся имена одним списком needles. Не заменяй их общей
+    подстрокой или исходным бизнес-термином. Каждая строка S2T возвращается один
+    раз, даже если совпала с несколькими needles; исходные дубликаты S2T
+    сохраняются. Если уже известны точные роли таблиц или полей либо нужны
+    конкретные возвращаемые колонки, используй list_s2t_transformations и
+    передай каждую роль отдельным аргументом. Использование точного
     target_table/target_field или source_table/source_field как needle
     запрещено: это ролевые фильтры, а не подстрочный поиск. Полная точная
     source_table.source_field → target_table.target_field всегда относится к
     list_s2t_transformations, даже если пользователь просит объяснение правила.
-    Это не
-    семантический поиск: needle
-    проверяется как подстрока в target/source table, field, layer и
+    Это не семантический поиск: каждый needle проверяется как подстрока в
+    target/source table, field, layer и
     transformation_rule. Читает глобальную s2t_transformations без file_id,
-    сохраняет дубликаты и возвращает только первые limit совпадений.
+    сохраняет дубликаты и возвращает только первые limit совпадений всего.
 
     Args:
-        needle: Непустая подстрока имени таблицы, колонки или правила преобразования.
-        limit: Максимальное число возвращаемых совпадений, от 1 до 100.
+        needle: Одна подстрока для совместимого одиночного вызова.
+        needles: Несколько подстрок из одного прошлого результата; максимум 50.
+        limit: Общий максимум возвращаемых совпадений, от 1 до 100.
     """
-    text = (needle or "").strip()
-    if not text:
-        return {"error": "needle must be non-empty", "query": needle, "total": 0, "rows": []}
-    if len(text) > 200:
-        return {"error": "needle too long", "query": text, "total": 0, "rows": []}
+    queries = list(
+        dict.fromkeys(
+            text
+            for item in ([needle] if needle is not None else [])
+            + list(needles or [])
+            if (text := str(item or "").strip())
+        )
+    )
+    if not queries:
+        return {
+            "error": "needle or needles must contain a non-empty value",
+            "queries": [],
+            "total": 0,
+            "rows": [],
+        }
+    if len(queries) > 50:
+        return {
+            "error": "needles supports at most 50 distinct values",
+            "queries": queries[:50],
+            "total": 0,
+            "rows": [],
+        }
+    if any(len(item) > 200 for item in queries):
+        return {
+            "error": "each needle must contain at most 200 characters",
+            "queries": queries,
+            "total": 0,
+            "rows": [],
+        }
 
     from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
 
@@ -204,13 +232,26 @@ def search_s2t_transformations(
     data = db_list_s2t_transformations(
         file_id=None,
         limit=clean_limit,
-        q=text,
+        q=queries[0] if len(queries) == 1 else None,
+        q_any=queries if len(queries) > 1 else None,
     )
-    data["query"] = text
+    if len(queries) == 1:
+        data["query"] = queries[0]
+    else:
+        data["queries"] = queries
     data["searched_table"] = "s2t_transformations"
     from storage.database import S2T_RECORD_FIELDS
 
     data["searched_columns"] = list(S2T_RECORD_FIELDS)
+    if len(queries) > 1:
+        for row in data.get("rows", []):
+            searchable = " ".join(
+                str(row.get(field) or "")
+                for field in S2T_RECORD_FIELDS
+            ).casefold()
+            row["matched_needles"] = [
+                item for item in queries if item.casefold() in searchable
+            ]
     return data
 
 

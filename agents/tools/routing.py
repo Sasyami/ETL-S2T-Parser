@@ -80,18 +80,20 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     },
     "search_column_catalog": {
         "use_when": (
-            "Подстрока в имени, типе или описании колонок внутри scope и "
-            "точных структурных фильтров."
+            "Явная буквальная подстрока в name/type/description колонки; "
+            "scope и фильтры ограничивают выборку."
         ),
-        "not_for": "Смысловая близость или точные table/column.",
+        "not_for": (
+            "Смысл/назначение, синонимы, переводы, варианты или точные имена."
+        ),
     },
     "semantic_search_descriptions": {
         "use_when": (
-            "Смысловой поиск объекта с неизвестным точным именем по descriptions; "
-            "scope ограничивает files/tables/columns и source/target, для колонок "
-            "доступны структурные фильтры подвыборки."
+            "Смысл/бизнес-смысл/назначение/описание или вероятное соответствие "
+            "при неизвестном имени; scope: files/tables/columns, source/target "
+            "и фильтры колонок."
         ),
-        "not_for": "Точное имя, значения Excel-ячеек, S2T-маппинг или lineage.",
+        "not_for": "Подстрока, точное имя, Excel-значения, S2T или lineage.",
     },
     "list_s2t_transformations": {
         "use_when": (
@@ -120,8 +122,9 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     },
     "search_s2t_transformations": {
         "use_when": (
-            "Одна подстрока: роль значения неизвестна, имя неполное/неквалифицированное "
-            "или сужается набор semantic_search_descriptions до S2T-роли/таблицы."
+            "Подстрока с неизвестной ролью или неполное имя. Для технических "
+            "кандидатов прошлого результата — отдельный вызов по каждому "
+            "различающемуся имени; вызовы верни вместе."
         ),
         "not_for": (
             "Точная полная source→target-пара, несколько условий, columns или агрегация."
@@ -276,13 +279,16 @@ _TOOL_ROUTER_PROMPT = """
 палитру `tools`, `skills`, `schemas`. Используй точные имена из каталогов.
 
 `current_task` — единственная операция worker. `stable_context` задаёт только
-общие ограничения. `previous_results` содержит result_id и descriptions прошлых
-результатов. Внутренний reader уже доступен planner; выбери внешние tools для
-операций после чтения result, а не из-за самого наличия result_id.
+общие ограничения. `previous_results` содержит result_id, description и, для
+табличного результата, result_schema. Внутренний reader уже доступен planner;
+выбери внешние tools для операций над строками после чтения result, а не из-за
+самого наличия result_id.
 
 Для каждой отдельной операции с данными выбери tool, чей `use_when` совпадает.
 `not_for` — жёсткий запрет для указанной операции. Не добавляй взаимозаменяемые
 tools «на всякий случай», но покрой все разные операции и обязательные входы.
+Сохраняй тип поиска из task: смысл/назначение/описание — semantic; явно данный
+буквальный фрагмент — substring. Не заменяй один тип другим.
 Обработчик выбирай, только если вход дан или будет получен выбранным tool.
 Tool с обязательным opaque ID допустим, только если точный ID есть в task,
 description или результате другого выбранного tool. Не придумывай входы.
@@ -475,7 +481,7 @@ def select_chat_route(
         payload["stable_context"] = request_parts.stable_context
     if request_parts.previous_results is not None:
         payload["previous_results"] = [
-            item.model_dump(mode="json")
+            item.model_dump(mode="json", exclude_none=True)
             for item in request_parts.previous_results
         ]
     if reroute_context:

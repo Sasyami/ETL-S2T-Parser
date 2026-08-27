@@ -12,6 +12,7 @@ from agents.contracts import (
     WORKER_PREVIOUS_RESULTS_MARKER,
     WORKER_STABLE_CONTEXT_MARKER,
     WorkerOutcome,
+    WorkerPlan,
     parse_worker_request,
 )
 from agents.coordinator import CoordinatorAnswer
@@ -379,6 +380,7 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     from agents.coordinator import (
         _DOWNSTREAM_PLAN_PROMPT,
         _DOWNSTREAM_PLAN_REPAIR_PROMPT,
+        _DOWNSTREAM_CAPABILITY_CONTEXT,
         _DOWNSTREAM_TABLE_CONTEXT,
         _UPSTREAM_ANALYSIS_CONTEXT,
         _UPSTREAM_ANSWER_PROMPT,
@@ -401,8 +403,15 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     ):
         assert domain_detail not in combined
 
-    assert len(_DOWNSTREAM_PLAN_PROMPT) < 3000
-    assert len(_DOWNSTREAM_PLAN_PROMPT) - len(_DOWNSTREAM_TABLE_CONTEXT) < 2200
+    assert len(_DOWNSTREAM_PLAN_PROMPT) < 3600
+    assert (
+        len(_DOWNSTREAM_PLAN_PROMPT)
+        - len(_DOWNSTREAM_TABLE_CONTEXT)
+        - len(_DOWNSTREAM_CAPABILITY_CONTEXT)
+        < 2200
+    )
+    assert _DOWNSTREAM_CAPABILITY_CONTEXT in _DOWNSTREAM_PLAN_PROMPT
+    assert _DOWNSTREAM_TABLE_CONTEXT in _DOWNSTREAM_PLAN_PROMPT
     assert len(_UPSTREAM_DATA_DECISION_PROMPT) < 1300
     assert len(_UPSTREAM_ANSWER_PROMPT) < 2300
     assert len(_UPSTREAM_ANALYSIS_CONTEXT) < 1800
@@ -414,34 +423,71 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     )
     assert "прямо необходимых фактов" in _DOWNSTREAM_PLAN_PROMPT
     assert "Каждый step обязан быть незаменимым" in _DOWNSTREAM_PLAN_PROMPT
-    assert "Наличие\nтаблицы в справочнике не является причиной" in (
+    assert "Наличие\nтаблицы в справочнике не требует её чтения" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "первым\nstep получи из каталога его технические имена" in (
+    assert "использует результат предыдущего" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "Минимизируй обмен" in _DOWNSTREAM_PLAN_PROMPT
+    assert "только краткие lazy-ссылки" in _DOWNSTREAM_PLAN_PROMPT
+    assert "отдельный worker может сначала получить" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "следующий — найти эти кандидаты в S2T" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
     assert "S2T-поиск по подстроке лексический, не семантический" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "это делает upstream" in _DOWNSTREAM_PLAN_PROMPT
-    assert "сравнения, оценки, объяснения, вывода" in _DOWNSTREAM_PLAN_PROMPT
-    assert "роли source/target, тип сущности, направление, scope" in (
+    assert "делает upstream" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Сравнение, оценку, объяснение, вывод" in _DOWNSTREAM_PLAN_PROMPT
+    assert "роль source/target известна,\nтолько если" in (
         _DOWNSTREAM_PLAN_PROMPT.lower()
     )
-    assert "Не превращай бизнес-термин в придуманное имя" in (
-        _DOWNSTREAM_PLAN_PROMPT
-    )
-    assert "не пиши task как\nвызов функции" in (
-        _DOWNSTREAM_PLAN_PROMPT
-    )
-    assert "смысл поля ищется сразу в каталогах\nколонок" in (
+    assert "роль результата не задаёт роль кандидата" in (
         _DOWNSTREAM_PLAN_PROMPT.lower()
     )
-    assert "лениво прочитать принятые результаты прошлых workers" in (
+    assert "Не превращай бизнес-термин в техническое имя" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "не пиши task как вызов функции" in _DOWNSTREAM_PLAN_PROMPT
+    assert "при неизвестной роли — сразу в обоих" in (
+        _DOWNSTREAM_PLAN_PROMPT.lower()
+    )
+    assert "семантический кандидат не\nимеет s2t-роли" in (
+        _DOWNSTREAM_PLAN_PROMPT.lower()
+    )
+    assert "Сохраняй тип поиска из original_task" in _DOWNSTREAM_PLAN_PROMPT
+    assert "смысловой поиск цельной естественной фразой" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "буквальный поиск, только если фрагмент явно дан" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "Не превращай смысловой поиск в «найти содержащие»" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
     assert "справка, не список шагов" in _DOWNSTREAM_TABLE_CONTEXT
     assert "наличие таблицы не требует её чтения" in _DOWNSTREAM_TABLE_CONTEXT
+    assert "описывай нужные данные, не инструмент" in (
+        _DOWNSTREAM_CAPABILITY_CONTEXT
+    )
+    assert "буквальный поиск" in _DOWNSTREAM_CAPABILITY_CONTEXT
+    assert "явно данному фрагменту" in _DOWNSTREAM_CAPABILITY_CONTEXT
+    assert "смысловой поиск по описаниям" in _DOWNSTREAM_CAPABILITY_CONTEXT
+    assert "S2T-строки" in _DOWNSTREAM_CAPABILITY_CONTEXT
+    assert "сохранённые результаты прошлых workers" in (
+        _DOWNSTREAM_CAPABILITY_CONTEXT
+    )
+    for tool_name in (
+        "list_column_catalog",
+        "semantic_search_descriptions",
+        "list_s2t_transformations",
+        "run_sql",
+        "read_previous_result",
+    ):
+        assert tool_name not in _DOWNSTREAM_CAPABILITY_CONTEXT
     for table_name in (
         "files",
         "file_sheet_headers",
@@ -457,13 +503,21 @@ def test_coordinator_prompts_and_schemas_match_contracts():
         assert f"`{table_name}`" in _DOWNSTREAM_TABLE_CONTEXT
     assert "бизнес-описания таблиц" in _DOWNSTREAM_TABLE_CONTEXT
     assert "текст правила" in _DOWNSTREAM_TABLE_CONTEXT
-    assert "только реальные таблицы\nхранилища" in _DOWNSTREAM_PLAN_REPAIR_PROMPT
+    assert "неизвестные бизнес-объекты оставляй текстом поиска" in (
+        _DOWNSTREAM_PLAN_REPAIR_PROMPT
+    )
     assert "скопируй `original_task`" not in _DOWNSTREAM_PLAN_PROMPT
     plan_schema_text = str(_plan_tool_schema())
     assert "По умолчанию один шаг" not in plan_schema_text
     assert "без отдельных шагов производного анализа" in plan_schema_text
+    assert "input_steps" not in plan_schema_text
+    assert _plan_tool_schema()["function"]["parameters"]["properties"][
+        "steps"
+    ]["items"]["required"] == ["task"]
     worker_plan_schema_text = str(WorkerPlan.model_json_schema())
     assert "По умолчанию один шаг" not in worker_plan_schema_text
+    assert "лениво использовать принятые результаты" in worker_plan_schema_text
+    assert "результаты между шагами не передаются" not in worker_plan_schema_text
     assert "decision=\"pass\"" in _UPSTREAM_DATA_DECISION_PROMPT
     assert "decision=\"reroute\"" in _UPSTREAM_DATA_DECISION_PROMPT
     assert "не предлагай имена таблиц, колонок" in (
@@ -480,6 +534,9 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "limitations" not in combined.lower()
     assert "каждый запрошенный" in combined
     assert "значение одной метрики" in combined
+    assert "Промежуточный список кандидатов" in (
+        _UPSTREAM_DATA_DECISION_PROMPT
+    )
     assert "подпиши смысл каждого значения" in _UPSTREAM_ANSWER_PROMPT
     assert "безымянную CSV-последовательность" in _UPSTREAM_ANSWER_PROMPT
     assert "observations" not in combined
@@ -506,6 +563,7 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     plan_schema = _plan_tool_schema()["function"]["parameters"]
     step_schema = plan_schema["properties"]["steps"]["items"]
     assert step_schema["required"] == ["task"]
+    assert "input_steps" not in step_schema["properties"]
     assert "depends_on" not in step_schema["properties"]
     assert "needs_from_previous" not in step_schema["properties"]
     assert "required_evidence" not in step_schema["properties"]
@@ -743,7 +801,7 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
     assert second_parts.current_task == "Проверь найденное имя."
     assert second_parts.stable_context == "Общий фон"
     assert [
-        item.model_dump(mode="json")
+        item.model_dump(mode="json", exclude_none=True)
         for item in (second_parts.previous_results or [])
     ] == [
         {
@@ -1422,7 +1480,7 @@ def test_coordinator_repairs_plan_that_exceeds_worker_limit():
     assert plan_messages[1][-2].tool_call_id == "plan-invalid"
     assert "rejected" in plan_messages[1][-2].content
     assert "от 1 до 8 элементов" in plan_messages[1][-1].content
-    assert "самодостаточную `task`" in plan_messages[1][-1].content
+    assert "непустую `task`" in plan_messages[1][-1].content
 
 
 def test_coordinator_uses_generated_task_without_semantic_checks():

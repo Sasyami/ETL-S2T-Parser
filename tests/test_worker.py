@@ -129,6 +129,11 @@ def test_worker_prompt_does_not_require_full_table_in_text():
     assert "действие `analyze`" not in _WORKER_PLANNER_PROMPT
     assert "Обычный текст без tool_calls\nзапрещён" in _WORKER_PLANNER_PROMPT
     assert "`finish_worker` разрешён на любом шаге" in _WORKER_PLANNER_PROMPT
+    assert "`result_schema` рядом с description" in _WORKER_PLANNER_PROMPT
+    assert "одним batch-вызовом" in _WORKER_PLANNER_PROMPT
+    assert "не вызывай `read_previous_result` повторно" in (
+        _WORKER_PLANNER_PROMPT
+    )
     assert "scrollable" not in _WORKER_PLANNER_PROMPT
 
 
@@ -1159,7 +1164,7 @@ def test_worker_requires_dependent_value_in_current_tool_filter():
     request_parts = parse_worker_request(task)
     assert request_parts.current_task.startswith("Используя target_table")
     assert [
-        item.model_dump(mode="json")
+        item.model_dump(mode="json", exclude_none=True)
         for item in (request_parts.previous_results or [])
     ] == previous_payload["previous_results"]
 
@@ -1669,11 +1674,21 @@ def test_worker_exposes_only_saved_results_accepted_by_observer():
         result = worker_chat("Получи корректное значение.")
         assert len(result.previous_results) == 1
         reference = result.previous_results[0]
-        assert set(reference.model_dump()) == {"result_id", "description"}
+        assert set(reference.model_dump()) == {
+            "result_id",
+            "description",
+            "result_schema",
+        }
         assert reference.description == (
             'run_sql: args={"query":"SELECT value FROM result"}'
         )
         assert "correct" not in reference.description
+        assert reference.result_schema is not None
+        assert reference.result_schema.row_count == 1
+        assert [
+            (column.name, column.sqlite_type)
+            for column in reference.result_schema.columns
+        ] == [("value", "TEXT")]
         resolved = read_previous_result.invoke(
             {"result_id": reference.result_id}
         )

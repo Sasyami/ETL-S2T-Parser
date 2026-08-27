@@ -16,6 +16,7 @@ SUPPORTED_LLM_PROVIDERS = ("gigachat", "openrouter", "ollama")
 
 DEFAULT_GIGACHAT_BASE_URL = "https://api.giga.chat/v1"
 DEFAULT_GIGACHAT_MODEL = "GigaChat"
+DEFAULT_GIGACHAT_JUDGE_MODEL = "GigaChat-2-Pro"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "openrouter/free"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
@@ -85,6 +86,34 @@ def get_chat_model_name() -> str:
     )
 
 
+def get_judge_model_name() -> str:
+    """Return the independently configurable model used by LLM-as-judge."""
+    provider = get_llm_provider()
+    generic_override = os.getenv("LLM_JUDGE_MODEL", "").strip()
+    if provider == "gigachat":
+        return (
+            os.getenv("GIGACHAT_JUDGE_MODEL", "").strip()
+            or generic_override
+            or DEFAULT_GIGACHAT_JUDGE_MODEL
+        )
+    if provider == "openrouter":
+        return (
+            os.getenv("OPENROUTER_JUDGE_MODEL", "").strip()
+            or generic_override
+            or get_chat_model_name()
+        )
+    if provider == "ollama":
+        return (
+            os.getenv("OLLAMA_JUDGE_MODEL", "").strip()
+            or generic_override
+            or get_chat_model_name()
+        )
+    raise ValueError(
+        f"Unsupported LLM_PROVIDER={provider!r}. "
+        f"Use {', '.join(repr(item) for item in SUPPORTED_LLM_PROVIDERS)}."
+    )
+
+
 def _normalize_ollama_base_url(value: str) -> str:
     base_url = value.strip().rstrip("/")
     if base_url.endswith("/v1"):
@@ -92,7 +121,10 @@ def _normalize_ollama_base_url(value: str) -> str:
     return base_url
 
 
-def _create_gigachat_chat_model(timeout: Optional[float] = None) -> GigaChat:
+def _create_gigachat_chat_model(
+    timeout: Optional[float] = None,
+    model_name: Optional[str] = None,
+) -> GigaChat:
     credentials = (
         os.getenv("GIGACHAT_API_KEY")
         or os.getenv("GIGACHAT_CREDENTIALS")
@@ -105,7 +137,8 @@ def _create_gigachat_chat_model(timeout: Optional[float] = None) -> GigaChat:
         )
 
     return GigaChat(
-        model=os.getenv(
+        model=model_name
+        or os.getenv(
             "GIGACHAT_MODEL",
             os.getenv("MODEL", DEFAULT_GIGACHAT_MODEL),
         ),
@@ -120,7 +153,10 @@ def _create_gigachat_chat_model(timeout: Optional[float] = None) -> GigaChat:
     )
 
 
-def _create_openrouter_chat_model(timeout: Optional[float] = None) -> ChatOpenAI:
+def _create_openrouter_chat_model(
+    timeout: Optional[float] = None,
+    model_name: Optional[str] = None,
+) -> ChatOpenAI:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise ValueError("Missing OPENROUTER_API_KEY")
@@ -134,7 +170,8 @@ def _create_openrouter_chat_model(timeout: Optional[float] = None) -> ChatOpenAI
         headers["X-Title"] = app_title
 
     return ChatOpenAI(
-        model=os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
+        model=model_name
+        or os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
         api_key=api_key,
         base_url=os.getenv("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL),
         timeout=float(
@@ -147,7 +184,10 @@ def _create_openrouter_chat_model(timeout: Optional[float] = None) -> ChatOpenAI
     )
 
 
-def _create_ollama_chat_model(timeout: Optional[float] = None) -> ChatOllama:
+def _create_ollama_chat_model(
+    timeout: Optional[float] = None,
+    model_name: Optional[str] = None,
+) -> ChatOllama:
     base_url = _normalize_ollama_base_url(
         os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)
     )
@@ -158,7 +198,7 @@ def _create_ollama_chat_model(timeout: Optional[float] = None) -> ChatOllama:
     }
 
     return ChatOllama(
-        model=os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
+        model=model_name or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
         base_url=base_url,
         temperature=_env_float("OLLAMA_TEMPERATURE", 0.0),
         reasoning=_env_bool("OLLAMA_REASONING", False),
@@ -168,15 +208,24 @@ def _create_ollama_chat_model(timeout: Optional[float] = None) -> ChatOllama:
     )
 
 
-def create_chat_model(timeout: Optional[float] = None) -> BaseChatModel:
+def create_chat_model(
+    timeout: Optional[float] = None,
+    *,
+    model_name: Optional[str] = None,
+) -> BaseChatModel:
     provider = get_llm_provider()
     if provider == "gigachat":
-        return _create_gigachat_chat_model(timeout)
+        return _create_gigachat_chat_model(timeout, model_name)
     if provider == "openrouter":
-        return _create_openrouter_chat_model(timeout)
+        return _create_openrouter_chat_model(timeout, model_name)
     if provider == "ollama":
-        return _create_ollama_chat_model(timeout)
+        return _create_ollama_chat_model(timeout, model_name)
     raise ValueError(
         f"Unsupported LLM_PROVIDER={provider!r}. "
         f"Use {', '.join(repr(item) for item in SUPPORTED_LLM_PROVIDERS)}."
     )
+
+
+def create_judge_chat_model(timeout: Optional[float] = None) -> BaseChatModel:
+    """Create the judge model independently from the agent model."""
+    return create_chat_model(timeout=timeout, model_name=get_judge_model_name())

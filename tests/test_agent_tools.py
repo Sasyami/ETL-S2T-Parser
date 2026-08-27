@@ -352,6 +352,17 @@ def test_previous_result_is_lazy_and_scoped_to_coordinator_run():
             description="run_sql: t_example содержит 42 строки.",
             dataset_ref=descriptor.result_ref,
         )
+        assert reference.result_schema is not None
+        assert reference.result_schema.result_ref == descriptor.result_ref
+        assert reference.result_schema.row_count == 1
+        assert reference.result_schema.truncated is False
+        assert [
+            (column.name, column.sqlite_type)
+            for column in reference.result_schema.columns
+        ] == [
+            ("target_table", "TEXT"),
+            ("row_count", "INTEGER"),
+        ]
         handoff = {
             "previous_results": [reference.model_dump(mode="json")]
         }
@@ -667,6 +678,7 @@ def test_column_catalog_tools_support_exact_and_substring_subsets():
         }
     )
     assert exact["total_matches"] == 1
+    assert exact["truncated"] is False
     assert exact["rows"] == [
         {
             "record_id": 31,
@@ -675,6 +687,13 @@ def test_column_catalog_tools_support_exact_and_substring_subsets():
             "data_type": "uuid",
         }
     ]
+
+    limited = list_column_catalog.invoke(
+        {"scope": "all_tables", "file_id": 30, "limit": 1}
+    )
+    assert limited["total_matches"] == 3
+    assert limited["returned_rows"] == 1
+    assert limited["truncated"] is True
 
     searched = search_column_catalog.invoke(
         {
@@ -687,6 +706,7 @@ def test_column_catalog_tools_support_exact_and_substring_subsets():
     )
     assert searched["query"] == "договор"
     assert searched["total_matches"] == 2
+    assert searched["truncated"] is False
     assert {row["column_role"] for row in searched["rows"]} == {
         "source",
         "target",
@@ -695,6 +715,7 @@ def test_column_catalog_tools_support_exact_and_substring_subsets():
         {"needle": "сообщения", "scope": "source_columns"}
     )
     assert description_search["total_matches"] == 1
+    assert description_search["truncated"] is False
     assert description_search["rows"][0]["column_name"] == "payload"
     assert search_column_catalog.invoke(
         {"needle": " ", "scope": "all_tables"}
@@ -1070,7 +1091,11 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
     search_s2t_schema = tools[
         "search_s2t_transformations"
     ].args_schema.model_json_schema()
-    assert set(search_s2t_schema["properties"]) == {"needle", "limit"}
+    assert set(search_s2t_schema["properties"]) == {
+        "needle",
+        "needles",
+        "limit",
+    }
     description_schema = tools["summarize_table_descriptions"].args_schema.model_json_schema()
     assert description_schema["required"] == ["table_name"]
     assert set(description_schema["properties"]) == {"table_name", "file_id", "limit"}
@@ -2057,6 +2082,16 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "мог не быть embedding" in tools[
         "semantic_search_descriptions"
     ].description
+    assert "наиболее вероятному соответствию" in tools[
+        "semantic_search_descriptions"
+    ].description
+    assert "заменяй его поиском буквальной подстроки" in tools[
+        "semantic_search_descriptions"
+    ].description
+    assert "одной буквальной подстроке" in tools[
+        "search_column_catalog"
+    ].description
+    assert "список альтернатив" in tools["search_column_catalog"].description
     assert "правила ``* -> *`` объединяются в один путь" in tools[
         "trace_neo4j_lineage"
     ].description
@@ -2318,6 +2353,66 @@ def test_search_s2t_transformations_uses_sql_table():
     assert data["total"] == 1
     assert data["rows"][0]["source_table"] == "B700000025_AGR_CRED"
     assert "table_transformation_sql" not in data["rows"][0]
+
+
+def test_search_s2t_transformations_batches_distinct_needles():
+    from agents.tools import search_s2t_transformations
+
+    conn = get_db_connection()
+    conn.executemany(
+        """INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, target_table, target_field,
+         source_table, source_field, transformation_rule)
+        VALUES (?, 41, 's2t', ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                43,
+                1,
+                "b_loansagreement",
+                "i_debtlimit",
+                "l_loansdecision",
+                "c_debtlimit",
+                "ld.c_debtlimit",
+            ),
+            (
+                44,
+                2,
+                "b_loansagreement",
+                "i_debtlimit",
+                "l_loansdecision",
+                "c_debtlimit",
+                "ld.c_debtlimit",
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    data = search_s2t_transformations.invoke(
+        {
+            "needles": ["missing", "I_DEBTLIMIT", "c_debtlimit"],
+            "limit": 100,
+        }
+    )
+
+    assert data["queries"] == ["missing", "I_DEBTLIMIT", "c_debtlimit"]
+    assert data["total"] == 2
+    assert len(data["rows"]) == 2
+    assert all(
+        row["matched_needles"] == ["I_DEBTLIMIT", "c_debtlimit"]
+        for row in data["rows"]
+    )
+
+
+def test_search_s2t_transformations_rejects_empty_batch():
+    from agents.tools import search_s2t_transformations
+
+    data = search_s2t_transformations.invoke({"needles": []})
+
+    assert data["error"] == (
+        "needle or needles must contain a non-empty value"
+    )
+    assert data["rows"] == []
 
 
 def test_summarize_s2t_tables_groups_shared_targets_by_source():

@@ -1,6 +1,11 @@
 import json
 
-from agents.semantic_judge import SemanticJudgeVerdict, judge_agent_response
+from agents.semantic_judge import (
+    IdentifierEvidenceAudit,
+    SemanticJudgeVerdict,
+    _IDENTIFIER_AUDIT_PROMPT,
+    judge_agent_response,
+)
 
 
 class _StructuredJudge:
@@ -28,6 +33,16 @@ class _JudgeModel:
         self.schema = schema
         self.method = method
         return self.structured
+
+
+class _SchemaAwareJudgeModel:
+    def __init__(self, results):
+        self.results = results
+        self.calls = []
+
+    def with_structured_output(self, schema, method=None):
+        self.calls.append(schema)
+        return _StructuredJudge(self.results[schema])
 
 
 def test_semantic_judge_receives_only_user_visible_result():
@@ -59,17 +74,58 @@ def test_semantic_judge_receives_only_user_visible_result():
     }
     assert "worker" not in model.structured.messages[1].content.lower()
     judge_prompt = model.structured.messages[0].content
-    assert "только явные требования query" in judge_prompt
-    assert "фактического выполнения и измеренных результатов" in judge_prompt
-    assert "квалифицированную ссылку" in judge_prompt
-    assert "Возвращённый downstream и есть reverse lineage" in judge_prompt
-    assert "операция не запрошена" in judge_prompt
-    assert "перечисли» само по себе" in judge_prompt
-    assert "второго «обратного» направления нет" in judge_prompt
+    assert "Выдели только явно запрошенные части query" in judge_prompt
+    assert "не требуется фактически исполнять и измерять" in judge_prompt
+    assert "квалифицированная ссылка" in judge_prompt
+    assert "Downstream impact от source и есть\nreverse lineage" in judge_prompt
+    assert "операция не\nзапрошена" in judge_prompt
+    assert "каталоговых/семантических кандидатов недостаточно" in judge_prompt
+    assert "source→target-пара, правило" in judge_prompt
+    assert "слово «перечисли» само по себе" in judge_prompt
+    assert "второго направления не требуй" in judge_prompt
     assert "upstream" not in judge_prompt
-    assert "не доказывает ошибку answer" in judge_prompt
-    assert "ровно\nодну, самую существенную критическую ошибку" in judge_prompt
-    assert "Не добавляй вторичные претензии" in judge_prompt
-    assert "которого нет в query" in judge_prompt
-    assert "транзитивные уровни до terminal targets" in judge_prompt
-    assert "означает status=failed" in judge_prompt
+    assert "пустой/архивный display сам по себе не является ошибкой" in judge_prompt
+    assert "ровно одну самую существенную" in judge_prompt
+    assert "не придумывай отсутствующие в query требования" in judge_prompt
+    assert "транзитивный обход до terminal targets" in judge_prompt
+    assert "Следуй оставшимся проверкам строго по порядку" in judge_prompt
+    assert "Evidence-аудит новых физических идентификаторов уже выполнен" in judge_prompt
+    assert "до полного B" in judge_prompt
+    assert "B::subquery" in judge_prompt
+
+    audit_prompt = _IDENTIFIER_AUDIT_PROMPT
+    assert "таблиц, колонок, ключей" in audit_prompt
+    assert "`display_results[*].content`" in audit_prompt
+    assert "Сам answer не подтверждает" in audit_prompt
+    assert "`display_results=[]` означает ноль evidence" in audit_prompt
+    assert "Не считай\nлогическое продолжение или правдоподобие" in audit_prompt
+    assert "placeholders в угловых скобках" in audit_prompt
+
+
+def test_semantic_judge_rejects_llm_reported_unconfirmed_identifier():
+    model = _SchemaAwareJudgeModel(
+        {
+            IdentifierEvidenceAudit: {
+                "unconfirmed_identifiers": [
+                    "known_table",
+                    "placeholder_column",
+                    "made_up_column",
+                ]
+            },
+            SemanticJudgeVerdict: {
+                "status": "passed",
+                "reason": "Не должен вызываться.",
+            },
+        }
+    )
+
+    verdict = judge_agent_response(
+        query="Для file_id=3 составь SQL для known_table.",
+        answer="SELECT <placeholder_column>, made_up_column FROM known_table",
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "failed"
+    assert "made_up_column" in verdict.reason
+    assert model.calls == [IdentifierEvidenceAudit]

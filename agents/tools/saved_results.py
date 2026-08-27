@@ -18,6 +18,7 @@ from langchain_core.tools import BaseTool, tool
 
 from ..contracts import (
     PreviousResultReference,
+    PreviousResultSchema,
     SavedResultColumn,
     SavedResultDescriptor,
     parse_worker_request,
@@ -140,7 +141,7 @@ def _tabular_payload(payload: Any) -> Optional[Dict[str, Any]]:
         return None
 
     source_total: Optional[int] = None
-    for key in ("total", "row_count"):
+    for key in ("total", "total_matches", "row_count"):
         value = metadata.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             source_total = value
@@ -209,10 +210,6 @@ class SavedResultStore:
         dataset_ref: Optional[str] = None,
     ) -> PreviousResultReference:
         """Store one accepted tool result behind an opaque run-scoped id."""
-        reference = PreviousResultReference(
-            result_id=f"result_{uuid4().hex}",
-            description=description,
-        )
         clean_dataset_ref = str(dataset_ref or "").strip() or None
         with self._lock:
             if (
@@ -222,6 +219,28 @@ class SavedResultStore:
                 raise ValueError(
                     "previous result references an unknown saved dataset"
                 )
+            descriptor = (
+                self._descriptors.get(clean_dataset_ref)
+                if clean_dataset_ref is not None
+                else None
+            )
+            reference = PreviousResultReference(
+                result_id=f"result_{uuid4().hex}",
+                description=description,
+                result_schema=(
+                    PreviousResultSchema(
+                        result_ref=descriptor.result_ref,
+                        row_count=descriptor.row_count,
+                        truncated=descriptor.truncated,
+                        columns=[
+                            column.model_copy(deep=True)
+                            for column in descriptor.columns
+                        ],
+                    )
+                    if descriptor is not None
+                    else None
+                ),
+            )
             self._previous_results[reference.result_id] = {
                 "source_tool": str(source_tool or "unknown_tool"),
                 "source_tool_call_id": str(source_tool_call_id or "").strip(),

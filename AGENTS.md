@@ -1,104 +1,107 @@
 # AGENTS.md
 
-## О проекте
+## Назначение
 
-ETL S2T Parser - приложение для разбора Excel-файлов с S2T-маппингами: определяет структуру заголовков, сохраняет метаданные и примеры строк в SQLite, строит бизнес-саммари через настроенный LLM provider, сопоставляет листы с целевой S2T-схемой и отвечает на вопросы через инструментального агента.
+ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниями, сохраняет исходные данные и каталоги в SQLite, строит Neo4j-lineage и отвечает на вопросы через read-only инструментального агента.
 
-## Основные команды
+## Текущее состояние — 2026-08-27
 
-- Запуск Flask UI: `uv run python app.py`
-- Тесты: `pytest tests/ -q`
-- Тесты с покрытием: `pytest tests/ --cov=. --cov-config=.coveragerc`
+- Ветка: `codex/multiagent-worker-experiment`; рабочее дерево содержит незакоммиченные изменения агентной части и пользовательский каталог `artifacts/` — не удалять и не перезаписывать их.
+- `/chat` по умолчанию использует multiagent; `CHAT_AGENT_MODE=single_agent` оставлен как baseline.
+- Актуальный поток: `supervisor → downstream plan → workers → upstream decision → upstream answer`.
+- Downstream создаёт полный план из 1–8 задач чтения; coordinator допускает максимум два цикла. Workers идут последовательно и могут лениво читать принятые результаты предыдущих workers.
+- Router одновременно выбирает tools, retrieval-skills и schemas; planner вызывает выбранные tools; observer проверяет каждый data-tool result и возвращает только `complete`, `continue` или `reroute`.
+- Upstream получает исходную задачу и принятые evidence, решает `pass/reroute`, затем анализирует данные, формирует ответ и выбирает display-results.
+- Полные tool-results живут только в run-scoped хранилище; последующим workers передаются короткие `result_id`/schema references. SQLite проекта не изменяется.
+- Расширения handoff-схемы `source_total`, 3 и 8 sample rows проверены на GigaChat-2-Max и отклонены: они увеличивали prompt, но не решали последовательный перебор кандидатов. Handoff остаётся компактным; planner читает полный результат через `read_previous_result`.
+- `search_s2t_transformations` принимает совместимый одиночный `needle` и batch `needles` до 50 технических имён. Для набора из прошлого результата planner должен сделать один batch-вызов; исходные S2T-дубликаты сохраняются.
+- Downstream prompt содержит компактные возможности чтения и краткие описания публичных таблиц. Эксперимент с сильно сокращёнными правилами и полными списками колонок откатан: на GigaChat-2-Max он заменил семантический поиск лексическим S2T-поиском.
+- Текущий downstream system prompt занимает 3502 символа: 2180 правил, 520 описания возможностей и 802 справка по таблицам.
+- Корректный план «семантический каталог → технические имена → точный S2T» получался в live-прогонах GigaChat-3-Ultra `20260826_124348`, Lazy Dependencies `20260827_0430` и GigaChat-2-Max `20260827_084904`. Последний — текущий целевой вариант из двух workers.
+- Эксперимент GigaChat-2-Max `20260827_090853` с сокращённым prompt и полными списками колонок был семантически хуже: план начинался с лексического S2T-поиска по русскому бизнес-тексту. Изменения откатаны.
+- После batch-изменения 192 релевантных unit-теста прошли. Изолированный GigaChat-2-Max прогон с фиксированным semantic-result из 10 колонок завершился двумя data-вызовами (`read_previous_result` и один batch S2T search) при компактной схеме. Полный HTTP-прогон `20260827_100855` провалился раньше handoff: downstream снова выбрал лексический поиск по бизнес-терминам вместо семантического каталога; это отдельная неустойчивость плана.
+- LLM-as-judge отделён от агентной модели: для GigaChat по умолчанию используется `GigaChat-2-Pro`, независимо от `GIGACHAT_MODEL`; переопределение — `GIGACHAT_JUDGE_MODEL`. Для запросов по сохранённым данным отдельный короткий structured-вызов сначала извлекает неподтверждённые физические идентификаторы, затем основной judge оценивает маршрут и полноту.
 
-## Карта архитектуры
+## Основные компоненты
 
-- `app.py` - тонкий Flask API: маршруты загрузки, progress, summary, S2T transformations и chat; `/chat` по умолчанию запускает multiagent supervisor, а `CHAT_AGENT_MODE=single_agent` включает немультиагентный baseline для сравнительных live-прогонов.
-- `processing/excel.py` - механический разбор загруженного Excel: preview, существующее определение заголовков, построение колонок и чтение сырых строк без доменной очистки.
-- `agents/agent.py` - определение заголовков Excel и входная точка исходного немультиагентного chat agent; baseline использует тот же tool router и общий planner/tool/observer/responder LangGraph.
-- `agents/header_classifier.py` - выбор строки заголовка переданной CatBoost-моделью по 22 строковым признакам.
-- `agents/tools/routing.py` - отдельный LLM tool-router: модель получает раздельные компактные каталоги внешних data tools, retrieval-only skills и schemas и через `with_structured_output(ToolRoute, method="function_calling")` возвращает строго валидируемые списки; skills задают только оркестрацию получения исходных данных, а не производный анализ. Tools образуют доступную planner палитру, поэтому при неоднозначности router включает все уместные read-only возможности, не требуя минимального или взаимоисключающего выбора. Все три списка выбираются одновременно и независимо, каждый из них может быть пустым независимо от остальных, а выбранные runtime skills и фактические схемы/маппинги загружаются лениво. Внутренний `finish_worker` в каталог router не входит. После двух невалидных ответов router используется ограниченный общий read-only fallback по SQLite, Neo4j, Excel-значениям и семантическим описаниям; при reroute он дополняет, а не заменяет предыдущую палитру.
-- `agents/chat_graph.py` - общий многошаговый LangGraph с нативным tool calling: единственный observer через явный function-calling возвращает строгий `Observation(status, gap, accepted_tool_call_ids, facts, limitations)` только со статусами `complete`, `continue` и `reroute`, где каждый подтверждённый факт ссылается на `evidence_id` принятого результата; строковый `"null"` нормализуется до проверки status. Невалидная структура получает до пяти повторных попыток на том же payload без повторного data-tool; после их исчерпания worker возвращает техническую ошибку контракта, не создавая фиктивную observation. Отдельного completion audit и второго смыслового LLM-review нет. Legacy chat после planner использует responder, а изолированный worker обычно завершается native call `finish_worker(summary)`.
-- `agents/contracts.py` - единые типизированные границы worker/coordinator: `PlanStep`/`WorkerPlan`, `Observation`, `EvidenceFact`, `EvidenceArtifact`, `WorkerOutcome`, `PreviousResultReference`, `UpstreamDecision` и `UpstreamOutput`. `UpstreamDecision` линейно предшествует ответу и содержит обязательное `decision="pass" | "reroute"` и необязательный `problem`; только после `pass` отдельный `submit_upstream_answer` требует непустой `answer`, а evidence IDs оставляет опциональными. Upstream получает только `original_task` и принятые evidence с tool name, args, preview, truncated и безопасным display ID; worker summary, facts, limitations и runtime refs туда не передаются. Workers одного плана изолированы и не получают результаты друг друга.
-- `agents/worker.py` - экспериментальный изолированный read-only worker: получает одну самодостаточную task, внутри одновременно выбирает tools/retrieval skills/schemas, лениво загружает выбранные схемы и запускает planner/tool/observer-цикл. Task является единственным критерием завершения; отдельного дублирующего `required_evidence` нет. Если router вернул `tools=[]`, worker использует внутренний `analyze_known_facts`, который не читает данные. Наружу возвращается один `WorkerOutcome`: `finish_worker.summary`, facts и только принятые evidence с компактными аргументами и ограниченным preview. Каждый принятый полный tool result сохраняется под run-scoped `result_id`; handoff-description строится детерминированно только из tool name и точных args, а `read_previous_result` лениво читает полный результат при необходимости. Полные UI-результаты остаются за отдельным непрозрачным `display_ref`.
-- `agents/tools/saved_results.py` - временное хранилище одного coordinator-запуска: сохраняет принятые полные tool results под непрозрачными `result_id`; `read_previous_result` лениво возвращает их последующим workers. Табличные SQLite-результаты дополнительно материализуются с внутренним `result_ref`, схемой и признаком `truncated`, чтобы `query_saved_result` мог выполнять read-only SQL только над выбранной relation `result`. Хранилище удаляется после coordinator и не изменяет `excel_data.db`.
-- `agents/tools/sql.py` - `run_sql` выполняет произвольный read-only SQL по публичной SQLite-схеме; специализированные S2T- и каталожные запросы по возможности выполняются готовыми tools.
-- `agents/tools/s2t.py` - специализированные read-only S2T-tools; `list_s2t_table_mapping` имеет однозначный контракт только для точной пары `source_table → target_table`, а `get_s2t_rules_by_ids` принимает `transformation_id` из Neo4j lineage и возвращает точные правила без генерации свободного SQL моделью.
-- `agents/coordinator.py` - coordinator разделён по направлению потока и допускает максимум два полных цикла `downstream plan → workers → upstream`. Downstream planner возвращает последовательность независимых `PlanStep(task)` только на получение данных; каждая task самодостаточна, tools/skills в plan не выбираются, отдельные worker-задачи для анализа не создаются. Workers выполняются последовательно, но получают только собственную task и устойчивый context без результатов, ссылок или descriptions прошлых workers. Сформированный план исполняется без программной оценки числа шагов, формулировок или полноты; код только декодирует обязательный native call. После workers upstream сначала вызывает строгий `submit_upstream_data_decision`: `reroute` полностью сбрасывает `worker_runs` текущего цикла и передаёт следующему downstream только необязательный `problem`, а `pass` линейно запускает отдельный `submit_upstream_answer`. Только answer-этап выполняет SQL/S2T-анализ, формирует ответ и выбирает display evidence. Facts, evidence, tool args, previews, datasets и summaries между циклами не переносятся. Отдельного semantic reviewer/repair нет. На последнем цикле контракт допускает только `pass`, после чего answer явно указывает возможную нехватку данных. Перед структурным repair невалидный native call закрывается соответствующим `ToolMessage`, чтобы история оставалась допустимой для GigaChat.
-- `agents/supervisor.py` - верхний supervisor LangGraph `supervisor -> coordinator -> END`: supervisor один раз решает, нужен ли доступ к данным, и при необходимости передаёт coordinator конкретную самодостаточную task и отдельный context. Task содержит текущее исполнимое поручение и все нужные ему разовые факты с уже разрешёнными ссылками; context содержит только устойчивые правила, определения, предпочтения, инварианты и общие ограничения, установленные в диалоге, без пересказа task и истории. Context ограничен 4000 символами и не содержит tools, skills или план. Неявного выбранного/активного файла в состоянии агента нет; конкретный файл определяется только из явного запроса или однозначной ссылки в истории и встраивается в task. Последовательные продолжения выполняются внутри линейного coordinator-плана; агрегированный coordinator-ответ завершает запрос без повторного supervisor-аудита, а выбранные display refs разрешаются только на границе ответа UI.
-- `agents/run_metrics.py` - включаемая только для live-проверок пассивная трассировка одного supervisor-запуска: фактические LLM/tool-вызовы, линейные worker tasks, worker routes, observations со status/gap/provenance, `UpstreamOutput`, выбранные display tools, длительность и provider token usage по семантическим этапам (`supervisor`, `downstream_plan`, `router`, `worker_planner`, `observer`, `finish_worker`, `upstream`; legacy-вызовы размечаются отдельно). Полные tool results в метрики не копируются; завершённый снимок забирается тестом по `session_id`.
-- `scripts/run_live_agent_benchmark.py` - последовательный запуск одинаковых real-HTTP live-сценариев для `multiagent`/`single_agent` на выбранном LLM provider с отдельными transcript/JUnit и итоговым сравнительным Markdown-отчётом; запросы не пакетируются и не выполняются параллельно. Опциональный `--llm-judge` отдельным вызовом настроенной модели оценивает только исходный запрос, публичный answer и ограниченное содержимое display-results; `failed` или ошибка judge валят pytest-сценарий в autouse-finalizer после его обычных проверок.
-- `agents/summarizer_agent.py` - извлечение семантического каталога и один LLM-вызов для summary/description.
-- `sheet_skills/s2t.py` - sheet skill `usefull_col_extraction`: inspect, deterministic/LLM matching, валидация строк и построение записей S2T.
-- `sheet_skills/table_catalog.py` - sheet skill каталогов: построчно сохраняет `table_name` и `description` из групп `source_tables`/`target_tables`.
-- `sheet_skills/column_catalog.py` - строит `source_columns`/`target_columns`: заголовки специализированных листов сопоставляются общим механизмом exact/fuzzy по `column_mapping.json`, затем одним LLM-вызовом для листа с неполным набором ролей и сохранением подтверждённых новых aliases заголовков; специализированные листы имеют приоритет, недостающие колонки и атрибуты добираются из сырых строк S2T в `data` с учётом расположения одинаковых заголовков в source/target-блоках; конфликтующие описания одной `table_name`/`column_name` отражаются в отчёте, но не превращаются в aliases ETL-колонки.
-- `sheet_skills/structured_metadata.py` - sheet skill для `additional_objects` и `pxf_to_a`; `sheet_skills/additional_objects.py` преобразует SQL дополнительных объектов в строки общей ETL-таблицы, общая механика сопоставления полей находится в `sheet_skills/configured_rows.py`.
-- `storage/s2t.py` - транзакционная запись, очистка, чтение, поиск/агрегация, проверка S2T-записей и детерминированный backfill ETL-слоёв.
-- `storage/database.py` - актуальная публичная SQLite-схема: `files`, `file_sheet_headers`, `source_tables`, `target_tables`, `source_columns`, `target_columns`, `additional_objects`, `pxf_to_a`, `s2t_transformations`, `data`.
-- `graph_storage/` - изолированные настройки и lifecycle Neo4j driver.
-- `services/graph_sync.py` - пересобирает Neo4j-проекцию lineage одного файла: `ETLColumn`/`TRANSFORMS_TO` и `ETLTable`/`TABLE_TRANSFORMS_TO`; исходные факты остаются в SQLite.
-- `config/` - загрузчики и JSON-конфигурации sheet groups, column mappings и useful-column extraction.
-- `agents/tools/` - тематические модули с декорированными `@tool` и отдельный read-only/write registry.
-- `agents/tools/additional_objects.py` - точный `list_additional_objects` и подстрочный `search_additional_objects` для исходных строк `additional_objects` с `file_id`, происхождением и полным SQL без выполнения этого SQL.
-- `agents/observability.py` - необязательная интеграция Langfuse.
-- `services/logging_setup.py` - единая настройка console logging и ротационного UTF-8 файла `logs/agent.log`.
-- `agents/prompts/` - retrieval-only runtime skills worker, контекст chat-agent и постоянные правила анализа upstream coordinator.
-- `templates/chat_app.html` - основной chat-first веб-интерфейс; корневой маршрут `/` и совместимый `/chat_app` показывают одну страницу с чатом, загрузкой и просмотром данных.
+- `app.py` — Flask API, загрузка файлов, просмотр данных и `/chat`.
+- `processing/excel.py`, `sheet_skills/` — механический Excel-разбор и доменное извлечение каталогов/S2T.
+- `storage/database.py`, `storage/s2t.py` — публичная SQLite-схема и транзакционная запись.
+- `services/graph_sync.py`, `graph_storage/` — производная Neo4j-проекция lineage; исходные факты остаются в SQLite.
+- `agents/supervisor.py` — выделяет самодостаточную task и устойчивый context; не хранит неявный активный файл.
+- `agents/coordinator.py` — downstream-план, последовательный запуск workers, два upstream-этапа и reroute.
+- `agents/worker.py`, `agents/chat_graph.py` — router/planner/tool/observer/finish-worker цикл.
+- `agents/tools/routing.py` — компактные каталоги и structured selection tools/skills/schemas.
+- `agents/tools/saved_results.py` — временные полные результаты, `read_previous_result` и read-only SQL над сохранённой relation `result`.
+- `agents/tools/s2t.py` — точные S2T-фильтры и ролево-нейтральный batch-поиск по техническим именам из предыдущих результатов.
+- `agents/run_metrics.py`, `scripts/run_live_agent_benchmark.py` — пассивная трассировка и последовательные real-HTTP live-сценарии.
 
-## Правила для доработок
+## Поток агентного запроса
 
-- Сначала проверяй существующие паттерны проекта; не вводи новый фреймворк без явной пользы.
-- Храни факты о файлах, листах, колонках и маппингах в SQLite через существующий слой `storage/database.py`.
-- Не придумывай `file_id`, имена листов, колонок, ETL source/target tables или S2T rows: получай их через инструменты или SQL.
-- Для логических ETL/S2T-таблиц вида `t_*` не используй `PRAGMA` как для физических SQLite-таблиц; ищи их в `s2t_transformations.target_table` и связанных строках трансформаций.
-- Перед добавлением нового инструмента агента используй `@tool(parse_docstring=True)`, русский docstring и типы; затем явно добавляй готовый `BaseTool` в `agents/tools/registry.py` и обновляй тесты.
-- Runtime LLM-provider для агентной части и S2T matching настраивается через `LLM_PROVIDER`; по умолчанию используется `gigachat`. Альтернативы: OpenAI-compatible `openrouter` или локальный `ollama`. Не добавляй молчаливые non-LLM fallback-записи: если LLM не дал валидный план, возвращай ошибку.
-- Unit-тесты могут мокать транспорт LLM для проверки обвязки, но это не считается проверкой качества модели. Реальные проверки модели выноси в отдельные integration/smoke тесты с явным запуском.
-- Сохраняй русские промпты и документацию в UTF-8. Не переписывай русские строки только из-за mojibake в консоли PowerShell.
-- Summarizer делает один LLM-вызов по семантическому каталогу: извлекает описания таблиц, представлений, атрибутов и полей из всех листов с данными (включая пропущенные, если строки сохранены) и передаёт их в LLM без сырых S2T-строк, SQL и метаданных об исключённых листах.
+1. `supervisor` один раз решает, нужен ли доступ к данным. Он передаёт coordinator текущую самодостаточную `task` и отдельный устойчивый `context` до 4000 символов; история, tools и план в context не копируются.
+2. `downstream` возвращает обязательный native call `submit_worker_plan` с 1–8 `PlanStep(task)`. В plan нет tools/skills/schemas и отдельных задач анализа, сравнения или оформления.
+3. Workers выполняются последовательно. Coordinator добавляет каждой последующей task короткие references всех принятых результатов предыдущих workers; содержимое читается явно через `read_previous_result` либо анализируется через `query_saved_result`. Когда строки задают несколько однотипных входов, planner использует batch-аргумент соответствующего tool, а не расходует цикл на последовательный перебор. Prompt требует не использовать handoff, если следующая task исполнима прямо из исходного запроса.
+4. Внутри worker router одним structured вызовом независимо выбирает списки tools, retrieval-skills и schemas. Они могут быть пустыми; выбранные skills/schemas подгружаются лениво. После двух невалидных ответов используется ограниченная общая read-only палитра; при reroute новая палитра дополняет прежнюю.
+5. Planner вызывает data-tool. После каждого результата observer проверяет соответствие именно worker-task и возвращает `complete`, `continue` или `reroute`; статуса `blocked` нет. Невалидный structured observer-output повторяется до пяти раз на том же payload без повторного data-tool.
+6. `finish_worker` завершает worker и отдаёт summary, факты и только принятые evidence. Подтверждённые факты ссылаются на принятый `evidence_id`.
+7. После всех workers upstream получает только `original_task` и evidence: tool name, точные args, preview, `truncated` и безопасный display ID. Worker observations, summaries и runtime refs туда не передаются.
+8. `submit_upstream_data_decision` выбирает `pass` или `reroute`. Reroute сбрасывает результаты текущего цикла и передаёт следующему downstream только краткий `problem`; максимум два полных цикла. После `pass` отдельный `submit_upstream_answer` анализирует evidence, формирует ответ и выбирает display evidence.
 
-## Правила для агентной части
+## Результаты tools и наблюдаемость
 
-- Единый диалог должен быть read-only по умолчанию: отвечать про файлы, листы, заголовки, summary и S2T transformations.
-- Мутации вроде загрузки файла, повторного S2T refresh или очистки `s2t_transformations` должны идти только через явное действие пользователя или подтверждение.
-- Перед `usefull_col_extraction` запускай sheet-group subagent: exact/fuzzy по `config/sheet_groups.json`, затем LLM только для несматченных листов, затем запись новых алиасов в текущий `config/sheet_groups.json`. Шаг извлечения полезных колонок не должен сам решать группу листа по имени.
-- Запись `s2t_transformations` выполняется через target `s2t_transformations` в `usefull_col_extraction.json`: subagent выбирает колонки в два шага - сначала exact/fuzzy по `column_mapping.json`, затем настроенный OpenAI-compatible LLM только для листов, где сматчились не все настроенные роли.
-- `usefull_col_extraction` должен отправлять в настроенный LLM максимум один запрос на один неполностью сматченный лист и просить компактный ответ `column_roles`: каждой колонке по плоскому имени `column_name` сопоставляется ключ `mapping_field` из настроенной группы `column_mapping_json` или `null`.
-- Для targets `source_columns`/`target_columns` применяй тот же column-role resolver: если exact/fuzzy не закрыл хотя бы одну настроенную роль, отправляй не больше одного LLM-запроса на лист, требуй полный валидный `column_roles`, сохраняй подтверждённые aliases и не записывай частичный каталог при ошибке ответа.
-- Не отправляй LLM внутренние ID (`file_id`, `column_id`), `column_index`, полный `header_path`, valid/critical/nullable роли, `role_to_column_mapping_field` и эвристические подсказки для matching; в prompt достаточно `sheet_name`, настроенного `column_mapping_json`, плоского `column_name` и samples.
-- Exact/fuzzy matching можно использовать внутри Python для evidence и первичного сопоставления. В prompt это не отправлять; если deterministic pass нашел все v1-роли, LLM для этого листа не вызывается.
-- Если `usefull_col_extraction` подтвердил header с ролью не exact-ом, добавляй фактическое название header в `column_mapping.json` для соответствующего поля, без дублей.
-- Для вопросов по маппингам и трансформациям используй `search_s2t_transformations`, `list_s2t_transformations` или read-only SQL по `s2t_transformations`; Neo4j используй только для lineage колонок.
-- Полная точная пара `source_table.source_field → target_table.target_field`, включая просьбу объяснить или проанализировать сохранённую трансформацию, сначала читается через `list_s2t_transformations` с отдельными ролевыми фильтрами; сама стрелка не превращает одну пару в многошаговый `trace_transformation_path`.
-- Для исходных Additional objects используй `list_additional_objects` с точными file/name/id/sheet/row-фильтрами или `search_additional_objects` для подстроки в name/SQL; `trace_transformation_path` оставляй для связанного S2T-пути, а не простого списка объектов.
-- Для точных фильтров по `source_columns`/`target_columns` используй `list_column_catalog`, для подстроки — `search_column_catalog`, а для смысловой близости описаний — `semantic_search_descriptions` с колонковым scope и структурными фильтрами подвыборки.
-- Если на специализированном листе колонок отсутствует `table_name`, не наследуй имя предыдущей строки: разрешай таблицу только по однозначной паре с тем же `column_name` на сыром S2T-листе; неоднозначные и ненайденные строки сохраняй без придуманной таблицы и отражай в отчёте.
-- Не дедуплицируй строки `source_tables`, `target_tables`, `additional_objects`, `pxf_to_a` и `s2t_transformations`: одинаковые строки исходного Excel являются отдельными фактами.
-- `source_layer` и `target_layer` в `s2t_transformations` вычисляй по семантической группе исходного листа детерминированными правилами из `config/table_layers.json`; имена таблиц для этого не анализируй и не добавляй слои в обязательные LLM-роли.
-- После сохранения `additional_objects` разбирай каждый непустой SQL через SQLGlot с Greenplum-диалектом: создавай в `s2t_transformations` колонковые связи для выходов SELECT, включая вложенные SELECT/CTE. Для промежуточных scope additional objects сохраняй `NULL -> NULL`; только связи, входящие в конечную таблицу объекта, получают `NULL -> B`. Слой источника не определяй даже при наличии `source_table` в SQL.
-- Не обрезай SQL и другие значения Excel при сохранении в `data`; ошибки одного additional object сохраняй в отчёте и продолжай обработку остальных объектов.
-- Если в строке S2T отсутствует `target_table`, возвращай явную ошибку с листом и номером строки до начала транзакции; существующие `s2t_transformations` не изменяй.
-- Чат не передаёт и не хранит неявный активный `file_id`. Для файловых tools используй только идентификатор, явно названный пользователем, однозначно полученный из истории или найденный через `list_files`/`resolve_file`. Глобальная `s2t_transformations` никогда не ограничивается таким `file_id`.
+- Каждый принятый полный tool-result сохраняется на время coordinator-запуска под непрозрачным `result_id`; `display_ref` хранится отдельно от текстового preview.
+- Табличный результат дополнительно получает `result_ref`, список колонок и `truncated`; `query_saved_result` исполняет read-only SQL только над выбранной relation `result`.
+- Хранилище удаляется после coordinator и не пишет во внешнюю `excel_data.db`.
+- `agents/run_metrics.py` пишет этапы `supervisor`, `downstream_plan`, `router`, `worker_planner`, `observer`, `finish_worker`, `upstream`, планы, маршруты, observations, display-tools, время и provider tokens. Полные tool-results в метрики не копируются.
+- `agents/observability.py` содержит необязательную Langfuse-интеграцию; `logs/agent.log` — ротационный UTF-8 лог.
 
-## Проверка изменений
+## SQLite-данные
 
-- Для изменений Flask routes и UI-чата обновляй `tests/test_app.py`.
-- Для tools и агентной логики обновляй `tests/test_agent_tools.py`.
-- Для хранения S2T-строк обновляй `tests/test_database.py` и `tests/test_s2t_transformations.py`.
-- После изменений запускай минимум релевантные тесты, а перед крупным merge - `pytest tests/ -q`.
+Публичные таблицы: `files`, `file_sheet_headers`, `source_tables`, `target_tables`, `source_columns`, `target_columns`, `additional_objects`, `pxf_to_a`, `s2t_transformations`, `data`. Для обычных вопросов про «таблицы», DDL и схему показывать именно их, а не служебную реализацию SQLite.
 
-## Актуальные уточнения агентной части
+- `files`: `file_id`, имя файла, модель, время загрузки, summary, description и embedding.
+- `file_sheet_headers`: файл, лист, статус пропуска, координаты заголовка, структура и `headers_json`.
+- `source_tables`/`target_tables`: `id`, `file_id`, `sheet_name`, `row_num`, `table_name`, `description`, embedding. Одинаковые строки сохраняются отдельно.
+- `source_columns`/`target_columns`: происхождение, `table_name`, `column_name`, `data_type`, `primary_key`, `not_null`, `description`, embedding. Embedding строится из размеченных имени и описания, а при пустом описании — только из имени.
+- `s2t_transformations`: происхождение, `target_field`, `source_field`, `target_table`, `source_table`, `transformation_rule`, nullable `source_layer`/`target_layer`; включает сырой S2T и lineage из Additional objects.
+- `additional_objects`: происхождение, имя и полный SQL; `pxf_to_a`: происхождение и external/materialized/replica/SOD.
+- `data`: полные значения Excel с `file_id`, именем листа, строкой и `column_id`; SQL и длинные значения не обрезаются.
+- Aliases относятся только к физическим заголовкам Excel и хранятся в `config/column_mapping.json`, не в ETL-каталогах.
 
-- Когда пользователь спрашивает про "таблицы", по умолчанию имеются в виду таблицы ETL/S2T-слоев и сохраненные результаты анализа этих слоев, прежде всего `s2t_transformations`, а не физические служебные таблицы SQLite.
-- `data` входит в публичную схему и доступна для read-only анализа сохранённых значений строк Excel.
-- Для обычных вопросов про DDL/схему показывай публичную ETL-схему: `files`, `file_sheet_headers`, `source_tables`, `target_tables`, `source_columns`, `target_columns`, `additional_objects`, `pxf_to_a`, `s2t_transformations` и `data`.
+## Excel/S2T extraction
 
-## Актуальная SQLite-схема
+- `processing/excel.py` механически определяет preview/header и сохраняет сырые строки без доменной очистки.
+- Перед полезными колонками sheet-group resolver делает exact/fuzzy по `config/sheet_groups.json`, затем один LLM-вызов только для несопоставленных листов и сохраняет подтверждённые aliases.
+- `usefull_col_extraction` и каталоги колонок используют один resolver ролей: exact/fuzzy по `config/column_mapping.json`, затем максимум один LLM-вызов на лист, если сматчились не все настроенные роли. Невалидный LLM-ответ не создаёт частичный каталог.
+- В LLM передаются только `sheet_name`, настроенные mapping fields, плоское `column_name` и samples. Не передавать `file_id`, `column_id`, индекс, полный header path, valid/critical/nullable роли и эвристики matching.
+- Специализированные source/target column-листы имеют приоритет; отсутствующие колонки и атрибуты добираются из сырых S2T-строк в `data` с учётом стороны одинаковых заголовков.
+- `not_null`, `primary_key` и типы сохраняются как нормализованные значения; неизвестное остаётся `NULL`, а не угадывается. Конфликтующие описания отражаются в отчёте и не превращаются в aliases ETL-колонки.
+- `source_layer`/`target_layer` вычисляются детерминированно по группе листа через `config/table_layers.json`, не по именам таблиц и не через LLM.
 
-- Для текущей задачи показывай пользовательски значимые таблицы: `files`, `file_sheet_headers`, `source_tables`, `target_tables`, `source_columns`, `target_columns`, `additional_objects`, `pxf_to_a`, `s2t_transformations`, `data`.
-- `source_tables` и `target_tables` хранят `id`, `file_id`, `sheet_name`, `row_num`, `table_name`, `description`; одинаковые исходные строки сохраняются отдельно.
-- `source_columns` и `target_columns` хранят связанную с `table_name`/`column_name` метаинформацию: `data_type`, `primary_key`, `not_null`, `description` и `description_embedding`; embedding строится из размеченных `column_name` и `description`, а при пустом описании — только из имени. Происхождение строки определяется по `file_id`, `sheet_name` и `row_num`, отдельного `metadata_source` нет. Aliases относятся к физическим заголовкам исходных листов и хранятся в `column_mapping.json`, а не в ETL-каталогах. Отсутствующие специализированные листы и значения дополняются только из сырых строк S2T в `data`.
-- `s2t_transformations` является общей таблицей колонковых ETL-связей: содержит строки исходного S2T и lineage, извлечённый из `additional_objects.sql`; nullable `source_layer` и `target_layer` вычисляются по группе исходного листа.
-- `additional_objects` хранит `id`, extraction metadata, `name`, `sql`; `pxf_to_a` хранит extraction metadata, `external_a_table`, `materialized_storage`, `replica_table`, `sod`.
-- `data` — публичная таблица для анализа и добора значений: `id`, `file_id`, `table_name`, `row_num`, `column_id`, `value`.
-- `table_name` в `data` хранит имя листа/таблицы Excel, чтобы анализировать значения без лишнего join.
-- Для обычных вопросов пользователя про таблицы, DDL или схему показывай `files`, `file_sheet_headers`, `source_tables`, `target_tables`, `source_columns`, `target_columns`, `additional_objects`, `pxf_to_a`, `s2t_transformations` и `data`.
+## Обязательные правила
+
+- Чат read-only по умолчанию. Загрузка, refresh и очистка требуют явного действия пользователя.
+- Не придумывать `file_id`, листы, таблицы, колонки, S2T-строки и роли source/target; получать их из tools/SQL/evidence.
+- Не хранить неявный активный `file_id`. Глобальную `s2t_transformations` никогда не ограничивать файловым `file_id`.
+- Логические ETL-таблицы вида `t_*` искать в S2T, а не через SQLite `PRAGMA`.
+- Точную пару `source_table.source_field → target_table.target_field` сначала читать через точные ролевые S2T-фильтры; Neo4j использовать для lineage, а не вместо S2T.
+- Для колонок: точный поиск — каталог, одна явно данная буквальная подстрока — каталоговый search, бизнес-смысл/назначение/описание при неизвестном имени — semantic search; при неизвестной роли искать source и target. Не заменять смысловой запрос набором подстрок, синонимов или переводов.
+- Для Additional objects использовать точный/подстрочный read-only поиск с полным SQL. `trace_transformation_path` предназначен для связанного S2T-пути.
+- Для точной известной S2T-роли/таблицы использовать точный list-инструмент; для фрагмента или неизвестной роли — search; произвольный `run_sql` оставлять нестандартным срезам, не покрытым готовыми tools.
+- Полная SQL-строка анализируется SQL-инструментами; сохранённая `table.column` сначала ищется в S2T/Neo4j. Не выдавать текст transformation rule за исполняемый SQL.
+- Не дедуплицировать одинаковые строки исходного Excel. Отсутствующий `target_table` в S2T — ошибка до транзакции.
+- Колонковые листы сопоставлять exact/fuzzy по config, затем максимум одним LLM-вызовом на неполный лист; не отправлять LLM внутренние ID и эвристические служебные поля. Подтверждённые новые названия заголовков сохранять как aliases.
+- Если на колонковом листе нет `table_name`, разрешать его только по однозначному совпадению `column_name` на сыром S2T-листе; иначе сохранять без придуманной таблицы и сообщать в отчёте.
+- Additional objects после сохранения разбирать SQLGlot с Greenplum-диалектом, включая CTE и вложенные SELECT. Для промежуточных scope хранить `NULL → NULL`; только связи в конечную таблицу получают `NULL → B`. Ошибка одного объекта не останавливает остальные.
+- Новые agent tools оформлять через `@tool(parse_docstring=True)` с русским docstring и типами, регистрировать в `agents/tools/registry.py` и покрывать тестами.
+- Использовать существующие паттерны, UTF-8 и настроенный `LLM_PROVIDER` (`gigachat`, `openrouter`, `ollama`); не добавлять молчаливые non-LLM записи при невалидном ответе модели.
+
+## Проверка
+
+- UI/API: `tests/test_app.py`.
+- Tools и агентная логика: `tests/test_agent_tools.py`, `tests/test_agent.py`, `tests/test_worker.py`, `tests/test_coordinator.py`.
+- Хранение и S2T: `tests/test_database.py`, `tests/test_s2t_transformations.py`.
+- Unit: `pytest tests/ -q`; покрытие: `pytest tests/ --cov=. --cov-config=.coveragerc`.
+- Live quality проверяется отдельно через `scripts/run_live_agent_benchmark.py`: real-HTTP сценарии идут последовательно, сохраняют transcript/JUnit/comparison report; mock-тесты не оценивают качество модели.
+- `--llm-judge` оценивает только исходный запрос, публичный answer и ограниченные display-results. Новые физические идентификаторы в основанном на сохранённых данных SQL требуют подтверждения display либо явного placeholder; маршрут `A → B` должен достигать точного `B`. Не использовать judge как замену ручному разбору плана и evidence.
+- Запуск UI: `uv run python app.py`.

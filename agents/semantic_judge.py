@@ -8,7 +8,7 @@ from typing import Any, Literal, Sequence
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .llm_factory import create_chat_model
+from .llm_factory import create_judge_chat_model
 
 
 JUDGE_MAX_DISPLAY_CHARS = 24_000
@@ -31,51 +31,83 @@ class SemanticJudgeVerdict(BaseModel):
         return clean_value
 
 
+class IdentifierEvidenceAudit(BaseModel):
+    """Physical identifiers introduced without user-visible evidence."""
+
+    unconfirmed_identifiers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Все конкретные физические идентификаторы answer, которых дословно "
+            "нет в query и display_results.content."
+        ),
+    )
+
+
+_IDENTIFIER_AUDIT_PROMPT = """
+Ты выполняешь только evidence-аудит физических идентификаторов, без оценки полноты
+или полезности ответа. Извлеки все конкретные имена таблиц, колонок, ключей,
+справочников и полей фильтра, которые встречаются в answer, но дословно отсутствуют
+и в query, и в `display_results[*].content`.
+
+`display_results=[]` означает ноль evidence. Сам answer не подтверждает собственные
+утверждения. SQL-шаблон, план и тест-протокол не являются исключениями. Не считай
+логическое продолжение или правдоподобие подтверждением. Не включай SQL-ключевые
+слова, псевдонимы и placeholders в угловых скобках. Ничего не объясняй: верни только
+структурированный список unconfirmed_identifiers.
+""".strip()
+
+
 _JUDGE_PROMPT = """
 Ты независимый LLM-as-judge. Оцени только выполнение дословного query
 по пользовательским answer и display_results.
 
-Сначала мысленно выдели только явные требования query. Не добавляй новые
-действия, факты, форматы или критерии. В частности:
-- если просят составить протокол, план, шаблон или критерии, не требуй их
-  фактического выполнения и измеренных результатов;
-- не требуй повторять в answer уже заданные в query идентификаторы, если ответ
-  однозначен;
-- таблица уже перечислена, если её полное имя входит в квалифицированную ссылку
-  table.column; не требуй дублировать её отдельным списком;
-- полный сохранённый SQL допустим как transformation rule, если query не требует
-  именно выражение одного поля;
-- в этом ETL-домене reverse lineage от изменяемого source означает downstream impact:
-  обход от source к зависимым targets. Возвращённый downstream и есть reverse lineage;
-  второго «обратного» направления нет.
+Evidence-аудит новых физических идентификаторов уже выполнен отдельным LLM-вызовом.
+Здесь не повторяй его. Следуй оставшимся проверкам строго по порядку.
 
-Верни status=passed, если совокупность answer и display_results:
-- отвечает на все явно запрошенные части;
-- сохраняет объекты, роли, направление и ограничения;
-- не содержит явных фактических противоречий.
-Фраза answer «операция не запрошена» противоречит query, если эта операция там явно запрошена.
+1. Проверка маршрута.
+Если query задаёт путь от A до B, answer должен показать непрерывную цепочку именно
+до полного B. Общий префикс недостаточен: B::subquery и B::branch не равны B.
+Фраза «напрямую» при остановке на другом объекте означает failed. Для impact или
+reverse lineage нужен транзитивный обход до terminal targets либо явное утверждение,
+что обход завершён и дальнейших descendants нет. Downstream impact от source и есть
+reverse lineage; второго направления не требуй.
 
-Пустой или архивно недоступный payload display_results не доказывает ошибку answer.
-Не ставь failed только из-за невозможности независимо перепроверить факт по display.
-Но если пользователь явно просил показать полный табличный результат, отсутствие такого
-результата в answer и display_results является невыполненным требованием.
-Слово «перечисли» само по себе не является требованием display или табличного payload.
+2. Проверка требований.
+Выдели только явно запрошенные части query. Совокупность answer и display_results
+должна выполнить каждую из них, сохранить объекты, роли, направление и ограничения
+и не содержать противоречий. Если требуются S2T, mapping или transformation rule,
+одних каталоговых/семантических кандидатов недостаточно: нужна конкретная
+source→target-пара, правило либо явный результат их поиска. Фраза «операция не
+запрошена» противоречит query, если операция явно запрошена.
 
-Никогда не используй как единственную причину status=failed:
-- отсутствие второго «обратного» направления в downstream impact;
-- недоступность архивного display payload, если требуемый факт уже есть в answer;
-- невозможность независимо подтвердить факт, если в answer нет явного противоречия.
+Уточнения:
+- протокол, план или шаблон не требуется фактически исполнять и измерять;
+- не требуй повторять идентификатор из query, если ответ однозначен;
+- квалифицированная ссылка table.column уже называет таблицу;
+- полный сохранённый SQL допустим как transformation rule, если не запросили только
+  выражение одного поля;
+- пустой/архивный display сам по себе не является ошибкой вне evidence-аудита;
+- явно запрошенный полный табличный результат должен быть в answer или display;
+- слово «перечисли» само по себе не требует отдельного display.
 
-Не штрафуй за стиль, краткость и необязательные детали. При status=failed укажи ровно
-одну, самую существенную критическую ошибку: конкретное явное требование query,
-которое не выполнено, либо конкретное противоречие. Не добавляй вторичные претензии
-и не называй в reason требование, которого нет в query.
-
-Перед status=passed для impact/reverse-lineage query обязательно проверь: answer должен либо
-показать транзитивные уровни до terminal targets, либо явно сказать, что полный
-транзитивный обход завершён и дальнейших descendants нет. Простой список первого hop
-без такого подтверждения означает status=failed.
+Верни passed только после прохождения обеих проверок. Не штрафуй за стиль,
+краткость и необязательные детали. При failed назови ровно одну самую существенную
+критическую ошибку и не придумывай отсутствующие в query требования.
 """.strip()
+
+
+def _needs_identifier_audit(query: str) -> bool:
+    normalized = str(query or "").casefold()
+    markers = ("file_id", "s2t", "mapping", "маппинг", "схем", "каталог", "sql")
+    return any(marker in normalized for marker in markers)
+
+
+def _invoke_structured(model: Any, schema: type[BaseModel], messages: list[Any]) -> Any:
+    try:
+        structured = model.with_structured_output(schema, method="function_calling")
+    except TypeError:
+        structured = model.with_structured_output(schema)
+    return structured.with_retry(stop_after_attempt=3).invoke(messages)
 
 
 def _compact_display_items(display_items: Sequence[Any]) -> list[dict[str, str]]:
@@ -104,31 +136,58 @@ def judge_agent_response(
     model: Any = None,
 ) -> SemanticJudgeVerdict:
     """Judge one completed exchange using the configured real chat model."""
-    judge_model = model or create_chat_model(timeout=180)
-    try:
-        structured = judge_model.with_structured_output(
-            SemanticJudgeVerdict,
-            method="function_calling",
+    judge_model = model or create_judge_chat_model(timeout=180)
+    compact_display = _compact_display_items(display_items)
+    payload = {
+        "query": str(query or ""),
+        "answer": answer,
+        "display_results": compact_display,
+    }
+    human_message = HumanMessage(
+        content=json.dumps(payload, ensure_ascii=False)
+    )
+
+    if _needs_identifier_audit(str(query or "")):
+        audit_result = _invoke_structured(
+            judge_model,
+            IdentifierEvidenceAudit,
+            [SystemMessage(content=_IDENTIFIER_AUDIT_PROMPT), human_message],
         )
-    except TypeError:
-        structured = judge_model.with_structured_output(SemanticJudgeVerdict)
-    runnable = structured.with_retry(stop_after_attempt=3)
-    result = runnable.invoke(
-        [
-            SystemMessage(content=_JUDGE_PROMPT),
-            HumanMessage(
-                content=json.dumps(
-                    {
-                        "query": str(query or ""),
-                        "answer": answer,
-                        "display_results": _compact_display_items(display_items),
-                    },
-                    ensure_ascii=False,
-                )
-            ),
+        audit = IdentifierEvidenceAudit.model_validate(audit_result)
+        query_text = str(query or "").casefold()
+        answer_text = str(answer or "").casefold()
+        display_text = "\n".join(
+            item.get("content", "") for item in compact_display
+        ).casefold()
+        unconfirmed = [
+            name.strip()
+            for name in audit.unconfirmed_identifiers
+            if name.strip()
+            and "<" not in name
+            and ">" not in name
+            and f"<{name.strip().casefold()}>" not in answer_text
+            and name.strip().casefold() not in query_text
+            and name.strip().casefold() not in display_text
         ]
+        if unconfirmed:
+            return SemanticJudgeVerdict(
+                status="failed",
+                reason=(
+                    "В ответе используется неподтверждённый физический "
+                    f"идентификатор: {unconfirmed[0]}."
+                ),
+            )
+
+    result = _invoke_structured(
+        judge_model,
+        SemanticJudgeVerdict,
+        [SystemMessage(content=_JUDGE_PROMPT), human_message],
     )
     return SemanticJudgeVerdict.model_validate(result)
 
 
-__all__ = ["SemanticJudgeVerdict", "judge_agent_response"]
+__all__ = [
+    "IdentifierEvidenceAudit",
+    "SemanticJudgeVerdict",
+    "judge_agent_response",
+]

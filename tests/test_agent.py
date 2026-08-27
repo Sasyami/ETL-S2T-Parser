@@ -452,10 +452,12 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "S2T-ролью/таблицей" in s2t_list_contract["not_for"]
     assert "происхождение по цепочке" in s2t_list_contract["not_for"]
     s2t_search_contract = contracts["search_s2t_transformations"]
-    assert "Одна подстрока" in s2t_search_contract["use_when"]
-    assert "роль значения неизвестна" in s2t_search_contract["use_when"]
-    assert "неполное/неквалифицированное" in s2t_search_contract["use_when"]
-    assert "semantic_search_descriptions" in s2t_search_contract["use_when"]
+    assert "Подстрока с неизвестной ролью" in s2t_search_contract["use_when"]
+    assert "неполное имя" in s2t_search_contract["use_when"]
+    assert "технических кандидатов" in s2t_search_contract["use_when"]
+    assert "по каждому" in (
+        s2t_search_contract["use_when"]
+    )
     assert "последовательный перебор" in s2t_list_contract["not_for"]
     assert "Точная полная source→target-пара" in s2t_search_contract["not_for"]
     assert "несколько условий" in s2t_search_contract["not_for"]
@@ -477,10 +479,13 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "Глобальные множества source/target-таблиц" in table_names_description
     assert "операции над ними" in table_names_description
     semantic_description = contracts["semantic_search_descriptions"]["use_when"]
-    assert "неизвестным точным именем" in semantic_description
+    assert "неизвестном имени" in semantic_description
+    assert "бизнес-смысл" in semantic_description
+    assert "вероятное соответствие" in semantic_description
     assert "files/tables/columns" in semantic_description
     assert "source/target" in semantic_description
-    assert "структурные фильтры подвыборки" in semantic_description
+    assert "фильтры колонок" in semantic_description
+    assert "Подстрока" in contracts["semantic_search_descriptions"]["not_for"]
     list_columns_contract = contracts["list_column_catalog"]
     assert "Точный структурный срез source/target-каталога" in (
         list_columns_contract["use_when"]
@@ -490,9 +495,10 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "разные роли" in list_columns_contract["use_when"]
     assert "Подстрока" in list_columns_contract["not_for"]
     search_columns_contract = contracts["search_column_catalog"]
-    assert "Подстрока" in search_columns_contract["use_when"]
-    assert "точных структурных фильтров" in search_columns_contract["use_when"]
-    assert "Смысловая близость" in search_columns_contract["not_for"]
+    assert "Явная буквальная подстрока" in search_columns_contract["use_when"]
+    assert "фильтры ограничивают" in search_columns_contract["use_when"]
+    assert "Смысл/назначение" in search_columns_contract["not_for"]
+    assert "варианты" in search_columns_contract["not_for"]
     sql_graph_contract = contracts["visualize_sql_lineage"]
     assert "Полный SQL уже явно дан" in sql_graph_contract["use_when"]
     assert "интерактивный lineage-граф" in sql_graph_contract["use_when"]

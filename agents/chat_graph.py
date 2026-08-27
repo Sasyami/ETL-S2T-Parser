@@ -122,6 +122,12 @@ tools либо один native call `finish_worker`. Обычный текст �
 сохраняется отдельно: не копируй результаты и не формулируй финальный ответ.
 Если доступны несколько нужных `previous_results`, прочитай их одним вызовом
 `read_previous_result(result_ids=[...])`, чтобы сохранить шаги для data-tools.
+`result_schema` рядом с description описывает сохранённую таблицу результата,
+но не заменяет её строки. Если строки предыдущего результата задают входы нового
+чтения, сначала прочитай нужный result. Если data-tool принимает список входов,
+передай их одним batch-вызовом; иначе независимые вызовы верни вместе.
+Не заменяй значения строк общей подстрокой или исходным бизнес-термином. После
+успешного чтения result не вызывай `read_previous_result` повторно без новой причины.
 
 Следуй `status` последней Observation: при `continue` закрой `gap` следующим
 worker-tool вызовом; при `complete` заверши работу через `finish_worker`;
@@ -142,33 +148,31 @@ ToolMessage.
 """.strip()
 
 _OBSERVER_PROMPT = """
-Ты observer worker. Верни только structured output Observation по схеме, без Markdown
-и пояснений. Сверь `user_request`, `prior_state`, текущие tool call и
-result. Не выполняй производный анализ: upstream сделает его.
+Ты observer worker. Верни structured output Observation по схеме, без Markdown.
+Сверь `user_request`, `prior_state`, текущий tool call и result. Не выполняй
+производный анализ: upstream сделает его.
 
 Выбери ровно один `status`:
 - `complete` — принятые результаты содержат все исходные данные для task;
 - `continue` — остаётся `gap`, который можно закрыть текущей палитрой tools;
 - `reroute` — остаётся `gap`, но ни один available tool его не закрывает.
 
-`gap` — одна консолидированная строка незакрытых требований; только при
-`complete` верни JSON null, не строку `"null"`. Не повторяй одну причину и её
-следствия.
+`gap` — одна консолидированная строка незакрытых требований. При `complete`
+верни JSON null. Не повторяй одну причину и её следствия.
 
-`accepted_tool_call_ids` — накопительный список успешных tool results, которые
-подтверждают task. Исключай ошибочные, нерелевантные и заменённые результаты.
-В `facts` сохраняй только подтверждённые факты и их `evidence_ids`; ошибки,
-предположения и аргументы вызова фактами не являются. `limitations` содержит
-только ограничения. Результат внутреннего `analyze_known_facts` не является новым evidence.
+`accepted_tool_call_ids` — накопительный список подтверждающих task успешных
+results без ошибочных, нерелевантных и заменённых. В `facts` оставь только
+подтверждённые факты с `evidence_ids`; `limitations` — только ограничения.
+Результат внутреннего `analyze_known_facts` не является новым evidence.
 
 Вызов не подтверждает task, если его аргументы потеряли или изменили объект,
-scope, фильтр либо операцию. Нулевой результат подтверждает отсутствие данных только
-при точных аргументах из task или принятого evidence. Объект, который
-planner сам составил, не подтверждает исходную операцию: верни `gap`.
-`previous_results` — только навигация до их чтения tool. `saved_result` —
-служебная ссылка; при `truncated=true` полнота набора не подтверждена.
-Если task зависит от прошлого результата, сначала прочитай нужный `result_id`
-через `read_previous_result`; не заменяй его догадкой по description.
+scope, фильтр или операцию. Нулевой результат подтверждает отсутствие данных только
+при точных аргументах из task/evidence. Объект, который planner сам составил,
+не подтверждает исходную операцию: верни `gap`.
+`previous_results` и `saved_result` — служебные ссылки; `truncated=true` не
+доказывает полноту. Зависимый result сначала читается по `result_id`. Если его
+строки задают входы нового чтения, `complete` требует подтверждённый вызов для
+каждого различающегося нужного входа; общий запрос или часть строк оставляет gap.
 
 Выбирай `reroute`, только если ни один `available_tools` не закрывает gap. Если
 достаточно изменить аргументы текущего tool, выбери `continue`.
@@ -380,7 +384,10 @@ def _split_worker_request(
     """Expose only the current task and minimal previous result refs."""
     parts = parse_worker_request(value)
     previous_results = (
-        [item.model_dump(mode="json") for item in parts.previous_results]
+        [
+            item.model_dump(mode="json", exclude_none=True)
+            for item in parts.previous_results
+        ]
         if parts.previous_results is not None
         else None
     )

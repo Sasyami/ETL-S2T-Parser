@@ -52,6 +52,23 @@ _DOWNSTREAM_TABLE_DESCRIPTIONS: Dict[str, str] = {
 }
 
 
+def get_downstream_capability_context() -> str:
+    """Return compact planning capabilities without concrete tool names."""
+    return "\n".join(
+        [
+            "Доступные возможности чтения (описывай нужные данные, не инструмент):",
+            "- точные фильтры и списки файлов, листов, таблиц и колонок;",
+            "- буквальный поиск таблиц и колонок по явно данному фрагменту;",
+            "- смысловой поиск по описаниям, когда точное имя неизвестно;",
+            "- точные и частичные S2T-строки, пары таблиц, правила и агрегации;",
+            "- Additional objects по атрибутам или фрагменту, включая полный SQL;",
+            "- lineage колонок и таблиц, пути, влияние и разбор явно данного SQL;",
+            "- сырые значения Excel и read-only срезы хранилища;",
+            "- полные сохранённые результаты прошлых workers и SQL-анализ их строк.",
+        ]
+    )
+
+
 def get_downstream_table_context() -> str:
     """Return exact storage table names with compact planning descriptions."""
     from storage.database import USER_FACING_TABLES

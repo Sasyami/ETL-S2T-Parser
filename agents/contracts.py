@@ -15,6 +15,26 @@ WORKER_STABLE_CONTEXT_MARKER = "\n\nУстойчивые правила конт
 WORKER_PREVIOUS_RESULTS_MARKER = "\n\nРезультаты прошлых workers."
 
 
+class SavedResultColumn(BaseModel):
+    """One physical column exposed by a run-scoped dataset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    sqlite_type: str
+
+
+class PreviousResultSchema(BaseModel):
+    """Compact table schema exposed with a lazy previous-result reference."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    result_ref: str = Field(min_length=1)
+    row_count: int = Field(ge=0)
+    truncated: bool = False
+    columns: List[SavedResultColumn] = Field(default_factory=list)
+
+
 class PreviousResultReference(BaseModel):
     """Minimal lazy reference passed from one worker to later workers."""
 
@@ -22,6 +42,7 @@ class PreviousResultReference(BaseModel):
 
     result_id: str = Field(min_length=1)
     description: str = Field(min_length=1, max_length=600)
+    result_schema: Optional[PreviousResultSchema] = None
 
     @field_validator("result_id", "description")
     @classmethod
@@ -231,15 +252,6 @@ class EvidenceArtifact(BaseModel):
         return clean_value or None
 
 
-class SavedResultColumn(BaseModel):
-    """One physical column exposed by a run-scoped dataset."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    sqlite_type: str
-
-
 class SavedResultDescriptor(BaseModel):
     """Internal run-scoped descriptor of a materialized tabular result."""
 
@@ -345,7 +357,8 @@ class WorkerOutcome(BaseModel):
         """Serialize only lazy result references for later workers."""
         return {
             "previous_results": [
-                item.model_dump(mode="json") for item in self.previous_results
+                item.model_dump(mode="json", exclude_none=True)
+                for item in self.previous_results
             ],
         }
 
@@ -379,8 +392,8 @@ class WorkerPlan(BaseModel):
         min_length=1,
         max_length=MAX_PLAN_STEPS,
         description=(
-            "Последовательность независимых самодостаточных worker tasks; "
-            "результаты между шагами не передаются."
+            "Последовательность worker tasks на получение данных; следующая "
+            "task может лениво использовать принятые результаты предыдущих."
         ),
     )
 
@@ -480,6 +493,7 @@ __all__ = [
     "ObservationStatus",
     "PlanStep",
     "PreviousResultReference",
+    "PreviousResultSchema",
     "SavedResultColumn",
     "SavedResultDescriptor",
     "UpstreamOutput",

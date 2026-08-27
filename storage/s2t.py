@@ -77,6 +77,7 @@ def list_s2t_transformations(
     file_id: Optional[int] = None,
     limit: Optional[int] = 200,
     q: Optional[str] = None,
+    q_any: Optional[List[str]] = None,
     columns: Optional[List[str]] = None,
     target_table: Optional[str] = None,
     source_table: Optional[str] = None,
@@ -106,12 +107,26 @@ def list_s2t_transformations(
     if file_id is not None:
         where.insert(0, "file_id = ?")
         params.append(int(file_id))
-    if q:
-        pattern = f"%{q.strip()}%"
-        where.append(
-            "(" + " OR ".join(f"{_sql_identifier(field)} LIKE ?" for field in S2T_RECORD_FIELDS) + ")"
-        )
-        params.extend([pattern] * len(S2T_RECORD_FIELDS))
+    query_terms = [str(q).strip()] if q and str(q).strip() else []
+    query_terms.extend(
+        str(item).strip()
+        for item in (q_any or [])
+        if str(item).strip()
+    )
+    query_terms = list(dict.fromkeys(query_terms))
+    if query_terms:
+        term_conditions = []
+        for term in query_terms:
+            term_conditions.append(
+                "("
+                + " OR ".join(
+                    f"{_sql_identifier(field)} LIKE ?"
+                    for field in S2T_RECORD_FIELDS
+                )
+                + ")"
+            )
+            params.extend([f"%{term}%"] * len(S2T_RECORD_FIELDS))
+        where.append("(" + " OR ".join(term_conditions) + ")")
     exact_filters = {
         "target_table": str(target_table or "").strip(),
         "source_table": str(source_table or "").strip(),
