@@ -13,6 +13,10 @@ UpstreamAction = Literal["pass", "reroute"]
 MAX_PLAN_STEPS = 8
 WORKER_STABLE_CONTEXT_MARKER = "\n\nУстойчивые правила контекста:\n"
 WORKER_PREVIOUS_RESULTS_MARKER = "\n\nРезультаты прошлых workers."
+WORKER_OPERATION_EXECUTION_MARKER = "\n\nOperation-skill текущей задачи:\n"
+WORKER_OPERATION_COMPLETENESS_MARKER = (
+    "\n\nOperation-skill проверки полноты:\n"
+)
 
 
 class SavedResultColumn(BaseModel):
@@ -59,6 +63,8 @@ class WorkerRequestParts:
 
     current_task: str
     stable_context: str = ""
+    operation_execution_context: str = ""
+    operation_completeness_context: str = ""
     previous_results: Optional[List[PreviousResultReference]] = None
 
 
@@ -98,9 +104,25 @@ def parse_worker_request(value: Any) -> WorkerRequestParts:
             1,
         )
 
+    operation_completeness_context = ""
+    if WORKER_OPERATION_COMPLETENESS_MARKER in current_task:
+        current_task, operation_completeness_context = current_task.split(
+            WORKER_OPERATION_COMPLETENESS_MARKER,
+            1,
+        )
+
+    operation_execution_context = ""
+    if WORKER_OPERATION_EXECUTION_MARKER in current_task:
+        current_task, operation_execution_context = current_task.split(
+            WORKER_OPERATION_EXECUTION_MARKER,
+            1,
+        )
+
     return WorkerRequestParts(
         current_task=current_task.strip(),
         stable_context=stable_context.strip(),
+        operation_execution_context=operation_execution_context.strip(),
+        operation_completeness_context=operation_completeness_context.strip(),
         previous_results=previous_results,
     )
 
@@ -504,6 +526,8 @@ __all__ = [
     "WorkerOutcomeStatus",
     "WorkerPlan",
     "WORKER_PREVIOUS_RESULTS_MARKER",
+    "WORKER_OPERATION_COMPLETENESS_MARKER",
+    "WORKER_OPERATION_EXECUTION_MARKER",
     "WORKER_STABLE_CONTEXT_MARKER",
     "parse_worker_request",
 ]

@@ -45,6 +45,8 @@ from pydantic import (
 from .contracts import (
     EvidenceFact,
     Observation,
+    WORKER_PREVIOUS_RESULTS_MARKER,
+    WORKER_STABLE_CONTEXT_MARKER,
     parse_worker_request,
 )
 from .observability import get_callback_handler, langfuse_trace_context
@@ -131,6 +133,9 @@ tools либо один native call `finish_worker`. Обычный текст �
 но не заменяет её строки. Если строки предыдущего результата задают входы нового
 чтения, сначала прочитай нужный result. Если data-tool принимает список входов,
 передай их одним batch-вызовом; иначе независимые вызовы верни вместе.
+В compact result с `row_format=named_records_with_dictionary_refs` каждая row
+содержит явные имена полей. Только поля из `dictionaries` содержат 0-based
+transport reference вместо значения; каждая row остаётся отдельным фактом.
 Не заменяй значения строк общей подстрокой или исходным бизнес-термином. После
 успешного чтения result не вызывай `read_previous_result` повторно без новой причины.
 
@@ -178,6 +183,9 @@ scope, фильтр или операцию. Нулевой результат �
 доказывает полноту. Зависимый result сначала читается по `result_id`. Если его
 строки задают входы нового чтения, `complete` требует подтверждённый вызов для
 каждого различающегося нужного входа; общий запрос или часть строк оставляет gap.
+В compact result с `row_format=named_records_with_dictionary_refs` row уже
+содержит явные имена полей. Индексы только в полях из `dictionaries` являются
+transport references, не database/group IDs; не схлопывай отдельные rows.
 
 Выбирай `reroute`, только если ни один `available_tools` не закрывает gap. Если
 достаточно изменить аргументы текущего tool, выбери `continue`.
@@ -272,6 +280,8 @@ class WorkerCycleTrace(BaseModel):
 class AgentGraphState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     system_prompt: str
+    planner_operation_context: str
+    observer_operation_context: str
     planner_message: Optional[AIMessage]
     observations: List[Observation]
     cycle_history: List[WorkerCycleTrace]
@@ -338,8 +348,110 @@ def _tool_content_text(content: Any) -> str:
         return str(content)
 
 
+def _tool_model_content(content: Any) -> str:
+    """Expose packed tables to models as named rows without expanding dictionaries."""
+    original = _tool_content_text(content)
+    try:
+        from .tools.saved_results import _decode_tool_content, _tabular_payload
+
+        payload = _decode_tool_content(content)
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("row_format") != "arrays_in_column_order"
+        ):
+            return original
+
+        raw_rows = payload.get("rows")
+        dictionaries = payload.get("dictionaries")
+        tabular = _tabular_payload(payload)
+        if (
+            tabular is None
+            or not isinstance(raw_rows, list)
+            or not isinstance(dictionaries, Mapping)
+        ):
+            return original
+        columns = list(tabular["columns"])
+        decoded_rows = list(tabular["rows"])
+        column_positions = {
+            column: index for index, column in enumerate(columns)
+        }
+        reference_columns = [
+            column
+            for column in dictionaries
+            if column == "transformation_rule"
+            and column in column_positions
+        ]
+
+        named_rows: List[Dict[str, Any]] = []
+        for raw_row, decoded_row in zip(raw_rows, decoded_rows):
+            item = dict(decoded_row)
+            for column in reference_columns:
+                item[column] = {
+                    "dictionary_ref": raw_row[column_positions[column]]
+                }
+            named_rows.append(item)
+
+        model_payload = {
+            str(key): value
+            for key, value in payload.items()
+            if key not in {"row_format", "dictionaries", "rows"}
+        }
+        model_payload["row_format"] = "named_records_with_dictionary_refs"
+        model_payload["dictionaries"] = {
+            column: dictionaries[column] for column in reference_columns
+        }
+        model_payload["rows"] = named_rows
+        return json.dumps(
+            model_payload,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        logger.exception("Compact tool result could not be named for model preview")
+        return original
+
+
+def _tool_display_content(content: Any) -> str:
+    """Expand compact table dictionaries only for the user-facing copy."""
+    original = _tool_content_text(content)
+    try:
+        from .tools.saved_results import _decode_tool_content, _tabular_payload
+
+        payload = _decode_tool_content(content)
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("row_format") != "arrays_in_column_order"
+        ):
+            return original
+        tabular = _tabular_payload(payload)
+        if tabular is None:
+            return original
+
+        columns = list(tabular["columns"])
+        display_payload = {
+            str(key): value
+            for key, value in payload.items()
+            if key not in {"row_format", "dictionaries", "preview_rows"}
+        }
+        display_payload["columns"] = columns
+        display_payload["rows"] = [
+            [row.get(column) for column in columns]
+            for row in tabular["rows"]
+        ]
+        return json.dumps(
+            display_payload,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        logger.exception("Compact tool result could not be expanded for display")
+        return original
+
+
 def _tool_message_preview(content: Any, max_chars: int) -> str:
-    text = _tool_content_text(content).strip()
+    text = _tool_model_content(content).strip()
     limit = max(1, int(max_chars))
     if len(text) <= limit:
         return text
@@ -422,7 +534,7 @@ def _with_structured_output(model: Any, schema: Any) -> Any:
 
 def _split_worker_request(
     value: Any,
-) -> tuple[str, Optional[List[Dict[str, Any]]]]:
+) -> tuple[str, Optional[List[Dict[str, Any]]], str]:
     """Expose only the current task and minimal previous result refs."""
     parts = parse_worker_request(value)
     previous_results = (
@@ -433,7 +545,11 @@ def _split_worker_request(
         if parts.previous_results is not None
         else None
     )
-    return parts.current_task, previous_results
+    return (
+        parts.current_task,
+        previous_results,
+        parts.operation_completeness_context,
+    )
 
 
 def _history_messages(
@@ -681,6 +797,11 @@ def _planner_messages(
             )
 
     system_parts = [state["system_prompt"].strip(), planner_instruction]
+    planner_operation_context = str(
+        state.get("planner_operation_context") or ""
+    ).strip()
+    if planner_operation_context:
+        system_parts.append(planner_operation_context)
     runtime_context = _runtime_context(state)
     if runtime_context is not None:
         system_parts.append(runtime_context)
@@ -1269,9 +1390,16 @@ def build_agent_graph(
             if tool_call_id in retained_tool_results
         ]
 
-        current_user_request, previous_results = _split_worker_request(
-            _last_user_query(state["messages"])
-        )
+        (
+            current_user_request,
+            previous_results,
+            legacy_observer_context,
+        ) = _split_worker_request(_last_user_query(state["messages"]))
+        operation_observer_context = str(
+            state.get("observer_operation_context")
+            or legacy_observer_context
+            or ""
+        ).strip()
         payload = {
             "user_request": current_user_request,
             "available_tools": [
@@ -1316,6 +1444,7 @@ def build_agent_graph(
                             "{{PRIOR_STATE_RULE}}",
                             prior_state_rule,
                         ),
+                        operation_observer_context,
                     )
                     if part
                 )
@@ -1605,6 +1734,8 @@ def run_agent_graph(
     initial_state: AgentGraphState = {
         "messages": initial_messages,
         "system_prompt": system_prompt,
+        "planner_operation_context": "",
+        "observer_operation_context": "",
         "planner_message": None,
         "observations": [],
         "cycle_history": [],
@@ -1673,9 +1804,30 @@ def run_worker_graph(
     callbacks: Optional[List[Any]] = None,
 ) -> WorkerRunResult:
     """Run the internal worker graph and retain its selected UI results locally."""
-    clean_task = str(task or "").strip()
-    if not clean_task:
+    raw_task = str(task or "").strip()
+    if not raw_task:
         raise WorkerResponseError("Worker получил пустую task.")
+
+    request_parts = parse_worker_request(raw_task)
+    clean_task = request_parts.current_task
+    if request_parts.stable_context:
+        clean_task += (
+            WORKER_STABLE_CONTEXT_MARKER + request_parts.stable_context
+        )
+    if request_parts.previous_results is not None:
+        clean_task += (
+            WORKER_PREVIOUS_RESULTS_MARKER
+            + "\n"
+            + json.dumps(
+                {
+                    "previous_results": [
+                        item.model_dump(mode="json", exclude_none=True)
+                        for item in request_parts.previous_results
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
 
     bounded_steps = max(1, int(max_steps))
     preview_chars = max(1, int(tool_message_preview_chars))
@@ -1694,6 +1846,12 @@ def run_worker_graph(
     initial_state: AgentGraphState = {
         "messages": [HumanMessage(content=clean_task)],
         "system_prompt": system_prompt,
+        "planner_operation_context": (
+            request_parts.operation_execution_context
+        ),
+        "observer_operation_context": (
+            request_parts.operation_completeness_context
+        ),
         "planner_message": None,
         "observations": [],
         "cycle_history": [],
@@ -1769,11 +1927,11 @@ def run_worker_graph(
 
     display_items: List[WorkerDisplayItem] = []
     for message in successful_messages:
-        full_content = _tool_content_text(message.content)
+        model_content = _tool_model_content(message.content)
         display_items.append(
             WorkerDisplayItem(
                 name=str(message.name or "unknown_tool"),
-                content=full_content,
+                content=_tool_display_content(message.content),
                 evidence_id=evidence_ids_by_tool_call.get(
                     str(message.tool_call_id or ""),
                     "",
@@ -1782,7 +1940,7 @@ def run_worker_graph(
                 arguments=tool_arguments.get(message.tool_call_id, {}),
                 preview=_tool_message_preview(message.content, preview_chars),
                 truncated=(
-                    len(full_content.strip()) > preview_chars
+                    len(model_content.strip()) > preview_chars
                     or _tool_result_truncated(message)
                 ),
             )

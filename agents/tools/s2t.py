@@ -4,27 +4,13 @@ from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.tools import tool
 
-from .common import clamped_int
+from .common import clamped_int, pack_tabular_rows
 
 
-@tool(parse_docstring=True)
-def get_s2t_rules_by_ids(
+def _read_s2t_rules_by_ids(
     transformation_ids: List[int],
 ) -> Dict[str, Any]:
-    """Получить точные S2T-правила по transformation_id из lineage.
-
-    Используй после trace_neo4j_lineage, когда его результат уже содержит
-    transformation_id и для impact-ответа нужны соответствующие
-    transformation_rule. Передай найденные идентификаторы как список чисел без
-    SQL и без повторного поиска по именам. Neo4j transformation_id соответствует
-    первичному ключу s2t_transformations.id; tool выполняет это сопоставление сам.
-    Читает глобальную s2t_transformations без неявного file_id и возвращает
-    точные строки, отсутствующие id перечисляет отдельно.
-
-    Args:
-        transformation_ids: Непустой список числовых transformation_id,
-            дословно полученных из trace_neo4j_lineage; максимум 100 id.
-    """
+    """Read exact S2T rows for trusted transformation identifiers."""
     clean_ids: List[int] = []
     for value in transformation_ids or []:
         try:
@@ -68,6 +54,27 @@ def get_s2t_rules_by_ids(
 
 
 @tool(parse_docstring=True)
+def get_s2t_rules_by_ids(
+    transformation_ids: List[int],
+) -> Dict[str, Any]:
+    """Получить точные S2T-правила по transformation_id из lineage.
+
+    Используй после trace_neo4j_lineage, когда его результат уже содержит
+    transformation_id и для impact-ответа нужны соответствующие
+    transformation_rule. Передай найденные идентификаторы как список чисел без
+    SQL и без повторного поиска по именам. Neo4j transformation_id соответствует
+    первичному ключу s2t_transformations.id; tool выполняет это сопоставление сам.
+    Читает глобальную s2t_transformations без неявного file_id и возвращает
+    точные строки, отсутствующие id перечисляет отдельно.
+
+    Args:
+        transformation_ids: Непустой список числовых transformation_id,
+            дословно полученных из trace_neo4j_lineage; максимум 100 id.
+    """
+    return _read_s2t_rules_by_ids(transformation_ids)
+
+
+@tool(parse_docstring=True)
 def list_s2t_table_mapping(
     source_table: str,
     target_table: str,
@@ -86,8 +93,6 @@ def list_s2t_table_mapping(
         target_table: Точное полное имя целевой S2T-таблицы.
         limit: Максимальное число возвращаемых строк, от 1 до 1000.
     """
-    from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
-
     clean_source_table = str(source_table or "").strip()
     clean_target_table = str(target_table or "").strip()
     if not clean_source_table or not clean_target_table:
@@ -95,12 +100,192 @@ def list_s2t_table_mapping(
             "error": "source_table and target_table must be non-empty",
             "rows": [],
         }
+    from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
+
     return db_list_s2t_transformations(
         file_id=None,
         limit=clamped_int(limit, 1000, minimum=1, maximum=1000),
         source_table=clean_source_table,
         target_table=clean_target_table,
     )
+
+
+@tool(parse_docstring=True)
+def list_s2t_field_mapping(
+    source_table: str,
+    source_field: str,
+    target_table: str,
+    target_field: str,
+) -> Dict[str, Any]:
+    """Получить одну точную ролевую S2T-пару полей со всеми дублями.
+
+    Все четыре роли обязательны, поэтому planner не может опустить таблицу или
+    перепутать имя поля с именем таблицы. Используй для уже известной связи
+    ``source_table.source_field → target_table.target_field`` и её полного
+    ``transformation_rule``. Глобальную S2T tool не ограничивает ``file_id``.
+
+    Args:
+        source_table: Точное полное имя исходной S2T-таблицы.
+        source_field: Точное имя исходного поля без имени таблицы.
+        target_table: Точное полное имя целевой S2T-таблицы.
+        target_field: Точное имя целевого поля без имени таблицы.
+    """
+    return _list_narrow_s2t_rows(
+        source_table=source_table,
+        source_field=source_field,
+        target_table=target_table,
+        target_field=target_field,
+    )
+
+
+@tool(parse_docstring=True)
+def read_s2t_mapping(
+    source_table: str,
+    target_table: str,
+) -> Dict[str, Any]:
+    """Прочитать полный exact S2T-маппинг заданной source→target-пары.
+
+    Обе таблицы обязательны; field/ID/file-фильтров намеренно нет. Возвращает
+    все raw-строки пары без лимита и дедупликации, включая provenance
+    ``file_id``/``sheet_name``/``row_num``. Точные поля выбираются upstream из
+    полного набора. Формат lossless: позиции задаёт ``columns``, словарные
+    значения — 0-based индексы в ``dictionaries``. Это transport references,
+    не transformation/group ID; каждый дубль остаётся отдельной row.
+
+    Args:
+        source_table: Точное полное имя исходной S2T-таблицы.
+        target_table: Точное полное имя целевой S2T-таблицы.
+    """
+    result = _list_narrow_s2t_rows(
+        source_table=source_table,
+        target_table=target_table,
+    )
+    return _compact_s2t_result(result)
+
+
+@tool(parse_docstring=True)
+def read_s2t_source_to_target(
+    source_table: str,
+    target_table: str,
+) -> Dict[str, Any]:
+    """Прочитать все S2T-строки точной направленной пары таблиц.
+
+    Используй только когда известны обе роли: ``source_table`` и
+    ``target_table``. Tool не принимает поля, ID, file scope или limit,
+    возвращает все исходные строки без дедупликации вместе с provenance.
+    Формат lossless: позиции задаёт ``columns``, повторяющиеся значения могут
+    быть 0-based индексами в ``dictionaries``. Эти индексы не являются domain
+    ID; каждая positional row остаётся отдельной исходной строкой.
+
+    Args:
+        source_table: Точное полное имя исходной S2T-таблицы.
+        target_table: Точное полное имя целевой S2T-таблицы.
+    """
+    result = _list_narrow_s2t_rows(
+        source_table=source_table,
+        target_table=target_table,
+    )
+    return _compact_s2t_result(result)
+
+
+@tool(parse_docstring=True)
+def read_s2t_by_source_table(
+    source_table: str,
+) -> Dict[str, Any]:
+    """Прочитать все S2T-строки одной точной source_table.
+
+    Используй для source-only задачи, когда ``target_table`` не задана. Tool
+    фиксирует source-роль сигнатурой, не принимает поля, ID, file scope или
+    limit и сохраняет provenance, порядок и исходные дубли. Формат lossless:
+    позиции задаёт ``columns``, а словарные значения — 0-based индексы в
+    ``dictionaries``; это transport references, не domain ID.
+
+    Args:
+        source_table: Точное полное имя исходной S2T-таблицы.
+    """
+    result = _list_narrow_s2t_rows(source_table=source_table)
+    return _compact_s2t_result(result)
+
+
+@tool(parse_docstring=True)
+def read_s2t_by_target_table(
+    target_table: str,
+) -> Dict[str, Any]:
+    """Прочитать все S2T-строки одной точной target_table.
+
+    Используй для target-only задачи, когда ``source_table`` не задана. Tool
+    фиксирует target-роль сигнатурой, не принимает поля, ID, file scope или
+    limit и сохраняет provenance, порядок и исходные дубли. Формат lossless:
+    позиции задаёт ``columns``, а словарные значения — 0-based индексы в
+    ``dictionaries``; это transport references, не domain ID.
+
+    Args:
+        target_table: Точное полное имя целевой S2T-таблицы.
+    """
+    result = _list_narrow_s2t_rows(target_table=target_table)
+    return _compact_s2t_result(result)
+
+
+@tool(parse_docstring=True)
+def list_s2t_occurrences(
+    table_name: str,
+) -> Dict[str, Any]:
+    """Прочитать точное имя S2T-таблицы сразу в source и target-ролях.
+
+    Для одной таблицы делает два точных ролевых чтения и помечает occurrence
+    полем ``matched_role``. Field/ID/file-фильтров нет; возвращаются все строки
+    и provenance. Дубли сохраняются, self-match возвращается дважды. Формат
+    lossless: позиции задаёт ``columns``, словарные значения — 0-based индексы
+    в ``dictionaries``. Индексы — transport references, не domain IDs.
+
+    Args:
+        table_name: Точное полное имя S2T-таблицы без имени поля.
+    """
+    clean_table = str(table_name or "").strip()
+    if not clean_table:
+        return {"error": "table_name must be non-empty", "rows": []}
+
+    from storage.database import S2T_RECORD_FIELDS
+    from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
+
+    result_columns = ["file_id", "sheet_name", "row_num", *S2T_RECORD_FIELDS]
+
+    role_results: Dict[str, Dict[str, Any]] = {}
+    rows: List[Dict[str, Any]] = []
+    columns: List[str] = []
+    for role in ("source", "target"):
+        filters: Dict[str, str] = {f"{role}_table": clean_table}
+        result = db_list_s2t_transformations(
+            file_id=None,
+            limit=None,
+            columns=result_columns,
+            **filters,
+        )
+        role_results[role] = result
+        if not columns:
+            columns = list(result.get("columns") or [])
+        rows.extend(
+            {**dict(row), "matched_role": role}
+            for row in (result.get("rows") or [])
+        )
+
+    if "matched_role" not in columns:
+        columns.append("matched_role")
+    role_counts = {
+        role: len(result.get("rows") or [])
+        for role, result in role_results.items()
+    }
+    raw_result = {
+        "scope": "global_s2t_occurrences",
+        "filters": {"table_name": clean_table},
+        "columns": columns,
+        "role_counts": role_counts,
+        "total_matches": sum(role_counts.values()),
+        "returned_rows": len(rows),
+        "truncated": False,
+        "rows": rows,
+    }
+    return _compact_s2t_result(raw_result, include_matched_role=True)
 
 
 def _list_narrow_s2t_rows(**filters: str) -> Dict[str, Any]:
@@ -116,9 +301,81 @@ def _list_narrow_s2t_rows(**filters: str) -> Dict[str, Any]:
             + ", ".join(missing),
             "rows": [],
         }
+    from storage.database import S2T_RECORD_FIELDS
     from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
 
-    return db_list_s2t_transformations(file_id=None, limit=None, **clean_filters)
+    result = db_list_s2t_transformations(
+        file_id=None,
+        limit=None,
+        columns=["file_id", "sheet_name", "row_num", *S2T_RECORD_FIELDS],
+        **clean_filters,
+    )
+    rows = list(result.get("rows") or [])
+    result["returned_rows"] = len(rows)
+    result["truncated"] = False
+    return result
+
+
+def _compact_s2t_result(
+    result: Dict[str, Any],
+    *,
+    include_matched_role: bool = False,
+) -> Dict[str, Any]:
+    """Pack a complete S2T result without collapsing raw occurrences."""
+    if result.get("error"):
+        return result
+    columns = [
+        "file_id",
+        "sheet_name",
+        "row_num",
+        "source_table",
+        "source_field",
+        "target_table",
+        "target_field",
+        "transformation_rule",
+        "source_layer",
+        "target_layer",
+    ]
+    if include_matched_role:
+        columns.insert(3, "matched_role")
+    dictionary_columns = [
+        column
+        for column in (
+            "sheet_name",
+            "matched_role",
+            "source_table",
+            "target_table",
+            "transformation_rule",
+            "source_layer",
+            "target_layer",
+        )
+        if column in columns
+    ]
+    raw_rows = [dict(row) for row in (result.get("rows") or [])]
+    packed = pack_tabular_rows(
+        raw_rows,
+        columns=columns,
+        dictionary_columns=dictionary_columns,
+    )
+    packed_rows = packed.pop("rows")
+    compact: Dict[str, Any] = {
+        "scope": result.get("scope") or "global",
+        "filters": dict(result.get("filters") or {}),
+        **packed,
+    }
+    if include_matched_role:
+        compact["role_counts"] = dict(result.get("role_counts") or {})
+    total_matches = result.get(
+        "total_matches",
+        result.get("total", len(raw_rows)),
+    )
+    compact.update(
+        total_matches=int(total_matches or 0),
+        returned_rows=len(raw_rows),
+        truncated=False,
+        rows=packed_rows,
+    )
+    return compact
 
 
 @tool(parse_docstring=True)
@@ -251,13 +508,14 @@ def search_s2t_transformations(
     все различающиеся имена одним списком needles. Не заменяй их общей
     подстрокой или исходным бизнес-термином. Каждая строка S2T возвращается один
     раз, даже если совпала с несколькими needles; исходные дубликаты S2T
-    сохраняются. Если уже известны точные роли таблиц или полей либо нужны
-    конкретные возвращаемые колонки, используй list_s2t_transformations и
-    передай каждую роль отдельным аргументом. Использование точного
+    сохраняются. Если уже известна направленная пара таблиц, используй exact
+    directed mapping-reader активной палитры; если известна только одна таблица
+    или поле, используй exact occurrence/role reader. Использование точного
     target_table/target_field или source_table/source_field как needle
     запрещено: это ролевые фильтры, а не подстрочный поиск. Полная точная
-    source_table.source_field → target_table.target_field всегда относится к
-    list_s2t_transformations, даже если пользователь просит объяснение правила.
+    source_table.source_field → target_table.target_field всегда сначала
+    читается directed exact reader по обеим таблицам; точные поля выбираются из
+    полного результата, даже если пользователь просит объяснение правила.
     Это не семантический поиск: каждый needle проверяется как подстрока в
     target/source table, field, layer и
     transformation_rule. Читает глобальную s2t_transformations без file_id,

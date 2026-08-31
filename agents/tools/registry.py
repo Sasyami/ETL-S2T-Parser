@@ -15,7 +15,11 @@ from .files import (
 )
 from .columns import (
     filter_column_catalog,
+    get_source_target_column_pair,
     list_column_catalog,
+    list_column_metadata,
+    list_source_column_catalog,
+    list_target_column_catalog,
     search_column_catalog,
 )
 from .planning import show_plan
@@ -28,6 +32,8 @@ from .neo4j import (
 )
 from .s2t import (
     get_s2t_rules_by_ids,
+    list_s2t_occurrences,
+    list_s2t_field_mapping,
     list_s2t_source_field,
     list_s2t_source_table,
     list_s2t_table_mapping,
@@ -35,6 +41,10 @@ from .s2t import (
     list_s2t_target_field,
     list_s2t_target_table,
     list_s2t_transformations,
+    read_s2t_by_source_table,
+    read_s2t_by_target_table,
+    read_s2t_mapping,
+    read_s2t_source_to_target,
     search_s2t_transformations,
     summarize_s2t_tables,
     summarize_table_descriptions,
@@ -99,19 +109,49 @@ WRITE_TOOLS: Tuple[BaseTool, ...] = (
     update_table_info_from_user_query,
 )
 
-_NARROW_S2T_TOOLS: Tuple[BaseTool, ...] = (
+_LEGACY_NARROW_S2T_TOOLS: Tuple[BaseTool, ...] = (
+    list_s2t_field_mapping,
     list_s2t_source_table,
     list_s2t_target_table,
     list_s2t_source_field,
     list_s2t_target_field,
 )
+_STRICT_S2T_TOOLS: Tuple[BaseTool, ...] = (
+    read_s2t_source_to_target,
+    read_s2t_by_source_table,
+    read_s2t_by_target_table,
+)
+_COMPAT_S2T_TOOLS: Tuple[BaseTool, ...] = (
+    read_s2t_mapping,
+    list_s2t_occurrences,
+)
+_STRICT_COLUMN_TOOLS: Tuple[BaseTool, ...] = (
+    get_source_target_column_pair,
+    list_column_metadata,
+)
+_COMPAT_COLUMN_TOOLS: Tuple[BaseTool, ...] = (
+    list_source_column_catalog,
+    list_target_column_catalog,
+)
 _EXPERIMENT_READ_ONLY_TOOLS: Tuple[BaseTool, ...] = tuple(
     tool
     for tool in READ_ONLY_TOOLS
-    if tool.name != "list_s2t_transformations"
-) + _NARROW_S2T_TOOLS
+    if tool.name
+    not in {
+        "get_s2t_rules_by_ids",
+        "list_s2t_table_mapping",
+        "list_s2t_transformations",
+        "list_column_catalog",
+        "filter_column_catalog",
+    }
+) + _STRICT_S2T_TOOLS + _STRICT_COLUMN_TOOLS + _COMPAT_COLUMN_TOOLS
 _REGISTERED_READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
-    READ_ONLY_TOOLS + _NARROW_S2T_TOOLS
+    READ_ONLY_TOOLS
+    + _LEGACY_NARROW_S2T_TOOLS
+    + _STRICT_S2T_TOOLS
+    + _COMPAT_S2T_TOOLS
+    + _STRICT_COLUMN_TOOLS
+    + _COMPAT_COLUMN_TOOLS
 )
 
 ALL_TOOLS: Tuple[BaseTool, ...] = _REGISTERED_READ_ONLY_TOOLS + WRITE_TOOLS

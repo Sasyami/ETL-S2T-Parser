@@ -40,17 +40,30 @@ GENERAL_FALLBACK_TOOL_NAMES = (
     "trace_neo4j_lineage",
     "get_s2t_rules_by_ids",
     "list_s2t_table_mapping",
+    "read_s2t_source_to_target",
+    "read_s2t_by_source_table",
+    "read_s2t_by_target_table",
+    "read_s2t_mapping",
+    "list_s2t_occurrences",
+    "list_s2t_field_mapping",
     "list_s2t_source_table",
     "list_s2t_target_table",
     "list_s2t_source_field",
     "list_s2t_target_field",
+    "list_s2t_transformations",
+    "search_s2t_transformations",
+    "get_source_target_column_pair",
+    "list_column_metadata",
+    "list_source_column_catalog",
+    "list_target_column_catalog",
+    "list_column_catalog",
+    "filter_column_catalog",
+    "search_column_catalog",
     "run_sql",
     "read_previous_result",
     "run_cypher",
     "search_excel_values",
     "semantic_search_descriptions",
-    "list_s2t_transformations",
-    "search_s2t_transformations",
 )
 
 _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
@@ -119,18 +132,19 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     },
     "get_s2t_rules_by_ids": {
         "use_when": (
-            "Точный transformation_id явно есть в task/description; нужен его rule."
+            "Точные transformation_id прочитаны из принятого результата lineage; "
+            "нужны соответствующие rules."
         ),
         "not_for": (
-            "Без ID: просьба получить точные rules не создаёт transformation_id; "
-            "не поиск, lineage или SQL."
+            "Числа из task, имён таблиц или текста; без lineage-result ID не "
+            "подтверждён."
         ),
     },
     "search_s2t_transformations": {
         "use_when": (
             "Подстрока с неизвестной ролью или неполное имя. Для технических "
-            "кандидатов прошлого результата — отдельный вызов по каждому "
-            "различающемуся имени; вызовы верни вместе."
+            "кандидатов прошлого результата — один batch-вызов со всеми "
+            "различающимися именами."
         ),
         "not_for": (
             "Точная полная source→target-пара, несколько условий, columns или агрегация."
@@ -266,6 +280,101 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
 }
 
 _NARROW_S2T_ROUTING_CONTRACTS: Dict[str, Dict[str, str]] = {
+    "read_s2t_source_to_target": {
+        "use_when": (
+            "Заданы обе точные роли source_table и target_table; tool читает "
+            "все строки только этой направленной пары с provenance."
+        ),
+        "not_for": (
+            "Source-only или target-only задача, неизвестная сторона, поле, "
+            "подстрока, путь, ID либо file scope."
+        ),
+    },
+    "read_s2t_by_source_table": {
+        "use_when": (
+            "Source-only задача: все S2T-строки одной точной source_table, "
+            "когда target_table не задана."
+        ),
+        "not_for": (
+            "Target-only задача, заданная source→target пара, поле, "
+            "подстрока, путь, ID либо file scope."
+        ),
+    },
+    "read_s2t_by_target_table": {
+        "use_when": (
+            "Target-only задача: все S2T-строки одной точной target_table, "
+            "когда source_table не задана."
+        ),
+        "not_for": (
+            "Source-only задача, заданная source→target пара, поле, "
+            "подстрока, путь, ID либо file scope."
+        ),
+    },
+    "read_s2t_mapping": {
+        "use_when": (
+            "Точная направленная source_table → target_table пара; tool всегда "
+            "читает полную пару, а заданные task поля выбираются из результата; "
+            "строки сохраняют provenance file_id без file-фильтра."
+        ),
+        "not_for": (
+            "Одна таблица без второй, неизвестное/частичное имя или путь; "
+            "field-фильтров и ID у tool нет."
+        ),
+    },
+    "list_s2t_occurrences": {
+        "use_when": (
+            "Все точные occurrences одной table сразу в "
+            "source/target-ролях с matched_role и provenance file_id."
+        ),
+        "not_for": (
+            "Направленная source→target-пара, подстрока, путь или агрегация."
+        ),
+    },
+    "get_source_target_column_pair": {
+        "use_when": (
+            "Атрибуты точной source_table.source_column → "
+            "target_table.target_column в одном известном file_id."
+        ),
+        "not_for": (
+            "Одна сторона, неизвестный file_id, поиск, S2T или множество "
+            "колонок таблицы."
+        ),
+    },
+    "list_column_metadata": {
+        "use_when": (
+            "Полная структура одной или нескольких точных таблиц в обеих "
+            "catalog-ролях; file_scope — строка file_id либо явная строка all."
+        ),
+        "not_for": (
+            "Сравнение двух точных разноимённых колонок, подстрока, смысл или "
+            "S2T; у tool нет фильтров по предполагаемому type/PK/NOT NULL."
+        ),
+    },
+    "list_source_column_catalog": {
+        "use_when": (
+            "Точные source-колонки одной table в обязательном file_id; "
+            "опционально exact column/type/PK/NOT NULL."
+        ),
+        "not_for": (
+            "Target-колонки, неизвестный file_id/table, подстрока, смысл, S2T."
+        ),
+    },
+    "list_target_column_catalog": {
+        "use_when": (
+            "Точные target-колонки одной table в обязательном file_id; "
+            "опционально exact column/type/PK/NOT NULL."
+        ),
+        "not_for": (
+            "Source-колонки, неизвестный file_id/table, подстрока, смысл, S2T."
+        ),
+    },
+    "list_s2t_field_mapping": {
+        "use_when": (
+            "Одна точная полная source_table.source_field → "
+            "target_table.target_field со всеми четырьмя известными ролями."
+        ),
+        "not_for": "Неполная пара, таблица без поля, подстрока или путь.",
+    },
     "list_s2t_source_table": {
         "use_when": "Все S2T-строки одной точной известной source_table.",
         "not_for": "Target-only запрос, отдельное поле, пара таблиц или подстрока.",
@@ -303,9 +412,10 @@ _TOOL_ROUTER_PROMPT = """
 Ты router read-only worker. По задаче и каталогам выбери необходимую planner
 палитру `tools`, `skills`, `schemas`. Используй точные имена из каталогов.
 
-`current_task` — единственная операция worker. `stable_context` задаёт только
-общие ограничения. `previous_results` содержит result_id, description и, для
-табличного результата, result_schema. Внутренний reader уже доступен planner;
+`current_task` — операция worker, `stable_context` — общие ограничения.
+`operation_context` — обязательные правила исполнения, не основание для tool.
+`previous_results` содержит result_id, description и result_schema.
+Внутренний reader уже доступен planner;
 выбери внешние tools для операций над строками после чтения result, а не из-за
 самого наличия result_id.
 
@@ -316,8 +426,9 @@ _TOOL_ROUTER_PROMPT = """
 Сохраняй тип поиска из task: смысл/назначение/описание — semantic; явно данный
 буквальный фрагмент — substring. Не заменяй один тип другим.
 Обработчик выбирай, только если вход дан или будет получен выбранным tool.
-Tool с обязательным opaque ID допустим, только если точный ID есть в task,
-description или результате другого выбранного tool. Не придумывай входы.
+Tool с обязательным opaque ID допустим, только если точный ID уже есть в
+принятом результате другого tool. Числа из task, имени или описания не являются
+ID. Не придумывай входы.
 
 Если description даёт фильтр нового чтения, выбери источник этого чтения.
 `query_saved_result` — только для строк сохранённого dataset с совместимой schema.
@@ -508,6 +619,10 @@ def select_chat_route(
     }
     if request_parts.stable_context:
         payload["stable_context"] = request_parts.stable_context
+    if request_parts.operation_execution_context:
+        payload["operation_context"] = (
+            request_parts.operation_execution_context
+        )
     if request_parts.previous_results is not None:
         payload["previous_results"] = [
             item.model_dump(mode="json", exclude_none=True)

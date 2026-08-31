@@ -455,17 +455,13 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "Подстрока с неизвестной ролью" in s2t_search_contract["use_when"]
     assert "неполное имя" in s2t_search_contract["use_when"]
     assert "технических кандидатов" in s2t_search_contract["use_when"]
-    assert "по каждому" in (
-        s2t_search_contract["use_when"]
-    )
+    assert "один batch-вызов" in s2t_search_contract["use_when"]
     assert "последовательный перебор" in s2t_list_contract["not_for"]
     assert "Точная полная source→target-пара" in s2t_search_contract["not_for"]
     assert "несколько условий" in s2t_search_contract["not_for"]
     rules_contract = contracts["get_s2t_rules_by_ids"]
-    assert "transformation_id явно есть" in rules_contract["use_when"]
-    assert "просьба получить точные rules не создаёт" in rules_contract[
-        "not_for"
-    ]
+    assert "из принятого результата lineage" in rules_contract["use_when"]
+    assert "Числа из task" in rules_contract["not_for"]
     path_contract = contracts["trace_transformation_path"]
     assert "точной пары table+column" in path_contract["use_when"]
     assert "target-пары" in path_contract["use_when"]
@@ -555,7 +551,7 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "Tools, skills и schemas выбирай независимо" in router_prompt
     assert "каждый список может быть пустым" in router_prompt
     assert "оставляй `tools=[]`" in router_prompt
-    assert len(model.messages[0].content) < 1700
+    assert len(model.messages[0].content) < 1750
     assert "COUNT, DISTINCT, GROUP BY" not in router_prompt
     assert "обязательно включай `run_sql`" not in router_prompt
     assert "самостоятельно составить и выполнить SQL" not in model.messages[0].content
@@ -1257,7 +1253,7 @@ def test_observer_prompt_requires_semantic_task_comparison():
     )
 
     normalized_observer_prompt = " ".join(_OBSERVER_PROMPT.split())
-    assert len(_OBSERVER_PROMPT) < 1900
+    assert len(_OBSERVER_PROMPT) < 2000
     assert "structured output" in _OBSERVER_PROMPT
     assert "без Markdown" in _OBSERVER_PROMPT
     for status in ("complete", "continue", "reroute"):
@@ -1305,6 +1301,9 @@ def test_observer_prompt_requires_semantic_task_comparison():
         _OBSERVER_PROMPT
     )
     assert "не подтверждает исходную операцию" in _OBSERVER_PROMPT
+    assert "row_format=named_records_with_dictionary_refs" in _OBSERVER_PROMPT
+    assert "явные имена полей" in _OBSERVER_PROMPT
+    assert "не схлопывай отдельные rows" in _OBSERVER_PROMPT
     normalized_worker_prompt = " ".join(_WORKER_PLANNER_PROMPT.split())
     assert "при `continue` закрой `gap`" in normalized_worker_prompt
     assert "действие `analyze`" not in _WORKER_PLANNER_PROMPT
@@ -1312,6 +1311,14 @@ def test_observer_prompt_requires_semantic_task_comparison():
     assert "Обычный текст запрещён" in normalized_worker_prompt
     assert "`table.column` разделяй на `table_name` и `column_name`" in (
         normalized_worker_prompt
+    )
+    assert (
+        "row_format=named_records_with_dictionary_refs"
+        in _WORKER_PLANNER_PROMPT
+    )
+    assert "0-based" in _WORKER_PLANNER_PROMPT
+    assert "каждая row остаётся отдельным фактом" in (
+        _WORKER_PLANNER_PROMPT
     )
 
 
@@ -1579,7 +1586,7 @@ def test_tool_router_prompt_is_generic_and_catalog_driven():
     assert "`not_for` — запрет" in normalized_prompt
     assert "полнота палитры важнее компактности" in normalized_prompt
     assert "не добавляй явно нерелевантные tools" in normalized_prompt
-    assert len(_TOOL_ROUTER_PROMPT) < 1700
+    assert len(_TOOL_ROUTER_PROMPT) < 1750
     for domain_detail in (
         "trace_neo4j_table_lineage",
         "run_cypher",

@@ -106,6 +106,16 @@ class _BoundModel:
 class _CoordinatorModel:
     def __init__(self, responses):
         self.responses = {name: list(items) for name, items in responses.items()}
+        self.responses.setdefault(
+            "select_operation_skills",
+            [
+                _tool_message(
+                    "select_operation_skills",
+                    {"skills": []},
+                    "operation-skills-1",
+                )
+            ],
+        )
         legacy_upstream = self.responses.pop("submit_upstream_output", [])
         if legacy_upstream:
             decisions = self.responses.setdefault(
@@ -205,6 +215,7 @@ def test_coordinator_graph_routes_tasks_downstream_and_one_result_upstream():
     graph_view = graph.get_graph()
 
     assert model.tool_choices == [
+        ("select_operation_skills", "select_operation_skills"),
         ("submit_worker_plan", "submit_worker_plan"),
         (
             "submit_upstream_data_decision",
@@ -223,6 +234,162 @@ def test_coordinator_graph_routes_tasks_downstream_and_one_result_upstream():
     assert ("downstream_plan", "worker") in edges
     assert ("upstream", "downstream_plan") in edges
     assert ("upstream", "__end__") in edges
+
+
+def test_operation_skill_is_selected_once_and_applied_by_stage():
+    from agents.coordinator import coordinator_chat
+
+    responses = _responses(answer="Риск оценён.", plan_task="Прочитай правило.")
+    responses["select_operation_skills"] = [
+        _tool_message(
+            "select_operation_skills",
+            {"skills": ["Анализ SQL-рисков"]},
+            "operation-skills-risk",
+        )
+    ]
+    model = _CoordinatorModel(responses)
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            return_value=_outcome("Правило прочитано."),
+        ) as worker,
+    ):
+        result = coordinator_chat("Оцени риск потери строк в A → B.")
+
+    assert result.answer == "Риск оценён."
+    assert [name for name, _ in model.messages].count(
+        "select_operation_skills"
+    ) == 1
+    worker_parts = parse_worker_request(worker.call_args.args[0])
+    normalized_execution = " ".join(
+        worker_parts.operation_execution_context.split()
+    )
+    normalized_completeness = " ".join(
+        worker_parts.operation_completeness_context.split()
+    )
+    assert (
+        "используй единственный directed mapping-reader только с обязательными "
+        "`source_table` и `target_table`"
+    ) in normalized_execution
+    assert "Вызов по ID нерелевантен" in (
+        worker_parts.operation_completeness_context
+    )
+    assert "Вызов по ID нерелевантен" not in (
+        worker_parts.operation_execution_context
+    )
+    assert "используй единственный directed mapping-reader" not in (
+        normalized_completeness
+    )
+
+    plan_system = next(
+        messages[0].content
+        for name, messages in model.messages
+        if name == "submit_worker_plan"
+    )
+    decision_system = next(
+        messages[0].content
+        for name, messages in model.messages
+        if name == "submit_upstream_data_decision"
+    )
+    answer_system = next(
+        messages[0].content
+        for name, messages in model.messages
+        if name == "submit_upstream_answer"
+    )
+    normalized_decision = " ".join(decision_system.split())
+    assert "Не создавай transformation ID" in plan_system
+    assert "Нулевой mapping подтверждает отсутствие" in decision_system
+    assert "не требуй больше evidence" in normalized_decision
+    assert "условный вывод" in normalized_decision
+    assert "не являются обязательным условием `pass`" in normalized_decision
+    assert "Вызов по ID нерелевантен" not in decision_system
+    assert "Различай итоговые" in answer_system
+    assert "Нулевой mapping подтверждает отсутствие" not in answer_system
+
+
+def test_operation_skill_loader_returns_only_requested_stage():
+    from agents.tools.context import load_operation_skills
+
+    contexts = {
+        stage: load_operation_skills(
+            ["Совместимость колонок"],
+            stage=stage,
+        )
+        for stage in (
+            "plan",
+            "planner",
+            "observer",
+            "upstream_decision",
+            "upstream",
+        )
+    }
+
+    assert "Создай одну задачу" in contexts["plan"]
+    assert "exact pair-reader" in contexts["planner"]
+    assert "Pair-result" in contexts["observer"]
+    assert "`pass` допустим" in contexts["upstream_decision"]
+    assert "Верни фактические" in contexts["upstream"]
+    assert len(set(contexts.values())) == 5
+    assert all("Покрытие маппинга" not in text for text in contexts.values())
+    assert load_operation_skills([], stage="planner") == ""
+
+
+def test_sql_risk_operation_skill_allows_pass_for_conditional_answer():
+    from agents.tools.context import load_operation_skills
+
+    decision = load_operation_skills(
+        ["Анализ SQL-рисков"],
+        stage="upstream_decision",
+    )
+    normalized = " ".join(decision.split())
+
+    assert "достаточность только относительно `original_task`" in normalized
+    assert "условный вывод" in normalized
+    assert "не являются обязательным условием `pass`" in normalized
+    assert "Не делай `reroute` ради оценки вероятности" in normalized
+    assert "`pass` требует exact mapping" not in normalized
+
+
+def test_sql_risk_operation_skill_separates_risk_layers_by_stage():
+    from agents.tools.context import load_operation_skills
+
+    contexts = {
+        stage: " ".join(
+            load_operation_skills(
+                ["Анализ SQL-рисков"],
+                stage=stage,
+            ).split()
+        )
+        for stage in (
+            "plan",
+            "planner",
+            "observer",
+            "upstream_decision",
+            "upstream",
+        )
+    }
+
+    assert "полный mapping достаточен" in contexts["plan"]
+    assert "Не добавляй metadata только ради проверки ключей" in contexts["plan"]
+    assert "Не сокращай metadata-задачу до одной стороны" in contexts["plan"]
+    assert "Planner получает факты" in contexts["planner"]
+    assert "не оценивай безопасность" in contexts["observer"]
+    assert "target-only evidence подтверждает ограничение" in (
+        contexts["upstream_decision"]
+    )
+    answer = contexts["upstream"]
+    assert "отсечение входных строк самим SQL" in answer
+    assert "размножение или схлопывание строк" in answer
+    assert "rejection результата ограничениями загрузки" in answer
+    assert "write semantics" in answer
+    assert "`Не оценено` никогда не является фактором снижения риска" in answer
+    assert "Прямой field mapping не доказывает кардинальность 1:1" in answer
+    assert "его нельзя назвать минимальным" in answer
+    assert "отсечение входных строк самим SQL" not in contexts["observer"]
 
 
 def test_plan_requires_only_self_contained_task():
@@ -414,7 +581,15 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert _DOWNSTREAM_TABLE_CONTEXT in _DOWNSTREAM_PLAN_PROMPT
     assert len(_UPSTREAM_DATA_DECISION_PROMPT) < 1300
     assert len(_UPSTREAM_ANSWER_PROMPT) < 2300
-    assert len(_UPSTREAM_ANALYSIS_CONTEXT) < 3000
+    assert len(_UPSTREAM_ANALYSIS_CONTEXT) < 3500
+    assert (
+        "row_format=named_records_with_dictionary_refs"
+        in _UPSTREAM_ANALYSIS_CONTEXT
+    )
+    assert "0-based индексом" in _UPSTREAM_ANALYSIS_CONTEXT
+    assert "не схлопывай одинаковые occurrences" in (
+        _UPSTREAM_ANALYSIS_CONTEXT
+    )
     assert "`depends_on`" not in _DOWNSTREAM_PLAN_PROMPT
     assert "needs_from_previous" not in _DOWNSTREAM_PLAN_PROMPT
     assert "required_evidence" not in _DOWNSTREAM_PLAN_PROMPT
@@ -468,13 +643,9 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "Не превращай смысловой поиск в «найти содержащие»" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "Сначала определи требуемый результат" in _DOWNSTREAM_PLAN_PROMPT
-    assert "фактические значения, расчёт или выполнение" in (
-        _DOWNSTREAM_PLAN_PROMPT
-    )
-    assert "методику, шаблон, план проверки или протокол" in (
-        _DOWNSTREAM_PLAN_PROMPT
-    )
+    assert "Планируй чтение только тех фактов" in _DOWNSTREAM_PLAN_PROMPT
+    assert "просит описать способ будущего действия" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Для вывода по сохранённому выражению" in _DOWNSTREAM_PLAN_PROMPT
     assert "глобальную `s2t_transformations` не ограничивай `file_id`" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
@@ -551,7 +722,13 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "безымянную CSV-последовательность" in _UPSTREAM_ANSWER_PROMPT
     assert "observations" not in combined
     assert "Правила upstream-анализа" in _UPSTREAM_ANALYSIS_CONTEXT
-    assert "`LEFT JOIN`" in _UPSTREAM_ANALYSIS_CONTEXT
+    assert "`LEFT JOIN ... ON p`" in _UPSTREAM_ANALYSIS_CONTEXT
+    assert "Полевой маппинг задаёт конкретная S2T-строка" in (
+        _UPSTREAM_ANALYSIS_CONTEXT
+    )
+    assert "`ON TRUE AND p` эквивалентно `ON p`" in " ".join(
+        _UPSTREAM_ANALYSIS_CONTEXT.split()
+    )
     assert "Технические поля хранилища" in _UPSTREAM_ANALYSIS_CONTEXT
     assert "не переименовывай" in _UPSTREAM_ANALYSIS_CONTEXT
     assert "Не подставляй фиктивное значение" in _UPSTREAM_ANALYSIS_CONTEXT
@@ -919,6 +1096,7 @@ def test_upstream_selects_only_requested_display_and_discards_other_refs():
     )
     discard.assert_called_once_with(["display-first"])
     assert stages == [
+        "operation_router",
         "downstream_plan",
         "upstream",
         "upstream",
@@ -1090,6 +1268,7 @@ def test_upstream_normalizes_structured_answer_after_data_pass():
 
     assert result == CoordinatorAnswer(answer='[{"value":42}]', display_refs=[])
     assert [name for name, _ in model.messages] == [
+        "select_operation_skills",
         "submit_worker_plan",
         "submit_upstream_data_decision",
         "submit_upstream_answer",

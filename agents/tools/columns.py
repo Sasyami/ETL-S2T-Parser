@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from langchain_core.tools import tool
 
-from .common import clamped_int
+from .common import clamped_int, pack_tabular_rows
 
 
 ColumnScope = Literal["all_tables", "source_columns", "target_columns"]
@@ -122,7 +122,7 @@ def _subset_conditions(
 def _query_catalog(
     *,
     scope: ColumnScope,
-    limit: int,
+    limit: Optional[int],
     columns: Optional[Sequence[str]],
     file_id: Optional[int],
     table_name: Optional[str],
@@ -157,8 +157,13 @@ def _query_catalog(
         return {"error": str(exc), "rows": []}
 
     where_sql = "WHERE " + " AND ".join(conditions) if conditions else ""
-    clean_limit = clamped_int(limit, 50, 1, 100)
+    clean_limit = (
+        clamped_int(limit, 50, 1, 100)
+        if limit is not None
+        else None
+    )
     select_sql = ", ".join(f'"{field}"' for field in selected)
+    limit_sql = "LIMIT ?" if clean_limit is not None else ""
     query = f"""
         WITH catalog AS (
             {_catalog_cte(scope)}
@@ -169,9 +174,10 @@ def _query_catalog(
         SELECT {select_sql}, COUNT(*) OVER () AS __total_matches
         FROM matched
         ORDER BY column_role, file_id, table_name, column_name, record_id
-        LIMIT ?
+        {limit_sql}
     """
-    params.append(clean_limit)
+    if clean_limit is not None:
+        params.append(clean_limit)
 
     from storage.database import get_db_connection
 
@@ -194,6 +200,304 @@ def _query_catalog(
         "returned_rows": len(rows),
         "truncated": total_matches > len(rows),
         "rows": rows,
+    }
+
+
+def _list_role_column_catalog(
+    *,
+    scope: Literal["source_columns", "target_columns"],
+    file_id: int,
+    table_name: str,
+    column_name: Optional[str],
+    data_type: Optional[str],
+    primary_key: Optional[bool],
+    not_null: Optional[bool],
+) -> Dict[str, Any]:
+    """Read one explicit catalog role inside a required file and table."""
+    try:
+        clean_table = _clean_exact_filter(table_name, "table_name")
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc), "rows": []}
+    if clean_table is None:
+        return {"error": "table_name must be non-empty", "rows": []}
+    return _query_catalog(
+        scope=scope,
+        limit=None,
+        columns=None,
+        file_id=file_id,
+        table_name=clean_table,
+        column_name=column_name,
+        data_type=data_type,
+        primary_key=primary_key,
+        not_null=not_null,
+    )
+
+
+@tool(parse_docstring=True)
+def list_source_column_catalog(
+    file_id: int,
+    table_name: str,
+    column_name: Optional[str] = None,
+    data_type: Optional[str] = None,
+    primary_key: Optional[bool] = None,
+    not_null: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Прочитать source-колонки одной точной таблицы конкретного файла.
+
+    Роль source, ``file_id`` и ``table_name`` зафиксированы сигнатурой и не
+    могут быть потеряны либо заменены target-каталогом. Для одной известной
+    колонки передай ``column_name``; без него вернутся колонки всей таблицы.
+    Фильтры типа, PK и NOT NULL ограничивают это же точное множество.
+
+    Args:
+        file_id: Положительный идентификатор явно выбранной загрузки.
+        table_name: Точное полное имя исходной логической таблицы.
+        column_name: Опциональное точное имя исходной колонки.
+        data_type: Опциональный точный тип данных.
+        primary_key: Опциональный фильтр признака первичного ключа.
+        not_null: Опциональный фильтр обязательности значения.
+    """
+    return _list_role_column_catalog(
+        scope="source_columns",
+        file_id=file_id,
+        table_name=table_name,
+        column_name=column_name,
+        data_type=data_type,
+        primary_key=primary_key,
+        not_null=not_null,
+    )
+
+
+@tool(parse_docstring=True)
+def list_target_column_catalog(
+    file_id: int,
+    table_name: str,
+    column_name: Optional[str] = None,
+    data_type: Optional[str] = None,
+    primary_key: Optional[bool] = None,
+    not_null: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Прочитать target-колонки одной точной таблицы конкретного файла.
+
+    Роль target, ``file_id`` и ``table_name`` зафиксированы сигнатурой и не
+    могут быть потеряны либо заменены source-каталогом. Для одной известной
+    колонки передай ``column_name``; без него вернутся колонки всей таблицы.
+    Фильтры типа, PK и NOT NULL ограничивают это же точное множество.
+
+    Args:
+        file_id: Положительный идентификатор явно выбранной загрузки.
+        table_name: Точное полное имя целевой логической таблицы.
+        column_name: Опциональное точное имя целевой колонки.
+        data_type: Опциональный точный тип данных.
+        primary_key: Опциональный фильтр признака первичного ключа.
+        not_null: Опциональный фильтр обязательности значения.
+    """
+    return _list_role_column_catalog(
+        scope="target_columns",
+        file_id=file_id,
+        table_name=table_name,
+        column_name=column_name,
+        data_type=data_type,
+        primary_key=primary_key,
+        not_null=not_null,
+    )
+
+
+@tool(parse_docstring=True)
+def get_source_target_column_pair(
+    file_id: int,
+    source_table: str,
+    source_column: str,
+    target_table: str,
+    target_column: str,
+) -> Dict[str, Any]:
+    """Прочитать точную source/target-пару колонок одного файла.
+
+    Используй для сравнения атрибутов уже известных S2T-колонок. Все пять
+    идентификаторов обязательны, поэтому одна сторона, роль или ``file_id`` не
+    могут исчезнуть между вызовами. Tool только возвращает две каталоговые
+    записи; совместимость анализирует upstream.
+
+    Args:
+        file_id: Положительный идентификатор явно выбранной загрузки.
+        source_table: Точное полное имя исходной логической таблицы.
+        source_column: Точное имя исходной колонки.
+        target_table: Точное полное имя целевой логической таблицы.
+        target_column: Точное имя целевой колонки.
+    """
+    names: Dict[str, str] = {}
+    try:
+        for name, value in (
+            ("source_table", source_table),
+            ("source_column", source_column),
+            ("target_table", target_table),
+            ("target_column", target_column),
+        ):
+            clean_value = _clean_exact_filter(value, name)
+            if clean_value is None:
+                return {"error": f"{name} must be non-empty", "rows": []}
+            names[name] = clean_value
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc), "rows": []}
+
+    source = _query_catalog(
+        scope="source_columns",
+        limit=None,
+        columns=None,
+        file_id=file_id,
+        table_name=names["source_table"],
+        column_name=names["source_column"],
+        data_type=None,
+        primary_key=None,
+        not_null=None,
+    )
+    target = _query_catalog(
+        scope="target_columns",
+        limit=None,
+        columns=None,
+        file_id=file_id,
+        table_name=names["target_table"],
+        column_name=names["target_column"],
+        data_type=None,
+        primary_key=None,
+        not_null=None,
+    )
+    for result in (source, target):
+        if result.get("error"):
+            return {"error": result["error"], "rows": []}
+    rows = [*source.get("rows", []), *target.get("rows", [])]
+    return {
+        "scope": "source_target_pair",
+        "filters": {"file_id": int(file_id), **names},
+        "columns": list(COLUMN_RESULT_FIELDS),
+        "role_counts": {
+            "source": int(source.get("total_matches") or 0),
+            "target": int(target.get("total_matches") or 0),
+        },
+        "total_matches": int(source.get("total_matches") or 0)
+        + int(target.get("total_matches") or 0),
+        "returned_rows": len(rows),
+        "truncated": False,
+        "rows": rows,
+    }
+
+
+def _normalize_file_scope(
+    file_scope: str,
+) -> Tuple[Optional[int], str]:
+    if not isinstance(file_scope, str):
+        raise ValueError("file_scope must be 'all' or a positive decimal file_id")
+    clean_scope = file_scope.strip()
+    if clean_scope.casefold() == "all":
+        return None, "all"
+    if not clean_scope.isdecimal() or int(clean_scope) <= 0:
+        raise ValueError("file_scope must be 'all' or a positive decimal file_id")
+    clean_file_id = int(clean_scope)
+    return clean_file_id, str(clean_file_id)
+
+
+@tool(parse_docstring=True)
+def list_column_metadata(
+    file_scope: str,
+    table_names: List[str],
+) -> Dict[str, Any]:
+    """Прочитать полную структуру точных таблиц в обеих catalog-ролях.
+
+    ``file_scope`` — строка с decimal file_id (например ``"3"``) либо ``"all"``.
+    Одним batch читает полную структуру ``table_names`` в source/target-ролях
+    без лимита. Type/PK/NOT NULL-фильтров нет: фактические значения выбираются
+    из результата. Description читается search/semantic tool. Формат lossless:
+    позиции задаёт ``columns``, словарные значения — 0-based индексы в
+    ``dictionaries``. Это transport references; каждая catalog-row сохранена.
+
+    Args:
+        file_scope: Строка ``all`` либо положительный десятичный file_id, например ``3``.
+        table_names: Непустой список точных полных имён таблиц; максимум 20.
+    """
+    try:
+        file_id, normalized_scope = _normalize_file_scope(file_scope)
+        clean_tables: List[str] = []
+        seen_tables = set()
+        for value in table_names or []:
+            clean_value = _clean_exact_filter(value, "table_name")
+            if clean_value is None:
+                continue
+            identity = clean_value.casefold()
+            if identity not in seen_tables:
+                seen_tables.add(identity)
+                clean_tables.append(clean_value)
+        if not clean_tables:
+            raise ValueError("table_names must contain at least one exact name")
+        if len(clean_tables) > 20:
+            raise ValueError("table_names supports at most 20 exact names")
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc), "rows": []}
+
+    rows: List[Dict[str, Any]] = []
+    table_counts: Dict[str, Dict[str, int]] = {}
+    role_counts = {"source": 0, "target": 0}
+    result_columns = [
+        "record_id",
+        "column_role",
+        "file_id",
+        "filename",
+        "sheet_name",
+        "row_num",
+        "table_name",
+        "column_name",
+        "data_type",
+        "primary_key",
+        "not_null",
+    ]
+    for table_name in clean_tables:
+        result = _query_catalog(
+            scope="all_tables",
+            limit=None,
+            columns=result_columns,
+            file_id=file_id,
+            table_name=table_name,
+            column_name=None,
+            data_type=None,
+            primary_key=None,
+            not_null=None,
+        )
+        if result.get("error"):
+            return {"error": result["error"], "rows": []}
+        current_counts = {"source": 0, "target": 0}
+        for row in result.get("rows") or []:
+            item = dict(row)
+            role = str(item.get("column_role") or "")
+            if role in current_counts:
+                current_counts[role] += 1
+                role_counts[role] += 1
+            rows.append(item)
+        table_counts[table_name] = current_counts
+
+    filters: Dict[str, Any] = {
+        "file_scope": normalized_scope,
+        "table_names": clean_tables,
+    }
+    packed = pack_tabular_rows(
+        rows,
+        columns=result_columns,
+        dictionary_columns=[
+            "column_role",
+            "filename",
+            "sheet_name",
+            "table_name",
+        ],
+    )
+    packed_rows = packed.pop("rows")
+    return {
+        "scope": "source_and_target_column_structure",
+        "filters": filters,
+        **packed,
+        "role_counts": role_counts,
+        "table_role_counts": table_counts,
+        "total_matches": len(rows),
+        "returned_rows": len(rows),
+        "truncated": False,
+        "rows": packed_rows,
     }
 
 
@@ -314,7 +618,7 @@ def search_column_catalog(
     придуманные синонимы или переводы бизнес-термина. Для поиска по назначению,
     бизнес-смыслу или описанию при неизвестном точном фрагменте используй
     semantic_search_descriptions. После разрешения точных имён передавай их в
-    list_column_catalog.
+    exact catalog reader активной палитры.
 
     Args:
         needle: Одна непустая буквальная подстрока длиной до 300 символов.
@@ -350,6 +654,10 @@ def search_column_catalog(
 __all__ = [
     "COLUMN_RESULT_FIELDS",
     "filter_column_catalog",
+    "get_source_target_column_pair",
     "list_column_catalog",
+    "list_column_metadata",
+    "list_source_column_catalog",
+    "list_target_column_catalog",
     "search_column_catalog",
 ]

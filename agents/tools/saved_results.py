@@ -38,20 +38,30 @@ SQLITE_RESULT_TOOL_NAMES = frozenset(
         "get_excel_row",
         "get_file_description",
         "get_s2t_rules_by_ids",
+        "get_source_target_column_pair",
         "filter_column_catalog",
         "list_column_catalog",
+        "list_column_metadata",
         "list_columns",
         "list_file_sheet_headers",
         "list_files",
         "list_s2t_table_mapping",
+        "list_s2t_occurrences",
+        "list_s2t_field_mapping",
         "list_s2t_table_names",
         "list_s2t_source_field",
         "list_s2t_source_table",
         "list_s2t_target_field",
         "list_s2t_target_table",
         "list_s2t_transformations",
+        "list_source_column_catalog",
+        "list_target_column_catalog",
         "list_sheets",
         "query_saved_result",
+        "read_s2t_by_source_table",
+        "read_s2t_by_target_table",
+        "read_s2t_mapping",
+        "read_s2t_source_to_target",
         "resolve_file",
         "run_sql",
         "search_column_catalog",
@@ -135,11 +145,53 @@ def _tabular_payload(payload: Any) -> Optional[Dict[str, Any]]:
         return None
 
     rows: List[Dict[str, Any]] = []
-    for item in raw_rows:
-        if isinstance(item, Mapping):
-            rows.append({str(key): value for key, value in item.items()})
-        else:
-            rows.append({"value": item})
+    packed_format = (
+        isinstance(metadata, Mapping)
+        and metadata.get("row_format") == "arrays_in_column_order"
+    )
+    if packed_format:
+        packed_columns = [str(value or "").strip() for value in declared_columns]
+        if (
+            not packed_columns
+            or any(not value for value in packed_columns)
+            or len(set(packed_columns)) != len(packed_columns)
+        ):
+            return None
+        raw_dictionaries = metadata.get("dictionaries", {})
+        if not isinstance(raw_dictionaries, Mapping):
+            return None
+        dictionaries: Dict[str, List[Any]] = {}
+        for key, values in raw_dictionaries.items():
+            column = str(key or "").strip()
+            if column not in packed_columns or not isinstance(values, list):
+                return None
+            dictionaries[column] = values
+        for item in raw_rows:
+            if (
+                not isinstance(item, Sequence)
+                or isinstance(item, (str, bytes, bytearray))
+                or len(item) != len(packed_columns)
+            ):
+                return None
+            decoded: Dict[str, Any] = {}
+            for column, value in zip(packed_columns, item):
+                if column in dictionaries:
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                        or value >= len(dictionaries[column])
+                    ):
+                        return None
+                    value = dictionaries[column][value]
+                decoded[column] = value
+            rows.append(decoded)
+    else:
+        for item in raw_rows:
+            if isinstance(item, Mapping):
+                rows.append({str(key): value for key, value in item.items()})
+            else:
+                rows.append({"value": item})
 
     columns = _normalized_columns(rows, declared_columns)
     if not columns:

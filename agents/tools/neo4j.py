@@ -255,14 +255,10 @@ def run_cypher(
     когда требуется произвольный табличный обход, несколько условий,
     группировка или нестандартная форма графового ответа.
 
-    Для точного пути длины N между известными таблицами используй форму
-    `MATCH path=(source:ETLProjection:ETLTable {name: $source})-
-    [:TABLE_TRANSFORMS_TO*N]->
-    (target:ETLProjection:ETLTable {name: $target}) RETURN
-    [node IN nodes(path) | node.name] AS table_path, length(path) AS depth`,
-    где N — безопасный числовой литерал из задачи, а имена передаются только
-    через parameters. Передавай настоящий многострочный query, а не текст с
-    буквальными последовательностями `\\n`.
+    Для обычного направленного пути между двумя известными таблицами используй
+    trace_neo4j_table_path. Свободный Cypher оставляй только запросам, форму
+    которых не покрывают специализированные lineage-tools. Передавай настоящий
+    многострочный query, а не текст с буквальными последовательностями `\\n`.
 
     Поддерживаются MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN,
     SHOW, EXPLAIN и PROFILE. Изменяющие конструкции, несколько выражений и
@@ -581,6 +577,7 @@ def trace_neo4j_lineage(
     direction: Literal["upstream", "downstream", "both"] = "both",
     max_depth: int = 1,
     limit: int = 50,
+    include_transformation_rules: bool = False,
 ) -> Dict[str, Any]:
     """Найти upstream/downstream lineage конкретной именованной колонки.
 
@@ -591,15 +588,15 @@ def trace_neo4j_lineage(
     Не используй для lineage всей таблицы без колонки: там нужен
     trace_neo4j_table_lineage. Используй для структуры графа и именованных
     зависимостей колонок. Если пользователь просит правила преобразования для
-    найденного impact, после lineage передай его transformation_id в
-    get_s2t_rules_by_ids. Для заранее известной точной S2T-пары, её объяснимого
-    пути или запроса на готовую схему используй trace_transformation_path: он
-    также возвращает text_diagram.
+    найденного impact, передай include_transformation_rules=true: tool сам
+    извлечёт transformation_id только из найденных им lineage-шагов и дочитает
+    точные строки S2T. Для заранее известной точной S2T-пары, её объяснимого пути
+    или запроса на готовую схему используй trace_transformation_path: он также
+    возвращает text_diagram.
 
     Передай полную ссылку ``table_name.column_name`` одним атомарным аргументом
     column_reference. Дословно скопируй её из task без сокращения схемы или имени
-    таблицы. Например,
-    ``schema.layer.a_000025_t_loanscontract.c_closedate`` целиком передаётся в
+    таблицы. Например, ``schema.table.column`` целиком передаётся в
     column_reference. Tool сам разделит ссылку по последней точке.
 
     Используй только когда пользователь просит lineage/upstream/downstream
@@ -617,10 +614,9 @@ def trace_neo4j_lineage(
     одноимённые колонки.
     В публичных шагах такое ребро возвращается как source_field="*" и
     target_field="*" без отдельного boolean-признака.
-    Для произвольного графового запроса используй run_cypher, для правил
-    найденного impact — get_s2t_rules_by_ids. SQL и additional objects этим
-    tool не разбираются. file_id допустим только при явном файловом scope.
-    Пустой rows не отменяет факты SQLite.
+    Для произвольного графового запроса используй run_cypher. SQL и additional objects
+    этим tool не разбираются. file_id допустим только при явном файловом
+    scope. Пустой rows не отменяет факты SQLite.
 
     Args:
         column_reference: Дословная полная ссылка table_name.column_name из
@@ -630,6 +626,8 @@ def trace_neo4j_lineage(
         direction: upstream, downstream или оба направления both.
         max_depth: Максимальная глубина пути именованной колонки, от 1 до 50.
         limit: Максимальное число найденных связей колонок, от 1 до 100.
+        include_transformation_rules: При true дочитать точные S2T-строки только
+            по transformation_id, найденным текущим lineage-вызовом.
     """
     clean_column_reference = str(column_reference or "").strip()
     if not clean_column_reference:
@@ -690,8 +688,34 @@ def trace_neo4j_lineage(
             "direction": direction,
             "max_depth": clean_max_depth,
             "limit": clean_limit,
+            "include_transformation_rules": bool(include_transformation_rules),
         }
     )
+    if include_transformation_rules:
+        transformation_ids = []
+        for row in result.get("rows") or []:
+            value = row.get("transformation_id")
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            if value > 0 and value not in transformation_ids:
+                transformation_ids.append(value)
+            if len(transformation_ids) >= 100:
+                break
+
+        if transformation_ids:
+            from .s2t import _read_s2t_rules_by_ids
+
+            result["transformation_rules"] = _read_s2t_rules_by_ids(
+                transformation_ids
+            )
+        else:
+            result["transformation_rules"] = {
+                "columns": [],
+                "rows": [],
+                "requested_ids": [],
+                "missing_ids": [],
+                "returned_rows": 0,
+            }
     return result
 
 

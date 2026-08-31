@@ -38,6 +38,26 @@ SCHEMA_CATALOG: Dict[str, str] = {
 }
 
 
+OPERATION_SKILL_CATALOG: Dict[str, str] = {
+    "Совместимость колонок": (
+        "Явное сравнение типов, nullable или ключевых признаков точных "
+        "source/target-колонок."
+    ),
+    "Анализ SQL-рисков": (
+        "Явная оценка размножения либо потери строк по сохранённому "
+        "SQL/S2T-правилу."
+    ),
+    "Покрытие маппинга": (
+        "Явный поиск разности между ограниченным каталогом колонок и "
+        "S2T-полями той же роли."
+    ),
+    "Проектирование проверки": (
+        "Составление методики или тест-протокола будущих проверок по "
+        "подтверждённым правилам и метаданным."
+    ),
+}
+
+
 _DOWNSTREAM_TABLE_DESCRIPTIONS: Dict[str, str] = {
     "files": "загруженные Excel-файлы и их сохранённые описания",
     "file_sheet_headers": "листы файлов и распознанные заголовки",
@@ -272,6 +292,71 @@ def load_skills(sections: Optional[Iterable[str]] = None) -> str:
             selected_lines.extend(block_lines)
 
     return "\n".join(selected_lines).strip()
+
+
+def load_operation_skills(
+    sections: Iterable[str],
+    *,
+    stage: Literal[
+        "plan",
+        "planner",
+        "observer",
+        "upstream_decision",
+        "upstream",
+    ],
+) -> str:
+    """Load only the selected operation-skill rules for one LLM stage."""
+    text = _prompt_text("operation_skills.md")
+    if not text:
+        return ""
+
+    stage_titles = {
+        "plan": "Downstream plan",
+        "planner": "Planner",
+        "observer": "Observer",
+        "upstream_decision": "Upstream decision",
+        "upstream": "Upstream answer",
+    }
+    requested = {
+        str(section).strip().casefold()
+        for section in sections
+        if str(section).strip()
+    }
+    if not requested:
+        return ""
+
+    selected: List[str] = []
+    current_skill: Optional[str] = None
+    current_stage: Optional[str] = None
+    stage_lines: List[str] = []
+
+    def flush_stage() -> None:
+        if (
+            current_skill is not None
+            and current_skill.casefold() in requested
+            and current_stage == stage_titles[stage]
+        ):
+            body = "\n".join(stage_lines).strip()
+            if body:
+                selected.append(f"## {current_skill}\n{body}")
+
+    for line in text.splitlines():
+        if line.startswith("## "):
+            flush_stage()
+            current_skill = line[3:].strip()
+            current_stage = None
+            stage_lines = []
+        elif line.startswith("### "):
+            flush_stage()
+            current_stage = line[4:].strip()
+            stage_lines = []
+        elif current_stage is not None:
+            stage_lines.append(line)
+    flush_stage()
+
+    if not selected:
+        return ""
+    return "Правила выбранных operation-skills:\n\n" + "\n\n".join(selected)
 
 
 def load_chat_agent_context() -> str:

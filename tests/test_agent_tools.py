@@ -296,6 +296,126 @@ def test_saved_sqlite_tool_result_is_queryable_with_bound_schema():
         assert forbidden["error"] == "Saved result SQL query failed"
 
 
+def test_packed_tool_result_materializes_decoded_rows_losslessly():
+    from agents.tools.saved_results import (
+        query_saved_result,
+        saved_result_store_scope,
+    )
+
+    packed = {
+        "row_format": "arrays_in_column_order",
+        "columns": ["matched_role", "transformation_rule", "row_num"],
+        "dictionaries": {
+            "matched_role": ["source", "target"],
+            "transformation_rule": ["same rule"],
+        },
+        "total_matches": 3,
+        "truncated": False,
+        "rows": [
+            [0, 0, 1],
+            [0, 0, 1],
+            [1, 0, 2],
+        ],
+    }
+
+    with saved_result_store_scope() as store:
+        descriptor = store.save_payload(
+            source_tool="list_s2t_occurrences",
+            payload=packed,
+        )
+        assert descriptor is not None
+        assert descriptor.row_count == 3
+        assert descriptor.truncated is False
+        queried = query_saved_result.invoke(
+            {
+                "result_ref": descriptor.result_ref,
+                "query": (
+                    "SELECT matched_role, transformation_rule, row_num "
+                    "FROM result ORDER BY row_num, matched_role"
+                ),
+            }
+        )
+        assert queried["rows"] == [
+            {
+                "matched_role": "source",
+                "transformation_rule": "same rule",
+                "row_num": 1,
+            },
+            {
+                "matched_role": "source",
+                "transformation_rule": "same rule",
+                "row_num": 1,
+            },
+            {
+                "matched_role": "target",
+                "transformation_rule": "same rule",
+                "row_num": 2,
+            },
+        ]
+
+
+@pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        {
+            "row_format": "arrays_in_column_order",
+            "columns": ["kind", "value"],
+            "dictionaries": [],
+            "rows": [[0, 1]],
+        },
+        {
+            "row_format": "arrays_in_column_order",
+            "columns": ["kind", "value"],
+            "dictionaries": {"unknown": ["source"]},
+            "rows": [[0, 1]],
+        },
+        {
+            "row_format": "arrays_in_column_order",
+            "columns": ["kind", "value"],
+            "dictionaries": {"kind": "source"},
+            "rows": [[0, 1]],
+        },
+        {
+            "row_format": "arrays_in_column_order",
+            "columns": ["kind", "value"],
+            "dictionaries": {"kind": ["source"]},
+            "rows": [[True, 1]],
+        },
+        {
+            "row_format": "arrays_in_column_order",
+            "columns": ["kind", "value"],
+            "dictionaries": {"kind": ["source"]},
+            "rows": [[-1, 1]],
+        },
+        {
+            "row_format": "arrays_in_column_order",
+            "columns": ["kind", "value"],
+            "dictionaries": {"kind": ["source"]},
+            "rows": [[1, 1]],
+        },
+        {
+            "row_format": "arrays_in_column_order",
+            "columns": ["kind", "value"],
+            "dictionaries": {"kind": ["source"]},
+            "rows": [[0]],
+        },
+    ],
+    ids=[
+        "dictionaries-not-object",
+        "unknown-dictionary-column",
+        "dictionary-values-not-array",
+        "boolean-dictionary-index",
+        "negative-dictionary-index",
+        "out-of-range-dictionary-index",
+        "wrong-row-length",
+    ],
+)
+def test_packed_tool_result_decoder_rejects_invalid_transport(invalid_payload):
+    from agents.tools.saved_results import _tabular_payload
+
+    assert _tabular_payload(invalid_payload) is None
+
+
 def test_query_saved_result_is_scoped_and_read_only():
     from agents.tools.saved_results import (
         query_saved_result,
@@ -792,6 +912,171 @@ def test_list_column_catalog_uses_explicit_all_tables_scope():
     }
 
 
+def test_strict_column_tools_fix_roles_scope_and_return_complete_tables():
+    from agents.tools import (
+        get_source_target_column_pair,
+        list_column_metadata,
+        list_source_column_catalog,
+        list_target_column_catalog,
+    )
+
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO files (file_id, filename, upload_time) "
+        "VALUES (32, 'strict-columns.xlsx', '2026-01-01')"
+    )
+    conn.execute(
+        """
+        INSERT INTO source_columns
+        (id, file_id, sheet_name, row_num, table_name, column_name,
+         data_type, primary_key, not_null, description)
+        VALUES (500, 32, 'Source columns', 1, 'raw.payment', 'object_id_uid',
+                'uuid', 0, 0, 'Source ID')
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO target_columns
+        (id, file_id, sheet_name, row_num, table_name, column_name,
+         data_type, primary_key, not_null, description)
+        VALUES (?, 32, 'Target columns', ?, 'mart.payment', ?,
+                'uuid', ?, 1, 'Target column')
+        """,
+        [
+            (
+                600 + index,
+                index,
+                "payment_id" if index == 0 else f"required_{index}",
+                1 if index == 0 else 0,
+            )
+            for index in range(121)
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    target = list_target_column_catalog.invoke(
+        {
+            "file_id": 32,
+            "table_name": "mart.payment",
+            "not_null": True,
+        }
+    )
+    assert target["scope"] == "target_columns"
+    assert target["total_matches"] == 121
+    assert target["returned_rows"] == 121
+    assert target["truncated"] is False
+    assert {row["column_role"] for row in target["rows"]} == {"target"}
+
+    pair = get_source_target_column_pair.invoke(
+        {
+            "file_id": 32,
+            "source_table": "raw.payment",
+            "source_column": "object_id_uid",
+            "target_table": "mart.payment",
+            "target_column": "payment_id",
+        }
+    )
+    assert pair["role_counts"] == {"source": 1, "target": 1}
+    assert pair["truncated"] is False
+    assert [row["column_role"] for row in pair["rows"]] == [
+        "source",
+        "target",
+    ]
+    assert pair["rows"][0]["not_null"] == 0
+    assert pair["rows"][1]["not_null"] == 1
+
+    metadata = list_column_metadata.invoke(
+        {
+            "file_scope": "all",
+            "table_names": ["raw.payment", "mart.payment"],
+        }
+    )
+    assert metadata["scope"] == "source_and_target_column_structure"
+    assert metadata["filters"] == {
+        "file_scope": "all",
+        "table_names": ["raw.payment", "mart.payment"],
+    }
+    assert metadata["role_counts"] == {"source": 1, "target": 121}
+    assert metadata["table_role_counts"] == {
+        "raw.payment": {"source": 1, "target": 0},
+        "mart.payment": {"source": 0, "target": 121},
+    }
+    assert metadata["returned_rows"] == 122
+    assert metadata["total_matches"] == 122
+    assert metadata["truncated"] is False
+    assert metadata["row_format"] == "arrays_in_column_order"
+    assert all(isinstance(row, list) for row in metadata["rows"])
+
+    from agents.tools.saved_results import _tabular_payload
+
+    decoded_metadata = _tabular_payload(metadata)
+    assert decoded_metadata is not None
+    assert len(decoded_metadata["rows"]) == 122
+    assert {
+        row["column_role"] for row in decoded_metadata["rows"]
+    } == {"source", "target"}
+    assert sum(
+        row["table_name"] == "mart.payment"
+        and row["not_null"] == 1
+        for row in decoded_metadata["rows"]
+    ) == 121
+
+    assert list_source_column_catalog.args_schema.model_json_schema()[
+        "required"
+    ] == ["file_id", "table_name"]
+    target_properties = (
+        list_target_column_catalog.args_schema.model_json_schema()["properties"]
+    )
+    assert "scope" not in target_properties
+    assert "limit" not in target_properties
+    assert get_source_target_column_pair.args_schema.model_json_schema()[
+        "required"
+    ] == [
+        "file_id",
+        "source_table",
+        "source_column",
+        "target_table",
+        "target_column",
+    ]
+    metadata_schema = list_column_metadata.args_schema.model_json_schema()
+    assert metadata_schema["required"] == ["file_scope", "table_names"]
+    assert metadata_schema["properties"]["file_scope"]["type"] == "string"
+    assert {
+        "scope",
+        "file_id",
+        "column_name",
+        "limit",
+        "data_type",
+        "primary_key",
+        "not_null",
+    }.isdisjoint(metadata_schema["properties"])
+
+
+def test_list_column_metadata_validates_explicit_scope_and_batch_names():
+    from agents.tools import list_column_metadata
+
+    assert "positive decimal file_id" in list_column_metadata.invoke(
+        {"file_scope": "0", "table_names": ["mart.payment"]}
+    )["error"]
+    assert "positive decimal file_id" in list_column_metadata.invoke(
+        {"file_scope": "32.0", "table_names": ["mart.payment"]}
+    )["error"]
+    scoped = list_column_metadata.invoke(
+        {"file_scope": "32", "table_names": ["mart.payment"]}
+    )
+    assert scoped["filters"]["file_scope"] == "32"
+    assert "at least one exact name" in list_column_metadata.invoke(
+        {"file_scope": "all", "table_names": []}
+    )["error"]
+    assert "at most 20" in list_column_metadata.invoke(
+        {
+            "file_scope": "all",
+            "table_names": [f"table_{index}" for index in range(21)],
+        }
+    )["error"]
+
+
 def test_trace_transformation_path_combines_s2t_sql_and_additional_objects():
     from agents.tools import trace_transformation_path
 
@@ -1151,6 +1436,7 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
         "direction",
         "max_depth",
         "limit",
+        "include_transformation_rules",
     }
     table_names_schema = tools[
         "list_s2t_table_names"
@@ -1686,6 +1972,80 @@ def test_trace_neo4j_lineage_uses_exact_names_and_scope(mock_read):
     assert "wildcard_passthrough" not in result["rows"][0]
     assert "matched_source_field" not in result["rows"][0]
     assert "matched_target_field" not in result["rows"][0]
+    assert result["include_transformation_rules"] is False
+
+
+@patch("agents.tools.neo4j.execute_neo4j_read")
+def test_trace_neo4j_lineage_reads_rules_only_for_its_returned_ids(mock_read):
+    from agents.tools import trace_neo4j_lineage
+
+    conn = get_db_connection()
+    conn.executemany(
+        """INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field, transformation_rule)
+        VALUES (?, 7, 'S2T', ?, 'a_source', 'client_id',
+                'b_target', 'client_id', ?)""",
+        [
+            (91, 1, "exact rule from lineage"),
+            (999, 2, "unrelated rule"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    mock_read.return_value = [
+        {
+            "state_index": 0,
+            "file_id": 7,
+            "transformation_id": 91,
+            "source_table": "a_source",
+            "source_layer": "B",
+            "source_field": "client_id",
+            "target_table": "b_target",
+            "target_layer": "T",
+            "target_field": "client_id",
+            "matched_source_field": "client_id",
+            "matched_target_field": "client_id",
+            "match_direction": "downstream",
+        }
+    ]
+
+    result = trace_neo4j_lineage.invoke(
+        {
+            "column_reference": "a_source.client_id",
+            "direction": "downstream",
+            "include_transformation_rules": True,
+        }
+    )
+
+    rules = result["transformation_rules"]
+    assert result["include_transformation_rules"] is True
+    assert rules["requested_ids"] == [91]
+    assert [row["id"] for row in rules["rows"]] == [91]
+    assert rules["rows"][0]["transformation_rule"] == "exact rule from lineage"
+    assert 999 not in rules["requested_ids"]
+
+
+@patch("agents.tools.neo4j.execute_neo4j_read")
+def test_trace_neo4j_lineage_returns_empty_rules_without_lineage_ids(mock_read):
+    from agents.tools import trace_neo4j_lineage
+
+    mock_read.return_value = []
+
+    result = trace_neo4j_lineage.invoke(
+        {
+            "column_reference": "a_source.client_id",
+            "include_transformation_rules": True,
+        }
+    )
+
+    assert result["transformation_rules"] == {
+        "columns": [],
+        "rows": [],
+        "requested_ids": [],
+        "missing_ids": [],
+        "returned_rows": 0,
+    }
 
 
 @patch("agents.tools.neo4j.execute_neo4j_read")
@@ -1722,11 +2082,16 @@ def test_trace_neo4j_lineage_contract_keeps_qualified_reference_atomic():
         "direction",
         "max_depth",
         "limit",
+        "include_transformation_rules",
     }
     assert "Дословная полная ссылка" in properties["column_reference"][
         "description"
     ]
     assert "Не сокращай" in properties["column_reference"]["description"]
+    assert properties["include_transformation_rules"]["default"] is False
+    assert "текущим lineage-вызовом" in properties[
+        "include_transformation_rules"
+    ]["description"]
 
 
 @patch("agents.tools.neo4j.execute_neo4j_read")
@@ -2023,22 +2388,26 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "разреши по результату точное полное" in tools[
         "search_s2t_transformations"
     ].description
-    assert "используй list_s2t_transformations" in tools[
+    assert "directed mapping-reader" in tools[
         "search_s2t_transformations"
     ].description
     assert "точные s2t-строки" in tools["run_sql"].description.casefold()
     assert "это сценарий Neo4j" in tools["run_sql"].description
     assert "не должны содержать" in tools["run_sql"].description
     assert "фильтр по file_id" in tools["run_sql"].description
-    assert "Непустой source_table" in tools["run_sql"].description
-    assert "TRIM(source_table) <> ''" in tools["run_sql"].description
-    assert "не добавляй JOIN" in " ".join(
-        tools["run_sql"].description.split()
-    )
+    assert "Условия по атрибутам S2T-строк" in tools["run_sql"].description
+    assert "Не связывай её с каталогами" in tools["run_sql"].description
+    assert "target_table = X" not in tools["run_sql"].description
 
     assert "только для сложных графовых путей" in tools["run_cypher"].description
     assert "Для обычной таблицы S2T-трансформаций" in tools["run_cypher"].description
+    assert "trace_neo4j_table_path" in tools["run_cypher"].description
+    assert "TABLE_TRANSFORMS_TO*N" not in tools["run_cypher"].description
     assert "только когда пользователь просит lineage" in tools[
+        "trace_neo4j_lineage"
+    ].description
+    assert "schema.table.column" in tools["trace_neo4j_lineage"].description
+    assert "a_000025_t_loanscontract" not in tools[
         "trace_neo4j_lineage"
     ].description
     assert "max_depth=1" in tools["trace_neo4j_lineage"].description
@@ -2085,10 +2454,10 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "list_s2t_table_names" in tools["run_sql"].description
     assert "UNION ALL с сортировкой" in tools["run_sql"].description
     assert "не доказывает пересечение" in tools["run_sql"].description
-    assert "transformation_id из Neo4j соответствует" in tools[
+    assert "include_transformation_rules=true" in tools["run_sql"].description
+    assert "Не составляй SQL по transformation_id" in tools[
         "run_sql"
     ].description
-    assert "s2t_transformations.id" in tools["run_sql"].description
     assert "не требует одной и той же строки" in tools[
         "list_s2t_table_names"
     ].description
@@ -2769,6 +3138,218 @@ def test_list_s2t_table_mapping_keeps_table_roles_unambiguous():
     assert result["rows"][0]["target_field"] == "optn_id"
 
 
+def test_strict_s2t_pair_tools_require_roles_and_do_not_truncate():
+    from agents.tools import (
+        list_s2t_field_mapping,
+        list_s2t_table_mapping,
+        read_s2t_source_to_target,
+    )
+
+    conn = get_db_connection()
+    conn.executemany(
+        """
+        INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field, transformation_rule)
+        VALUES (?, 61, 'S2T', ?, 'source_full', ?, 'target_full', ?, ?)
+        """,
+        [
+            (
+                800 + index,
+                index,
+                "source_id" if index == 0 else f"source_{index}",
+                "target_id" if index == 0 else f"target_{index}",
+                f"rule_{index}",
+            )
+            for index in range(121)
+        ],
+    )
+    conn.execute(
+        """
+        INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field, transformation_rule)
+        VALUES (999, 61, 'S2T', 999, 'source_full', 'source_id',
+                'other_target', 'target_id', 'wrong target')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    table_mapping = list_s2t_table_mapping.invoke(
+        {"source_table": "source_full", "target_table": "target_full"}
+    )
+    assert table_mapping["total"] == 121
+    assert len(table_mapping["rows"]) == 121
+    table_schema = list_s2t_table_mapping.args_schema.model_json_schema()
+    assert table_schema["required"] == ["source_table", "target_table"]
+    assert table_schema["properties"]["limit"]["default"] == 1000
+
+    field_mapping = list_s2t_field_mapping.invoke(
+        {
+            "source_table": "source_full",
+            "source_field": "source_id",
+            "target_table": "target_full",
+            "target_field": "target_id",
+        }
+    )
+    assert field_mapping["total"] == 1
+    assert field_mapping["rows"][0]["transformation_rule"] == "rule_0"
+    assert field_mapping["rows"][0]["target_table"] == "target_full"
+    assert list_s2t_field_mapping.args_schema.model_json_schema()[
+        "required"
+    ] == [
+        "source_table",
+        "source_field",
+        "target_table",
+        "target_field",
+    ]
+
+    strict_table_mapping = read_s2t_source_to_target.invoke(
+        {"source_table": "source_full", "target_table": "target_full"}
+    )
+    assert strict_table_mapping["total_matches"] == 121
+    assert strict_table_mapping["returned_rows"] == 121
+    assert strict_table_mapping["truncated"] is False
+    assert strict_table_mapping["row_format"] == "arrays_in_column_order"
+    assert {"file_id", "sheet_name", "row_num"}.issubset(
+        strict_table_mapping["columns"]
+    )
+    assert strict_table_mapping["filters"] == {
+        "source_table": "source_full",
+        "target_table": "target_full",
+    }
+
+    from agents.tools.saved_results import _tabular_payload
+
+    decoded_mapping = _tabular_payload(strict_table_mapping)
+    assert decoded_mapping is not None
+    assert {row["file_id"] for row in decoded_mapping["rows"]} == {61}
+    exact_rows = [
+        row for row in decoded_mapping["rows"]
+        if row["source_field"] == "source_id"
+        and row["target_field"] == "target_id"
+    ]
+    assert len(exact_rows) == 1
+    assert exact_rows[0]["transformation_rule"] == "rule_0"
+    strict_schema = read_s2t_source_to_target.args_schema.model_json_schema()
+    assert strict_schema["required"] == ["source_table", "target_table"]
+    assert set(strict_schema["properties"]) == {"source_table", "target_table"}
+
+
+def test_list_s2t_occurrences_reads_both_exact_roles_and_preserves_duplicates():
+    from agents.tools import list_s2t_occurrences
+
+    conn = get_db_connection()
+    conn.executemany(
+        """INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field, transformation_rule)
+        VALUES (?, 61, 'S2T', ?, ?, ?, ?, ?, ?)""",
+        [
+            (1101, 1, "shared", "id", "target_a", "id", "same rule"),
+            (1102, 2, "shared", "id", "target_a", "id", "same rule"),
+            (1103, 3, "source_b", "id", "shared", "id", "to shared"),
+            (1104, 4, "shared", "id", "shared", "id", "self mapping"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = list_s2t_occurrences.invoke({"table_name": "shared"})
+
+    assert result["filters"] == {"table_name": "shared"}
+    assert result["role_counts"] == {"source": 3, "target": 2}
+    assert result["total_matches"] == 5
+    assert result["returned_rows"] == 5
+    assert result["truncated"] is False
+    assert result["row_format"] == "arrays_in_column_order"
+    assert {"file_id", "sheet_name", "row_num"}.issubset(result["columns"])
+
+    from agents.tools.saved_results import _tabular_payload
+
+    decoded = _tabular_payload(result)
+    assert decoded is not None
+    decoded_rows = decoded["rows"]
+    assert {row["file_id"] for row in decoded_rows} == {61}
+    assert [
+        row["transformation_rule"] for row in decoded_rows
+    ].count("self mapping") == 2
+    assert {row["matched_role"] for row in decoded_rows} == {
+        "source",
+        "target",
+    }
+    schema = list_s2t_occurrences.args_schema.model_json_schema()
+    assert schema["required"] == ["table_name"]
+    assert set(schema["properties"]) == {"table_name"}
+
+
+def test_strict_role_shaped_s2t_readers_do_not_mix_roles_and_keep_duplicates():
+    from agents.tools import (
+        read_s2t_by_source_table,
+        read_s2t_by_target_table,
+    )
+    from agents.tools.saved_results import _tabular_payload
+
+    conn = get_db_connection()
+    conn.executemany(
+        """INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field, transformation_rule)
+        VALUES (?, 61, 'S2T', ?, ?, ?, ?, ?, ?)""",
+        [
+            (1201, 1, "shared", "id", "target_a", "id", "same rule"),
+            (1202, 2, "shared", "id", "target_a", "id", "same rule"),
+            (1203, 3, "source_b", "id", "shared", "id", "to shared"),
+            (1204, 4, "shared", "id", "shared", "id", "self mapping"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    source_result = read_s2t_by_source_table.invoke({"source_table": "shared"})
+    target_result = read_s2t_by_target_table.invoke({"target_table": "shared"})
+    source_rows = _tabular_payload(source_result)["rows"]
+    target_rows = _tabular_payload(target_result)["rows"]
+
+    assert source_result["filters"] == {"source_table": "shared"}
+    assert source_result["total_matches"] == 3
+    assert [row["transformation_rule"] for row in source_rows].count(
+        "same rule"
+    ) == 2
+    assert all(row["source_table"] == "shared" for row in source_rows)
+    assert target_result["filters"] == {"target_table": "shared"}
+    assert target_result["total_matches"] == 2
+    assert all(row["target_table"] == "shared" for row in target_rows)
+    assert source_result["truncated"] is False
+    assert target_result["truncated"] is False
+
+    source_schema = read_s2t_by_source_table.args_schema.model_json_schema()
+    target_schema = read_s2t_by_target_table.args_schema.model_json_schema()
+    assert source_schema["required"] == ["source_table"]
+    assert set(source_schema["properties"]) == {"source_table"}
+    assert target_schema["required"] == ["target_table"]
+    assert set(target_schema["properties"]) == {"target_table"}
+
+
+def test_strict_tool_schemas_do_not_use_gigachat_incompatible_any_of():
+    from agents.tools import (
+        list_column_metadata,
+        read_s2t_by_source_table,
+        read_s2t_by_target_table,
+        read_s2t_source_to_target,
+    )
+
+    for strict_tool in (
+        read_s2t_source_to_target,
+        read_s2t_by_source_table,
+        read_s2t_by_target_table,
+        list_column_metadata,
+    ):
+        schema = strict_tool.args_schema.model_json_schema()
+        assert "anyOf" not in json.dumps(schema)
+
+
 def test_narrow_s2t_tools_keep_exact_roles_required():
     from agents.tools import (
         list_s2t_source_field,
@@ -2813,7 +3394,7 @@ def test_narrow_s2t_tools_keep_exact_roles_required():
     ] == ["target_table", "target_field"]
 
 
-def test_narrow_s2t_experiment_replaces_only_ambiguous_public_tool(monkeypatch):
+def test_narrow_s2t_experiment_uses_strict_public_retrieval_surface(monkeypatch):
     from agents.tools.registry import (
         S2T_NARROW_TOOLS_EXPERIMENT_ENV,
         get_tools,
@@ -2823,17 +3404,54 @@ def test_narrow_s2t_experiment_replaces_only_ambiguous_public_tool(monkeypatch):
     default_names = {tool.name for tool in get_tools()}
     assert "list_s2t_transformations" in default_names
     assert "list_s2t_source_field" not in default_names
+    assert "get_source_target_column_pair" not in default_names
 
     monkeypatch.setenv(S2T_NARROW_TOOLS_EXPERIMENT_ENV, "1")
     experiment_names = {tool.name for tool in get_tools()}
-    assert "list_s2t_transformations" not in experiment_names
     assert {
+        "get_s2t_rules_by_ids",
         "list_s2t_table_mapping",
+        "list_s2t_transformations",
+        "list_s2t_field_mapping",
         "list_s2t_source_table",
         "list_s2t_target_table",
         "list_s2t_source_field",
         "list_s2t_target_field",
+        "list_column_catalog",
+        "filter_column_catalog",
+        "read_s2t_mapping",
+        "list_s2t_occurrences",
+    }.isdisjoint(experiment_names)
+    assert {
+        "read_s2t_source_to_target",
+        "read_s2t_by_source_table",
+        "read_s2t_by_target_table",
+        "get_source_target_column_pair",
+        "list_column_metadata",
+        "list_source_column_catalog",
+        "list_target_column_catalog",
+        "search_column_catalog",
     }.issubset(experiment_names)
+    assert all("transformation_ids" not in tool.args for tool in get_tools())
+
+    from agents.tools.routing import _tool_catalog
+
+    strict_catalog_names = {
+        item["name"] for item in _tool_catalog(get_tools())
+    }
+    assert experiment_names == strict_catalog_names
+
+
+def test_second_iteration_strict_tools_are_saved_result_relations():
+    from agents.tools.saved_results import SQLITE_RESULT_TOOL_NAMES
+
+    assert {
+        "read_s2t_source_to_target",
+        "read_s2t_by_source_table",
+        "read_s2t_by_target_table",
+        "get_source_target_column_pair",
+        "list_column_metadata",
+    }.issubset(SQLITE_RESULT_TOOL_NAMES)
 
 
 def test_list_s2t_transformations_selects_requested_columns():

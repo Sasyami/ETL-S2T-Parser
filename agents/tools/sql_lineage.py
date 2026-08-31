@@ -98,7 +98,6 @@ def _source_column(node: Node) -> Dict[str, str]:
         "column": name,
     }
 
-
 def _lineage_item(
     root: Node,
     target_table: Optional[str],

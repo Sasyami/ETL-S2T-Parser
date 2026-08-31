@@ -3,9 +3,11 @@
 from .common import PROJECT_ROOT
 from .additional_objects import list_additional_objects, search_additional_objects
 from .context import (
+    OPERATION_SKILL_CATALOG,
     SCHEMA_CATALOG,
     get_sqlite_schema_cheatsheet,
     load_chat_agent_context,
+    load_operation_skills,
     load_schemas,
     load_skills,
     load_upstream_analysis_context,
@@ -19,7 +21,11 @@ from .files import (
 )
 from .columns import (
     filter_column_catalog,
+    get_source_target_column_pair,
     list_column_catalog,
+    list_column_metadata,
+    list_source_column_catalog,
+    list_target_column_catalog,
     search_column_catalog,
 )
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
@@ -46,6 +52,8 @@ from .registry import (
 )
 from .s2t import (
     get_s2t_rules_by_ids,
+    list_s2t_occurrences,
+    list_s2t_field_mapping,
     list_s2t_source_field,
     list_s2t_source_table,
     list_s2t_table_mapping,
@@ -53,6 +61,10 @@ from .s2t import (
     list_s2t_target_field,
     list_s2t_target_table,
     list_s2t_transformations,
+    read_s2t_by_source_table,
+    read_s2t_by_target_table,
+    read_s2t_mapping,
+    read_s2t_source_to_target,
     search_s2t_transformations,
     summarize_s2t_tables,
     summarize_table_descriptions,
@@ -93,6 +105,7 @@ __all__ = [
     "ALL_TOOLS",
     "ALL_TOOLS_BY_NAME",
     "PROJECT_ROOT",
+    "OPERATION_SKILL_CATALOG",
     "READ_ONLY_TOOLS",
     "SCHEMA_CATALOG",
     "SQL_EXPORT_DIR",
@@ -107,6 +120,7 @@ __all__ = [
     "get_all_tools",
     "get_file_description",
     "get_excel_row",
+    "get_source_target_column_pair",
     "get_sqlite_schema_cheatsheet",
     "get_s2t_rules_by_ids",
     "get_tools",
@@ -117,9 +131,14 @@ __all__ = [
     "list_columns",
     "list_additional_objects",
     "list_column_catalog",
+    "list_column_metadata",
+    "list_source_column_catalog",
+    "list_target_column_catalog",
     "list_file_sheet_headers",
     "list_files",
     "list_s2t_table_mapping",
+    "list_s2t_occurrences",
+    "list_s2t_field_mapping",
     "list_s2t_table_names",
     "list_s2t_source_field",
     "list_s2t_source_table",
@@ -129,6 +148,7 @@ __all__ = [
     "list_sheet_group_classifications",
     "list_sheets",
     "load_chat_agent_context",
+    "load_operation_skills",
     "load_schemas",
     "load_skills",
     "load_upstream_analysis_context",
@@ -140,6 +160,10 @@ __all__ = [
     "run_cypher",
     "run_sql",
     "query_saved_result",
+    "read_s2t_by_source_table",
+    "read_s2t_by_target_table",
+    "read_s2t_mapping",
+    "read_s2t_source_to_target",
     "read_previous_result",
     "SavedResultColumn",
     "SavedResultDescriptor",

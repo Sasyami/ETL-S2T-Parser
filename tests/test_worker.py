@@ -278,6 +278,61 @@ class _WorkerModel:
         return self.responses.pop(0)
 
 
+def test_worker_operation_contexts_are_isolated_by_role():
+    from agents.contracts import (
+        WORKER_OPERATION_COMPLETENESS_MARKER,
+        WORKER_OPERATION_EXECUTION_MARKER,
+    )
+
+    def lookup():
+        return {"value": 1}
+
+    tool_call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "lookup",
+                "args": {},
+                "id": "lookup-role-context",
+                "type": "tool_call",
+            }
+        ],
+    )
+    model = _WorkerModel([tool_call, _finish_message("Готово.")])
+    planner_rule = "PLANNER_ONLY_EXACT_CALL"
+    observer_rule = "OBSERVER_ONLY_ACCEPTANCE"
+
+    run_worker_graph(
+        task=(
+            "Прочитай значение."
+            + WORKER_OPERATION_EXECUTION_MARKER
+            + planner_rule
+            + WORKER_OPERATION_COMPLETENESS_MARKER
+            + observer_rule
+        ),
+        system_prompt="Базовый prompt.",
+        model=model,
+        tools={"lookup": _as_tool(lookup)},
+    )
+
+    planner_systems = [str(messages[0].content) for messages in model.messages]
+    assert planner_systems
+    assert all(planner_rule in text for text in planner_systems)
+    assert all(observer_rule not in text for text in planner_systems)
+    planner_human_text = "\n".join(
+        str(message.content)
+        for messages in model.messages
+        for message in messages[1:]
+        if message.__class__.__name__ == "HumanMessage"
+    )
+    assert observer_rule not in planner_human_text
+    assert WORKER_OPERATION_COMPLETENESS_MARKER not in planner_human_text
+
+    observer_system = str(model.observer.messages[0][0].content)
+    assert observer_rule in observer_system
+    assert planner_rule not in observer_system
+
+
 class _BoundToolChoiceModel:
     def __init__(self, parent, tool_choice=None):
         self.parent = parent
@@ -1517,6 +1572,79 @@ def test_worker_keeps_text_preview_and_returns_full_successful_result():
     assert preview_messages
     assert all(isinstance(message.content, str) for message in preview_messages)
     assert all(len(message.content) <= 50 for message in preview_messages)
+
+
+def test_worker_decodes_packed_display_content_and_names_model_preview_rows():
+    repeated_value = "exact transformation rule " + ("x" * 500)
+    packed_payload = {
+        "row_format": "arrays_in_column_order",
+        "columns": ["source_table", "transformation_rule", "row_num"],
+        "dictionaries": {
+            "source_table": ["raw.payment"],
+            "transformation_rule": [repeated_value],
+        },
+        "returned_rows": 50,
+        "truncated": False,
+        "rows": [[0, 0, index] for index in range(50)],
+    }
+
+    def packed_result():
+        return packed_payload
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "packed_result",
+                        "args": {},
+                        "id": "call-packed",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Packed result получен."),
+        ]
+    )
+
+    preview_limit = 10_000
+    result = run_worker_graph(
+        task="Получи полный packed result.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(packed_result),),
+        max_steps=2,
+        tool_message_preview_chars=preview_limit,
+    )
+
+    item = result.display_items[0]
+    decoded_content = json.loads(item.content)
+    compact_preview = json.loads(item.preview)
+    assert len(item.preview) < preview_limit
+    assert len(item.content) > preview_limit
+    assert item.truncated is False
+    assert "row_format" not in decoded_content
+    assert "dictionaries" not in decoded_content
+    assert decoded_content["columns"] == packed_payload["columns"]
+    assert decoded_content["rows"] == [
+        ["raw.payment", repeated_value, index]
+        for index in range(50)
+    ]
+    assert compact_preview["row_format"] == (
+        "named_records_with_dictionary_refs"
+    )
+    assert compact_preview["dictionaries"]["transformation_rule"] == [
+        repeated_value
+    ]
+    assert compact_preview["rows"] == [
+        {
+            "source_table": "raw.payment",
+            "transformation_rule": {"dictionary_ref": 0},
+            "row_num": index,
+        }
+        for index in range(50)
+    ]
 
 
 def test_worker_returns_all_successful_tool_results_for_coordinator():

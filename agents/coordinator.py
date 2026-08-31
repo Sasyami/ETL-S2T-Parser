@@ -27,6 +27,8 @@ from .contracts import (
     PlanStep,
     UpstreamDecision,
     UpstreamOutput,
+    WORKER_OPERATION_COMPLETENESS_MARKER,
+    WORKER_OPERATION_EXECUTION_MARKER,
     WORKER_PREVIOUS_RESULTS_MARKER,
     WORKER_STABLE_CONTEXT_MARKER,
     WorkerOutcome,
@@ -40,8 +42,10 @@ from .run_metrics import (
     record_upstream_output,
 )
 from .tools.context import (
+    OPERATION_SKILL_CATALOG,
     get_downstream_capability_context,
     get_downstream_table_context,
+    load_operation_skills,
     load_upstream_analysis_context,
 )
 from .worker import discard_worker_display_refs, worker_chat
@@ -53,13 +57,12 @@ COORDINATOR_MAX_WORKERS = MAX_PLAN_STEPS
 COORDINATOR_MAX_CYCLES = 2
 COORDINATOR_CONTEXT_MAX_CHARS = 4000
 _PLAN_TOOL_NAME = "submit_worker_plan"
+_OPERATION_SKILL_TOOL_NAME = "select_operation_skills"
 _UPSTREAM_ANSWER_TOOL_NAME = "submit_upstream_answer"
 _UPSTREAM_DATA_DECISION_TOOL_NAME = "submit_upstream_data_decision"
 _UPSTREAM_ANALYSIS_CONTEXT = load_upstream_analysis_context()
 _DOWNSTREAM_CAPABILITY_CONTEXT = get_downstream_capability_context()
 _DOWNSTREAM_TABLE_CONTEXT = get_downstream_table_context()
-
-
 class CoordinatorAnswer(BaseModel):
     """Coordinator output consumed by the top-level supervisor."""
 
@@ -67,6 +70,14 @@ class CoordinatorAnswer(BaseModel):
 
     answer: str
     display_refs: List[str] = Field(default_factory=list)
+
+
+class OperationSkillSelection(BaseModel):
+    """Prompt profiles selected once for the complete user operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    skills: List[str]
 
 
 class CoordinatorWorkerRun(TypedDict):
@@ -78,6 +89,7 @@ class CoordinatorWorkerRun(TypedDict):
 class CoordinatorGraphState(TypedDict):
     task: str
     context: str
+    operation_skills: Optional[List[str]]
     cycle: int
     plan: List[Dict[str, Any]]
     next_step: int
@@ -86,6 +98,40 @@ class CoordinatorGraphState(TypedDict):
     upstream_output: Optional[Dict[str, Any]]
     final_answer: Optional[str]
     selected_display_refs: List[str]
+
+
+_OPERATION_SKILL_CATALOG_CONTEXT = "\n".join(
+    f"- `{name}` — {description}"
+    for name, description in OPERATION_SKILL_CATALOG.items()
+)
+
+_OPERATION_SKILL_PROMPT = f"""
+Ты выбираешь operation-skills один раз для всей `original_task`. Верни ровно
+один native call `{_OPERATION_SKILL_TOOL_NAME}` с массивом `skills`.
+
+Operation-skill — профиль выполнения явно запрошенной операции, а не источник
+данных, тип объекта или retrieval-skill. Выбирай профиль только при точном
+совпадении операции с его назначением. Несколько профилей допустимы, только если
+исходная задача явно содержит несколько таких операций.
+
+`skills=[]` — нормальный вариант по умолчанию. Оставляй массив пустым для
+простого чтения, списка либо объяснения одной сохранённой трансформации, если
+пользователь не просит сравнение атрибутов, оценку риска строк, разность покрытия
+маппинга или проектирование проверки. Само наличие SQL, S2T, пары source→target,
+колонок либо слова «трансформация» не является основанием выбрать профиль.
+
+Доступные operation-skills:
+{_OPERATION_SKILL_CATALOG_CONTEXT}
+
+Не отвечай на задачу, не планируй чтение и не придумывай новый профиль.
+""".strip()
+
+_OPERATION_SKILL_REPAIR_PROMPT = f"""
+Предыдущий native call `{_OPERATION_SKILL_TOOL_NAME}` нарушает схему или содержит
+имя вне каталога. Верни ровно один исправленный call с единственным полем
+`skills`. Массив может быть пустым. Используй только дословные имена из каталога
+и не выбирай профиль по упоминанию объекта или источника данных.
+""".strip()
 
 
 class CoordinatorResponseError(RuntimeError):
@@ -121,16 +167,11 @@ SQLite-каталоги хранят метаданные. Значения `tab
 `target_table` — логические ETL-объекты, а не SQLite-таблицы для физического SQL.
 Для target-объекта читай атрибуты из `target_columns`, для source — из
 `source_columns`; глобальную `s2t_transformations` не ограничивай `file_id`.
-Сначала определи требуемый результат:
-- если пользователь просит фактические значения, расчёт или выполнение
-  проверки — планируй чтение необходимых данных;
-- если он просит методику, шаблон, план проверки или протокол — читай только
-  метаданные и правила, необходимые upstream для построения результата. Не
-  планируй выполнение проектируемых проверок и сбор фактических метрик без
-  явного запроса.
-
-Для оценки SQL-рисков сначала достаточно полного `transformation_rule`: не
-подменяй его анализ чтением PK, индексов или физических данных без явного запроса.
+Планируй чтение только тех фактов, без которых нельзя получить запрошенный
+результат. Если пользователь просит описать способ будущего действия, не выполняй
+это действие вместо описания. Для вывода по сохранённому выражению сначала читай
+само выражение; дополнительные данные запрашивай лишь когда они действительно
+нужны исходной задаче.
 Не создавай значения для неподтверждённых физических объектов и полей. Передавай
 upstream только подтверждённые имена, а нехватку данных опиши явно.
 
@@ -228,6 +269,38 @@ _UPSTREAM_ANSWER_REPAIR_PROMPT = f"""
 `{_UPSTREAM_ANSWER_TOOL_NAME}` с обязательным `answer` и опциональными evidence
 IDs. Используй только доступные evidence_id и не добавляй факты.
 """.strip()
+
+
+def _operation_skill_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": _OPERATION_SKILL_TOOL_NAME,
+            "description": (
+                "Выбрать применимые prompt-профили для всей операции."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skills": {
+                        "type": "array",
+                        "maxItems": len(OPERATION_SKILL_CATALOG),
+                        "items": {
+                            "type": "string",
+                            "enum": list(OPERATION_SKILL_CATALOG),
+                        },
+                        "description": (
+                            "Точные имена применимых профилей; пустой массив "
+                            "означает, что специальный профиль не нужен."
+                        ),
+                    }
+                },
+                "required": ["skills"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
 
 def _plan_tool_schema() -> Dict[str, Any]:
     return {
@@ -389,6 +462,25 @@ def _native_upstream_decision(message: Any) -> UpstreamDecision:
     return decision
 
 
+def _native_operation_skills(message: Any) -> List[str]:
+    """Parse and validate the once-per-operation prompt profile selection."""
+    selection = _native_payload(
+        message,
+        _OPERATION_SKILL_TOOL_NAME,
+        OperationSkillSelection,
+    )
+    assert isinstance(selection, OperationSkillSelection)
+    unknown = [
+        name for name in selection.skills if name not in OPERATION_SKILL_CATALOG
+    ]
+    if unknown:
+        raise CoordinatorResponseError(
+            "Operation router выбрал неизвестные skills: "
+            + ", ".join(dict.fromkeys(unknown))
+        )
+    return list(dict.fromkeys(selection.skills))
+
+
 def _native_upstream_answer(message: Any) -> UpstreamOutput:
     """Parse the final answer after the data decision returned pass."""
     output = _native_payload(
@@ -448,6 +540,10 @@ def build_coordinator_graph(
         except TypeError:
             return model.bind_tools([schema])
 
+    operation_skill_model = bind_required_tool(
+        _operation_skill_tool_schema(),
+        _OPERATION_SKILL_TOOL_NAME,
+    )
     plan_model = bind_required_tool(_plan_tool_schema(), _PLAN_TOOL_NAME)
     upstream_data_decision_model = bind_required_tool(
         _upstream_data_decision_tool_schema(),
@@ -477,6 +573,48 @@ def build_coordinator_graph(
             ) from exc
 
     def downstream_plan_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+        operation_skills = state.get("operation_skills")
+        if operation_skills is None:
+            operation_payload = {
+                "original_task": state["task"],
+                "context": state["context"],
+            }
+            operation_messages: List[BaseMessage] = [
+                SystemMessage(content=_OPERATION_SKILL_PROMPT),
+                HumanMessage(
+                    content=json.dumps(operation_payload, ensure_ascii=False)
+                ),
+            ]
+            operation_result = invoke(
+                operation_skill_model,
+                operation_messages,
+                stage="operation_router",
+            )
+            try:
+                operation_skills = _native_operation_skills(operation_result)
+            except CoordinatorResponseError as first_error:
+                logger.warning(
+                    "Operation skill call violated selection schema; "
+                    "requesting one LLM repair: %s",
+                    first_error,
+                )
+                operation_result = invoke(
+                    operation_skill_model,
+                    _repair_messages(
+                        operation_messages,
+                        operation_result,
+                        _OPERATION_SKILL_REPAIR_PROMPT
+                        + "\nОшибка: "
+                        + str(first_error),
+                    ),
+                    stage="operation_router",
+                )
+                operation_skills = _native_operation_skills(operation_result)
+
+        plan_operation_context = load_operation_skills(
+            operation_skills,
+            stage="plan",
+        )
         plan_payload: Dict[str, Any] = {
             "original_task": state["task"],
             "context": state["context"],
@@ -484,7 +622,16 @@ def build_coordinator_graph(
         if state["upstream_problem"] is not None:
             plan_payload["problem"] = state["upstream_problem"]
         plan_messages: List[BaseMessage] = [
-            SystemMessage(content=_DOWNSTREAM_PLAN_PROMPT),
+            SystemMessage(
+                content="\n\n".join(
+                    part
+                    for part in (
+                        _DOWNSTREAM_PLAN_PROMPT,
+                        plan_operation_context,
+                    )
+                    if part
+                )
+            ),
             HumanMessage(
                 content=json.dumps(
                     plan_payload,
@@ -535,6 +682,7 @@ def build_coordinator_graph(
                 "cycle": state["cycle"],
                 "step": index,
                 "task": step.task,
+                "operation_skills": list(operation_skills),
             }
             for index, step in enumerate(plan.steps, start=1)
         ]
@@ -545,6 +693,7 @@ def build_coordinator_graph(
         )
         record_coordinator_plan(recorded_plan)
         return {
+            "operation_skills": list(operation_skills),
             "plan": [step.model_dump() for step in plan.steps],
             "next_step": 0,
         }
@@ -558,6 +707,24 @@ def build_coordinator_graph(
                 "Coordinator вызвал worker с пустой task из плана."
             )
         worker_task = planned_task
+        selected_operation_skills = state.get("operation_skills") or []
+        planner_context = load_operation_skills(
+            selected_operation_skills,
+            stage="planner",
+        )
+        observer_context = load_operation_skills(
+            selected_operation_skills,
+            stage="observer",
+        )
+        if planner_context:
+            worker_task += (
+                WORKER_OPERATION_EXECUTION_MARKER + planner_context
+            )
+        if observer_context:
+            worker_task += (
+                WORKER_OPERATION_COMPLETENESS_MARKER
+                + observer_context
+            )
         context = state["context"].strip()
         if context:
             worker_task += WORKER_STABLE_CONTEXT_MARKER + context
@@ -636,6 +803,15 @@ def build_coordinator_graph(
         return output
 
     def upstream_node(state: CoordinatorGraphState) -> Dict[str, Any]:
+        selected_operation_skills = state.get("operation_skills") or []
+        decision_context = load_operation_skills(
+            selected_operation_skills,
+            stage="upstream_decision",
+        )
+        analysis_context = load_operation_skills(
+            selected_operation_skills,
+            stage="upstream",
+        )
         available_evidence_ids: set[str] = set()
         available_display_refs: Dict[str, str] = {}
         evidence_payload: List[Dict[str, Any]] = []
@@ -673,6 +849,7 @@ def build_coordinator_graph(
                                 "Возможную нехватку данных кратко укажи в problem."
                             )
                         ),
+                        decision_context,
                     )
                     if part
                 )
@@ -808,6 +985,7 @@ def build_coordinator_graph(
                     for part in (
                         _UPSTREAM_ANSWER_PROMPT,
                         _UPSTREAM_ANALYSIS_CONTEXT,
+                        analysis_context,
                     )
                     if part
                 )
@@ -901,6 +1079,7 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
     initial_state: CoordinatorGraphState = {
         "task": clean_task,
         "context": clean_context,
+        "operation_skills": None,
         "cycle": 1,
         "plan": [],
         "next_step": 0,
@@ -912,7 +1091,7 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
     }
     config = {
         "recursion_limit": (
-            COORDINATOR_MAX_CYCLES * (COORDINATOR_MAX_WORKERS + 2) + 4
+            COORDINATOR_MAX_CYCLES * (COORDINATOR_MAX_WORKERS + 2) + 5
         ),
         "run_name": "worker_coordinator",
     }

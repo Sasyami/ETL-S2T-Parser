@@ -361,7 +361,7 @@ def trace_transformation_path(
     Используй, когда нужны порядок нескольких S2T-шагов, правила/SQL,
     additional objects или готовая схема пути. Для одной точной пары
     source_table.source_field → target_table.target_field и её правила используй
-    list_s2t_transformations; сама стрелка не означает многошаговый путь.
+    four-role exact S2T tool; сама стрелка не означает многошаговый путь.
 
     Стартовая точка всегда является точной парой одной роли:
     - downstream: source_table + source_field;

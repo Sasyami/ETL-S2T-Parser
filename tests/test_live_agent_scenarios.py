@@ -49,6 +49,9 @@ LIVE_AGENT_ENABLED = os.getenv("RUN_LIVE_AGENT_SCENARIOS", "").strip().lower() i
 LIVE_AGENT_LLM_JUDGE = os.getenv(
     "LIVE_AGENT_LLM_JUDGE", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
+STRICT_RETRIEVAL_ENABLED = os.getenv(
+    "S2T_NARROW_TOOLS_EXPERIMENT", ""
+).strip().lower() in {"1", "true", "yes", "on"}
 _LIVE_TRANSCRIPT_LOCK = threading.Lock()
 _LIVE_TRANSCRIPT_INDEX = 0
 _LIVE_SEMANTIC_RESULTS: list[dict[str, str]] = []
@@ -670,13 +673,28 @@ def _assert_s2t_work_case_execution(
     metrics = exchange.metrics
     allowed_tools = {
         "get_excel_row",
+        "get_source_target_column_pair",
         "list_additional_objects",
         "list_column_catalog",
+        "list_column_metadata",
         "list_columns",
         "list_file_sheet_headers",
+        "list_source_column_catalog",
+        "list_target_column_catalog",
+        "list_s2t_field_mapping",
+        "list_s2t_source_field",
+        "list_s2t_source_table",
+        "list_s2t_table_mapping",
+        "list_s2t_occurrences",
+        "list_s2t_target_field",
+        "list_s2t_target_table",
         "list_s2t_transformations",
         "parse_sql_column_lineage",
         "parse_sql_table_lineage",
+        "read_s2t_by_source_table",
+        "read_s2t_by_target_table",
+        "read_s2t_mapping",
+        "read_s2t_source_to_target",
         "query_saved_result",
         "read_previous_result",
         "run_sql",
@@ -1329,7 +1347,11 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
     _assert_public_answer(result.answer)
     _assert_s2t_work_case_execution(
         exchange,
-        required_tools={"list_column_catalog"},
+        required_tools={
+            "get_source_target_column_pair"
+            if STRICT_RETRIEVAL_ENABLED
+            else "list_column_catalog"
+        },
         require_analysis=True,
     )
 
@@ -1349,7 +1371,11 @@ def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client
     _assert_public_answer(result.answer)
     _assert_s2t_work_case_execution(
         exchange,
-        required_tools={"list_column_catalog"},
+        required_tools={
+            "get_source_target_column_pair"
+            if STRICT_RETRIEVAL_ENABLED
+            else "list_column_catalog"
+        },
         require_analysis=True,
     )
 
@@ -1366,6 +1392,11 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
     _assert_public_answer(result.answer)
     _assert_s2t_work_case_execution(
         exchange,
+        required_tools=(
+            {"read_s2t_source_to_target"}
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
         require_analysis=True,
     )
 
@@ -1385,7 +1416,11 @@ def test_live_agent_checks_unmapped_required_target_fields(live_chat_client):
     _assert_public_answer(result.answer)
     _assert_s2t_work_case_execution(
         exchange,
-        required_tools={"list_column_catalog"},
+        required_tools=(
+            {"list_target_column_catalog", "read_s2t_by_target_table"}
+            if STRICT_RETRIEVAL_ENABLED
+            else {"list_column_catalog"}
+        ),
         require_analysis=True,
     )
 
@@ -1402,6 +1437,11 @@ def test_live_agent_checks_row_loss_risk(live_chat_client):
     _assert_public_answer(result.answer)
     _assert_s2t_work_case_execution(
         exchange,
+        required_tools=(
+            {"read_s2t_source_to_target"}
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
         require_analysis=True,
     )
 
@@ -1420,6 +1460,11 @@ def test_live_agent_explains_table_transformation(live_chat_client):
     _assert_public_answer(result.answer)
     _assert_s2t_work_case_execution(
         exchange,
+        required_tools=(
+            {"read_s2t_source_to_target"}
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
         require_analysis=True,
     )
 
@@ -1441,6 +1486,15 @@ def test_live_agent_writes_s2t_test_protocol(live_chat_client):
     _assert_public_answer(result.answer)
     _assert_s2t_work_case_execution(
         exchange,
+        required_tools=(
+            {
+                "read_s2t_source_to_target",
+                "read_s2t_by_target_table",
+                "list_target_column_catalog",
+            }
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
         require_analysis=True,
     )
 

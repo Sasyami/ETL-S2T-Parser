@@ -35,8 +35,6 @@ def test_load_skills_contains_tool_orchestration_and_domain_context():
         "trace_neo4j_lineage",
         "search_excel_values",
         "semantic_search_descriptions",
-        "list_column_catalog",
-        "filter_column_catalog",
         "search_column_catalog",
         "trace_transformation_path",
     ):
@@ -53,6 +51,8 @@ def test_load_skills_contains_tool_orchestration_and_domain_context():
         assert semantic_scope in text
     assert "`all` — только без" in text
     assert "Атомарные контракты tools" in text
+    assert "directed exact reader" in text
+    assert "pair-reader" in text
     assert "Производный анализ, сравнение и объяснение выполняет upstream" in text
     assert "## Анализ трансформаций" not in text
     assert "`analyze`" not in text
@@ -76,7 +76,7 @@ def test_s2t_skill_only_prepares_transformation_data_for_upstream():
     assert "Путь S2T-преобразования" not in text
     assert "source_table.source_field → target_table.target_field" in text
     assert "сохрани его дословно" in text
-    assert "эти данные анализирует\n  upstream coordinator" in text
+    assert "Правило анализирует upstream coordinator" in text
     assert "`analyze`" not in text
     assert "## Анализ трансформаций" not in text
     assert "source_table`, `source_field`, `target_table` и `target_field`" in text
@@ -94,16 +94,21 @@ def test_upstream_analysis_context_is_independent_and_sql_precise():
     assert "фактический `transformation_rule` или SQL" in text
     assert "`transformation_rule` или SQL" in text
     assert "`WHERE 1=1` не фильтрует" in text
-    assert "`LEFT JOIN`" in text
-    assert "не удаляет левую" in text
+    assert "`LEFT JOIN ... ON p`" in text
+    assert "может размножить" in text
+    assert "не доказывает `UPSERT`" in text
     assert "`UNION ALL`" in text
     assert "Полные одинаковые строки" in text
     assert "Технические поля хранилища" in text
     assert "не переименовывай" in text
     assert "без прямого подтверждения в evidence" in text
     assert "Не подставляй фиктивное значение" in text
+    assert "row_format=named_records_with_dictionary_refs" in text
+    assert "0-based индексом" in text
+    assert "не схлопывай одинаковые occurrences" in text
+    assert "returned_rows == len(rows)" in text
     assert "`{PLACEHOLDER}`" not in text
-    assert len(text) < 3000
+    assert len(text) < 3500
     assert "`analyze`" not in text
 
 
@@ -126,7 +131,8 @@ def test_load_skills_can_select_excel_section():
     assert "## Excel и описания" in text
     assert "search_excel_values" in text
     assert "semantic_search_descriptions" in text
-    assert "list_column_catalog" in text
+    assert "exact catalog tool" in text
+    assert "pair-reader" in text
     assert "## Neo4j" not in text
 
 
