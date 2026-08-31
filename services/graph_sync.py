@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from graph_storage import (
@@ -12,6 +13,16 @@ from graph_storage import (
     load_neo4j_settings,
 )
 from storage.database import get_db_connection
+from storage.graph_outbox import (
+    get_graph_sync_state,
+    list_pending_graph_syncs,
+    mark_graph_sync_applied,
+    mark_graph_sync_failed,
+    request_graph_sync,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 def _text(value: Any) -> Optional[str]:
@@ -41,13 +52,6 @@ def _build_file_graph_projection(file_id: int) -> Dict[str, Any]:
     clean_file_id = int(file_id)
     conn = get_db_connection()
     try:
-        file_exists = conn.execute(
-            "SELECT 1 FROM files WHERE file_id = ?",
-            (clean_file_id,),
-        ).fetchone()
-        if file_exists is None:
-            raise ValueError(f"File not found: {clean_file_id}")
-
         transformations = [
             dict(row)
             for row in conn.execute(
@@ -166,7 +170,6 @@ def _build_file_graph_projection(file_id: int) -> Dict[str, Any]:
         if (
             source_table_key is not None
             and target_table_key is not None
-            and sql_query is not None
         ):
             table_lineage.append(
                 {
@@ -177,6 +180,9 @@ def _build_file_graph_projection(file_id: int) -> Dict[str, Any]:
                     "source_layer": _text(row.get("source_layer")),
                     "target_layer": _text(row.get("target_layer")),
                     "sql_query": sql_query,
+                    "rule_status": (
+                        "present" if sql_query is not None else "missing"
+                    ),
                 }
             )
 
@@ -347,7 +353,8 @@ def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
             transformation_id: row.transformation_id,
             source_layer: row.source_layer,
             target_layer: row.target_layer,
-            sql_query: row.sql_query
+            sql_query: row.sql_query,
+            rule_status: row.rule_status
         }]->(target)
         """,
         file_id=file_id,
@@ -355,19 +362,41 @@ def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
     ).consume()
 
 
-def sync_file_graph(file_id: int) -> Dict[str, Any]:
-    """Replace one file's table- and column-lineage graph from SQLite facts."""
+def _sync_file_graph_revision(file_id: int, revision: int) -> Dict[str, Any]:
+    """Apply one requested revision and confirm it only after Neo4j commits."""
+    clean_file_id = int(file_id)
+    clean_revision = int(revision)
     projection = _build_file_graph_projection(file_id)
-    settings = load_neo4j_settings()
-    driver = create_neo4j_driver(settings)
     try:
-        with driver.session(database=settings.database) as session:
-            session.execute_write(_replace_file_graph, projection)
-    finally:
-        close_neo4j_driver(driver)
+        settings = load_neo4j_settings()
+        driver = create_neo4j_driver(settings)
+        try:
+            with driver.session(database=settings.database) as session:
+                session.execute_write(_replace_file_graph, projection)
+        finally:
+            close_neo4j_driver(driver)
+    except Exception as exc:
+        try:
+            mark_graph_sync_failed(clean_file_id, clean_revision, str(exc))
+        except Exception:
+            logger.exception(
+                "Failed to record graph outbox error for file_id=%s revision=%s",
+                clean_file_id,
+                clean_revision,
+            )
+        raise
+
+    mark_graph_sync_applied(clean_file_id, clean_revision)
+    state = get_graph_sync_state(clean_file_id) or {}
 
     return {
-        "file_id": int(file_id),
+        "file_id": clean_file_id,
+        "desired_revision": int(
+            state.get("desired_revision", clean_revision)
+        ),
+        "applied_revision": int(
+            state.get("applied_revision", clean_revision)
+        ),
         "columns": len(projection["columns"]),
         "lineage_relationships": len(projection["lineage"]),
         "wildcard_membership_relationships": (
@@ -375,6 +404,49 @@ def sync_file_graph(file_id: int) -> Dict[str, Any]:
         ),
         "tables": len(projection["tables"]),
         "table_lineage_relationships": len(projection["table_lineage"]),
+    }
+
+
+def sync_file_graph(file_id: int) -> Dict[str, Any]:
+    """Deliver the latest requested projection revision for one file."""
+    clean_file_id = int(file_id)
+    state = get_graph_sync_state(clean_file_id)
+    if state is None or int(state["desired_revision"]) <= int(
+        state["applied_revision"]
+    ):
+        revision = request_graph_sync(clean_file_id)
+    else:
+        revision = int(state["desired_revision"])
+    return _sync_file_graph_revision(clean_file_id, revision)
+
+
+def sync_pending_graph_projections(limit: int = 100) -> Dict[str, Any]:
+    """Retry pending outbox rows, retaining failed revisions for later runs."""
+    rows = list_pending_graph_syncs(limit=limit)
+    applied: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for row in rows:
+        file_id = int(row["file_id"])
+        revision = int(row["desired_revision"])
+        try:
+            applied.append(_sync_file_graph_revision(file_id, revision))
+        except Exception as exc:
+            logger.exception(
+                "Pending Neo4j projection failed for file_id=%s revision=%s",
+                file_id,
+                revision,
+            )
+            errors.append(
+                {
+                    "file_id": file_id,
+                    "desired_revision": revision,
+                    "error": str(exc),
+                }
+            )
+    return {
+        "pending": len(rows),
+        "applied": applied,
+        "errors": errors,
     }
 
 

@@ -205,14 +205,11 @@ def list_column_catalog(
     file_id: Optional[int] = None,
     table_name: Optional[str] = None,
     column_name: Optional[str] = None,
-    data_type: Optional[str] = None,
-    primary_key: Optional[bool] = None,
-    not_null: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Получить подвыборку каталога колонок по точным структурным фильтрам.
+    """Прочитать колонки и их атрибуты по точным идентификаторам.
 
     Используй для известной роли и точных значений table_name/column_name либо
-    для выборки по file_id, типу, PK и not-null. Квалифицированное имя
+    для списка колонок явно выбранной таблицы или файла. Квалифицированное имя
     ``table.column`` всегда разделяй: часть до последней точки передавай в
     ``table_name``, часть после неё — в ``column_name``. Обязательный scope
     all_tables объединяет source_columns и target_columns; ролевые scope читают
@@ -221,9 +218,10 @@ def list_column_catalog(
     column_name ко всему выбранному scope: разные source/target пары получай
     отдельными вызовами, не ищи target по идентификаторам source. Для фрагмента имени или текста сначала используй
     search_column_catalog, для смысла описания — semantic_search_descriptions.
-    Передавай все относящиеся к операции точные фильтры, явно названные в task:
-    если названы file_id, table_name и not_null, нельзя опускать table_name и
-    расширять результат до всех таблиц файла.
+    Чтобы получить data_type, primary_key или not_null известной колонки, просто
+    прочитай её этим tool: эти атрибуты входят в результат и не являются
+    входными аргументами. Для отбора множества колонок по значениям атрибутов
+    используй filter_column_catalog.
     Без columns возвращает все публичные поля, но никогда не возвращает BLOB.
 
     Args:
@@ -233,9 +231,6 @@ def list_column_catalog(
         file_id: Опциональный точный идентификатор явно выбранной загрузки.
         table_name: Опциональное точное полное имя таблицы; обязательно передай, если оно явно задано task.
         column_name: Опциональное точное имя колонки без префикса table_name.
-        data_type: Опциональный точный тип данных.
-        primary_key: Опциональный фильтр признака первичного ключа.
-        not_null: Опциональный фильтр обязательности значения.
     """
     return _query_catalog(
         scope=scope,
@@ -244,6 +239,55 @@ def list_column_catalog(
         file_id=file_id,
         table_name=table_name,
         column_name=column_name,
+        data_type=None,
+        primary_key=None,
+        not_null=None,
+    )
+
+
+@tool(parse_docstring=True)
+def filter_column_catalog(
+    scope: ColumnScope,
+    limit: int = 50,
+    columns: Optional[List[str]] = None,
+    file_id: Optional[int] = None,
+    table_name: Optional[str] = None,
+    data_type: Optional[str] = None,
+    primary_key: Optional[bool] = None,
+    not_null: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Отобрать множество колонок по типу, PK или nullable-ограничению.
+
+    Используй, когда task просит найти все колонки с заданным data_type,
+    primary_key или not_null, опционально внутри точного file_id/table_name.
+    Хотя бы один из трёх атрибутных фильтров обязателен. Этот tool не принимает
+    column_name: атрибуты уже известной колонки читай через list_column_catalog.
+
+    Args:
+        scope: Обязательная область: all_tables, source_columns или target_columns.
+        limit: Максимальное число строк, от 1 до 100.
+        columns: Опциональная подвыборка возвращаемых публичных полей.
+        file_id: Опциональный точный идентификатор явно выбранной загрузки.
+        table_name: Опциональное точное полное имя таблицы для ограничения множества.
+        data_type: Опциональный точный тип данных для отбора колонок.
+        primary_key: Опциональный фильтр признака первичного ключа.
+        not_null: Опциональный фильтр обязательности значения.
+    """
+    has_data_type = bool(str(data_type or "").strip())
+    if not has_data_type and primary_key is None and not_null is None:
+        return {
+            "error": (
+                "one of data_type, primary_key or not_null must be provided"
+            ),
+            "rows": [],
+        }
+    return _query_catalog(
+        scope=scope,
+        limit=limit,
+        columns=columns,
+        file_id=file_id,
+        table_name=table_name,
+        column_name=None,
         data_type=data_type,
         primary_key=primary_key,
         not_null=not_null,
@@ -305,6 +349,7 @@ def search_column_catalog(
 
 __all__ = [
     "COLUMN_RESULT_FIELDS",
+    "filter_column_catalog",
     "list_column_catalog",
     "search_column_catalog",
 ]

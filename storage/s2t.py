@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from config.table_layers import resolve_sheet_layers
 
 from .database import S2T_RECORD_FIELDS, _sql_identifier, get_db_connection
+from .graph_outbox import enqueue_graph_sync
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,8 @@ def insert_s2t_transformations(file_id: int, records: List[Dict[str, Any]]) -> D
                 for row in records
             ],
         )
+        if records:
+            enqueue_graph_sync(cursor, file_id)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -61,14 +64,27 @@ def insert_s2t_transformations(file_id: int, records: List[Dict[str, Any]]) -> D
 
 
 def clear_s2t_transformations(file_id: int) -> int:
-    """Delete generated S2T transformation rows for one workbook."""
+    """Delete one file's S2T rows and enqueue its graph rebuild atomically."""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) AS n FROM s2t_transformations WHERE file_id = ?", (file_id,))
-    deleted = int(cursor.fetchone()["n"])
-    cursor.execute("DELETE FROM s2t_transformations WHERE file_id = ?", (file_id,))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN")
+        cursor.execute(
+            "SELECT COUNT(*) AS n FROM s2t_transformations WHERE file_id = ?",
+            (int(file_id),),
+        )
+        deleted = int(cursor.fetchone()["n"])
+        cursor.execute(
+            "DELETE FROM s2t_transformations WHERE file_id = ?",
+            (int(file_id),),
+        )
+        enqueue_graph_sync(cursor, int(file_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     logger.info("Cleared %s S2T transformation rows for file %s", deleted, file_id)
     return deleted
 

@@ -13,9 +13,15 @@ from services.analysis import (
     finish_analysis,
     try_generate_description,
     try_generate_summary,
+    try_sync_file_graph,
+    try_sync_pending_graph_projections,
 )
 from services.graph_sync import clear_graph_projection
 from storage.database import clear_all_data, get_file, init_db, store_excel_data
+from storage.graph_outbox import (
+    get_graph_sync_state,
+    mark_all_graph_syncs_applied,
+)
 from processing.excel import (
     allowed_file,
     convert_to_serializable,
@@ -301,7 +307,17 @@ def get_transformations(file_id: int):
 def delete_transformations(file_id: int):
     try:
         deleted = clear_s2t_transformations(file_id)
-        return jsonify({"file_id": file_id, "deleted": deleted}), 200
+        graph_sync_report, graph_sync_error = try_sync_file_graph(file_id)
+        return jsonify(
+            {
+                "status": "partial" if graph_sync_error else "ok",
+                "file_id": file_id,
+                "deleted": deleted,
+                "graph_sync_report": graph_sync_report,
+                "graph_sync_error": graph_sync_error,
+                "graph_sync_state": get_graph_sync_state(file_id),
+            }
+        ), 200
     except Exception as e:
         logger.exception("Failed to clear S2T transformations")
         return jsonify({"error": str(e)}), 500
@@ -322,6 +338,8 @@ def delete_all_storage():
     warnings = []
     try:
         graph_deleted = clear_graph_projection()
+        if not graph_deleted.get("skipped"):
+            mark_all_graph_syncs_applied()
     except Exception as e:
         logger.warning("SQLite cleared, but Neo4j cleanup failed: %s", e)
         graph_deleted = {
@@ -446,5 +464,10 @@ def chat():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
+    recovery_report, recovery_error = try_sync_pending_graph_projections()
+    if recovery_error:
+        logger.warning("Graph outbox recovery incomplete: %s", recovery_error)
+    elif recovery_report and recovery_report.get("pending"):
+        logger.info("Graph outbox recovery: %s", recovery_report)
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     app.run(debug=debug, use_reloader=debug)

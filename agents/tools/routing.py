@@ -40,6 +40,10 @@ GENERAL_FALLBACK_TOOL_NAMES = (
     "trace_neo4j_lineage",
     "get_s2t_rules_by_ids",
     "list_s2t_table_mapping",
+    "list_s2t_source_table",
+    "list_s2t_target_table",
+    "list_s2t_source_field",
+    "list_s2t_target_field",
     "run_sql",
     "read_previous_result",
     "run_cypher",
@@ -72,11 +76,13 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     },
     "list_column_catalog": {
         "use_when": (
-            "Точный структурный срез source/target-каталога колонок по "
-            "file/table/column/type/PK/not-null; scope обязателен, разные роли "
-            "и пары запрашиваются отдельно."
+            "Точная source/target table.column: атрибуты; scope обязателен."
         ),
-        "not_for": "Подстрока, смысл описания, S2T-маппинг или lineage.",
+        "not_for": "Атрибутный отбор, подстрока, смысл, S2T, lineage.",
+    },
+    "filter_column_catalog": {
+        "use_when": "Колонки по data_type/primary_key/not_null.",
+        "not_for": "Точная table.column, подстрока, смысл, S2T, lineage.",
     },
     "search_column_catalog": {
         "use_when": (
@@ -259,6 +265,25 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+_NARROW_S2T_ROUTING_CONTRACTS: Dict[str, Dict[str, str]] = {
+    "list_s2t_source_table": {
+        "use_when": "Все S2T-строки одной точной известной source_table.",
+        "not_for": "Target-only запрос, отдельное поле, пара таблиц или подстрока.",
+    },
+    "list_s2t_target_table": {
+        "use_when": "Все S2T-строки одной точной известной target_table.",
+        "not_for": "Source-only запрос, отдельное поле, пара таблиц или подстрока.",
+    },
+    "list_s2t_source_field": {
+        "use_when": "Все цели точной пары source_table.source_field.",
+        "not_for": "Target-поле, таблица без поля, полная пара или подстрока.",
+    },
+    "list_s2t_target_field": {
+        "use_when": "Все источники точной пары target_table.target_field.",
+        "not_for": "Source-поле, таблица без поля, полная пара или подстрока.",
+    },
+}
+
 
 class ToolRoutingError(RuntimeError):
     """Raised when the tool-router cannot produce a valid selection."""
@@ -333,7 +358,10 @@ def _history_payload(
 def _tool_catalog(tools: Sequence[BaseTool]) -> List[Dict[str, Any]]:
     catalog: List[Dict[str, Any]] = []
     for tool in tools:
-        contract = _TOOL_ROUTING_CONTRACTS.get(tool.name)
+        contract = (
+            _TOOL_ROUTING_CONTRACTS.get(tool.name)
+            or _NARROW_S2T_ROUTING_CONTRACTS.get(tool.name)
+        )
         if contract is None:
             raise ToolRoutingError(
                 f"Для зарегистрированного tool отсутствует routing contract: {tool.name}"

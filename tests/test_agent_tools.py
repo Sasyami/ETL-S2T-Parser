@@ -16,7 +16,8 @@ def test_sqlite_schema_cheatsheet_is_generated_from_db_storage():
         for column_name in columns:
             assert f"`{column_name}`" in text
     assert "сгенерирован из `storage/database.py`" in text
-    assert "Внутренние таблицы упоминай" not in text
+    assert "Внутренние таблицы упоминай" in text
+    assert "`graph_sync_outbox`" in text
 
 
 @pytest.fixture(autouse=True)
@@ -618,7 +619,11 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
 
 
 def test_column_catalog_tools_support_exact_and_substring_subsets():
-    from agents.tools import list_column_catalog, search_column_catalog
+    from agents.tools import (
+        filter_column_catalog,
+        list_column_catalog,
+        search_column_catalog,
+    )
 
     conn = get_db_connection()
     conn.execute(
@@ -672,8 +677,6 @@ def test_column_catalog_tools_support_exact_and_substring_subsets():
             "file_id": 30,
             "table_name": "RAW.CONTRACT",
             "column_name": "contract_id",
-            "primary_key": True,
-            "not_null": True,
             "columns": ["record_id", "table_name", "column_name", "data_type"],
         }
     )
@@ -694,6 +697,23 @@ def test_column_catalog_tools_support_exact_and_substring_subsets():
     assert limited["total_matches"] == 3
     assert limited["returned_rows"] == 1
     assert limited["truncated"] is True
+
+    filtered = filter_column_catalog.invoke(
+        {
+            "scope": "all_tables",
+            "file_id": 30,
+            "data_type": "uuid",
+            "primary_key": True,
+        }
+    )
+    assert filtered["total_matches"] == 2
+    assert {row["column_role"] for row in filtered["rows"]} == {
+        "source",
+        "target",
+    }
+    assert filter_column_catalog.invoke(
+        {"scope": "source_columns", "file_id": 30}
+    )["error"].startswith("one of data_type")
 
     searched = search_column_catalog.invoke(
         {
@@ -732,7 +752,7 @@ def test_column_catalog_tools_support_exact_and_substring_subsets():
 
 
 def test_list_column_catalog_uses_explicit_all_tables_scope():
-    from agents.tools import list_column_catalog
+    from agents.tools import filter_column_catalog
 
     conn = get_db_connection()
     conn.execute(
@@ -756,7 +776,7 @@ def test_list_column_catalog_uses_explicit_all_tables_scope():
     conn.commit()
     conn.close()
 
-    result = list_column_catalog.invoke(
+    result = filter_column_catalog.invoke(
         {
             "scope": "all_tables",
             "file_id": 31,
@@ -1031,6 +1051,21 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
         "source_columns",
         "target_columns",
     ]
+    assert not {
+        "data_type",
+        "primary_key",
+        "not_null",
+    }.intersection(column_list_schema["properties"])
+    column_filter_schema = tools[
+        "filter_column_catalog"
+    ].args_schema.model_json_schema()
+    assert column_filter_schema["required"] == ["scope"]
+    assert "column_name" not in column_filter_schema["properties"]
+    assert {
+        "data_type",
+        "primary_key",
+        "not_null",
+    }.issubset(column_filter_schema["properties"])
     assert tools[
         "trace_transformation_path"
     ].args_schema.model_json_schema()["required"] == ["table_name"]
@@ -1961,6 +1996,9 @@ def test_tool_descriptions_separate_sqlite_and_neo4j_scenarios():
     assert "без префикса table_name" in column_catalog_schema[
         "properties"
     ]["column_name"]["description"]
+    assert "атрибуты уже известной колонки" in tools[
+        "filter_column_catalog"
+    ].description
     assert "source/target table или field" in tools[
         "list_s2t_transformations"
     ].description
@@ -2600,7 +2638,7 @@ def test_summarize_table_descriptions_does_not_guess_similar_name():
     assert result["combined_descriptions"] == []
 
 
-def test_list_s2t_transformations_is_non_terminal_preview():
+def test_list_s2t_transformations_returns_complete_requested_range():
     from agents.tools import list_s2t_transformations
 
     conn = get_db_connection()
@@ -2627,8 +2665,8 @@ def test_list_s2t_transformations_is_non_terminal_preview():
 
     result = list_s2t_transformations.invoke({"limit": 1000})
     assert result["total"] == 25
-    assert result["limit"] == 20
-    assert len(result["rows"]) == 20
+    assert result["limit"] == 1000
+    assert len(result["rows"]) == 25
     assert result["scope"] == "global"
     assert result["columns"] == [
         "row_num",
@@ -2731,6 +2769,73 @@ def test_list_s2t_table_mapping_keeps_table_roles_unambiguous():
     assert result["rows"][0]["target_field"] == "optn_id"
 
 
+def test_narrow_s2t_tools_keep_exact_roles_required():
+    from agents.tools import (
+        list_s2t_source_field,
+        list_s2t_source_table,
+        list_s2t_target_field,
+        list_s2t_target_table,
+    )
+
+    conn = get_db_connection()
+    conn.executemany(
+        """INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field, transformation_rule)
+        VALUES (?, 61, 'S2T', ?, ?, ?, ?, ?, ?)""",
+        [
+            (241, 1, "source_a", "field_a", "target_x", "field_x", "a_to_x"),
+            (242, 2, "source_a", "field_a", "target_y", "field_y", "a_to_y"),
+            (243, 3, "source_b", "field_b", "target_x", "field_x", "b_to_x"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    assert list_s2t_source_table.invoke({"source_table": "source_a"})[
+        "total"
+    ] == 2
+    assert list_s2t_target_table.invoke({"target_table": "target_x"})[
+        "total"
+    ] == 2
+    assert list_s2t_source_field.invoke(
+        {"source_table": "source_a", "source_field": "field_a"}
+    )["total"] == 2
+    assert list_s2t_target_field.invoke(
+        {"target_table": "target_x", "target_field": "field_x"}
+    )["total"] == 2
+
+    assert list_s2t_source_table.args_schema.model_json_schema()[
+        "required"
+    ] == ["source_table"]
+    assert list_s2t_target_field.args_schema.model_json_schema()[
+        "required"
+    ] == ["target_table", "target_field"]
+
+
+def test_narrow_s2t_experiment_replaces_only_ambiguous_public_tool(monkeypatch):
+    from agents.tools.registry import (
+        S2T_NARROW_TOOLS_EXPERIMENT_ENV,
+        get_tools,
+    )
+
+    monkeypatch.delenv(S2T_NARROW_TOOLS_EXPERIMENT_ENV, raising=False)
+    default_names = {tool.name for tool in get_tools()}
+    assert "list_s2t_transformations" in default_names
+    assert "list_s2t_source_field" not in default_names
+
+    monkeypatch.setenv(S2T_NARROW_TOOLS_EXPERIMENT_ENV, "1")
+    experiment_names = {tool.name for tool in get_tools()}
+    assert "list_s2t_transformations" not in experiment_names
+    assert {
+        "list_s2t_table_mapping",
+        "list_s2t_source_table",
+        "list_s2t_target_table",
+        "list_s2t_source_field",
+        "list_s2t_target_field",
+    }.issubset(experiment_names)
+
+
 def test_list_s2t_transformations_selects_requested_columns():
     from agents.tools import list_s2t_transformations
 
@@ -2820,7 +2925,7 @@ def test_list_s2t_transformations_empty_result_is_global_not_file_error():
     assert result == {
         "scope": "global",
         "total": 0,
-        "limit": 20,
+        "limit": 200,
         "columns": [
             "row_num",
             "target_field",

@@ -37,6 +37,7 @@ from sheet_skills.column_catalog import (
 from storage.database import get_db_connection, init_db, store_excel_data
 from storage.s2t import (
     clear_s2t_transformations,
+    insert_s2t_transformations,
     list_s2t_transformations,
 )
 
@@ -2645,6 +2646,102 @@ def test_clear_s2t_transformations_deletes_only_current_file(s2t_db):
     conn.close()
 
     assert rows == [{"id": 3, "file_id": 20}]
+    conn = get_db_connection()
+    try:
+        state = conn.execute(
+            """
+            SELECT desired_revision, applied_revision
+            FROM graph_sync_outbox
+            WHERE file_id = 10
+            """
+        ).fetchone()
+        assert tuple(state) == (1, 0)
+    finally:
+        conn.close()
+
+
+def test_insert_s2t_transformations_enqueues_graph_revision(s2t_db):
+    result = insert_s2t_transformations(
+        10,
+        [
+            {
+                "file_id": 10,
+                "sheet_name": "S2T",
+                "row_num": 1,
+                "target_table": "target_a",
+                "source_table": "source_a",
+            }
+        ],
+    )
+
+    assert result == {"file_id": 10, "count": 1}
+    conn = get_db_connection()
+    try:
+        state = conn.execute(
+            """
+            SELECT desired_revision, applied_revision
+            FROM graph_sync_outbox
+            WHERE file_id = 10
+            """
+        ).fetchone()
+        assert tuple(state) == (1, 0)
+    finally:
+        conn.close()
+
+
+def test_insert_s2t_rolls_back_when_outbox_write_fails(s2t_db):
+    with patch(
+        "storage.s2t.enqueue_graph_sync",
+        side_effect=RuntimeError("outbox unavailable"),
+    ), pytest.raises(RuntimeError, match="outbox unavailable"):
+        insert_s2t_transformations(
+            10,
+            [
+                {
+                    "file_id": 10,
+                    "sheet_name": "S2T",
+                    "row_num": 1,
+                    "target_table": "target_a",
+                }
+            ],
+        )
+
+    conn = get_db_connection()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM s2t_transformations"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_clear_s2t_rolls_back_when_outbox_write_fails(s2t_db):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO s2t_transformations
+            (id, file_id, sheet_name, row_num, target_table)
+            VALUES (1, 10, 'S2T', 1, 'target_a')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with patch(
+        "storage.s2t.enqueue_graph_sync",
+        side_effect=RuntimeError("outbox unavailable"),
+    ), pytest.raises(RuntimeError, match="outbox unavailable"):
+        clear_s2t_transformations(10)
+
+    conn = get_db_connection()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM s2t_transformations WHERE file_id = 10"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_list_s2t_transformations_without_file_id_reads_global_table(s2t_db):

@@ -1428,11 +1428,13 @@ def test_live_agent_writes_s2t_test_protocol(live_chat_client):
     file_id, target_table, source_table, _, _ = _s2t_work_case_fixture()
     exchange = _chat(
         live_chat_client,
-        f"Для file_id={file_id} составь тест-протокол сохранённой S2T-загрузки "
-        f"{source_table} → {target_table}. "
-        "Включи проверки count(source) vs count(target), уникальности ключа, null-rate "
-        "обязательных полей и контроль трансформаций. Для каждой проверки дай "
-        "цель, SQL-шаблон и критерий прохождения.",
+        f"Для file_id={file_id} по сохранённой S2T-спецификации "
+        f"{source_table} → {target_table} составь тест-протокол для проверки "
+        "ETL-загрузки во внешней СУБД. Включи проверки количества строк, "
+        "уникальности ключа, null-rate обязательных полей и корректности "
+        "трансформаций. Для каждой проверки дай цель, SQL-шаблон и критерий "
+        "прохождения. Используй подтверждённые таблицы, колонки и правила; "
+        "фактические метрики не вычисляй.",
     )
     result = exchange.result
 

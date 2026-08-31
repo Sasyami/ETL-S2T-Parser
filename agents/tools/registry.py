@@ -1,5 +1,6 @@
 """Explicit read-only and mutating tool registries."""
 
+import os
 from typing import Dict, Iterable, Tuple
 
 from langchain_core.tools import BaseTool
@@ -12,7 +13,11 @@ from .files import (
     update_file_description,
     update_table_info_from_user_query,
 )
-from .columns import list_column_catalog, search_column_catalog
+from .columns import (
+    filter_column_catalog,
+    list_column_catalog,
+    search_column_catalog,
+)
 from .planning import show_plan
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
 from .neo4j import (
@@ -23,8 +28,12 @@ from .neo4j import (
 )
 from .s2t import (
     get_s2t_rules_by_ids,
+    list_s2t_source_field,
+    list_s2t_source_table,
     list_s2t_table_mapping,
     list_s2t_table_names,
+    list_s2t_target_field,
+    list_s2t_target_table,
     list_s2t_transformations,
     search_s2t_transformations,
     summarize_s2t_tables,
@@ -46,6 +55,8 @@ from .sql_lineage import (
 )
 from .transformation_paths import trace_transformation_path
 
+S2T_NARROW_TOOLS_EXPERIMENT_ENV = "S2T_NARROW_TOOLS_EXPERIMENT"
+
 READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     show_plan,
     search_excel_values,
@@ -54,6 +65,7 @@ READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     list_additional_objects,
     search_additional_objects,
     list_column_catalog,
+    filter_column_catalog,
     search_column_catalog,
     visualize_s2t_table_graph,
     trace_transformation_path,
@@ -87,9 +99,26 @@ WRITE_TOOLS: Tuple[BaseTool, ...] = (
     update_table_info_from_user_query,
 )
 
-ALL_TOOLS: Tuple[BaseTool, ...] = READ_ONLY_TOOLS + WRITE_TOOLS
+_NARROW_S2T_TOOLS: Tuple[BaseTool, ...] = (
+    list_s2t_source_table,
+    list_s2t_target_table,
+    list_s2t_source_field,
+    list_s2t_target_field,
+)
+_EXPERIMENT_READ_ONLY_TOOLS: Tuple[BaseTool, ...] = tuple(
+    tool
+    for tool in READ_ONLY_TOOLS
+    if tool.name != "list_s2t_transformations"
+) + _NARROW_S2T_TOOLS
+_REGISTERED_READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
+    READ_ONLY_TOOLS + _NARROW_S2T_TOOLS
+)
+
+ALL_TOOLS: Tuple[BaseTool, ...] = _REGISTERED_READ_ONLY_TOOLS + WRITE_TOOLS
 TOOLS: Tuple[BaseTool, ...] = READ_ONLY_TOOLS
-TOOLS_BY_NAME: Dict[str, BaseTool] = {tool.name: tool for tool in TOOLS}
+TOOLS_BY_NAME: Dict[str, BaseTool] = {
+    tool.name: tool for tool in TOOLS
+}
 WRITE_TOOLS_BY_NAME: Dict[str, BaseTool] = {
     tool.name: tool for tool in WRITE_TOOLS
 }
@@ -97,9 +126,20 @@ ALL_TOOLS_BY_NAME: Dict[str, BaseTool] = {
     tool.name: tool for tool in ALL_TOOLS
 }
 
+
+def _narrow_s2t_experiment_enabled() -> bool:
+    return str(
+        os.getenv(S2T_NARROW_TOOLS_EXPERIMENT_ENV, "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_tools() -> Tuple[BaseTool, ...]:
-    """Вернуть неизменяемую коллекцию read-only инструментов."""
-    return TOOLS
+    """Вернуть активную неизменяемую коллекцию read-only инструментов."""
+    return (
+        _EXPERIMENT_READ_ONLY_TOOLS
+        if _narrow_s2t_experiment_enabled()
+        else TOOLS
+    )
 
 
 def get_tools_for_names(
@@ -110,17 +150,19 @@ def get_tools_for_names(
     if not selected:
         return ()
 
-    unknown = [name for name in selected if name not in TOOLS_BY_NAME]
+    active_tools = get_tools()
+    active_by_name = {tool.name: tool for tool in active_tools}
+    unknown = [name for name in selected if name not in active_by_name]
     if unknown:
         raise ValueError(f"Неизвестные read-only tools: {', '.join(unknown)}")
 
     selected_set = set(selected)
-    return tuple(tool for tool in TOOLS if tool.name in selected_set)
+    return tuple(tool for tool in active_tools if tool.name in selected_set)
 
 
 def get_tools_by_name() -> Dict[str, BaseTool]:
     """Вернуть копию read-only реестра инструментов по именам."""
-    return dict(TOOLS_BY_NAME)
+    return {tool.name: tool for tool in get_tools()}
 
 
 def get_write_tools() -> Tuple[BaseTool, ...]:

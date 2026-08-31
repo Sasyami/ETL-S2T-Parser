@@ -487,13 +487,15 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "фильтры колонок" in semantic_description
     assert "Подстрока" in contracts["semantic_search_descriptions"]["not_for"]
     list_columns_contract = contracts["list_column_catalog"]
-    assert "Точный структурный срез source/target-каталога" in (
+    assert "атрибуты" in (
         list_columns_contract["use_when"]
     )
-    assert "file/table/column/type/PK/not-null" in list_columns_contract["use_when"]
+    assert "table.column" in list_columns_contract["use_when"]
     assert "scope обязателен" in list_columns_contract["use_when"]
-    assert "разные роли" in list_columns_contract["use_when"]
-    assert "Подстрока" in list_columns_contract["not_for"]
+    assert "Атрибутный отбор" in list_columns_contract["not_for"]
+    filter_columns_contract = contracts["filter_column_catalog"]
+    assert "data_type" in filter_columns_contract["use_when"]
+    assert "Точная table.column" in filter_columns_contract["not_for"]
     search_columns_contract = contracts["search_column_catalog"]
     assert "Явная буквальная подстрока" in search_columns_contract["use_when"]
     assert "фильтры ограничивают" in search_columns_contract["use_when"]

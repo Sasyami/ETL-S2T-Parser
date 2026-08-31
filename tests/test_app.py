@@ -635,6 +635,8 @@ def test_get_transformations_filter(client):
 
 
 def test_delete_transformations(client):
+    from storage.graph_outbox import mark_graph_sync_applied
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.executemany(
@@ -652,10 +654,41 @@ def test_delete_transformations(client):
     conn.commit()
     conn.close()
 
-    response = client.delete("/transformations/207")
+    def apply_projection(file_id):
+        mark_graph_sync_applied(file_id, 1)
+        return (
+            {
+                "file_id": file_id,
+                "desired_revision": 1,
+                "applied_revision": 1,
+            },
+            None,
+        )
+
+    with patch("app.try_sync_file_graph", side_effect=apply_projection):
+        response = client.delete("/transformations/207")
 
     assert response.status_code == 200
-    assert response.get_json()["deleted"] == 2
+    body = response.get_json()
+    state = body.pop("graph_sync_state")
+    assert body == {
+        "status": "ok",
+        "file_id": 207,
+        "deleted": 2,
+        "graph_sync_report": {
+            "file_id": 207,
+            "desired_revision": 1,
+            "applied_revision": 1,
+        },
+        "graph_sync_error": None,
+    }
+    assert state["file_id"] == 207
+    assert state["desired_revision"] == 1
+    assert state["applied_revision"] == 1
+    assert state["attempts"] == 0
+    assert state["last_error"] is None
+    assert state["updated_at"]
+    assert state["applied_at"]
 
     conn = get_db_connection()
     cursor = conn.cursor()

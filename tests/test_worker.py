@@ -398,6 +398,65 @@ def test_worker_repairs_observer_without_repeating_data_tool():
     ]
 
 
+def test_worker_repairs_provider_markup_before_executing_tool():
+    tool_calls = []
+
+    def lookup(data_type=None):
+        tool_calls.append(data_type)
+        return {"data_type": "uuid"}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {
+                            "data_type": (
+                                "}}!#native#!#tool_call_id-00001"
+                                "#!#/native#!#native_result!#{"
+                            )
+                        },
+                        "id": "call-invalid",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-valid",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Тип uuid подтверждён."),
+        ]
+    )
+
+    result = run_worker_graph(
+        task="Получи тип данных.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+    )
+
+    assert result.answer == "Тип uuid подтверждён."
+    assert tool_calls == [None]
+    assert len(model.observer.messages) == 1
+    repair_prompt = str(model.messages[1][-1].content)
+    assert "служебную разметку LLM-провайдера" in repair_prompt
+    assert "Неизвестные необязательные аргументы полностью опусти" in (
+        repair_prompt
+    )
+    assert "call-invalid" not in str(result)
+
+
 def test_worker_rejects_unknown_accepted_tool_call_id_without_repeating_tool():
     tool_calls = []
 

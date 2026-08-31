@@ -9,6 +9,7 @@ from storage.database import (
     DatabaseSchemaError,
     FILES_COLUMNS,
     FILE_SHEET_HEADER_COLUMNS,
+    GRAPH_SYNC_OUTBOX_COLUMNS,
     INTERNAL_TABLES,
     PXF_TO_A_COLUMNS,
     S2T_TRANSFORMATION_COLUMNS,
@@ -63,6 +64,9 @@ def test_init_db(temp_db):
     cursor.execute("PRAGMA table_info(data)")
     data_columns = [row[1] for row in cursor.fetchall()]
     assert data_columns == list(DATA_COLUMNS)
+    cursor.execute("PRAGMA table_info(graph_sync_outbox)")
+    outbox_columns = [row[1] for row in cursor.fetchall()]
+    assert outbox_columns == list(GRAPH_SYNC_OUTBOX_COLUMNS)
 
 
 def test_store_excel_data_preserves_long_cell_values(temp_db):
@@ -108,7 +112,7 @@ def test_storage_schema_constants_cover_current_tables():
         "s2t_transformations",
         "data",
     )
-    assert INTERNAL_TABLES == ()
+    assert INTERNAL_TABLES == ("graph_sync_outbox",)
     assert tuple(get_usefull_col_extraction_target("source_tables")["fields"]) == tuple(
         SOURCE_TABLE_COLUMNS[4:-1]
     )
@@ -265,9 +269,10 @@ def test_clear_all_data_deletes_every_row_and_keeps_schema(temp_db):
     }
     assert tables == set(CORE_TABLES)
     for table_name, expected_columns in STORAGE_SCHEMA_COLUMNS.items():
+        expected_count = 1 if table_name == "graph_sync_outbox" else 0
         assert temp_db.execute(
             f'SELECT COUNT(*) FROM "{table_name}"'
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == expected_count
         actual_columns = tuple(
             row[1]
             for row in temp_db.execute(
@@ -275,6 +280,13 @@ def test_clear_all_data_deletes_every_row_and_keeps_schema(temp_db):
             ).fetchall()
         )
         assert actual_columns == tuple(expected_columns)
+    outbox = temp_db.execute(
+        """
+        SELECT file_id, desired_revision, applied_revision
+        FROM graph_sync_outbox
+        """
+    ).fetchone()
+    assert tuple(outbox) == (10, 1, 0)
 
 
 def test_init_db_rejects_old_table_catalog_schema_without_mutating_data(temp_db):

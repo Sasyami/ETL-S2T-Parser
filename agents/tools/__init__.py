@@ -17,7 +17,11 @@ from .files import (
     update_file_description,
     update_table_info_from_user_query,
 )
-from .columns import list_column_catalog, search_column_catalog
+from .columns import (
+    filter_column_catalog,
+    list_column_catalog,
+    search_column_catalog,
+)
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
 from .planning import show_plan
 from .neo4j import (
@@ -42,8 +46,12 @@ from .registry import (
 )
 from .s2t import (
     get_s2t_rules_by_ids,
+    list_s2t_source_field,
+    list_s2t_source_table,
     list_s2t_table_mapping,
     list_s2t_table_names,
+    list_s2t_target_field,
+    list_s2t_target_table,
     list_s2t_transformations,
     search_s2t_transformations,
     summarize_s2t_tables,
@@ -105,6 +113,7 @@ __all__ = [
     "get_tools_by_name",
     "get_tools_for_names",
     "get_write_tools",
+    "filter_column_catalog",
     "list_columns",
     "list_additional_objects",
     "list_column_catalog",
@@ -112,6 +121,10 @@ __all__ = [
     "list_files",
     "list_s2t_table_mapping",
     "list_s2t_table_names",
+    "list_s2t_source_field",
+    "list_s2t_source_table",
+    "list_s2t_target_field",
+    "list_s2t_target_table",
     "list_s2t_transformations",
     "list_sheet_group_classifications",
     "list_sheets",

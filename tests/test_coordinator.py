@@ -403,12 +403,12 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     ):
         assert domain_detail not in combined
 
-    assert len(_DOWNSTREAM_PLAN_PROMPT) < 3600
+    assert len(_DOWNSTREAM_PLAN_PROMPT) < 5000
     assert (
         len(_DOWNSTREAM_PLAN_PROMPT)
         - len(_DOWNSTREAM_TABLE_CONTEXT)
         - len(_DOWNSTREAM_CAPABILITY_CONTEXT)
-        < 2200
+        < 3200
     )
     assert _DOWNSTREAM_CAPABILITY_CONTEXT in _DOWNSTREAM_PLAN_PROMPT
     assert _DOWNSTREAM_TABLE_CONTEXT in _DOWNSTREAM_PLAN_PROMPT
@@ -466,6 +466,16 @@ def test_coordinator_prompts_and_schemas_match_contracts():
         _DOWNSTREAM_PLAN_PROMPT
     )
     assert "Не превращай смысловой поиск в «найти содержащие»" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "Сначала определи требуемый результат" in _DOWNSTREAM_PLAN_PROMPT
+    assert "фактические значения, расчёт или выполнение" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "методику, шаблон, план проверки или протокол" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "глобальную `s2t_transformations` не ограничивай `file_id`" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
     assert "справка, не список шагов" in _DOWNSTREAM_TABLE_CONTEXT
@@ -544,7 +554,8 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "`LEFT JOIN`" in _UPSTREAM_ANALYSIS_CONTEXT
     assert "Технические поля хранилища" in _UPSTREAM_ANALYSIS_CONTEXT
     assert "не переименовывай" in _UPSTREAM_ANALYSIS_CONTEXT
-    assert "`{PLACEHOLDER}`" in _UPSTREAM_ANALYSIS_CONTEXT
+    assert "Не подставляй фиктивное значение" in _UPSTREAM_ANALYSIS_CONTEXT
+    assert "`{PLACEHOLDER}`" not in _UPSTREAM_ANALYSIS_CONTEXT
     assert "`analyze`" not in _UPSTREAM_ANALYSIS_CONTEXT
 
     answer_schema = _upstream_answer_tool_schema()["function"]["parameters"]

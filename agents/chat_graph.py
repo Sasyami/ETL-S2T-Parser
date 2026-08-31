@@ -67,6 +67,11 @@ DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS = 6000
 _FINISH_WORKER_TOOL_NAME = "finish_worker"
 _ANALYZE_KNOWN_FACTS_TOOL_NAME = "analyze_known_facts"
 _OBSERVER_MAX_RETRIES = 5
+_PROVIDER_TOOL_ARGUMENT_MARKERS = (
+    "!#native",
+    "!#/native",
+    "!#native_result",
+)
 
 
 @tool(parse_docstring=True)
@@ -226,6 +231,17 @@ Observer вернул status=continue: завершать worker сейчас з
 значения task; не возвращай обычный текст и не вызывай finish_worker.
 """.strip()
 
+_TOOL_ARGUMENT_REPAIR_PROMPT = """
+Предыдущий native call отброшен до выполнения: один из его аргументов содержит
+служебную разметку LLM-провайдера и не является значением task. Верни исправленный
+native call. Неизвестные необязательные аргументы полностью опусти; не заменяй их
+пустой строкой, placeholder или догадкой. Используй только точные значения из
+task либо подтверждённых tool results.
+
+Отброшенные calls:
+{invalid_calls}
+""".strip()
+
 _OBSERVER_REPAIR_PROMPT = """
 Предыдущий observer-вызов не вернул валидный structured output Observation.
 Повторно оцени тот же исходный user_request, prior_state, tool_calls и
@@ -280,6 +296,32 @@ def _message_content_text(content: Any) -> str:
         if parts:
             return "".join(parts)
     return str(content)
+
+
+def _tool_calls_with_provider_markup(
+    tool_calls: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return data-tool calls containing leaked provider protocol markup."""
+
+    def contains_markup(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return any(contains_markup(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(contains_markup(item) for item in value)
+        if not isinstance(value, str):
+            return False
+        lowered = value.lower()
+        return any(marker in lowered for marker in _PROVIDER_TOOL_ARGUMENT_MARKERS)
+
+    return [
+        {
+            "name": str(call.get("name") or "unknown_tool"),
+            "args": call.get("args", {}),
+        }
+        for call in tool_calls
+        if call.get("name") != _FINISH_WORKER_TOOL_NAME
+        and contains_markup(call.get("args", {}))
+    ]
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -977,6 +1019,55 @@ def build_agent_graph(
                     content=(
                         "Worker planner после repair не вернул допустимый "
                         "native data-tool call."
+                    )
+                )
+            reply = repaired_reply
+
+        invalid_argument_calls = _tool_calls_with_provider_markup(
+            reply.tool_calls
+        )
+        if invalid_argument_calls:
+            logger.warning(
+                "Worker planner returned provider markup in tool arguments; "
+                "discarding calls before execution: %s",
+                invalid_argument_calls,
+            )
+            argument_repair_prompt = _TOOL_ARGUMENT_REPAIR_PROMPT.format(
+                invalid_calls=json.dumps(
+                    invalid_argument_calls,
+                    ensure_ascii=False,
+                    default=str,
+                )[:2000]
+            )
+            repaired_reply = invoke_with_fallback(
+                selected_model,
+                [
+                    *planner_messages,
+                    HumanMessage(content=argument_repair_prompt),
+                ],
+                stage=planner_stage,
+                fallback_model=selected_fallback,
+            )
+            if not isinstance(repaired_reply, AIMessage):
+                repaired_reply = AIMessage(
+                    content=_message_content_text(repaired_reply)
+                )
+            repaired_continue_finish = bool(
+                must_continue
+                and any(
+                    call.get("name") == _FINISH_WORKER_TOOL_NAME
+                    for call in repaired_reply.tool_calls
+                )
+            )
+            if (
+                not repaired_reply.tool_calls
+                or repaired_continue_finish
+                or _tool_calls_with_provider_markup(repaired_reply.tool_calls)
+            ):
+                repaired_reply = AIMessage(
+                    content=(
+                        "Worker planner после repair снова вернул "
+                        "недопустимые аргументы native call."
                     )
                 )
             reply = repaired_reply

@@ -19,7 +19,8 @@ def test_chat_agent_context_keeps_general_anti_invention_rules_out_of_queries():
     text = load_chat_agent_context()
 
     assert "Не выдумывай ID, файлы, листы, колонки, таблицы и строки" in text
-    assert "`{PLACEHOLDER}`" in text
+    assert "не подставляй вместо" in text
+    assert "`{PLACEHOLDER}`" not in text
 
 
 def test_load_skills_contains_tool_orchestration_and_domain_context():
@@ -35,6 +36,7 @@ def test_load_skills_contains_tool_orchestration_and_domain_context():
         "search_excel_values",
         "semantic_search_descriptions",
         "list_column_catalog",
+        "filter_column_catalog",
         "search_column_catalog",
         "trace_transformation_path",
     ):
@@ -99,7 +101,8 @@ def test_upstream_analysis_context_is_independent_and_sql_precise():
     assert "Технические поля хранилища" in text
     assert "не переименовывай" in text
     assert "без прямого подтверждения в evidence" in text
-    assert "`{PLACEHOLDER}`" in text
+    assert "Не подставляй фиктивное значение" in text
+    assert "`{PLACEHOLDER}`" not in text
     assert len(text) < 3000
     assert "`analyze`" not in text
 

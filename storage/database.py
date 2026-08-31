@@ -85,6 +85,15 @@ TARGET_COLUMN_COLUMNS = (
 ADDITIONAL_OBJECT_COLUMNS = EXTRACTION_METADATA_COLUMNS + ADDITIONAL_OBJECT_FIELDS
 PXF_TO_A_COLUMNS = EXTRACTION_METADATA_COLUMNS + PXF_TO_A_FIELDS
 S2T_TRANSFORMATION_COLUMNS = EXTRACTION_METADATA_COLUMNS + S2T_RECORD_FIELDS
+GRAPH_SYNC_OUTBOX_COLUMNS = (
+    "file_id",
+    "desired_revision",
+    "applied_revision",
+    "attempts",
+    "last_error",
+    "updated_at",
+    "applied_at",
+)
 DATA_COLUMNS = (
     "id",
     "file_id",
@@ -92,18 +101,6 @@ DATA_COLUMNS = (
     "row_num",
     "column_id",
     "value",
-)
-CORE_TABLES = (
-    "files",
-    "data",
-    "file_sheet_headers",
-    "source_tables",
-    "target_tables",
-    "source_columns",
-    "target_columns",
-    "additional_objects",
-    "pxf_to_a",
-    "s2t_transformations",
 )
 USER_FACING_TABLES = (
     "files",
@@ -117,8 +114,9 @@ USER_FACING_TABLES = (
     "s2t_transformations",
     "data",
 )
-INTERNAL_TABLES = ()
-STORAGE_SCHEMA_TABLE_ORDER = USER_FACING_TABLES
+INTERNAL_TABLES = ("graph_sync_outbox",)
+CORE_TABLES = USER_FACING_TABLES + INTERNAL_TABLES
+STORAGE_SCHEMA_TABLE_ORDER = CORE_TABLES
 STORAGE_SCHEMA_COLUMNS = {
     "files": FILES_COLUMNS,
     "file_sheet_headers": FILE_SHEET_HEADER_COLUMNS,
@@ -130,10 +128,11 @@ STORAGE_SCHEMA_COLUMNS = {
     "pxf_to_a": PXF_TO_A_COLUMNS,
     "s2t_transformations": S2T_TRANSFORMATION_COLUMNS,
     "data": DATA_COLUMNS,
+    "graph_sync_outbox": GRAPH_SYNC_OUTBOX_COLUMNS,
 }
 PRE_COLUMN_CATALOG_CORE_TABLES = tuple(
     table_name
-    for table_name in CORE_TABLES
+    for table_name in USER_FACING_TABLES
     if table_name not in {"source_columns", "target_columns"}
 )
 
@@ -335,6 +334,19 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
         )
         """
     )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {names['graph_sync_outbox']} (
+            file_id INTEGER PRIMARY KEY,
+            desired_revision INTEGER NOT NULL DEFAULT 0,
+            applied_revision INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            applied_at TEXT
+        )
+        """
+    )
 
 
 def _schema_mismatches(
@@ -362,6 +374,7 @@ def _schema_mismatches(
         "additional_objects": "id",
         "pxf_to_a": "id",
         "s2t_transformations": "id",
+        "graph_sync_outbox": "file_id",
     }
     for table_name, key_name in integer_primary_keys.items():
         if table_name not in selected:
@@ -428,6 +441,10 @@ def _create_indexes(cursor: sqlite3.Cursor) -> None:
         cursor.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{table_name}_file ON {table_name}(file_id)"
         )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_graph_sync_outbox_pending "
+        "ON graph_sync_outbox(desired_revision, applied_revision)"
+    )
 
 
 def init_db() -> None:
@@ -597,6 +614,17 @@ def clear_all_data() -> Dict[str, int]:
     try:
         cursor = conn.cursor()
         cursor.execute("BEGIN")
+        projection_file_ids: set[int] = set()
+        for table_name in ("files", "s2t_transformations", "graph_sync_outbox"):
+            if not _table_exists(cursor, table_name):
+                continue
+            projection_file_ids.update(
+                int(row[0])
+                for row in cursor.execute(
+                    f"SELECT DISTINCT file_id FROM {_sql_identifier(table_name)} "
+                    "WHERE file_id IS NOT NULL"
+                ).fetchall()
+            )
         deleted = {
             table_name: (
                 int(
@@ -613,6 +641,11 @@ def clear_all_data() -> Dict[str, int]:
             cursor.execute(f"DROP TABLE IF EXISTS {_sql_identifier(table_name)}")
         _create_current_tables(cursor)
         _create_indexes(cursor)
+        if projection_file_ids:
+            from .graph_outbox import enqueue_graph_sync
+
+            for file_id in sorted(projection_file_ids):
+                enqueue_graph_sync(cursor, file_id)
         mismatches = _schema_mismatches(cursor)
         if mismatches:
             raise DatabaseSchemaError(

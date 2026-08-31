@@ -6,7 +6,7 @@ from agents.sheet_group_classifier import classify_file_sheet_groups
 from agents.summarizer_agent import ensure_file_description, summarize_file
 from graph_storage import is_neo4j_configured
 from processing.excel import convert_to_serializable
-from services.graph_sync import sync_file_graph
+from services.graph_sync import sync_file_graph, sync_pending_graph_projections
 from sheet_skills.column_catalog import extract_column_catalogs
 from sheet_skills.s2t import S2TExtractionError, run_s2t_extraction_subagent
 from sheet_skills.structured_metadata import extract_structured_metadata
@@ -102,6 +102,22 @@ def try_sync_file_graph(
         return sync_file_graph(file_id), None
     except Exception as exc:
         logger.exception("Neo4j synchronization failed")
+        return None, str(exc)
+
+
+def try_sync_pending_graph_projections(
+    limit: int = 100,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Retry durable graph outbox rows without making SQLite writes disappear."""
+    if not is_neo4j_configured():
+        return None, "Neo4j не настроен; graph outbox остаётся в ожидании"
+    try:
+        report = sync_pending_graph_projections(limit=limit)
+        if report["errors"]:
+            return report, f"Не применено ревизий: {len(report['errors'])}"
+        return report, None
+    except Exception as exc:
+        logger.exception("Pending Neo4j synchronization failed")
         return None, str(exc)
 
 

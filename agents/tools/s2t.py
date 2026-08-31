@@ -71,7 +71,7 @@ def get_s2t_rules_by_ids(
 def list_s2t_table_mapping(
     source_table: str,
     target_table: str,
-    limit: int = 100,
+    limit: int = 1000,
 ) -> Dict[str, Any]:
     """Получить полный S2T-маппинг между двумя точными таблицами.
 
@@ -84,7 +84,7 @@ def list_s2t_table_mapping(
     Args:
         source_table: Точное полное имя исходной S2T-таблицы.
         target_table: Точное полное имя целевой S2T-таблицы.
-        limit: Максимальное число возвращаемых строк, от 1 до 100.
+        limit: Максимальное число возвращаемых строк, от 1 до 1000.
     """
     from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
 
@@ -97,15 +97,87 @@ def list_s2t_table_mapping(
         }
     return db_list_s2t_transformations(
         file_id=None,
-        limit=clamped_int(limit, 100, minimum=1, maximum=100),
+        limit=clamped_int(limit, 1000, minimum=1, maximum=1000),
         source_table=clean_source_table,
         target_table=clean_target_table,
     )
 
 
+def _list_narrow_s2t_rows(**filters: str) -> Dict[str, Any]:
+    """Read every S2T row matching required exact role filters."""
+    clean_filters = {
+        name: str(value or "").strip()
+        for name, value in filters.items()
+    }
+    missing = [name for name, value in clean_filters.items() if not value]
+    if missing:
+        return {
+            "error": "Required S2T filters must be non-empty: "
+            + ", ".join(missing),
+            "rows": [],
+        }
+    from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
+
+    return db_list_s2t_transformations(file_id=None, limit=None, **clean_filters)
+
+
+@tool(parse_docstring=True)
+def list_s2t_source_table(source_table: str) -> Dict[str, Any]:
+    """Получить все S2T-строки одной точной исходной таблицы.
+
+    Args:
+        source_table: Точное полное имя исходной S2T-таблицы.
+    """
+    return _list_narrow_s2t_rows(source_table=source_table)
+
+
+@tool(parse_docstring=True)
+def list_s2t_target_table(target_table: str) -> Dict[str, Any]:
+    """Получить все S2T-строки одной точной целевой таблицы.
+
+    Args:
+        target_table: Точное полное имя целевой S2T-таблицы.
+    """
+    return _list_narrow_s2t_rows(target_table=target_table)
+
+
+@tool(parse_docstring=True)
+def list_s2t_source_field(
+    source_table: str,
+    source_field: str,
+) -> Dict[str, Any]:
+    """Получить все цели одного точного исходного S2T-поля.
+
+    Args:
+        source_table: Точное полное имя исходной S2T-таблицы.
+        source_field: Точное имя исходного поля без имени таблицы.
+    """
+    return _list_narrow_s2t_rows(
+        source_table=source_table,
+        source_field=source_field,
+    )
+
+
+@tool(parse_docstring=True)
+def list_s2t_target_field(
+    target_table: str,
+    target_field: str,
+) -> Dict[str, Any]:
+    """Получить все источники одного точного целевого S2T-поля.
+
+    Args:
+        target_table: Точное полное имя целевой S2T-таблицы.
+        target_field: Точное имя целевого поля без имени таблицы.
+    """
+    return _list_narrow_s2t_rows(
+        target_table=target_table,
+        target_field=target_field,
+    )
+
+
 @tool(parse_docstring=True)
 def list_s2t_transformations(
-    limit: int = 20,
+    limit: int = 200,
     columns: Optional[List[str]] = None,
     target_table: Optional[str] = None,
     source_table: Optional[str] = None,
@@ -140,7 +212,7 @@ def list_s2t_transformations(
     Не строит графовый путь и не выполняет агрегации.
 
     Args:
-        limit: Максимальное число возвращаемых строк; фактически ограничивается 20.
+        limit: Максимальное число возвращаемых строк, от 1 до 1000; по умолчанию 200.
         columns: Точные имена возвращаемых колонок; null означает все колонки.
         target_table: Опциональное точное имя целевой таблицы без имени поля и операторов.
         source_table: Опциональное точное имя исходной таблицы без имени поля и операторов.
@@ -149,7 +221,7 @@ def list_s2t_transformations(
     """
     from storage.s2t import list_s2t_transformations as db_list_s2t_transformations
 
-    clean_limit = max(1, min(int(limit or 20), 20))
+    clean_limit = max(1, min(int(limit or 200), 1000))
     return db_list_s2t_transformations(
         file_id=None,
         limit=clean_limit,
