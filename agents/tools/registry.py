@@ -154,6 +154,58 @@ _REGISTERED_READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     + _COMPAT_COLUMN_TOOLS
 )
 
+# Worker routing starts with one unambiguous tool per common read operation.
+# Broad query tools and compatibility aliases remain executable, but are
+# exposed to the router only after the second observer-requested reroute.
+_WORKER_SPECIALIZED_TOOL_NAMES = frozenset(
+    {
+        "show_plan",
+        "search_excel_values",
+        "get_excel_row",
+        "semantic_search_descriptions",
+        "list_additional_objects",
+        "search_additional_objects",
+        "search_column_catalog",
+        "visualize_s2t_table_graph",
+        "trace_transformation_path",
+        "parse_sql_column_lineage",
+        "parse_sql_table_lineage",
+        "visualize_sql_lineage",
+        "query_saved_result",
+        "trace_neo4j_lineage",
+        "trace_neo4j_table_lineage",
+        "trace_neo4j_table_path",
+        "list_files",
+        "resolve_file",
+        "get_file_description",
+        "get_s2t_rules_by_ids",
+        "read_s2t_source_to_target",
+        "read_s2t_by_source_table",
+        "read_s2t_by_target_table",
+        "search_s2t_transformations",
+        "get_source_target_column_pair",
+        "list_column_metadata",
+        "list_source_column_catalog",
+        "list_target_column_catalog",
+        "list_s2t_table_names",
+        "summarize_s2t_tables",
+        "summarize_table_descriptions",
+        "list_sheets",
+        "list_file_sheet_headers",
+        "list_columns",
+    }
+)
+WORKER_GENERAL_FALLBACK_TOOL_NAMES = frozenset(
+    tool.name
+    for tool in _REGISTERED_READ_ONLY_TOOLS
+    if tool.name not in _WORKER_SPECIALIZED_TOOL_NAMES
+)
+_WORKER_SPECIALIZED_TOOLS: Tuple[BaseTool, ...] = tuple(
+    tool
+    for tool in _REGISTERED_READ_ONLY_TOOLS
+    if tool.name in _WORKER_SPECIALIZED_TOOL_NAMES
+)
+
 ALL_TOOLS: Tuple[BaseTool, ...] = _REGISTERED_READ_ONLY_TOOLS + WRITE_TOOLS
 TOOLS: Tuple[BaseTool, ...] = READ_ONLY_TOOLS
 TOOLS_BY_NAME: Dict[str, BaseTool] = {
@@ -179,6 +231,20 @@ def get_tools() -> Tuple[BaseTool, ...]:
         _EXPERIMENT_READ_ONLY_TOOLS
         if _narrow_s2t_experiment_enabled()
         else TOOLS
+    )
+
+
+def get_worker_tools(*, include_general: bool = False) -> Tuple[BaseTool, ...]:
+    """Return the staged read-only catalog used by the worker router.
+
+    The initial route and first reroute receive only specialized contracts.
+    The worker sets ``include_general`` after the second reroute to expose the
+    full registry, including broad query tools and compatibility aliases.
+    """
+    return (
+        _REGISTERED_READ_ONLY_TOOLS
+        if include_general
+        else _WORKER_SPECIALIZED_TOOLS
     )
 
 

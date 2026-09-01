@@ -12,7 +12,7 @@ from agents.agent import (
     agent_chat,
     get_header_decision,
 )
-from agents.tools import get_tools, load_schemas, load_skills
+from agents.tools import get_tools, get_worker_tools, load_schemas, load_skills
 from agents.tools.context import SchemaName
 from agents.tools.routing import (
     GENERAL_FALLBACK_TOOL_NAMES,
@@ -409,6 +409,7 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert {item["name"] for item in payload["available_tools"]} == {
         tool.name for tool in get_tools()
     }
+    assert payload["catalog_stage"] == "unrestricted"
     assert set(_TOOL_ROUTING_CONTRACTS) == {
         tool.name for tool in get_tools()
     } | {"read_previous_result"}
@@ -539,15 +540,17 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "физических заголовков" in SCHEMA_CATALOG["Excel-маппинги"]
     assert "произвольного run_cypher" in SCHEMA_CATALOG["Neo4j lineage"]
     router_prompt = " ".join(model.messages[0].content.split())
-    assert "необходимую planner палитру" in router_prompt
+    assert "необходимую planner-палитру" in router_prompt
     assert "точные имена из каталогов" in router_prompt
-    assert "Для каждой операции выбери все tools" in router_prompt
+    assert "Для каждой операции выбери все необходимые tools" in router_prompt
     assert "`not_for` — запрет" in router_prompt
-    assert "необходимости" in router_prompt
+    assert "все необходимые tools" in router_prompt
     assert "обязательные входы" in router_prompt
     assert "будет получен выбранным tool" in router_prompt
     assert "Не придумывай входы" in router_prompt
-    assert "полнота палитры важнее компактности" in router_prompt
+    assert "Полнота палитры важнее компактности" in router_prompt
+    assert "после двух reroute" in router_prompt
+    assert "перекрывающимися" in router_prompt
     assert "Tools, skills и schemas выбирай независимо" in router_prompt
     assert "каждый список может быть пустым" in router_prompt
     assert "оставляй `tools=[]`" in router_prompt
@@ -556,6 +559,51 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "обязательно включай `run_sql`" not in router_prompt
     assert "самостоятельно составить и выполнить SQL" not in model.messages[0].content
     assert "parse_sql_column_lineage" not in model.messages[0].content
+
+
+def test_chat_tool_router_marks_specialized_catalog_stage():
+    model = _ToolRouterModel(
+        {"tools": ["list_files"], "skills": [], "schemas": []}
+    )
+
+    route = _select_chat_route(
+        "Перечисли загруженные файлы",
+        model=model,
+        available_tools=get_worker_tools(),
+        catalog_stage="specialized_only",
+    )
+
+    assert route.tools == ["list_files"]
+    payload = json.loads(model.messages[1].content)
+    assert payload["catalog_stage"] == "specialized_only"
+    assert all(
+        not item["use_when"].startswith("Общий fallback:")
+        for item in payload["available_tools"]
+    )
+
+
+def test_chat_tool_router_marks_general_tools_in_fallback_stage():
+    model = _ToolRouterModel(
+        {"tools": ["run_sql"], "skills": [], "schemas": []}
+    )
+
+    route = _select_chat_route(
+        "Выполни нестандартный read-only срез",
+        model=model,
+        available_tools=get_worker_tools(include_general=True),
+        catalog_stage="general_fallback",
+    )
+
+    assert route.tools == ["run_sql"]
+    payload = json.loads(model.messages[1].content)
+    contracts = {
+        item["name"]: item for item in payload["available_tools"]
+    }
+    assert payload["catalog_stage"] == "general_fallback"
+    assert contracts["run_sql"]["use_when"].startswith("Общий fallback:")
+    assert not contracts["list_files"]["use_when"].startswith(
+        "Общий fallback:"
+    )
 
 
 def test_chat_tool_router_receives_explicit_reroute_context():
@@ -1578,14 +1626,16 @@ def test_tool_router_prompt_is_generic_and_catalog_driven():
 
     normalized_prompt = " ".join(_TOOL_ROUTER_PROMPT.split())
     assert "точные имена из каталогов" in normalized_prompt
-    assert "необходимую planner палитру" in normalized_prompt
+    assert "необходимую planner-палитру" in normalized_prompt
     assert "каждый список может быть пустым" in normalized_prompt
     assert "оставляй `tools=[]`" in normalized_prompt
-    assert "Покрой все разные операции" in normalized_prompt
+    assert "Покрой разные операции" in normalized_prompt
     assert "будет получен выбранным tool" in normalized_prompt
     assert "`not_for` — запрет" in normalized_prompt
-    assert "полнота палитры важнее компактности" in normalized_prompt
-    assert "не добавляй явно нерелевантные tools" in normalized_prompt
+    assert "Полнота палитры важнее компактности" in normalized_prompt
+    assert "Не добавляй явно нерелевантные tools" in normalized_prompt
+    assert "после двух reroute" in normalized_prompt
+    assert "точным специализированным контрактом" in normalized_prompt
     assert len(_TOOL_ROUTER_PROMPT) < 1750
     for domain_detail in (
         "trace_neo4j_table_lineage",

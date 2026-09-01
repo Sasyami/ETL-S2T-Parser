@@ -38,7 +38,7 @@ from .run_metrics import (
     record_worker_route,
     record_worker_task,
 )
-from .tools import get_tools, load_schemas, load_skills
+from .tools import get_worker_tools, load_schemas, load_skills
 from .tools.saved_results import (
     bind_saved_result_schemas,
     get_active_saved_result_store,
@@ -258,16 +258,32 @@ def worker_chat(
     reroute_count = 0
 
     while True:
-        available_tools = bind_saved_result_schemas(get_tools(), worker_request)
+        general_tools_available = reroute_count >= 2
+        available_tools = bind_saved_result_schemas(
+            get_worker_tools(include_general=True),
+            worker_request,
+        )
+        routable_tool_names = {
+            item.name
+            for item in get_worker_tools(
+                include_general=general_tools_available,
+            )
+        }
         routable_tools = tuple(
             item
             for item in available_tools
             if item.name != _READ_PREVIOUS_RESULT_TOOL_NAME
+            and item.name in routable_tool_names
         )
         route_kwargs: Dict[str, Any] = {
             "model": chat_model,
             "available_tools": routable_tools,
             "callbacks": callbacks,
+            "catalog_stage": (
+                "general_fallback"
+                if general_tools_available
+                else "specialized_only"
+            ),
         }
         if reroute_context is not None:
             route_kwargs["reroute_context"] = reroute_context
@@ -311,6 +327,7 @@ def worker_chat(
                     "skills": list(route.skills),
                     "schemas": list(route.schemas),
                     "gap": reroute_gap or None,
+                    "general_fallback_available": general_tools_available,
                 },
                 ensure_ascii=False,
             )[:8000],

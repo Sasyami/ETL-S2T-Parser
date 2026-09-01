@@ -14,7 +14,7 @@ from agents.chat_graph import (
     WorkerRunResult as WorkerRunResultContract,
     run_worker_graph,
 )
-from agents.tools import get_tools, load_schemas, load_skills
+from agents.tools import get_worker_tools, load_schemas, load_skills
 from agents.tools.routing import ToolRoute
 
 
@@ -2805,7 +2805,7 @@ def test_public_worker_contract_exposes_evidence_and_opaque_runtime_refs(
     assert "history" not in router.call_args.kwargs
     assert router.call_args.kwargs["available_tools"] == tuple(
         tool
-        for tool in get_tools()
+        for tool in get_worker_tools()
         if tool.name not in {"read_previous_result", "query_saved_result"}
     )
     assert result.previous_results == []
@@ -3016,6 +3016,85 @@ def test_public_worker_reroutes_original_task_after_observer_request():
     assert set(selected_tool_names[1]) == {
         "list_s2t_transformations",
         "trace_transformation_path",
+    }
+
+
+def test_public_worker_exposes_general_tools_only_after_second_reroute():
+    from agents.tools import WORKER_GENERAL_FALLBACK_TOOL_NAMES
+    from agents.worker import worker_chat
+
+    routes = [
+        ToolRoute(
+            tools=["read_s2t_by_target_table"],
+            skills=[],
+            schemas=[],
+        ),
+        ToolRoute(
+            tools=[
+                "read_s2t_by_target_table",
+                "search_s2t_transformations",
+            ],
+            skills=[],
+            schemas=[],
+        ),
+        ToolRoute(
+            tools=[
+                "read_s2t_by_target_table",
+                "search_s2t_transformations",
+                "run_sql",
+            ],
+            skills=[],
+            schemas=[],
+        ),
+    ]
+    graph_results = [
+        WorkerRunResult(
+            answer="Нужно другое точное чтение.",
+            goal_satisfied=False,
+            reroute_required=True,
+            problem="Не получены необходимые строки.",
+        ),
+        WorkerRunResult(
+            answer="Точных контрактов недостаточно.",
+            goal_satisfied=False,
+            reroute_required=True,
+            problem="Нужен нестандартный срез данных.",
+        ),
+        WorkerRunResult(answer="Срез получен."),
+    ]
+
+    with (
+        patch(
+            "agents.worker.select_chat_route",
+            side_effect=routes,
+        ) as router,
+        patch(
+            "agents.worker.run_worker_graph",
+            side_effect=graph_results,
+        ) as run_graph,
+    ):
+        result = worker_chat("Получи нестандартный срез S2T-данных")
+
+    assert result.summary == "Срез получен."
+    assert router.call_count == 3
+    routed_names = [
+        {tool.name for tool in call.kwargs["available_tools"]}
+        for call in router.call_args_list
+    ]
+    assert routed_names[0] == routed_names[1]
+    assert routed_names[0].isdisjoint(WORKER_GENERAL_FALLBACK_TOOL_NAMES)
+    assert "read_s2t_by_target_table" in routed_names[0]
+    assert "run_sql" not in routed_names[0]
+    assert "run_sql" in routed_names[2]
+    assert WORKER_GENERAL_FALLBACK_TOOL_NAMES.issubset(routed_names[2])
+    assert router.call_args_list[0].kwargs["catalog_stage"] == "specialized_only"
+    assert router.call_args_list[1].kwargs["catalog_stage"] == "specialized_only"
+    assert router.call_args_list[2].kwargs["catalog_stage"] == "general_fallback"
+    assert "reroute_context" not in router.call_args_list[0].kwargs
+    assert router.call_args_list[1].kwargs["reroute_context"]["attempt"] == 1
+    assert router.call_args_list[2].kwargs["reroute_context"]["attempt"] == 2
+    assert "run_sql" in {
+        tool.name for tool in run_graph.call_args_list[2].kwargs["tools"]
     }
 
 

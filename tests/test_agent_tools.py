@@ -3442,6 +3442,37 @@ def test_narrow_s2t_experiment_uses_strict_public_retrieval_surface(monkeypatch)
     assert experiment_names == strict_catalog_names
 
 
+def test_worker_tool_catalog_stages_general_fallback_tools():
+    from agents.tools.registry import (
+        WORKER_GENERAL_FALLBACK_TOOL_NAMES,
+        get_worker_tools,
+    )
+
+    specialized_names = {tool.name for tool in get_worker_tools()}
+    full_names = {
+        tool.name for tool in get_worker_tools(include_general=True)
+    }
+
+    assert specialized_names
+    assert specialized_names.isdisjoint(WORKER_GENERAL_FALLBACK_TOOL_NAMES)
+    assert {
+        "read_s2t_source_to_target",
+        "read_s2t_by_source_table",
+        "read_s2t_by_target_table",
+        "get_source_target_column_pair",
+        "list_column_metadata",
+    }.issubset(specialized_names)
+    assert {
+        "list_s2t_transformations",
+        "list_column_catalog",
+        "run_sql",
+        "run_cypher",
+    }.issubset(WORKER_GENERAL_FALLBACK_TOOL_NAMES)
+    assert full_names == (
+        specialized_names | WORKER_GENERAL_FALLBACK_TOOL_NAMES
+    )
+
+
 def test_second_iteration_strict_tools_are_saved_result_relations():
     from agents.tools.saved_results import SQLITE_RESULT_TOOL_NAMES
 

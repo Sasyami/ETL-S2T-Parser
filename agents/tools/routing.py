@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from ..contracts import parse_worker_request
 from ..run_metrics import llm_stage
 from .context import SCHEMA_CATALOG
+from .registry import WORKER_GENERAL_FALLBACK_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -68,20 +69,20 @@ GENERAL_FALLBACK_TOOL_NAMES = (
 
 _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     "show_plan": {
-        "use_when": "Нужно явно показать выполненные и следующие шаги многошаговой задачи.",
-        "not_for": "Чтение данных, одношаговый вопрос или финальный ответ.",
+        "use_when": "Явно показать шаги многошаговой задачи.",
+        "not_for": "Чтение данных или финальный ответ.",
     },
     "search_excel_values": {
         "use_when": "Буквальная подстрока в сохранённых Excel-ячейках таблицы data.",
         "not_for": "S2T, SQL, каталоги, логические ETL-таблицы или выполнение запросов.",
     },
     "get_excel_row": {
-        "use_when": "Известны точные file_id, sheet_name и row_num сохранённой Excel-строки.",
-        "not_for": "Поиск строки, S2T или логическая ETL-таблица.",
+        "use_when": "Точные file_id, sheet_name и row_num Excel-строки.",
+        "not_for": "Поиск, S2T или логическая ETL-таблица.",
     },
     "list_additional_objects": {
-        "use_when": "Точный список Additional objects по file/name/id/sheet/row с полным SQL.",
-        "not_for": "Подстрока, S2T-строки или выполнение SQL объекта.",
+        "use_when": "Точные Additional objects по file/name/id/sheet/row с полным SQL.",
+        "not_for": "Подстрока, S2T или выполнение SQL.",
     },
     "search_additional_objects": {
         "use_when": "Подстрока в name или SQL Additional objects, опционально внутри file_id.",
@@ -270,8 +271,8 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
         "not_for": "Заголовки, колонки, строки, ETL-таблицы или S2T.",
     },
     "list_file_sheet_headers": {
-        "use_when": "Нужны сохранённые результаты определения заголовков листов файла.",
-        "not_for": "Только имена листов, значения строк или повторное распознавание.",
+        "use_when": "Сохранённые заголовки листов файла.",
+        "not_for": "Имена листов, строки или повторное распознавание.",
     },
     "list_columns": {
         "use_when": "Нужны распознанные физические колонки конкретного Excel-листа.",
@@ -282,32 +283,32 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
 _NARROW_S2T_ROUTING_CONTRACTS: Dict[str, Dict[str, str]] = {
     "read_s2t_source_to_target": {
         "use_when": (
-            "Заданы обе точные роли source_table и target_table; tool читает "
-            "все строки только этой направленной пары с provenance."
+            "Заданы точные source_table и target_table; одно чтение возвращает "
+            "все поля, rules и provenance только этой направленной пары."
         ),
         "not_for": (
-            "Source-only или target-only задача, неизвестная сторона, поле, "
-            "подстрока, путь, ID либо file scope."
+            "Одна сторона, неизвестное или частичное имя, путь, ID либо file "
+            "scope; названное поле выбирается из полученных строк."
         ),
     },
     "read_s2t_by_source_table": {
         "use_when": (
-            "Source-only задача: все S2T-строки одной точной source_table, "
-            "когда target_table не задана."
+            "Известна только точная source_table: вернуть все её исходящие "
+            "S2T-строки, поля, rules и provenance."
         ),
         "not_for": (
-            "Target-only задача, заданная source→target пара, поле, "
-            "подстрока, путь, ID либо file scope."
+            "Target-only задача, заданная пара таблиц, частичное имя, путь, ID "
+            "либо file scope."
         ),
     },
     "read_s2t_by_target_table": {
         "use_when": (
-            "Target-only задача: все S2T-строки одной точной target_table, "
-            "когда source_table не задана."
+            "Известна только точная target_table: вернуть все её входящие "
+            "S2T-строки, поля, rules и provenance."
         ),
         "not_for": (
-            "Source-only задача, заданная source→target пара, поле, "
-            "подстрока, путь, ID либо file scope."
+            "Source-only задача, заданная пара таблиц, частичное имя, путь, ID "
+            "либо file scope."
         ),
     },
     "read_s2t_mapping": {
@@ -332,12 +333,13 @@ _NARROW_S2T_ROUTING_CONTRACTS: Dict[str, Dict[str, str]] = {
     },
     "get_source_target_column_pair": {
         "use_when": (
-            "Атрибуты точной source_table.source_column → "
-            "target_table.target_column в одном известном file_id."
+            "Одним чтением получить тип, PK, nullable и описание точной пары "
+            "source_table.source_column → target_table.target_column в "
+            "известном file_id."
         ),
         "not_for": (
             "Одна сторона, неизвестный file_id, поиск, S2T или множество "
-            "колонок таблицы."
+            "колонок; ожидаемые атрибуты не являются входными фильтрами."
         ),
     },
     "list_column_metadata": {
@@ -409,32 +411,32 @@ class ToolRoute(BaseModel):
 
 
 _TOOL_ROUTER_PROMPT = """
-Ты router read-only worker. По задаче и каталогам выбери необходимую planner
-палитру `tools`, `skills`, `schemas`. Используй точные имена из каталогов.
+Ты router read-only worker. Выбери необходимую planner-палитру `tools`,
+`skills`, `schemas`. Используй точные имена из каталогов.
 
-`current_task` — операция worker, `stable_context` — общие ограничения.
-`operation_context` — обязательные правила исполнения, не основание для tool.
-`previous_results` содержит result_id, description и result_schema.
-Внутренний reader уже доступен planner;
-выбери внешние tools для операций над строками после чтения result, а не из-за
-самого наличия result_id.
+`current_task` — операция, `stable_context` и `operation_context` — ограничения.
+`previous_results` содержит result_id, description и result_schema. Внутренний
+reader уже доступен planner; внешние tools выбирай для дальнейших операций, а
+не из-за самого наличия result_id.
 
-Для каждой операции выбери все tools с совпавшим `use_when`; `not_for` — запрет.
-При разных трактовках включи релевантные альтернативы: полнота палитры важнее
-компактности. Покрой все разные операции и обязательные входы; не добавляй
-явно нерелевантные tools.
+Для каждой операции выбери все необходимые tools с совпавшим `use_when`;
+`not_for` — запрет. Покрой разные операции и обязательные входы. Полнота
+палитры важнее компактности, но не дублируй одну операцию перекрывающимися
+специализированным и общим tools.
+`catalog_stage=general_fallback` означает: после двух reroute доступны также
+общие tools. Добавляй такой tool только для gap, который не выражается точным
+специализированным контрактом. Не добавляй явно нерелевантные tools.
 Сохраняй тип поиска из task: смысл/назначение/описание — semantic; явно данный
 буквальный фрагмент — substring. Не заменяй один тип другим.
-Обработчик выбирай, только если вход дан или будет получен выбранным tool.
-Tool с обязательным opaque ID допустим, только если точный ID уже есть в
-принятом результате другого tool. Числа из task, имени или описания не являются
-ID. Не придумывай входы.
+Tool выбирай, только если вход дан или будет получен выбранным tool. Обязательный
+opaque ID должен уже быть в принятом результате; числа из task или имени не
+являются ID. Не придумывай входы.
 
 Если description даёт фильтр нового чтения, выбери источник этого чтения.
 `query_saved_result` — только для строк сохранённого dataset с совместимой schema.
 
-Tools, skills и schemas выбирай независимо и только по необходимости; каждый
-список может быть пустым. Для ответа по уже данным фактам оставляй `tools=[]`.
+Tools, skills и schemas выбирай независимо; каждый список может быть пустым.
+Для уже данных фактов оставляй `tools=[]`.
 
 При `reroute_context` сохрани последнюю палитру и добавь tool, закрывающий
 указанный `gap`; не сокращай и не повторяй палитру без изменения.
@@ -466,7 +468,11 @@ def _history_payload(
     ]
 
 
-def _tool_catalog(tools: Sequence[BaseTool]) -> List[Dict[str, Any]]:
+def _tool_catalog(
+    tools: Sequence[BaseTool],
+    *,
+    mark_general_fallback: bool = False,
+) -> List[Dict[str, Any]]:
     catalog: List[Dict[str, Any]] = []
     for tool in tools:
         contract = (
@@ -477,6 +483,14 @@ def _tool_catalog(tools: Sequence[BaseTool]) -> List[Dict[str, Any]]:
             raise ToolRoutingError(
                 f"Для зарегистрированного tool отсутствует routing contract: {tool.name}"
             )
+        if (
+            mark_general_fallback
+            and tool.name in WORKER_GENERAL_FALLBACK_TOOL_NAMES
+        ):
+            contract = {
+                "use_when": "Общий fallback: " + contract["use_when"],
+                "not_for": contract["not_for"],
+            }
         catalog.append({"name": tool.name, **contract})
     return catalog
 
@@ -598,6 +612,7 @@ def select_chat_route(
     available_tools: Sequence[BaseTool],
     callbacks: Optional[Sequence[Any]] = None,
     reroute_context: Optional[Mapping[str, Any]] = None,
+    catalog_stage: str = "unrestricted",
 ) -> ToolRoute:
     """Select exact tools, skills, and schemas via structured output."""
     clean_query = str(user_query or "").strip()
@@ -605,6 +620,14 @@ def select_chat_route(
         raise ToolRoutingError("Tool-router получил пустой запрос")
     if not available_tools:
         raise ToolRoutingError("Tool-router не получил каталог tools")
+    if catalog_stage not in {
+        "unrestricted",
+        "specialized_only",
+        "general_fallback",
+    }:
+        raise ToolRoutingError(
+            f"Tool-router получил неизвестный catalog_stage: {catalog_stage}"
+        )
 
     request_parts = parse_worker_request(clean_query)
     if not request_parts.current_task:
@@ -613,7 +636,11 @@ def select_chat_route(
     payload = {
         "current_task": request_parts.current_task,
         "recent_history": _history_payload(history),
-        "available_tools": _tool_catalog(available_tools),
+        "available_tools": _tool_catalog(
+            available_tools,
+            mark_general_fallback=(catalog_stage == "general_fallback"),
+        ),
+        "catalog_stage": catalog_stage,
         "available_skills": _named_catalog(SKILL_CATALOG),
         "available_schemas": _named_catalog(SCHEMA_CATALOG),
     }
