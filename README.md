@@ -59,30 +59,44 @@ flowchart LR
 flowchart TD
     Q["Запрос + история"] --> S["Supervisor"]
     S -->|данные не нужны| A["Прямой ответ"]
-    S -->|нужны данные| C["Coordinator: план"]
-    C --> M["Materialize следующую самодостаточную task"]
-    M --> W["Worker"]
-    W --> R["LLM router: tools + skills + schemas"]
-    R --> P["Planner"]
-    P -->|tool call| T["Read-only tool"]
-    T --> O["Structured observer"]
-    O --> P
-    P -->|задача завершена| F["WorkerOutcome + lazy result_id refs"]
-    F --> C
-    C -->|есть следующий шаг| M
-    C -->|план завершён| G["Upstream coordinator"]
-    G -->|данных достаточно| UI["Ответ + выбранные scrollable results"]
-    G -->|только problem, максимум один раз| C
+    S -->|нужны данные| OR["Operation router"]
+    OR -->|обычный запрос| C["Downstream plan: 1–8 read tasks"]
+    C --> W["Последовательные workers"]
+    W --> R["Router: tools + retrieval skills + schemas"]
+    R --> P["Planner → read-only tool"]
+    P --> O["Observer каждого tool result"]
+    O -->|continue| P
+    O -->|reroute| R
+    O -->|complete| F["WorkerOutcome + accepted evidence"]
+    F -->|следующая task| W
+    F --> U["Upstream data decision"]
+    U -->|reroute, максимум один раз| C
+    U -->|pass| UA["Upstream answer + display selection"]
+    OR -->|S2T-анализ| SC["Typed contract → readers → analyzer"]
+    OR -->|тест-протокол| VC["Typed contract → readers → compiler"]
+    SC --> UI["Ответ + scrollable results"]
+    VC --> UI
+    UA --> UI
 ```
 
 Основные контракты:
 
 - supervisor отдельно формирует исполнимую `task` и устойчивый `context`;
-- неявного «активного файла» нет: файл берётся только из запроса, однозначной ссылки в истории или результата `list_files`/`resolve_file`;
-- coordinator создаёт последовательность независимых самодостаточных worker-задач; workers выполняются последовательно, но результаты и `result_id` между ними не передаются;
-- worker получает только самодостаточную строку задачи, внутри сам выбирает tools и runtime skills;
+- operation router один раз выбирает общий agentic-поток либо специализированный
+  пайплайн и подключает только относящиеся к операции stage-skills;
+- неявного «активного файла» нет: полный `filename` разрешается через
+  `resolve_file`, а внутренний `file_id` берётся только из запроса или принятого
+  результата разрешения; одна операция может ссылаться на несколько файлов;
+- в общем потоке downstream сразу создаёт полный план из 1–8 задач чтения;
+  workers выполняются последовательно и могут лениво прочитать принятые
+  результаты предыдущих workers по коротким `result_id`;
+- worker получает текущую задачу и короткие ссылки на доступные зависимости;
+  router независимо выбирает tools, retrieval-skills и schemas, а planner
+  вызывает только выбранные read-only tools;
 - planner видит исходную задачу, последний обмен с инструментом и накопительную observer-выжимку;
-- один observer возвращает `status`, единую строку `gap`, принятые tool-call IDs, факты с provenance и ограничения; невалидная структура повторно запрашивается на том же tool result без повторного data-tool, а после исчерпания format-retries worker контролируемо блокируется;
+- observer вызывается после каждого data-tool result и возвращает только
+  `complete`, `continue` или `reroute`; невалидная структура повторно
+  запрашивается на том же payload без повторного data-tool;
 - полные результаты инструментов не копируются в историю worker: там остаётся ограниченный preview;
 - upstream получает только `original_task` и принятые evidence: `evidence_id`, tool name, args, preview, `truncated` и булевый признак `displayable`; внутренний `display_ref`, worker summary, facts, limitations и runtime refs туда не передаются;
 - принятые полные tool results сохраняются под run-scoped `result_id` и читаются через `read_previous_result` только когда краткого description недостаточно; табличные SQLite-результаты дополнительно материализуются во временной relation `result`, доступной через `query_saved_result`;
@@ -91,6 +105,16 @@ flowchart TD
 - полные данные разрешаются по ссылкам только на границе HTTP-ответа.
 
 Worker завершается самим planner только через native `finish_worker(summary)`. Обычный финальный текст отклоняется; полноту исходных данных определяет тот же structured observer.
+
+Для повторяемых операций предусмотрены два специализированных маршрута:
+
+- `s2t_analysis`: typed contract описывает одну или несколько загрузок и
+  запрошенные виды анализа; детерминированные readers получают полные S2T-строки
+  и каталоги колонок, LLM-анализатор работает только с этими данными, после чего
+  ответ и display-results собираются общей схемой;
+- `validation_protocol`: typed contract задаёт загрузки и проверки,
+  детерминированные readers получают S2T и метаданные колонок, а compiler строит
+  Greenplum SQL-шаблоны и критерии прохождения без исполнения SQL во внешней БД.
 
 Для impact по колонке `trace_neo4j_lineage` возвращает точные
 `transformation_id`, а `get_s2t_rules_by_ids` одним параметризованным чтением
@@ -300,10 +324,13 @@ services/analysis.py           post-upload pipeline
 services/graph_sync.py         проекция SQLite → Neo4j
 graph_storage/                 lifecycle и настройки Neo4j
 agents/supervisor.py           верхний LangGraph
-agents/coordinator.py          план и агрегация workers
-agents/worker.py               изолированный worker runtime
+agents/coordinator.py          выбор pipeline, downstream/workers/upstream
+agents/worker.py               worker runtime и работа с зависимостями
 agents/chat_graph.py           planner/tool/observer loop
+agents/validation_protocol.py  typed S2T readers и анализ
+agents/test_protocol.py        compiler SQL тест-протоколов
 agents/tools/routing.py        LLM router tools и skills
+agents/tools/saved_results.py  run-scoped результаты и read-only relation
 agents/tools/                  read-only/write registries и tools
 agents/prompts/                runtime prompts и skills
 agents/run_metrics.py          метрики live-запусков
