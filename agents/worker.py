@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from threading import Lock
 from typing import Any, Dict, List, Sequence, Tuple
 from uuid import uuid4
@@ -54,8 +55,18 @@ _REROUTE_FEEDBACK_MAX_CHARS = 4000
 _TOOL_ARGUMENTS_MAX_CHARS = 2000
 _HANDOFF_DESCRIPTION_MAX_CHARS = 600
 _READ_PREVIOUS_RESULT_TOOL_NAME = "read_previous_result"
+_SPLIT_TOOL_CALL_PLANNING_ENV = "WORKER_SPLIT_TOOL_CALL_EXPERIMENT"
 _DISPLAY_RESULTS: Dict[str, WorkerDisplayItem] = {}
 _DISPLAY_RESULTS_LOCK = Lock()
+
+
+def _split_tool_call_planning_enabled() -> bool:
+    return str(os.getenv(_SPLIT_TOOL_CALL_PLANNING_ENV, "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _compact_tool_arguments(
@@ -168,6 +179,19 @@ def resolve_worker_display_refs(refs: Sequence[str]) -> List[WorkerDisplayItem]:
             for ref in refs
             if (item := _DISPLAY_RESULTS.pop(ref, None)) is not None
         ]
+
+
+def register_worker_display_items(
+    items: Sequence[WorkerDisplayItem],
+) -> List[str]:
+    """Register verified direct-pipeline results for user-facing display."""
+    refs: List[str] = []
+    with _DISPLAY_RESULTS_LOCK:
+        for item in items:
+            display_ref = uuid4().hex
+            _DISPLAY_RESULTS[display_ref] = item
+            refs.append(display_ref)
+    return refs
 
 
 def discard_worker_display_refs(refs: Sequence[str]) -> None:
@@ -352,6 +376,9 @@ def worker_chat(
                 max_steps=WORKER_MAX_STEPS,
                 tool_message_preview_chars=WORKER_TOOL_MESSAGE_PREVIEW_CHARS,
                 callbacks=callbacks,
+                split_tool_call_planning=(
+                    _split_tool_call_planning_enabled()
+                ),
             )
         except WorkerResponseError as exc:
             logger.warning("Worker contract failed: %s", exc)
@@ -440,6 +467,7 @@ __all__ = [
     "EvidenceArtifact",
     "WorkerOutcome",
     "discard_worker_display_refs",
+    "register_worker_display_items",
     "resolve_worker_display_refs",
     "worker_chat",
 ]

@@ -129,6 +129,8 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
         "cache_read_tokens": 20,
     }
     assert [item.name for item in metrics.tool_calls] == ["run_sql"]
+    assert metrics.tool_calls[0].arguments == {"query": "SELECT 1"}
+    assert metrics.tool_calls[0].input_preview == '{"query":"SELECT 1"}'
     assert metrics.worker_tasks == ["Выполни SELECT 1"]
     assert metrics.coordinator_plan[0]["task"] == "Получить единицу"
     assert [item["cycle"] for item in metrics.coordinator_plan] == [1, 2]
@@ -171,6 +173,27 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     assert metrics.display_tools == ["run_sql"]
     assert metrics.elapsed_seconds >= 0
     assert consume_agent_run_metrics(session_id) is None
+
+
+def test_run_metrics_parse_python_repr_tool_arguments(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    session_id = f"metrics-{uuid4()}"
+
+    with capture_agent_run(session_id):
+        callback = get_run_metrics_callback()
+        assert callback is not None
+        callback.on_tool_start(
+            {"name": "read_s2t_source_to_target"},
+            "{'source_table': 'source_name', 'target_table': 'target_name'}",
+            run_id=uuid4(),
+        )
+
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    assert metrics.tool_calls[0].arguments == {
+        "source_table": "source_name",
+        "target_table": "target_name",
+    }
 
 
 def test_run_metrics_are_disabled_by_default(monkeypatch):

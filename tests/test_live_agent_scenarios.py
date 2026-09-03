@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -24,9 +25,11 @@ from typing import Iterator
 from uuid import uuid4
 
 import pytest
+import sqlglot
 
 import storage.database as db_storage
 from agents.run_metrics import AgentRunMetrics, consume_agent_run_metrics
+from services.sql_dialects import GREENPLUM_DIALECT  # noqa: F401
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -276,6 +279,14 @@ def _record_live_exchange(
                 "llm_stages": [
                     item.model_dump(mode="json")
                     for item in metrics.llm_stages
+                ],
+                "tool_calls": [
+                    {
+                        key: value
+                        for key, value in item.model_dump(mode="json").items()
+                        if key != "input_preview"
+                    }
+                    for item in metrics.tool_calls
                 ],
                 "coordinator_plan": metrics.coordinator_plan,
                 "worker_tasks": metrics.worker_tasks,
@@ -661,6 +672,103 @@ def _s2t_work_case_fixture() -> tuple[int, str, str, str, str]:
     )
 
 
+def _multi_source_validation_case_fixture() -> tuple[int, str, str, str]:
+    row = _fetch_one(
+        """
+        SELECT 2, 't_agr_dep',
+               'b3050000420007_product',
+               'b3050000420004_nsoadditionalinfo'
+        WHERE (
+            SELECT COUNT(DISTINCT LOWER(TRIM(source_table)))
+            FROM s2t_transformations
+            WHERE LOWER(TRIM(target_table)) = 't_agr_dep'
+              AND LOWER(TRIM(source_table)) IN (
+                  'b3050000420007_product',
+                  'b3050000420004_nsoadditionalinfo'
+              )
+              AND COALESCE(TRIM(transformation_rule), '') <> ''
+        ) = 2
+          AND EXISTS (
+              SELECT 1
+              FROM target_columns
+              WHERE file_id = 2
+                AND LOWER(TRIM(table_name)) = 't_agr_dep'
+                AND primary_key = 1
+                AND not_null = 1
+          )
+        """
+    )
+    return int(row[0]), str(row[1]), str(row[2]), str(row[3])
+
+
+def _multi_target_validation_case_fixture() -> tuple[int, str, str, str]:
+    row = _fetch_one(
+        """
+        SELECT 3, 'b3050000420005_paymentdetails', 't_optn', 't_optn_type'
+        WHERE (
+            SELECT COUNT(DISTINCT LOWER(TRIM(target_table)))
+            FROM s2t_transformations
+            WHERE LOWER(TRIM(source_table)) =
+                  'b3050000420005_paymentdetails'
+              AND LOWER(TRIM(target_table)) IN ('t_optn', 't_optn_type')
+              AND COALESCE(TRIM(transformation_rule), '') <> ''
+        ) = 2
+          AND (
+              SELECT COUNT(DISTINCT LOWER(TRIM(table_name)))
+              FROM target_columns
+              WHERE file_id = 3
+                AND LOWER(TRIM(table_name)) IN ('t_optn', 't_optn_type')
+          ) = 2
+        """
+    )
+    return int(row[0]), str(row[1]), str(row[2]), str(row[3])
+
+
+def _independent_protocol_case_fixture() -> tuple[int, str, str]:
+    row = _fetch_one(
+        """
+        SELECT 3, 'b3050000420007_product', 't_crncy'
+        WHERE (
+            SELECT COUNT(DISTINCT file_id)
+            FROM s2t_transformations
+            WHERE LOWER(TRIM(source_table)) = 'b3050000420007_product'
+              AND LOWER(TRIM(target_table)) = 't_crncy'
+        ) = 1
+          AND (
+            SELECT MIN(file_id)
+            FROM s2t_transformations
+            WHERE LOWER(TRIM(source_table)) = 'b3050000420007_product'
+              AND LOWER(TRIM(target_table)) = 't_crncy'
+        ) = 3
+          AND (
+            SELECT COUNT(DISTINCT TRIM(transformation_rule))
+            FROM s2t_transformations
+            WHERE LOWER(TRIM(source_table)) = 'b3050000420007_product'
+              AND LOWER(TRIM(target_table)) = 't_crncy'
+              AND COALESCE(TRIM(transformation_rule), '') <> ''
+              AND (
+                  LOWER(LTRIM(transformation_rule)) LIKE 'select%'
+                  OR LOWER(LTRIM(transformation_rule)) LIKE 'with%'
+              )
+        ) = 1
+          AND (
+            SELECT COUNT(DISTINCT file_id)
+            FROM s2t_transformations
+            WHERE LOWER(TRIM(target_table)) = 't_crncy'
+        ) = 1
+          AND EXISTS (
+              SELECT 1
+              FROM target_columns
+              WHERE file_id = 3
+                AND LOWER(TRIM(table_name)) = 't_crncy'
+                AND primary_key = 1
+                AND not_null = 1
+          )
+        """
+    )
+    return int(row[0]), str(row[1]), str(row[2])
+
+
 def _assert_s2t_work_case_execution(
     exchange: _LiveExchange,
     *,
@@ -746,12 +854,23 @@ def _assert_s2t_work_case_execution(
         f"tool_calls={len(tool_names)} exceeds budget=12: {tool_names}",
     )
     if LIVE_AGENT_MODE == "multiagent":
-        _warn_unless(
-            bool(metrics.coordinator_plan)
-            and 0 < len(metrics.worker_tasks) <= len(metrics.coordinator_plan),
-            "efficiency",
-            "coordinator/worker trace is incomplete",
+        direct_pipeline = any(
+            str(step.get("pipeline") or "") == "validation_protocol"
+            for step in metrics.coordinator_plan
         )
+        if direct_pipeline:
+            _warn_unless(
+                bool(metrics.coordinator_plan) and not metrics.worker_tasks,
+                "efficiency",
+                "direct coordinator pipeline trace is inconsistent",
+            )
+        else:
+            _warn_unless(
+                bool(metrics.coordinator_plan)
+                and 0 < len(metrics.worker_tasks) <= len(metrics.coordinator_plan),
+                "efficiency",
+                "coordinator/worker trace is incomplete",
+            )
     else:
         _warn_unless(
             metrics.worker_tasks == [] and metrics.coordinator_plan == [],
@@ -773,6 +892,66 @@ def _assert_s2t_work_case_execution(
         "efficiency",
         f"total_tokens={metrics.total_tokens} exceeds budget={max_total_tokens}",
     )
+
+
+def _assert_compiled_test_protocol(
+    exchange: _LiveExchange,
+    *target_tables: str,
+    source_tables: tuple[str, ...] = (),
+    expected_pair_reads: int,
+) -> None:
+    answer = exchange.result.answer
+    folded = answer.casefold()
+    check_titles = (
+        "проверка количества строк",
+        "проверка уникальности ключа",
+        "проверка null-rate обязательных полей",
+        "проверка корректности трансформаций",
+    )
+    for required in (
+        *check_titles,
+        "цель:",
+        "sql-шаблон:",
+        "критерий прохождения:",
+        "```sql",
+        "фактические метрики не вычислялись",
+    ):
+        assert required in folded, answer
+    expected_protocol_count = len(target_tables)
+    for title in check_titles:
+        assert folded.count(title) == expected_protocol_count, answer
+    assert folded.count("sql-шаблон:") == 4 * expected_protocol_count, answer
+    assert folded.count("```sql") == 4 * expected_protocol_count, answer
+    assert "sql-шаблон не сформирован" not in folded, answer
+    sql_blocks = re.findall(r"```sql\n(.*?)\n```", answer, flags=re.DOTALL)
+    assert len(sql_blocks) == 4 * expected_protocol_count, answer
+    for sql_template in sql_blocks:
+        parseable = sql_template.replace("{{LOAD_SCOPE_PREDICATE}}", "TRUE")
+        parseable = re.sub(
+            r"(?<![\w$])\$\$([A-Za-z0-9_]+)(?=\.)",
+            lambda match: f'"$${match.group(1)}"',
+            parseable,
+        )
+        statements = sqlglot.parse(parseable, read=GREENPLUM_DIALECT)
+        assert len(statements) == 1, sql_template
+    for source_table in source_tables:
+        assert source_table.casefold() in folded, answer
+    for target_table in target_tables:
+        assert target_table.casefold() in folded, answer
+    metrics = exchange.metrics
+    assert any(
+        str(step.get("pipeline") or "") == "validation_protocol"
+        for step in metrics.coordinator_plan
+    ), metrics.coordinator_plan
+    assert not metrics.worker_tasks, metrics.worker_tasks
+    tool_names = [item.name for item in metrics.tool_calls]
+    assert tool_names.count("read_s2t_source_to_target") == expected_pair_reads
+    assert tool_names.count("read_s2t_by_target_table") == len(target_tables)
+    assert tool_names.count("list_target_column_catalog") == len(target_tables)
+    display_names = [item.name for item in exchange.result.display_items]
+    assert display_names.count("read_s2t_source_to_target") == len(target_tables)
+    assert display_names.count("list_target_column_catalog") == len(target_tables)
+    assert len(_display_payloads(exchange.result)) == 2 * len(target_tables)
 
 
 def test_live_agent_answers_simple_conversation_without_display_results(
@@ -1484,11 +1663,160 @@ def test_live_agent_writes_s2t_test_protocol(live_chat_client):
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    _assert_compiled_test_protocol(
+        exchange,
+        target_table,
+        source_tables=(source_table,),
+        expected_pair_reads=1,
+    )
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools=(
+            {
+                "read_s2t_by_target_table",
+                "list_target_column_catalog",
+            }
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
+        require_analysis=True,
+    )
+
+
+def test_live_agent_writes_independent_s2t_test_protocol(live_chat_client):
+    file_id, source_table, target_table = _independent_protocol_case_fixture()
+    exchange = _chat(
+        live_chat_client,
+        f"Для file_id={file_id} подготовь приёмочный протокол из Greenplum SQL "
+        f"для сохранённой загрузки {source_table} → {target_table}. Ничего не "
+        "запускай. Нужны четыре контроля: совпадает ли рассчитанный по правилу "
+        "набор с target; отсутствуют ли NULL в обязательных колонках; не "
+        "повторяется ли подтверждённый ключ; одинаково ли число ожидаемых и "
+        "загруженных строк. Для каждого укажи назначение, запрос и однозначное "
+        "условие успешной приёмки.",
+    )
+
+    _assert_public_answer(exchange.result.answer)
+    _assert_compiled_test_protocol(
+        exchange,
+        target_table,
+        source_tables=(source_table,),
+        expected_pair_reads=1,
+    )
+    sql_blocks = re.findall(
+        r"```sql\n(.*?)\n```",
+        exchange.result.answer,
+        flags=re.DOTALL,
+    )
+    folded_blocks = [block.casefold() for block in sql_blocks]
+    assert all(target_table.casefold() in block for block in folded_blocks)
+    assert all("{{load_scope_predicate}}" in block for block in folded_blocks)
+    combined_sql = "\n".join(folded_blocks)
+    assert "group by" in combined_sql
+    assert "having count(*) > 1" in combined_sql
+    assert "is null" in combined_sql
+    assert combined_sql.count("except all") == 2
     _assert_s2t_work_case_execution(
         exchange,
         required_tools=(
             {
                 "read_s2t_source_to_target",
+                "read_s2t_by_target_table",
+                "list_target_column_catalog",
+            }
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
+        require_analysis=True,
+    )
+
+
+def test_live_agent_analyzes_s2t_validation_risks(live_chat_client):
+    file_id, target_table, source_table, _, _ = _s2t_work_case_fixture()
+    exchange = _chat(
+        live_chat_client,
+        f"Для file_id={file_id} по сохранённой S2T-спецификации "
+        f"{source_table} → {target_table} оцени риск потери строк, риск "
+        "дубликатов, обязательные target-поля без S2T-маппинга и "
+        "согласованность трансформации. Используй только S2T и каталог "
+        "колонок; не обращайся к физическим данным ETL-таблиц.",
+    )
+
+    _assert_public_answer(exchange.result.answer)
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools=(
+            {"read_s2t_by_target_table", "list_target_column_catalog"}
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
+        require_analysis=True,
+    )
+
+
+def test_live_agent_writes_multi_source_s2t_validation_protocol(
+    live_chat_client,
+):
+    file_id, target_table, first_source, second_source = (
+        _multi_source_validation_case_fixture()
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"Для file_id={file_id} по сохранённой S2T-загрузке из "
+        f"{first_source} и {second_source} в {target_table} составь единый "
+        "тест-протокол для внешней СУБД. Включи проверки количества строк, "
+        "уникальности ключа, null-rate обязательных полей и корректности "
+        "трансформаций. Для каждой проверки дай цель, SQL-шаблон и критерий "
+        "прохождения; фактические метрики не вычисляй.",
+    )
+
+    _assert_public_answer(exchange.result.answer)
+    _assert_compiled_test_protocol(
+        exchange,
+        target_table,
+        source_tables=(first_source, second_source),
+        expected_pair_reads=2,
+    )
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools=(
+            {"read_s2t_by_target_table", "list_target_column_catalog"}
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
+        require_analysis=True,
+    )
+
+
+def test_live_agent_writes_multi_target_s2t_validation_protocol(
+    live_chat_client,
+):
+    file_id, source_table, first_target, second_target = (
+        _multi_target_validation_case_fixture()
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"Для file_id={file_id} по сохранённым S2T-загрузкам из "
+        f"{source_table} в {first_target} и {second_target} составь отдельный "
+        "тест-протокол для каждой target-таблицы во внешней СУБД. В каждый "
+        "включи проверки количества строк, уникальности ключа, null-rate "
+        "обязательных полей и корректности трансформаций. Для каждой проверки "
+        "дай цель, SQL-шаблон и критерий прохождения; фактические метрики не "
+        "вычисляй.",
+    )
+
+    _assert_public_answer(exchange.result.answer)
+    _assert_compiled_test_protocol(
+        exchange,
+        first_target,
+        second_target,
+        source_tables=(source_table,),
+        expected_pair_reads=2,
+    )
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools=(
+            {
                 "read_s2t_by_target_table",
                 "list_target_column_catalog",
             }

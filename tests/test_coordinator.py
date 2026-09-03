@@ -311,6 +311,184 @@ def test_operation_skill_is_selected_once_and_applied_by_stage():
     assert "Нулевой mapping подтверждает отсутствие" not in answer_system
 
 
+def test_operation_router_can_launch_typed_validation_pipeline():
+    from agents.coordinator import coordinator_chat
+
+    task = (
+        "Для file_id=41 по saved_source → saved_target оцени риск потери "
+        "строк, риск дубликатов и согласованность только по сохранённому S2T."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "s2t_analysis",
+                        "skills": ["Проектирование проверки"],
+                    },
+                    "operation-validation",
+                )
+            ],
+            "submit_s2t_analysis_contract": [
+                _tool_message(
+                    "submit_s2t_analysis_contract",
+                    {
+                        "file_id": 41,
+                        "source_tables": ["saved_source"],
+                        "target_tables": ["saved_target"],
+                        "requested_analyses": [
+                            "row_loss_risk",
+                            "duplicate_risk",
+                            "transformation_consistency",
+                        ],
+                    },
+                    "validation-contract",
+                )
+            ],
+            "submit_s2t_analysis": [
+                _tool_message(
+                    "submit_s2t_analysis",
+                    {
+                        "analyses": [
+                            {
+                                "target_table": "saved_target",
+                                "kind": "transformation_consistency",
+                                "conclusion": "S2T-источники согласованы.",
+                                "evidence": ["Роли совпадают"],
+                                "limitations": [],
+                            }
+                        ]
+                    },
+                    "s2t-analysis",
+                )
+            ],
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.read_validation_protocol_inputs",
+            return_value=[],
+        ) as readers,
+        patch(
+            "agents.coordinator.build_s2t_analysis_display_payloads",
+            return_value=[
+                {
+                    "name": "read_s2t_by_target_table",
+                    "content": '{"rows":[]}',
+                }
+            ],
+        ) as build_displays,
+        patch(
+            "agents.coordinator.register_worker_display_items",
+            return_value=["display-analysis"],
+        ) as register_displays,
+        patch("agents.coordinator.worker_chat") as worker,
+    ):
+        result = coordinator_chat(task)
+
+    assert "sources [`saved_source`] → targets [`saved_target`]" in result.answer
+    assert "S2T-источники согласованы" in result.answer
+    assert "определить нельзя" in result.answer
+    assert "Физические данные логических ETL-таблиц не запрашивались" in (
+        result.answer
+    )
+    assert result.display_refs == ["display-analysis"]
+    readers.assert_called_once()
+    build_displays.assert_called_once_with([])
+    register_displays.assert_called_once()
+    contract = readers.call_args.args[0]
+    assert contract.model_dump() == {
+        "file_id": 41,
+        "filename": None,
+        "source_tables": ["saved_source"],
+        "target_tables": ["saved_target"],
+        "requested_analyses": [
+            "row_loss_risk",
+            "duplicate_risk",
+            "transformation_consistency",
+        ],
+    }
+    worker.assert_not_called()
+    invoked = [name for name, _ in model.messages]
+    assert invoked == [
+        "select_operation_skills",
+        "submit_s2t_analysis_contract",
+        "submit_s2t_analysis",
+    ]
+
+
+def test_operation_router_can_compile_external_sql_test_protocol():
+    from agents.coordinator import coordinator_chat
+
+    task = (
+        "Для file_id=41 по saved_source → saved_target составь тест-протокол "
+        "для внешней СУБД: количество строк, уникальность ключа, null-rate "
+        "обязательных полей и корректность трансформаций."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "validation_protocol",
+                        "skills": ["Проектирование проверки"],
+                    },
+                    "operation-protocol",
+                )
+            ],
+            "submit_validation_protocol_contract": [
+                _tool_message(
+                    "submit_validation_protocol_contract",
+                    {
+                        "file_id": 41,
+                        "loads": [
+                            {
+                                "sources": ["saved_source"],
+                                "target": "saved_target",
+                                "checks": [
+                                    "row_count",
+                                    "key_uniqueness",
+                                    "required_null_rate",
+                                    "transformation_correctness",
+                                ],
+                            }
+                        ],
+                    },
+                    "protocol-contract",
+                )
+            ],
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.read_validation_protocol_inputs",
+            return_value=[],
+        ) as readers,
+        patch("agents.coordinator.worker_chat") as worker,
+    ):
+        result = coordinator_chat(task)
+
+    assert "Тест-протокол проверки ETL-загрузки" in result.answer
+    assert result.answer.count("SQL-шаблон:") == 4
+    assert "фактические метрики не вычислялись" in result.answer
+    readers.assert_called_once()
+    worker.assert_not_called()
+    assert [name for name, _ in model.messages] == [
+        "select_operation_skills",
+        "submit_validation_protocol_contract",
+    ]
+
+
 def test_operation_skill_loader_returns_only_requested_stage():
     from agents.tools.context import load_operation_skills
 
@@ -508,10 +686,23 @@ def test_contracts_keep_runtime_refs_out_of_llm_payloads():
                 "args": {"query": "t_example"},
                 "preview": '{"name":"t_example"}',
                 "truncated": False,
-                "display_id": "evidence-first",
+                "displayable": True,
             }
         ]
     }
+    nondisplayable = _outcome(
+        "Факт найден без отдельного display.",
+        evidence=[
+            _artifact(
+                None,
+                "lookup",
+                '{"name":"t_hidden"}',
+                evidence_id="evidence-hidden",
+            )
+        ],
+    ).upstream_payload()
+    assert nondisplayable["evidence"][0]["displayable"] is False
+    assert "display_id" not in nondisplayable["evidence"][0]
 
     with pytest.raises(ValueError, match="unknown evidence_id"):
         _outcome(
@@ -709,7 +900,8 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     )
     assert "used_evidence_ids" in _UPSTREAM_ANSWER_PROMPT
     assert "display_evidence_ids" in _UPSTREAM_ANSWER_PROMPT
-    assert "`display_id`" in _UPSTREAM_ANSWER_PROMPT
+    assert "`displayable`" in _UPSTREAM_ANSWER_PROMPT
+    assert "`display_id`" not in _UPSTREAM_ANSWER_PROMPT
     assert "summary" not in combined.lower()
     assert "facts" not in combined.lower()
     assert "limitations" not in combined.lower()
@@ -1014,7 +1206,7 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
             "args": {"query": "t_example"},
             "preview": '{"name":"t_example"}',
             "truncated": False,
-            "display_id": "evidence-first",
+            "displayable": True,
         },
         {
             "evidence_id": "evidence-second",
@@ -1022,7 +1214,7 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
             "args": {"name": "t_example"},
             "preview": '{"name":"t_example","valid":true}',
             "truncated": False,
-            "display_id": "evidence-second",
+            "displayable": True,
         },
     ]
     for forbidden in (
@@ -1239,7 +1431,7 @@ def test_upstream_receives_partial_worker_evidence():
             "args": {},
             "preview": '{"value":"partial"}',
             "truncated": False,
-            "display_id": "evidence-partial",
+            "displayable": True,
         }
     ]
     discard.assert_called_once_with(["display-partial"])

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import json
 import os
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -66,6 +68,7 @@ class ToolCallMetric(BaseModel):
 
     run_id: str
     name: str
+    arguments: Any = Field(default_factory=dict)
     input_preview: str = ""
     elapsed_seconds: float = 0.0
     has_error: bool = False
@@ -127,6 +130,27 @@ def _clip(value: Any) -> str:
     if len(text) <= _VALUE_PREVIEW_CHARS:
         return text
     return text[: _VALUE_PREVIEW_CHARS - 1].rstrip() + "…"
+
+
+def _tool_arguments(value: Any) -> Any:
+    """Keep exact tool arguments in a JSON-serializable form for diagnostics."""
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped)
+        except (TypeError, ValueError):
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (SyntaxError, ValueError):
+                return {"raw": value}
+            if isinstance(parsed, (dict, list, str, int, float, bool, type(None))):
+                return parsed
+            return {"raw": value}
+    return {"raw": str(value)}
 
 
 def _metrics_enabled() -> bool:
@@ -291,6 +315,7 @@ class _RunCollector:
                 {
                     "run_id": key,
                     "name": name,
+                    "arguments": _tool_arguments(input_value),
                     "input_preview": _clip(input_value),
                     "started_at": perf_counter(),
                 },

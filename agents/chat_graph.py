@@ -68,6 +68,7 @@ _PLANNER_HANDOFF_MAX_CHARS = 12000
 DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS = 6000
 _FINISH_WORKER_TOOL_NAME = "finish_worker"
 _ANALYZE_KNOWN_FACTS_TOOL_NAME = "analyze_known_facts"
+_SELECT_WORKER_TOOL_NAME = "select_worker_tool"
 _OBSERVER_MAX_RETRIES = 5
 _PROVIDER_TOOL_ARGUMENT_MARKERS = (
     "!#native",
@@ -237,6 +238,23 @@ _WORKER_CONTINUE_CALL_REPAIR_PROMPT = """
 Observer вернул status=continue: завершать worker сейчас запрещено. Вызови ровно
 один или несколько доступных data tools и закрой указанный gap. Сохрани точные
 значения task; не возвращай обычный текст и не вызывай finish_worker.
+""".strip()
+
+_WORKER_TOOL_SELECTOR_PROMPT = """
+Ты выбираешь одну следующую операцию read-only worker. Не заполняй аргументы и
+не выполняй операцию. Верни ровно один native call `select_worker_tool`, указав
+имя одной доступной операции. Учитывай исходную task и последний gap. При
+`continue` нельзя выбирать `finish_worker`.
+
+Доступные операции:
+{{TOOL_CATALOG}}
+""".strip()
+
+_WORKER_ARGUMENT_BUILDER_PROMPT = """
+Операция уже выбрана: `{tool_name}`. Верни ровно один native call только этой
+операции. Заполни аргументы по её native-схеме и описаниям полей, используя
+точные значения task и подтверждённых результатов. Не выбирай другую операцию,
+не добавляй пояснения и не заполняй отсутствующие значения догадками.
 """.strip()
 
 _TOOL_ARGUMENT_REPAIR_PROMPT = """
@@ -836,6 +854,95 @@ def _planner_messages(
     return messages
 
 
+def _worker_tool_selector_schema(
+    tool_names: Sequence[str],
+) -> Dict[str, Any]:
+    """Build the native selector call without exposing data-tool arguments."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _SELECT_WORKER_TOOL_NAME,
+            "description": "Выбрать одну следующую операцию worker.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "enum": list(tool_names),
+                        "description": "Имя выбранной доступной операции.",
+                    },
+                },
+                "required": ["tool_name"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _worker_tool_selector_messages(
+    state: AgentGraphState,
+    selectable_tools: Sequence[tuple[str, str]],
+) -> List[BaseMessage]:
+    """Expose task, compact contracts and gap, but no argument schemas."""
+    catalog = "\n".join(
+        f"- {name}: {_clip_text(description, 360)}"
+        for name, description in selectable_tools
+    )
+    system_parts = [
+        state["system_prompt"].strip(),
+        _WORKER_TOOL_SELECTOR_PROMPT.replace("{{TOOL_CATALOG}}", catalog),
+    ]
+    operation_context = str(
+        state.get("planner_operation_context") or ""
+    ).strip()
+    if operation_context:
+        system_parts.append(operation_context)
+    runtime_context = _runtime_context(state)
+    if runtime_context is not None:
+        system_parts.append(runtime_context)
+
+    messages: List[BaseMessage] = [
+        SystemMessage(content="\n\n".join(system_parts))
+    ]
+    task_message = next(
+        (
+            message
+            for message in state["messages"]
+            if isinstance(message, HumanMessage)
+        ),
+        None,
+    )
+    if task_message is not None:
+        messages.append(task_message)
+    return messages
+
+
+def _selected_worker_tool_name(
+    message: Any,
+    allowed_names: Sequence[str],
+) -> str:
+    """Validate the selector's single native call."""
+    if not isinstance(message, AIMessage):
+        raise ValueError("Tool selector не вернул AIMessage.")
+    matching_calls = [
+        call
+        for call in message.tool_calls
+        if str(call.get("name") or "").strip() == _SELECT_WORKER_TOOL_NAME
+    ]
+    if len(matching_calls) != 1 or len(message.tool_calls) != 1:
+        raise ValueError(
+            "Tool selector должен вернуть ровно один select_worker_tool call."
+        )
+    selected_name = str(
+        (matching_calls[0].get("args") or {}).get("tool_name") or ""
+    ).strip()
+    if selected_name not in set(allowed_names):
+        raise ValueError(
+            f"Tool selector выбрал недоступную операцию: {selected_name!r}."
+        )
+    return selected_name
+
+
 def _latest_tool_exchange(
     messages: Sequence[BaseMessage],
 ) -> tuple[AIMessage, List[ToolMessage]]:
@@ -962,6 +1069,7 @@ def build_agent_graph(
     evidence_ids_by_tool_call: Optional[Dict[str, str]] = None,
     tool_message_preview_chars: Optional[int] = None,
     worker_finish: bool = False,
+    split_tool_call_planning: bool = False,
 ):
     """Build planner -> tools -> observer -> planner."""
     tool_list = _normalize_tools(tools)
@@ -1024,6 +1132,87 @@ def build_agent_graph(
                 )
                 return fallback_model.invoke(messages)
 
+    def bind_required_tool(tool_definition: Any, tool_name: str) -> Any:
+        try:
+            return model.bind_tools(
+                [tool_definition],
+                tool_choice=tool_name,
+            )
+        except TypeError:
+            return model.bind_tools([tool_definition])
+
+    def select_worker_tool(
+        state: AgentGraphState,
+        *,
+        must_continue: bool,
+    ) -> tuple[str, Any]:
+        selectable_definitions: Dict[str, Any] = {
+            tool_item.name: tool_item for tool_item in tool_list
+        }
+        selectable_descriptions = [
+            (tool_item.name, str(tool_item.description or ""))
+            for tool_item in tool_list
+        ]
+        if worker_finish and not must_continue:
+            selectable_definitions[_FINISH_WORKER_TOOL_NAME] = finish_schema
+            selectable_descriptions.append(
+                (
+                    _FINISH_WORKER_TOOL_NAME,
+                    str(finish_schema["function"]["description"]),
+                )
+            )
+        allowed_names = tuple(selectable_definitions)
+        selector_schema = _worker_tool_selector_schema(allowed_names)
+        selector_model = bind_required_tool(
+            selector_schema,
+            _SELECT_WORKER_TOOL_NAME,
+        )
+        selector_messages = _worker_tool_selector_messages(
+            state,
+            selectable_descriptions,
+        )
+        try:
+            selector_reply = invoke_with_fallback(
+                selector_model,
+                selector_messages,
+                stage="worker_tool_selector",
+            )
+            selected_name = _selected_worker_tool_name(
+                selector_reply,
+                allowed_names,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Worker tool selector returned an invalid native call; "
+                "retrying the same selector payload",
+                exc_info=True,
+            )
+            repair_messages = [
+                *selector_messages,
+                HumanMessage(
+                    content=(
+                        "Предыдущий selector call не соответствует схеме. "
+                        "Верни ровно один select_worker_tool с одним именем "
+                        "из доступного списка."
+                    )
+                ),
+            ]
+            try:
+                selector_reply = invoke_with_fallback(
+                    selector_model,
+                    repair_messages,
+                    stage="worker_tool_selector",
+                )
+                selected_name = _selected_worker_tool_name(
+                    selector_reply,
+                    allowed_names,
+                )
+            except Exception as repair_exc:
+                raise WorkerResponseError(
+                    "Tool selector дважды не выбрал допустимую операцию."
+                ) from repair_exc
+        return selected_name, selectable_definitions[selected_name]
+
     def planner(state: AgentGraphState) -> Dict[str, Any]:
         limit_reached = state["tool_steps"] >= state["max_steps"]
         latest_observation = (
@@ -1045,30 +1234,61 @@ def build_agent_graph(
             and latest_observation is not None
             and latest_observation.status == "continue"
         )
-        if finish_only and worker_finish:
-            selected_model = finish_model
-        elif finish_only:
-            selected_model = model
-        elif must_continue:
-            selected_model = continuation_model
+        split_current_call = bool(
+            split_tool_call_planning
+            and worker_finish
+            and not finish_only
+        )
+        if split_current_call:
+            selected_name, selected_definition = select_worker_tool(
+                state,
+                must_continue=must_continue,
+            )
+            selected_model = bind_required_tool(
+                selected_definition,
+                selected_name,
+            )
+            planner_messages = _planner_messages(
+                state,
+                (selected_name,),
+                worker_finish=worker_finish,
+            )
+            planner_messages[0] = SystemMessage(
+                content=(
+                    _message_content_text(planner_messages[0].content)
+                    + "\n\n"
+                    + _WORKER_ARGUMENT_BUILDER_PROMPT.format(
+                        tool_name=selected_name
+                    )
+                )
+            )
+            selected_fallback = None
+            planner_stage = "worker_argument_builder"
         else:
-            selected_model = planner_model
-        planner_messages = _planner_messages(
-            state,
-            tool_names,
-            worker_finish=worker_finish,
-        )
+            if finish_only and worker_finish:
+                selected_model = finish_model
+            elif finish_only:
+                selected_model = model
+            elif must_continue:
+                selected_model = continuation_model
+            else:
+                selected_model = planner_model
+            planner_messages = _planner_messages(
+                state,
+                tool_names,
+                worker_finish=worker_finish,
+            )
 
-        selected_fallback = (
-            planner_model
-            if worker_finish and selected_model is finish_model
-            else None
-        )
-        planner_stage = (
-            "finish_worker"
-            if worker_finish and finish_only
-            else "worker_planner" if worker_finish else "legacy_planner"
-        )
+            selected_fallback = (
+                planner_model
+                if worker_finish and selected_model is finish_model
+                else None
+            )
+            planner_stage = (
+                "finish_worker"
+                if worker_finish and finish_only
+                else "worker_planner" if worker_finish else "legacy_planner"
+            )
         try:
             reply = invoke_with_fallback(
                 selected_model,
@@ -1802,6 +2022,7 @@ def run_worker_graph(
     *,
     tool_message_preview_chars: int = DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS,
     callbacks: Optional[List[Any]] = None,
+    split_tool_call_planning: bool = False,
 ) -> WorkerRunResult:
     """Run the internal worker graph and retain its selected UI results locally."""
     raw_task = str(task or "").strip()
@@ -1841,6 +2062,7 @@ def run_worker_graph(
         evidence_ids_by_tool_call=evidence_ids_by_tool_call,
         tool_message_preview_chars=preview_chars,
         worker_finish=True,
+        split_tool_call_planning=split_tool_call_planning,
     )
 
     initial_state: AgentGraphState = {
@@ -1873,7 +2095,10 @@ def run_worker_graph(
 
     with langfuse_trace_context(
         trace_name="isolated_worker",
-        metadata={"tool_message_preview_chars": preview_chars},
+        metadata={
+            "tool_message_preview_chars": preview_chars,
+            "split_tool_call_planning": split_tool_call_planning,
+        },
         tags=["worker", "experiment"],
     ):
         final_state = graph.invoke(initial_state, config=config)

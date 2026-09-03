@@ -44,7 +44,7 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 4. Внутри worker router одним structured вызовом независимо выбирает списки tools, retrieval-skills и schemas. Они могут быть пустыми; выбранные skills/schemas подгружаются лениво. После двух невалидных ответов используется ограниченная общая read-only палитра; при reroute новая палитра дополняет прежнюю.
 5. Planner вызывает data-tool. После каждого результата observer проверяет соответствие именно worker-task и возвращает `complete`, `continue` или `reroute`; статуса `blocked` нет. Невалидный structured observer-output повторяется до пяти раз на том же payload без повторного data-tool.
 6. `finish_worker` завершает worker и отдаёт summary, факты и только принятые evidence. Подтверждённые факты ссылаются на принятый `evidence_id`.
-7. После всех workers upstream получает только `original_task` и evidence: tool name, точные args, preview, `truncated` и безопасный display ID. Worker observations, summaries и runtime refs туда не передаются.
+7. После всех workers upstream получает только `original_task` и evidence: `evidence_id`, tool name, точные args, preview, `truncated` и булевый признак `displayable`. Внутренний `display_ref`, worker observations, summaries и runtime refs туда не передаются.
 8. `submit_upstream_data_decision` выбирает `pass` или `reroute`. Reroute сбрасывает результаты текущего цикла и передаёт следующему downstream только краткий `problem`; максимум два полных цикла. После `pass` отдельный `submit_upstream_answer` анализирует evidence, формирует ответ и выбирает display evidence.
 
 ## Результаты tools и наблюдаемость

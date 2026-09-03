@@ -365,11 +365,7 @@ class WorkerOutcome(BaseModel):
                     "args": item.compact_args,
                     "preview": item.preview,
                     "truncated": item.truncated,
-                    "display_id": (
-                        item.evidence_id
-                        if item.display_ref is not None
-                        else None
-                    ),
+                    "displayable": item.display_ref is not None,
                 }
                 for item in self.evidence
             ],

@@ -389,6 +389,96 @@ class _ToolChoiceFallbackModel:
         return _finish_message("Подтверждено через fallback.")
 
 
+class _SplitToolCallModel:
+    def __init__(self):
+        self.observer = _ObserverModel()
+        self.invocations = []
+
+    def bind_tools(self, tools, tool_choice=None):
+        del tools
+        return _BoundToolChoiceModel(self, tool_choice)
+
+    def with_structured_output(self, schema, method=None):
+        assert method == "function_calling"
+        if schema is ObservationContract:
+            return self.observer
+        raise AssertionError(f"Unexpected structured schema: {schema}")
+
+    def invoke_bound(self, tool_choice, messages):
+        self.invocations.append((tool_choice, list(messages)))
+        if tool_choice == "select_worker_tool":
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "select_worker_tool",
+                        "args": {"tool_name": "lookup"},
+                        "id": "select-lookup",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        if tool_choice == "lookup":
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {"table_name": "orders"},
+                        "id": "call-lookup",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        if tool_choice == "finish_worker":
+            return _finish_message("Чтение завершено.")
+        raise AssertionError(f"Unexpected tool choice: {tool_choice}")
+
+
+def test_worker_can_select_tool_and_build_arguments_in_separate_calls():
+    executed_arguments = []
+
+    def lookup(table_name: str):
+        executed_arguments.append(table_name)
+        return {"table_name": table_name}
+
+    model = _SplitToolCallModel()
+    result = run_worker_graph(
+        task="Прочитай таблицу orders.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+        split_tool_call_planning=True,
+    )
+
+    assert executed_arguments == ["orders"]
+    assert result.answer == "Чтение завершено."
+    invoked_choices = [choice for choice, _ in model.invocations]
+    assert invoked_choices == [
+        "select_worker_tool",
+        "lookup",
+        "finish_worker",
+    ]
+
+    selector_messages = model.invocations[0][1]
+    argument_messages = model.invocations[1][1]
+    assert "Доступные операции" in str(selector_messages[0].content)
+    assert "Операция уже выбрана: `lookup`" in str(
+        argument_messages[0].content
+    )
+    assert all(
+        not (
+            isinstance(message, AIMessage)
+            and any(
+                call.get("name") == "select_worker_tool"
+                for call in message.tool_calls
+            )
+        )
+        for message in argument_messages
+    )
+
+
 def test_worker_repairs_observer_without_repeating_data_tool():
     tool_calls = []
     stages = []

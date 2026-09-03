@@ -34,6 +34,7 @@ from .contracts import (
     WorkerOutcome,
     WorkerPlan,
 )
+from .chat_graph import WorkerDisplayItem
 from .observability import get_callback_handler, langfuse_trace_context
 from .run_metrics import (
     get_run_metrics_callback,
@@ -48,8 +49,35 @@ from .tools.context import (
     load_operation_skills,
     load_upstream_analysis_context,
 )
-from .worker import discard_worker_display_refs, worker_chat
+from .worker import (
+    discard_worker_display_refs,
+    register_worker_display_items,
+    worker_chat,
+)
 from .tools.saved_results import saved_result_store_scope
+from .test_protocol import (
+    MAX_PROTOCOL_OBJECTS,
+    PROTOCOL_CHECKS,
+    TestProtocolContract,
+    build_test_protocol_display_payloads,
+    compile_test_protocol,
+    render_test_protocol_answer,
+)
+from .validation_protocol import (
+    LLM_ANALYSES,
+    MAX_ANALYSIS_OBJECTS,
+    REQUESTED_ANALYSES,
+    S2TAnalysisOutput,
+    ValidationProtocolContract,
+    ValidationProtocolDataError,
+    build_deterministic_analysis_items,
+    build_s2t_analysis_display_payloads,
+    build_s2t_analysis_payload,
+    merge_s2t_analysis_output,
+    read_validation_protocol_inputs,
+    render_s2t_analysis_answer,
+    validate_s2t_analysis_output,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +86,9 @@ COORDINATOR_MAX_CYCLES = 2
 COORDINATOR_CONTEXT_MAX_CHARS = 4000
 _PLAN_TOOL_NAME = "submit_worker_plan"
 _OPERATION_SKILL_TOOL_NAME = "select_operation_skills"
+_S2T_ANALYSIS_CONTRACT_TOOL_NAME = "submit_s2t_analysis_contract"
+_VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME = "submit_validation_protocol_contract"
+_S2T_ANALYSIS_TOOL_NAME = "submit_s2t_analysis"
 _UPSTREAM_ANSWER_TOOL_NAME = "submit_upstream_answer"
 _UPSTREAM_DATA_DECISION_TOOL_NAME = "submit_upstream_data_decision"
 _UPSTREAM_ANALYSIS_CONTEXT = load_upstream_analysis_context()
@@ -73,10 +104,15 @@ class CoordinatorAnswer(BaseModel):
 
 
 class OperationSkillSelection(BaseModel):
-    """Prompt profiles selected once for the complete user operation."""
+    """Execution route and prompt profiles selected for one operation."""
 
     model_config = ConfigDict(extra="forbid")
 
+    pipeline: Literal[
+        "agentic",
+        "s2t_analysis",
+        "validation_protocol",
+    ] = "agentic"
     skills: List[str]
 
 
@@ -90,6 +126,9 @@ class CoordinatorGraphState(TypedDict):
     task: str
     context: str
     operation_skills: Optional[List[str]]
+    operation_pipeline: Optional[
+        Literal["agentic", "s2t_analysis", "validation_protocol"]
+    ]
     cycle: int
     plan: List[Dict[str, Any]]
     next_step: int
@@ -106,8 +145,18 @@ _OPERATION_SKILL_CATALOG_CONTEXT = "\n".join(
 )
 
 _OPERATION_SKILL_PROMPT = f"""
-Ты выбираешь operation-skills один раз для всей `original_task`. Верни ровно
-один native call `{_OPERATION_SKILL_TOOL_NAME}` с массивом `skills`.
+Ты operation router. Один раз для всей `original_task` выбери исполнительный
+`pipeline` и operation-skills. Верни ровно один native call
+`{_OPERATION_SKILL_TOOL_NAME}`.
+
+`pipeline="validation_protocol"` выбирай для явной просьбы составить SQL
+тест-протокол внешней Greenplum-проверки по заданному файлу и
+source→target S2T-загрузкам: row count, уникальность ключа, NULL обязательных
+полей или корректность трансформаций. SQL только проектируется и не исполняется.
+
+`pipeline="s2t_analysis"` выбирай для оценки рисков или согласованности тех же
+точно заданных S2T-загрузок без SQL-протокола. Во всех остальных случаях выбирай
+`pipeline="agentic"`.
 
 Operation-skill — профиль выполнения явно запрошенной операции, а не источник
 данных, тип объекта или retrieval-skill. Выбирай профиль только при точном
@@ -128,9 +177,85 @@ Operation-skill — профиль выполнения явно запроше�
 
 _OPERATION_SKILL_REPAIR_PROMPT = f"""
 Предыдущий native call `{_OPERATION_SKILL_TOOL_NAME}` нарушает схему или содержит
-имя вне каталога. Верни ровно один исправленный call с единственным полем
-`skills`. Массив может быть пустым. Используй только дословные имена из каталога
-и не выбирай профиль по упоминанию объекта или источника данных.
+имя вне каталога. Верни ровно один исправленный call с полями `pipeline` и
+`skills`. Pipeline — `agentic`, `s2t_analysis` либо `validation_protocol`;
+массив skills может быть пустым. Используй только дословные имена профилей из
+каталога.
+""".strip()
+
+_S2T_ANALYSIS_CONTRACT_PROMPT = f"""
+Извлеки только явно заданный контракт S2T-анализа из `original_task`. Верни
+ровно один native call `{_S2T_ANALYSIS_CONTRACT_TOOL_NAME}`.
+
+- Каждый элемент `source_tables` и `target_tables` копируй дословно; направление
+  задаёт source→target в запросе. Сохрани все явно перечисленные таблицы
+  соответствующей роли. Файл копируй как явно заданный `file_id` либо
+  `filename`; если он не задан и каталог не нужен, не придумывай scope.
+- `requested_analyses` содержит только явно запрошенные классы:
+  `row_loss_risk`, `duplicate_risk`, `unmapped_required_fields`,
+  `transformation_consistency`.
+- Не придумывай идентификаторы, scope-поля, SQL и дополнительные виды анализа.
+""".strip()
+
+_S2T_ANALYSIS_CONTRACT_REPAIR_PROMPT = f"""
+Предыдущий `{_S2T_ANALYSIS_CONTRACT_TOOL_NAME}` нарушает строгую схему. Верни один
+исправленный native call с непустыми точными массивами
+`source_tables`/`target_tables` и `requested_analyses` из разрешённого enum.
+`file_id` и `filename` необязательны и допустимы только при явном наличии в
+`original_task`. Остальные значения также копируй только из `original_task`.
+""".strip()
+
+_VALIDATION_PROTOCOL_CONTRACT_PROMPT = f"""
+Извлеки только явно заданный контракт SQL test protocol из `original_task`.
+Верни ровно один native call `{_VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME}`.
+
+- Файл копируй как `file_id` либо полное `filename`; идентификаторы копируй
+  дословно и не заполняй оба варианта одновременно.
+- `loads` содержит отдельный элемент для каждой явно заданной загрузки;
+  `sources` — все источники именно этого `target`, `target` — один приёмник.
+- `checks` каждого load содержит только явно запрошенные классы: `row_count`,
+  `key_uniqueness`, `required_null_rate`, `transformation_correctness`.
+- Не придумывай таблицы, колонки, SQL, проверки и scope-поля.
+""".strip()
+
+_VALIDATION_PROTOCOL_CONTRACT_REPAIR_PROMPT = f"""
+Предыдущий `{_VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME}` нарушает строгую схему.
+Верни один исправленный native call: укажи исходный `file_id` либо `filename` и
+непустой `loads`; в каждом load нужны непустые точные `sources`, один `target` и
+непустой `checks` из разрешённого enum. Копируй только из `original_task`.
+""".strip()
+
+_S2T_ANALYSIS_PROMPT = f"""
+Ты S2T analyzer. Получаешь строгий contract, lossless-компактные результаты
+readers и детерминированные derived_facts. Верни ровно один native call
+`{_S2T_ANALYSIS_TOOL_NAME}`.
+
+Для каждой `target_tables` дай один вывод `transformation_consistency`; в
+`target_table` дословно укажи текущий target. Сопоставь явно запрошенные
+`source_tables` со
+  `derived_facts.mapping_coverage.s2t_source_tables`. Missing/additional S2T
+  sources, покрытие catalog-полей, числа и physical_source_tables бери дословно
+  только из готового mapping_coverage. Если `unmapped_catalog_fields` не пуст,
+  не утверждай полного покрытия каталога; не путай его с отдельным покрытием
+  обязательных полей. Физические таблицы обязательно перечисли отдельно как
+  SQL-зависимости, но отличие физического имени от логического S2T-имени само по
+  себе не является противоречием. Оцени пустые/разные точные правила и
+  неоднозначные source→target маппинги.
+
+`mappings` сохраняет каждое raw-вхождение, а `rules` хранит каждый точный SQL
+один раз; `rule_id` связывает их. Анализируй только переданные данные. Не
+выполняй и не сочиняй запросы к
+логическим ETL-таблицам, не возвращай `row_loss_risk`, `duplicate_risk` или
+`unmapped_required_fields` (их считает код), не генерируй SQL-шаблоны и не
+сообщай физические метрики. В evidence называй конкретные подтверждённые поля,
+строки или фрагменты правила. Ограничения данных записывай в limitations.
+""".strip()
+
+_S2T_ANALYSIS_REPAIR_PROMPT = f"""
+Предыдущий `{_S2T_ANALYSIS_TOOL_NAME}` нарушает строгую схему либо не покрывает
+ровно все `llm_requested_analyses`. Верни один исправленный native call,
+используя только исходный contract, reader_results и derived_facts. Не добавляй
+виды анализа и факты.
 """.strip()
 
 
@@ -221,7 +346,7 @@ downstream-плану.
 значения, которых нет во входе. Описывай только недостающий факт или чтение.
 
 В evidence: `evidence_id`, `tool_name`, точные `args`, фактический `preview`,
-`truncated`, `display_id`. Args подтверждают область чтения, preview — данные.
+`truncated`, `displayable`. Args подтверждают область чтения, preview — данные.
 Не додумывай; `truncated=true` не подтверждает полный набор.
 
 Сопоставь каждый запрошенный исходный результат и его scope с прямым
@@ -240,10 +365,11 @@ _UPSTREAM_ANSWER_PROMPT = f"""
 нужные `display_evidence_ids`.
 
 Evidence содержит `evidence_id`, `tool_name`, точные `args`, фактический
-`preview`, `truncated` и безопасный `display_id`. Аргументы подтверждают область
+`preview`, `truncated` и признак `displayable`. Аргументы подтверждают область
 чтения, preview — найденные данные. Не додумывай отсутствующее; при
 `truncated=true` не утверждай полноту набора. `display_evidence_ids` выбирай
-только из непустых `display_id` и включай также в `used_evidence_ids`.
+как `evidence_id` только у результатов с `displayable=true` и включай также в
+`used_evidence_ids`.
 
 Перед `answer` сопоставь каждый запрошенный результат и его scope с прямым
 подтверждением в evidence. Нельзя повторять значение одной метрики вместо
@@ -282,6 +408,18 @@ def _operation_skill_tool_schema() -> Dict[str, Any]:
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "pipeline": {
+                        "type": "string",
+                        "enum": [
+                            "agentic",
+                            "s2t_analysis",
+                            "validation_protocol",
+                        ],
+                        "description": (
+                            "Общий агентный поток либо S2T-only анализ "
+                            "точной загрузки."
+                        ),
+                    },
                     "skills": {
                         "type": "array",
                         "maxItems": len(OPERATION_SKILL_CATALOG),
@@ -295,7 +433,196 @@ def _operation_skill_tool_schema() -> Dict[str, Any]:
                         ),
                     }
                 },
-                "required": ["skills"],
+                "required": ["pipeline", "skills"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _s2t_analysis_contract_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": _S2T_ANALYSIS_CONTRACT_TOOL_NAME,
+            "description": "Извлечь строгий контракт S2T-анализа.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Необязательный внутренний scope каталога; только "
+                            "если file_id явно дан в запросе."
+                        ),
+                    },
+                    "filename": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
+                        "description": (
+                            "Необязательное точное имя загруженного файла; "
+                            "только если оно явно дано в запросе."
+                        ),
+                    },
+                    "source_tables": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_ANALYSIS_OBJECTS,
+                        "uniqueItems": True,
+                        "items": {"type": "string"},
+                        "description": "Все точные source-table из запроса.",
+                    },
+                    "target_tables": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_ANALYSIS_OBJECTS,
+                        "uniqueItems": True,
+                        "items": {"type": "string"},
+                        "description": "Все точные target-table из запроса.",
+                    },
+                    "requested_analyses": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": len(REQUESTED_ANALYSES),
+                        "uniqueItems": True,
+                        "items": {
+                            "type": "string",
+                            "enum": list(REQUESTED_ANALYSES),
+                        },
+                        "description": (
+                            "Только явно запрошенные виды анализа сохранённого "
+                            "S2T."
+                        ),
+                    },
+                },
+                "required": [
+                    "source_tables",
+                    "target_tables",
+                    "requested_analyses",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _validation_protocol_contract_tool_schema() -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": _VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME,
+            "description": "Извлечь строгий scope внешнего SQL test protocol.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Явный file_id каталога метаданных.",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
+                        "description": "Точное имя загруженного файла.",
+                    },
+                    "loads": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_PROTOCOL_OBJECTS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "sources": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": MAX_PROTOCOL_OBJECTS,
+                                    "uniqueItems": True,
+                                    "items": {"type": "string"},
+                                },
+                                "target": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                },
+                                "checks": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": len(PROTOCOL_CHECKS),
+                                    "uniqueItems": True,
+                                    "items": {
+                                        "type": "string",
+                                        "enum": list(PROTOCOL_CHECKS),
+                                    },
+                                },
+                            },
+                            "required": ["sources", "target", "checks"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["loads"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _s2t_analysis_tool_schema() -> Dict[str, Any]:
+    item_schema = {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": list(LLM_ANALYSES),
+            },
+            "target_table": {
+                "type": "string",
+                "description": "Точный target текущего вывода из contract.",
+            },
+            "conclusion": {
+                "type": "string",
+                "description": "Вывод только по переданным S2T/catalog данным.",
+            },
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Конкретные подтверждённые основания вывода.",
+            },
+            "limitations": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Что нельзя установить по переданным данным.",
+            },
+        },
+        "required": [
+            "target_table",
+            "kind",
+            "conclusion",
+            "evidence",
+            "limitations",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "function",
+        "function": {
+            "name": _S2T_ANALYSIS_TOOL_NAME,
+            "description": "Вернуть выводы анализа сохранённого S2T.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "analyses": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": (
+                            MAX_ANALYSIS_OBJECTS * len(LLM_ANALYSES)
+                        ),
+                        "items": item_schema,
+                    }
+                },
+                "required": ["analyses"],
                 "additionalProperties": False,
             },
         },
@@ -462,8 +789,8 @@ def _native_upstream_decision(message: Any) -> UpstreamDecision:
     return decision
 
 
-def _native_operation_skills(message: Any) -> List[str]:
-    """Parse and validate the once-per-operation prompt profile selection."""
+def _native_operation_route(message: Any) -> OperationSkillSelection:
+    """Parse and validate the once-per-operation execution route."""
     selection = _native_payload(
         message,
         _OPERATION_SKILL_TOOL_NAME,
@@ -478,7 +805,77 @@ def _native_operation_skills(message: Any) -> List[str]:
             "Operation router выбрал неизвестные skills: "
             + ", ".join(dict.fromkeys(unknown))
         )
-    return list(dict.fromkeys(selection.skills))
+    return selection.model_copy(
+        update={"skills": list(dict.fromkeys(selection.skills))}
+    )
+
+
+def _native_operation_skills(message: Any) -> List[str]:
+    """Backward-compatible helper returning only selected prompt profiles."""
+    return _native_operation_route(message).skills
+
+
+def _native_s2t_analysis_contract(message: Any) -> ValidationProtocolContract:
+    contract = _native_payload(
+        message,
+        _S2T_ANALYSIS_CONTRACT_TOOL_NAME,
+        ValidationProtocolContract,
+    )
+    assert isinstance(contract, ValidationProtocolContract)
+    return contract
+
+
+def _native_validation_protocol_contract(message: Any) -> TestProtocolContract:
+    contract = _native_payload(
+        message,
+        _VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME,
+        TestProtocolContract,
+    )
+    assert isinstance(contract, TestProtocolContract)
+    return contract
+
+
+def _native_s2t_analysis(message: Any) -> S2TAnalysisOutput:
+    output = _native_payload(
+        message,
+        _S2T_ANALYSIS_TOOL_NAME,
+        S2TAnalysisOutput,
+    )
+    assert isinstance(output, S2TAnalysisOutput)
+    return output
+
+
+def _validate_contract_origin(
+    contract: Any,
+    original_task: str,
+) -> None:
+    """Reject identifiers invented by the typed-contract model."""
+    task = str(original_task or "")
+    missing = [
+        value
+        for value in (*contract.source_tables, *contract.target_tables)
+        if value not in task
+    ]
+    file_id_missing = (
+        contract.file_id is not None
+        and f"file_id={contract.file_id}" not in task.replace(" ", "")
+    )
+    filename = str(getattr(contract, "filename", None) or "").strip()
+    filename_missing = bool(
+        filename and filename.casefold() not in task.casefold()
+    )
+    if missing or file_id_missing or filename_missing:
+        details = (
+            ", ".join(missing)
+            if missing
+            else f"file_id={contract.file_id}"
+            if file_id_missing
+            else filename
+        )
+        raise CoordinatorResponseError(
+            "Typed contract содержит идентификатор не из original_task: "
+            + details
+        )
 
 
 def _native_upstream_answer(message: Any) -> UpstreamOutput:
@@ -574,6 +971,7 @@ def build_coordinator_graph(
 
     def downstream_plan_node(state: CoordinatorGraphState) -> Dict[str, Any]:
         operation_skills = state.get("operation_skills")
+        operation_pipeline = state.get("operation_pipeline")
         if operation_skills is None:
             operation_payload = {
                 "original_task": state["task"],
@@ -591,7 +989,7 @@ def build_coordinator_graph(
                 stage="operation_router",
             )
             try:
-                operation_skills = _native_operation_skills(operation_result)
+                operation_route = _native_operation_route(operation_result)
             except CoordinatorResponseError as first_error:
                 logger.warning(
                     "Operation skill call violated selection schema; "
@@ -609,7 +1007,296 @@ def build_coordinator_graph(
                     ),
                     stage="operation_router",
                 )
-                operation_skills = _native_operation_skills(operation_result)
+                operation_route = _native_operation_route(operation_result)
+            operation_skills = operation_route.skills
+            operation_pipeline = operation_route.pipeline
+        if operation_pipeline is None:
+            operation_pipeline = "agentic"
+
+        if operation_pipeline == "validation_protocol":
+            protocol_display_refs: List[str] = []
+            protocol_contract_model = bind_required_tool(
+                _validation_protocol_contract_tool_schema(),
+                _VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME,
+            )
+            protocol_payload = {"original_task": state["task"]}
+            protocol_messages: List[BaseMessage] = [
+                SystemMessage(content=_VALIDATION_PROTOCOL_CONTRACT_PROMPT),
+                HumanMessage(
+                    content=json.dumps(protocol_payload, ensure_ascii=False)
+                ),
+            ]
+            protocol_result = invoke(
+                protocol_contract_model,
+                protocol_messages,
+                stage="validation_protocol_contract",
+            )
+            try:
+                protocol_contract = _native_validation_protocol_contract(
+                    protocol_result
+                )
+                _validate_contract_origin(protocol_contract, state["task"])
+            except CoordinatorResponseError as first_error:
+                logger.warning(
+                    "Typed test protocol contract was invalid; requesting "
+                    "one LLM repair: %s",
+                    first_error,
+                )
+                protocol_result = invoke(
+                    protocol_contract_model,
+                    _repair_messages(
+                        protocol_messages,
+                        protocol_result,
+                        _VALIDATION_PROTOCOL_CONTRACT_REPAIR_PROMPT
+                        + "\nОшибка: "
+                        + str(first_error),
+                    ),
+                    stage="validation_protocol_contract",
+                )
+                try:
+                    protocol_contract = _native_validation_protocol_contract(
+                        protocol_result
+                    )
+                    _validate_contract_origin(protocol_contract, state["task"])
+                except CoordinatorResponseError as second_error:
+                    logger.warning(
+                        "Typed test protocol contract remained invalid; "
+                        "falling back to agentic: %s",
+                        second_error,
+                    )
+                    operation_pipeline = "agentic"
+
+            if operation_pipeline == "validation_protocol":
+                try:
+                    protocol_reader_results = read_validation_protocol_inputs(
+                        protocol_contract,
+                        callbacks=callback_list,
+                    )
+                except ValidationProtocolDataError as exc:
+                    answer = (
+                        "Тест-протокол не сформирован: подтверждённые S2T-данные "
+                        f"недостаточны ({exc})."
+                    )
+                else:
+                    compiled_protocol = compile_test_protocol(
+                        protocol_contract,
+                        reader_results=protocol_reader_results,
+                    )
+                    answer = render_test_protocol_answer(
+                        protocol_contract,
+                        compiled_protocol,
+                    )
+                    protocol_display_refs = register_worker_display_items(
+                        [
+                            WorkerDisplayItem(**item)
+                            for item in build_test_protocol_display_payloads(
+                                compiled_protocol
+                            )
+                        ]
+                    )
+                    if collected_display_refs is not None:
+                        collected_display_refs.extend(protocol_display_refs)
+                direct_plan = [
+                    {
+                        "cycle": state["cycle"],
+                        "step": index,
+                        "task": task,
+                        "operation_skills": list(operation_skills),
+                        "pipeline": "validation_protocol",
+                    }
+                    for index, task in enumerate(
+                        (
+                            "Прочитать S2T и target-каталог каждого target.",
+                            "Скомпилировать Greenplum SQL test protocol.",
+                        ),
+                        start=1,
+                    )
+                ]
+                record_coordinator_plan(direct_plan)
+                direct_output = {
+                    "answer": answer,
+                    "pipeline": "validation_protocol",
+                }
+                record_upstream_output(direct_output)
+                return {
+                    "operation_skills": list(operation_skills),
+                    "operation_pipeline": "validation_protocol",
+                    "plan": [],
+                    "next_step": 0,
+                    "upstream_output": direct_output,
+                    "final_answer": answer,
+                    "selected_display_refs": protocol_display_refs,
+                }
+
+        if operation_pipeline == "s2t_analysis":
+            analysis_display_refs: List[str] = []
+            contract_model = bind_required_tool(
+                _s2t_analysis_contract_tool_schema(),
+                _S2T_ANALYSIS_CONTRACT_TOOL_NAME,
+            )
+            contract_payload = {"original_task": state["task"]}
+            contract_messages: List[BaseMessage] = [
+                SystemMessage(content=_S2T_ANALYSIS_CONTRACT_PROMPT),
+                HumanMessage(
+                    content=json.dumps(contract_payload, ensure_ascii=False)
+                ),
+            ]
+            contract_result = invoke(
+                contract_model,
+                contract_messages,
+                stage="s2t_analysis_contract",
+            )
+            try:
+                contract = _native_s2t_analysis_contract(contract_result)
+                _validate_contract_origin(contract, state["task"])
+            except CoordinatorResponseError as first_error:
+                logger.warning(
+                    "Typed validation contract was invalid; requesting one "
+                    "LLM repair: %s",
+                    first_error,
+                )
+                contract_result = invoke(
+                    contract_model,
+                    _repair_messages(
+                        contract_messages,
+                        contract_result,
+                        _S2T_ANALYSIS_CONTRACT_REPAIR_PROMPT
+                        + "\nОшибка: "
+                        + str(first_error),
+                    ),
+                    stage="s2t_analysis_contract",
+                )
+                try:
+                    contract = _native_s2t_analysis_contract(contract_result)
+                    _validate_contract_origin(contract, state["task"])
+                except CoordinatorResponseError as second_error:
+                    logger.warning(
+                        "Typed validation contract remained invalid; falling "
+                        "back to the agentic pipeline: %s",
+                        second_error,
+                    )
+                    operation_pipeline = "agentic"
+                else:
+                    operation_pipeline = "s2t_analysis"
+
+            if operation_pipeline == "s2t_analysis":
+                try:
+                    reader_results = read_validation_protocol_inputs(
+                        contract,
+                        callbacks=callback_list,
+                    )
+                except ValidationProtocolDataError as exc:
+                    answer = (
+                        "S2T-анализ не выполнен: подтверждённые данные "
+                        f"недостаточны ({exc})."
+                    )
+                else:
+                    analysis_payload = build_s2t_analysis_payload(
+                        contract,
+                        reader_results=reader_results,
+                    )
+                    deterministic_items = build_deterministic_analysis_items(
+                        contract,
+                        reader_results=reader_results,
+                    )
+                    if analysis_payload["llm_requested_analyses"]:
+                        analysis_model = bind_required_tool(
+                            _s2t_analysis_tool_schema(),
+                            _S2T_ANALYSIS_TOOL_NAME,
+                        )
+                        analysis_messages: List[BaseMessage] = [
+                            SystemMessage(content=_S2T_ANALYSIS_PROMPT),
+                            HumanMessage(
+                                content=json.dumps(
+                                    analysis_payload,
+                                    ensure_ascii=False,
+                                )
+                            ),
+                        ]
+                        analysis_result = invoke(
+                            analysis_model,
+                            analysis_messages,
+                            stage="s2t_analysis",
+                        )
+                        try:
+                            analysis = _native_s2t_analysis(analysis_result)
+                            validate_s2t_analysis_output(contract, analysis)
+                        except (
+                            CoordinatorResponseError,
+                            ValueError,
+                        ) as first_error:
+                            logger.warning(
+                                "S2T analysis violated its contract; requesting "
+                                "one LLM repair: %s",
+                                first_error,
+                            )
+                            analysis_result = invoke(
+                                analysis_model,
+                                _repair_messages(
+                                    analysis_messages,
+                                    analysis_result,
+                                    _S2T_ANALYSIS_REPAIR_PROMPT
+                                    + "\nОшибка: "
+                                    + str(first_error),
+                                ),
+                                stage="s2t_analysis",
+                            )
+                            analysis = _native_s2t_analysis(analysis_result)
+                            try:
+                                validate_s2t_analysis_output(contract, analysis)
+                            except ValueError as second_error:
+                                raise CoordinatorResponseError(
+                                    str(second_error)
+                                ) from second_error
+                    else:
+                        analysis = S2TAnalysisOutput(analyses=[])
+                    analysis = merge_s2t_analysis_output(
+                        analysis,
+                        deterministic_items,
+                    )
+                    answer = render_s2t_analysis_answer(contract, analysis)
+                    analysis_display_refs = register_worker_display_items(
+                        [
+                            WorkerDisplayItem(**item)
+                            for item in build_s2t_analysis_display_payloads(
+                                reader_results
+                            )
+                        ]
+                    )
+                    if collected_display_refs is not None:
+                        collected_display_refs.extend(analysis_display_refs)
+                direct_plan = [
+                    {
+                        "cycle": state["cycle"],
+                        "step": index,
+                        "task": task,
+                        "operation_skills": list(operation_skills),
+                        "pipeline": "s2t_analysis",
+                    }
+                    for index, task in enumerate(
+                        (
+                            "Прочитать все S2T-строки каждого target.",
+                            "Прочитать target-каталог каждого file/table.",
+                            "Проанализировать только подтверждённые S2T и каталог.",
+                        ),
+                        start=1,
+                    )
+                ]
+                record_coordinator_plan(direct_plan)
+                direct_output = {
+                    "answer": answer,
+                    "pipeline": "s2t_analysis",
+                }
+                record_upstream_output(direct_output)
+                return {
+                    "operation_skills": list(operation_skills),
+                    "operation_pipeline": "s2t_analysis",
+                    "plan": [],
+                    "next_step": 0,
+                    "upstream_output": direct_output,
+                    "final_answer": answer,
+                    "selected_display_refs": analysis_display_refs,
+                }
 
         plan_operation_context = load_operation_skills(
             operation_skills,
@@ -694,6 +1381,7 @@ def build_coordinator_graph(
         record_coordinator_plan(recorded_plan)
         return {
             "operation_skills": list(operation_skills),
+            "operation_pipeline": operation_pipeline,
             "plan": [step.model_dump() for step in plan.steps],
             "next_step": 0,
         }
@@ -1019,6 +1707,13 @@ def build_coordinator_graph(
             return "worker"
         return "upstream"
 
+    def route_after_downstream(
+        state: CoordinatorGraphState,
+    ) -> Literal["worker", "end"]:
+        if str(state.get("final_answer") or "").strip():
+            return "end"
+        return "worker"
+
     def route_after_upstream(
         state: CoordinatorGraphState,
     ) -> Literal["downstream_plan", "end"]:
@@ -1035,7 +1730,14 @@ def build_coordinator_graph(
     graph.add_node("worker", worker_node)
     graph.add_node("upstream", upstream_node)
     graph.add_edge(START, "downstream_plan")
-    graph.add_edge("downstream_plan", "worker")
+    graph.add_conditional_edges(
+        "downstream_plan",
+        route_after_downstream,
+        {
+            "worker": "worker",
+            "end": END,
+        },
+    )
     graph.add_conditional_edges(
         "worker",
         route_after_worker,
@@ -1080,6 +1782,7 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
         "task": clean_task,
         "context": clean_context,
         "operation_skills": None,
+        "operation_pipeline": None,
         "cycle": 1,
         "plan": [],
         "next_step": 0,
