@@ -1515,9 +1515,15 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
+    filename = str(
+        _fetch_one(
+            "SELECT filename FROM files WHERE file_id = ?",
+            (file_id,),
+        )[0]
+    )
     exchange = _chat(
         live_chat_client,
-        f"Для file_id={file_id} оцени совместимость nullable-ограничений "
+        f"Для файла {filename!r} оцени совместимость nullable-ограничений "
         f"{source_table}.{source_field} → {target_table}.{target_field}. Верни "
         "source_not_null=<0|1>, target_not_null=<0|1> и вывод.",
     )
@@ -1582,9 +1588,15 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
 
 def test_live_agent_checks_unmapped_required_target_fields(live_chat_client):
     file_id, target_table, _, _, _ = _s2t_work_case_fixture()
+    filename = str(
+        _fetch_one(
+            "SELECT filename FROM files WHERE file_id = ?",
+            (file_id,),
+        )[0]
+    )
     exchange = _chat(
         live_chat_client,
-        f"Для file_id={file_id} найди обязательные поля {target_table} без "
+        f"Для файла {filename!r} найди обязательные поля {target_table} без "
         "сохранённого S2T-маппинга. Верни "
         "mandatory_fields_count=<число>, "
         "mandatory_fields_without_mapping_count=<число> и имена полей без "
@@ -1650,9 +1662,15 @@ def test_live_agent_explains_table_transformation(live_chat_client):
 
 def test_live_agent_writes_s2t_test_protocol(live_chat_client):
     file_id, target_table, source_table, _, _ = _s2t_work_case_fixture()
+    filename = str(
+        _fetch_one(
+            "SELECT filename FROM files WHERE file_id = ?",
+            (file_id,),
+        )[0]
+    )
     exchange = _chat(
         live_chat_client,
-        f"Для file_id={file_id} по сохранённой S2T-спецификации "
+        f"Для файла {filename!r} по сохранённой S2T-спецификации "
         f"{source_table} → {target_table} составь тест-протокол для проверки "
         "ETL-загрузки во внешней СУБД. Включи проверки количества строк, "
         "уникальности ключа, null-rate обязательных полей и корректности "

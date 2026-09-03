@@ -506,7 +506,11 @@ def test_operation_skill_loader_returns_only_requested_stage():
         )
     }
 
-    assert "Создай одну задачу" in contexts["plan"]
+    assert "создай одну задачу" in contexts["plan"]
+    assert "filename" in contexts["plan"]
+    assert "соответствующий имени текущей пары" in contexts["planner"]
+    assert "точном совпадении `filename`" in contexts["observer"]
+    assert "evidence его однозначного" in contexts["upstream_decision"]
     assert "exact pair-reader" in contexts["planner"]
     assert "Pair-result" in contexts["observer"]
     assert "`pass` допустим" in contexts["upstream_decision"]
@@ -789,6 +793,9 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     )
     assert "прямо необходимых фактов" in _DOWNSTREAM_PLAN_PROMPT
     assert "Каждый step обязан быть незаменимым" in _DOWNSTREAM_PLAN_PROMPT
+    assert "`file_id` допустим лишь из original_task либо принятого" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
     assert "Наличие\nтаблицы в справочнике не требует её чтения" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
