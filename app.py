@@ -53,6 +53,7 @@ PROGRESS_EVENT_FIELDS = (
     "sheet_name",
     "sheet_index",
     "sheet_count",
+    "total_data_row_count",
 )
 analysis_progress = {}
 analysis_progress_lock = Lock()

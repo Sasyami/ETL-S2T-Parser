@@ -296,7 +296,13 @@ def _skip_sheet(
     reason: str,
     detail: Optional[str] = None,
 ) -> None:
-    sheets.append({"sheet_name": sheet_name, "skip_reason": reason})
+    sheets.append(
+        {
+            "sheet_name": sheet_name,
+            "skip_reason": reason,
+            "data_row_count": 0,
+        }
+    )
     _report_sheet_progress(
         callback,
         sheet_index,
@@ -370,6 +376,7 @@ def _parse_loaded_sheet(
             },
             "columns": columns,
             "data_rows": rows,
+            "data_row_count": len(rows),
             "data_row_numbers": [
                 position - data_start for position in data_positions
             ],
@@ -447,12 +454,14 @@ def parse_excel_with_decisions(
 
             sheet = parsed["sheet"]
             sheets.append(sheet)
-            data_rows = sheet["data_rows"]
             columns = parsed["sheet"]["columns"]
             _report_sheet_progress(
                 *progress_args,
                 "Лист разобран...",
-                f"{sheet_name}: колонок {len(columns)}, строк {len(data_rows)}",
+                (
+                    f"{sheet_name}: колонок {len(columns)}, "
+                    f"строк {sheet['data_row_count']}"
+                ),
             )
 
     return sheets

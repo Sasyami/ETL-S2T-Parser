@@ -133,6 +133,7 @@ def test_parser_reads_each_sheet_once(sample_excel_bytes):
         "nested": False,
     }
     assert sheets[0]["data_rows"] == [["Alice", 30], ["Bob", 25]]
+    assert sheets[0]["data_row_count"] == 2
 
 
 def test_parser_preserves_excel_strings_that_pandas_treats_as_na_by_default():
@@ -244,6 +245,7 @@ def test_parser_excludes_hidden_rows_by_default_and_preserves_row_numbers():
         ["T_TEST", "FIELD_D", None],
     ]
     assert visible_sheets[0]["data_row_numbers"] == [1, 3]
+    assert visible_sheets[0]["data_row_count"] == 2
     assert all_sheets[0]["data_rows"] == [
         ["T_TEST", "FIELD_A", "shared rule"],
         ["T_TEST", "FIELD_B", "shared rule"],
@@ -251,3 +253,4 @@ def test_parser_excludes_hidden_rows_by_default_and_preserves_row_numbers():
         ["T_TEST", "FIELD_D", None],
     ]
     assert all_sheets[0]["data_row_numbers"] == [0, 1, 2, 3]
+    assert all_sheets[0]["data_row_count"] == 4

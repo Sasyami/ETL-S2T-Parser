@@ -125,16 +125,19 @@ def _public_sheets(sheets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Exclude stored workbook rows from the HTTP response."""
     result = []
     for sheet in sheets:
+        data_rows = sheet.get("data_rows", [])
+        data_row_count = len(data_rows) if sheet.get("header") is not None else 0
         item = {
             "sheet_name": sheet["sheet_name"],
             "skip_reason": sheet.get("skip_reason"),
+            "data_row_count": data_row_count,
         }
         if sheet.get("header") is not None:
             item.update(
                 {
                     "header": sheet["header"],
                     "columns": sheet.get("columns", []),
-                    "data_preview": sheet.get("data_rows", [])[:3],
+                    "data_preview": data_rows[:3],
                 }
             )
         result.append(item)
@@ -191,6 +194,9 @@ def finish_analysis(
     else:
         description, description_error = try_generate_description(file_id)
     response_sheets = _public_sheets(sheets)
+    total_data_row_count = sum(
+        int(sheet["data_row_count"]) for sheet in response_sheets
+    )
     response = convert_to_serializable(
         {
             "filename": filename,
@@ -200,6 +206,7 @@ def finish_analysis(
             "summary_error": summary_error,
             "description": description,
             "description_error": description_error,
+            "total_data_row_count": total_data_row_count,
             "s2t_transformations_count": count,
             "s2t_empty_target_columns_count": empty_target_columns_count,
             "s2t_transformations_error": extraction_error,
@@ -218,11 +225,13 @@ def finish_analysis(
         percent=100,
         message="Анализ файла завершен",
         detail=(
-            f"Листов: {len(response_sheets)}, S2T transformations: {count}, "
+            f"Листов: {len(response_sheets)}, строк данных: {total_data_row_count}, "
+            f"S2T transformations: {count}, "
             f"пустых target columns: {empty_target_columns_count}"
         ),
         file_id=file_id,
         filename=filename,
+        total_data_row_count=total_data_row_count,
         s2t_transformations_count=count,
         s2t_empty_target_columns_count=empty_target_columns_count,
         s2t_transformations_error=extraction_error,

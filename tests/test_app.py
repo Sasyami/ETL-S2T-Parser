@@ -2,6 +2,7 @@ import logging
 
 import pytest
 from unittest.mock import patch
+from openpyxl import Workbook
 from storage.database import init_db, get_db_connection
 import io
 
@@ -108,6 +109,8 @@ def test_index(client):
     assert "formData.append('include_hidden_rows', String(includeHiddenRows.checked))" in body
     assert "s2t_empty_target_columns_count" in body
     assert "empty_target_columns_count" in body
+    assert "total_data_row_count" in body
+    assert "data_row_count" in body
 
 
 def test_chat_app_single_user_no_session_cookie(client):
@@ -225,8 +228,8 @@ def test_upload(mock_generate_description, mock_summarize, mock_store, mock_pars
         "sheet_name": "Sheet1",
         "skip_reason": None,
         "header": {"start_row": 0, "row_count": 1, "nested": False},
-        "columns": ["Name"],
-        "data_rows": [],
+        "columns": ["Name", "Age"],
+        "data_rows": [["Alice", 30], ["Bob", 25]],
     }]
     mock_store.return_value = 101
     mock_summarize.return_value = "Test summary"
@@ -244,12 +247,17 @@ def test_upload(mock_generate_description, mock_summarize, mock_store, mock_pars
     assert json_data['summary_error'] is None
     assert json_data['description'] == 'Test description'
     assert json_data['description_error'] is None
+    assert json_data['total_data_row_count'] == 2
     assert json_data['s2t_transformations_count'] == 0
     assert json_data['s2t_empty_target_columns_count'] == 0
     assert json_data['s2t_transformations_error'] is None
     assert json_data['s2t_extraction_report']['status'] == 'ok'
     assert json_data["sheets"][0]["header"]["row_count"] == 1
-    assert json_data["sheets"][0]["data_preview"] == []
+    assert json_data["sheets"][0]["data_row_count"] == 2
+    assert json_data["sheets"][0]["data_preview"] == [
+        ["Alice", 30],
+        ["Bob", 25],
+    ]
     assert "data_rows" not in json_data["sheets"][0]
     assert json_data["graph_sync_report"] == {"file_id": 101}
     assert json_data["graph_sync_error"] is None
@@ -267,7 +275,7 @@ def test_upload_records_analysis_progress(mock_generate_description, mock_summar
         "skip_reason": None,
         "header": {"start_row": 0, "row_count": 1, "nested": False},
         "columns": ["Name"],
-        "data_rows": [],
+        "data_rows": [["Alice"], ["Bob"]],
     }]
     mock_store.return_value = 102
     mock_summarize.return_value = "Test summary"
@@ -288,9 +296,110 @@ def test_upload_records_analysis_progress(mock_generate_description, mock_summar
     assert progress["percent"] == 100
     assert progress["file_id"] == 102
     assert progress["filename"] == "test.xlsx"
+    assert progress["total_data_row_count"] == 2
+    assert progress["history"][-1]["total_data_row_count"] == 2
     assert progress["s2t_transformations_error"] is None
     assert progress["s2t_empty_target_columns_count"] == 0
     assert progress["history"]
+
+
+@pytest.mark.parametrize(
+    ("include_hidden_rows", "expected_main_rows", "expected_total_rows"),
+    ((False, 2, 4), (True, 3, 5)),
+)
+def test_upload_counts_parsed_rows_in_real_multicolumn_workbook(
+    client,
+    include_hidden_rows,
+    expected_main_rows,
+    expected_total_rows,
+):
+    workbook = Workbook()
+    main = workbook.active
+    main.title = "Main"
+    main.append(["Name", "Age"])
+    main.append(["same", 1])
+    main.append(["hidden", 2])
+    main.append(["same", 1])
+    main.row_dimensions[3].hidden = True
+
+    second = workbook.create_sheet("Second")
+    second.append(["Code", "Value"])
+    second.append(["A", 10])
+    second.append(["B", 20])
+    workbook.create_sheet("Empty")
+
+    output = io.BytesIO()
+    workbook.save(output)
+    upload = {
+        "file": (io.BytesIO(output.getvalue()), "row-counts.xlsx"),
+        "include_hidden_rows": str(include_hidden_rows).lower(),
+    }
+    extraction_report = {
+        "status": "ok",
+        "verification": {"count": 0},
+        "empty_target_columns_count": 0,
+        "sheets": [],
+    }
+
+    with (
+        patch(
+            "processing.excel.get_header_decision",
+            return_value=(0, 1, False),
+        ),
+        patch(
+            "services.analysis.classify_file_sheet_groups",
+            return_value={"status": "ok", "sheets": []},
+        ),
+        patch(
+            "services.analysis.try_extract_s2t_transformations",
+            return_value=(0, None, extraction_report),
+        ),
+        patch(
+            "services.analysis.try_generate_summary",
+            return_value=(None, None),
+        ),
+    ):
+        response = client.post(
+            "/upload",
+            data=upload,
+            content_type="multipart/form-data",
+        )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["total_data_row_count"] == expected_total_rows
+    counts = {
+        sheet["sheet_name"]: sheet["data_row_count"]
+        for sheet in payload["sheets"]
+    }
+    assert counts == {
+        "Main": expected_main_rows,
+        "Second": 2,
+        "Empty": 0,
+    }
+    assert all("data_rows" not in sheet for sheet in payload["sheets"])
+
+    conn = get_db_connection()
+    try:
+        stored = conn.execute(
+            """
+            SELECT table_name, COUNT(DISTINCT row_num), COUNT(*)
+            FROM data
+            WHERE file_id = ?
+            GROUP BY table_name
+            """,
+            (payload["file_id"],),
+        ).fetchall()
+    finally:
+        conn.close()
+    stored_counts = {
+        str(sheet_name): (int(row_count), int(cell_count))
+        for sheet_name, row_count, cell_count in stored
+    }
+    assert stored_counts == {
+        "Main": (expected_main_rows, expected_main_rows * 2),
+        "Second": (2, 4),
+    }
 
 
 def test_analysis_progress_missing(client):

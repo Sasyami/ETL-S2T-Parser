@@ -372,7 +372,7 @@
             <div id="lastUploadedFileName" class="status-value">Файлы ещё не загружались</div>
             <div class="status-label mt-3">ID файла</div>
             <div id="lastUploadedFileId" class="status-value text-muted">-</div>
-            <div class="status-label mt-3">S2T transformations</div>
+            <div class="status-label mt-3">Данные и S2T</div>
             <div id="currentTransformations" class="status-value text-muted">-</div>
             <div class="d-grid gap-2 mt-3">
                 <button id="viewAllTransformationsBtn" class="btn btn-outline-primary btn-sm" type="button">Показать полную таблицу трансформаций</button>
@@ -473,10 +473,11 @@
 
     function showLastUpload(data) {
         lastUploadTransformationsCount = Number(data.s2t_transformations_count || 0);
+        const totalDataRowCount = Number(data.total_data_row_count || 0);
         const emptyTargetColumnsCount = Number(data.s2t_empty_target_columns_count || 0);
         lastUploadedFileNameEl.textContent = data.filename || 'Файл загружен';
         lastUploadedFileIdEl.textContent = data.file_id || '-';
-        currentTransformationsEl.textContent = `${lastUploadTransformationsCount} строк · пустых target columns: ${emptyTargetColumnsCount}`;
+        currentTransformationsEl.textContent = `${totalDataRowCount} строк данных · ${lastUploadTransformationsCount} S2T · пустых target columns: ${emptyTargetColumnsCount}`;
         clearAllDataBtn.disabled = busy;
     }
 
@@ -512,6 +513,10 @@
 
             showLastUpload(data);
             const sheets = (data.sheets || []).map((sheet) => sheet.sheet_name).join(', ') || 'нет листов';
+            const sheetRowCounts = (data.sheets || [])
+                .map((sheet) => `${sheet.sheet_name}: ${Number(sheet.data_row_count || 0)}`)
+                .join(', ') || 'нет строк';
+            const totalDataRowCount = Number(data.total_data_row_count || 0);
             const summary = data.summary ? `\n\nСаммари:\n${data.summary}` : '';
             const summaryError = data.summary_error
                 ? (data.summary
@@ -529,7 +534,7 @@
                 : `\nПустые target columns: ${Number(data.s2t_empty_target_columns_count || 0)}`;
             addMessage(
                 'agent',
-                `Файл загружен: ${data.filename}\nID файла: ${data.file_id}\nЛисты: ${sheets}\nS2T transformations: ${lastUploadTransformationsCount}${emptyTargetColumns}${s2tError}${summary}${summaryError}`
+                `Файл загружен: ${data.filename}\nID файла: ${data.file_id}\nЛисты: ${sheets}\nСтроки данных: ${totalDataRowCount} (${sheetRowCounts})\nS2T transformations: ${lastUploadTransformationsCount}${emptyTargetColumns}${s2tError}${summary}${summaryError}`
             );
             if (lastUploadTransformationsCount > 0) {
                 addMessage('system', 'Можно спросить: "Покажи таблицу трансформаций".');
@@ -538,7 +543,7 @@
                 status: 'done',
                 percent: 100,
                 message: 'Анализ файла завершен',
-                detail: `Листов: ${(data.sheets || []).length}, S2T transformations: ${lastUploadTransformationsCount}, пустых target columns: ${Number(data.s2t_empty_target_columns_count || 0)}`
+                detail: `Листов: ${(data.sheets || []).length}, строк данных: ${totalDataRowCount}, S2T transformations: ${lastUploadTransformationsCount}, пустых target columns: ${Number(data.s2t_empty_target_columns_count || 0)}`
             });
         } catch (error) {
             updateAnalysisProgress({
