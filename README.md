@@ -74,11 +74,12 @@ flowchart TD
     F --> U["Upstream data decision"]
     U -->|reroute, максимум один раз| C
     U -->|pass| UA["Upstream answer + display selection"]
-    OR -->|S2T-анализ| SC["Typed contract → readers → analyzer"]
+    OR -.->|ОТКЛЮЧЁН| SC["S2T analysis<br/>(экспериментальный резерв)"]
     OR -->|тест-протокол| VC["Typed contract → readers → compiler"]
-    SC --> UI["Ответ + scrollable results"]
+    SC -.->|не используется| UI["Ответ + scrollable results"]
     VC --> UI
     UA --> UI
+    style SC fill:#f3f4f6,stroke:#b6bbc3,color:#8a9099,stroke-width:1px,stroke-dasharray:5 5
 ```
 
 Основные контракты:
