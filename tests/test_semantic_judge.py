@@ -85,6 +85,7 @@ def test_semantic_judge_receives_only_user_visible_result():
     assert "второго направления не требуй" in judge_prompt
     assert "upstream" not in judge_prompt
     assert "пустой/архивный display сам по себе не является ошибкой" in judge_prompt
+    assert "нулевой count уже однозначно задаёт пустой список" in judge_prompt
     assert "ровно одну самую существенную" in judge_prompt
     assert "не придумывай отсутствующие в query требования" in judge_prompt
     assert "транзитивный обход до terminal targets" in judge_prompt

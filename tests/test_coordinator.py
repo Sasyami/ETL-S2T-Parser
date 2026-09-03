@@ -744,10 +744,12 @@ def test_coordinator_prompts_and_schemas_match_contracts():
         _DOWNSTREAM_PLAN_REPAIR_PROMPT,
         _DOWNSTREAM_CAPABILITY_CONTEXT,
         _DOWNSTREAM_TABLE_CONTEXT,
+        _OPERATION_SKILL_PROMPT,
         _UPSTREAM_ANALYSIS_CONTEXT,
         _UPSTREAM_ANSWER_PROMPT,
         _UPSTREAM_DATA_DECISION_PROMPT,
         _plan_tool_schema,
+        _operation_skill_tool_schema,
         _upstream_answer_tool_schema,
         _upstream_data_decision_tool_schema,
     )
@@ -765,18 +767,26 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     ):
         assert domain_detail not in combined
 
-    assert len(_DOWNSTREAM_PLAN_PROMPT) < 5000
+    assert len(_DOWNSTREAM_PLAN_PROMPT) < 5300
     assert (
         len(_DOWNSTREAM_PLAN_PROMPT)
         - len(_DOWNSTREAM_TABLE_CONTEXT)
         - len(_DOWNSTREAM_CAPABILITY_CONTEXT)
-        < 3200
+        < 3800
     )
     assert _DOWNSTREAM_CAPABILITY_CONTEXT in _DOWNSTREAM_PLAN_PROMPT
     assert _DOWNSTREAM_TABLE_CONTEXT in _DOWNSTREAM_PLAN_PROMPT
     assert len(_UPSTREAM_DATA_DECISION_PROMPT) < 1300
     assert len(_UPSTREAM_ANSWER_PROMPT) < 2300
     assert len(_UPSTREAM_ANALYSIS_CONTEXT) < 3500
+    operation_pipeline_schema = _operation_skill_tool_schema()["function"][
+        "parameters"
+    ]["properties"]["pipeline"]
+    assert operation_pipeline_schema["enum"] == [
+        "agentic",
+        "validation_protocol",
+    ]
+    assert "s2t_analysis" not in _OPERATION_SKILL_PROMPT
     assert (
         "row_format=named_records_with_dictionary_refs"
         in _UPSTREAM_ANALYSIS_CONTEXT
@@ -794,6 +804,17 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "прямо необходимых фактов" in _DOWNSTREAM_PLAN_PROMPT
     assert "Каждый step обязан быть незаменимым" in _DOWNSTREAM_PLAN_PROMPT
     assert "`file_id` допустим лишь из original_task либо принятого" in (
+        _DOWNSTREAM_PLAN_PROMPT
+    )
+    assert "Worker не получает `original_task`" in _DOWNSTREAM_PLAN_PROMPT
+    normalized_downstream_prompt = " ".join(_DOWNSTREAM_PLAN_PROMPT.split())
+    assert "`filename` даёт `file_id`, но не определяет и не заменяет `table_name`" in (
+        normalized_downstream_prompt
+    )
+    assert "не заменить уже заданный идентификатор другой сущности" in (
+        normalized_downstream_prompt
+    )
+    assert "problem не заменяет и не переопределяет явные идентификаторы" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
     assert "Наличие\nтаблицы в справочнике не требует её чтения" in (
