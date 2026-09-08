@@ -494,6 +494,7 @@ def semantic_search_descriptions(
         ranked.append(candidate)
     ranked.sort(key=lambda item: (-item["score"], item["scope"], item["record_id"]))
     rows = ranked[:clean_limit]
+    truncated = len(ranked) > len(rows)
     return {
         "query": text,
         "scope": scope,
@@ -504,6 +505,8 @@ def semantic_search_descriptions(
         "embedding_model": embedding_model_name(),
         "total_candidates": len(ranked),
         "returned_rows": len(rows),
+        "coverage": "truncated" if truncated else "complete",
+        "truncated": truncated,
         "rows": rows,
     }
 

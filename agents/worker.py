@@ -30,6 +30,7 @@ from .contracts import (
     EvidenceArtifact,
     PreviousResultReference,
     SavedResultDescriptor,
+    WorkerCapability,
     WorkerOutcome,
 )
 from .observability import get_callback_handler
@@ -55,7 +56,11 @@ _REROUTE_FEEDBACK_MAX_CHARS = 4000
 _TOOL_ARGUMENTS_MAX_CHARS = 2000
 _HANDOFF_DESCRIPTION_MAX_CHARS = 600
 _READ_PREVIOUS_RESULT_TOOL_NAME = "read_previous_result"
-_SPLIT_TOOL_CALL_PLANNING_ENV = "WORKER_SPLIT_TOOL_CALL_EXPERIMENT"
+WORKER_SPLIT_TOOL_CALL_EXPERIMENT_ENV = "WORKER_SPLIT_TOOL_CALL_EXPERIMENT"
+_SPLIT_TOOL_CALL_PLANNING_ENV = WORKER_SPLIT_TOOL_CALL_EXPERIMENT_ENV
+WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV = (
+    "WORKER_CAPABILITY_REROUTE_EXPERIMENT"
+)
 _DISPLAY_RESULTS: Dict[str, WorkerDisplayItem] = {}
 _DISPLAY_RESULTS_LOCK = Lock()
 
@@ -67,6 +72,13 @@ def _split_tool_call_planning_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def _capability_reroute_enabled() -> bool:
+    value = os.getenv(WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV)
+    if value is None:
+        return True
+    return value.strip().casefold() not in {"0", "false", "no", "off"}
 
 
 def _compact_tool_arguments(
@@ -204,6 +216,10 @@ def discard_worker_display_refs(refs: Sequence[str]) -> None:
 def _planner_reroute_feedback(context: Dict[str, Any]) -> str:
     payload = {
         "gap": str(context.get("gap") or "").strip(),
+        "reason": str(context.get("reason") or "").strip(),
+        "required_capabilities": list(
+            context.get("required_capabilities") or []
+        ),
     }
     serialized = json.dumps(payload, ensure_ascii=False)
     if len(serialized) > _REROUTE_FEEDBACK_MAX_CHARS:
@@ -212,9 +228,38 @@ def _planner_reroute_feedback(context: Dict[str, Any]) -> str:
         "Повторный запуск worker после неуспешной попытки. Ниже только "
         "диагностическая выжимка предыдущего запуска, а не новая task. "
         "Учти её при первом следующем вызове data tool и исправь описанную "
-        "проблему с помощью расширенной палитры.\n"
+        "проблему с помощью палитры требуемых возможностей.\n"
         f"<reroute_feedback>{serialized}</reroute_feedback>"
     )
+
+
+def _required_reroute_capabilities(
+    graph_result: Any,
+) -> List[WorkerCapability]:
+    """Keep legacy reroutes useful while preferring typed capabilities."""
+    explicit = list(
+        dict.fromkeys(graph_result.required_capabilities or [])
+    )
+    if explicit:
+        return explicit
+    reason = str(graph_result.reroute_reason or "").strip()
+    if reason in {"wrong_arguments", "tool_error"}:
+        return []
+    if reason == "unresolved_entity":
+        return ["entity_resolution"]
+    if reason == "truncated_result":
+        return ["saved_result_read", "saved_result_aggregate"]
+
+    gap = str(graph_result.gap or "").casefold()
+    if any(marker in gap for marker in ("sql", "агрегац", "group by", "срез")):
+        return ["sql_read"]
+    if any(marker in gap for marker in ("разреш", "неизвестн", "кандидат", "опечат")):
+        return ["entity_resolution"]
+    if any(marker in gap for marker in ("обрез", "truncated", "полный результат")):
+        return ["saved_result_read", "saved_result_aggregate"]
+    if any(marker in gap for marker in ("cypher", "neo4j", "граф")):
+        return ["graph_read"]
+    return ["general_read"]
 
 
 def _final_outcome_summary(
@@ -242,6 +287,9 @@ def worker_chat(
     if not clean_task:
         return WorkerOutcome(
             summary="Worker получил пустую task.",
+            status="failed",
+            stop_reason="missing_input",
+            unmet_requirements=["Непустая worker task не передана."],
         )
     worker_request = clean_task
 
@@ -282,7 +330,12 @@ def worker_chat(
     reroute_count = 0
 
     while True:
-        general_tools_available = reroute_count >= 2
+        required_capabilities = tuple(
+            (reroute_context or {}).get("required_capabilities") or ()
+        )
+        previous_palette_names = set(
+            ((reroute_context or {}).get("previous_tool_palettes") or [[]])[-1]
+        )
         available_tools = bind_saved_result_schemas(
             get_worker_tools(include_general=True),
             worker_request,
@@ -290,9 +343,9 @@ def worker_chat(
         routable_tool_names = {
             item.name
             for item in get_worker_tools(
-                include_general=general_tools_available,
+                required_capabilities=required_capabilities,
             )
-        }
+        } | previous_palette_names
         routable_tools = tuple(
             item
             for item in available_tools
@@ -304,9 +357,13 @@ def worker_chat(
             "available_tools": routable_tools,
             "callbacks": callbacks,
             "catalog_stage": (
-                "general_fallback"
-                if general_tools_available
-                else "specialized_only"
+                "capability_expansion"
+                if required_capabilities
+                else (
+                    "reroute_palette"
+                    if reroute_context is not None
+                    else "specialized_only"
+                )
             ),
         }
         if reroute_context is not None:
@@ -351,7 +408,7 @@ def worker_chat(
                     "skills": list(route.skills),
                     "schemas": list(route.schemas),
                     "gap": reroute_gap or None,
-                    "general_fallback_available": general_tools_available,
+                    "required_capabilities": list(required_capabilities),
                 },
                 ensure_ascii=False,
             )[:8000],
@@ -382,7 +439,17 @@ def worker_chat(
             )
         except WorkerResponseError as exc:
             logger.warning("Worker contract failed: %s", exc)
-            return WorkerOutcome(summary=str(exc))
+            reason = (
+                "observer_error"
+                if "Observer" in str(exc)
+                else "tool_error"
+            )
+            return WorkerOutcome(
+                summary=str(exc),
+                status="failed",
+                stop_reason=reason,
+                unmet_requirements=[str(exc)],
+            )
         first_cycle_number = len(cycle_history) + 1
         new_cycles = [
             cycle.model_copy(
@@ -428,6 +495,18 @@ def worker_chat(
             )
             return WorkerOutcome(
                 summary=summary,
+                status=("partial" if graph_result.gap else "complete"),
+                stop_reason=(
+                    graph_result.stop_reason or "budget_exhausted"
+                    if graph_result.gap
+                    else None
+                ),
+                unmet_requirements=(
+                    list(graph_result.unmet_requirements)
+                    or [str(graph_result.gap)]
+                    if graph_result.gap
+                    else []
+                ),
                 facts=list(graph_result.facts),
                 evidence=_store_evidence_items(
                     graph_result.display_items,
@@ -438,16 +517,54 @@ def worker_chat(
             )
 
         if reroute_count >= WORKER_MAX_REROUTES:
+            datasets = newly_saved_datasets(
+                graph_result.accepted_tool_call_ids
+            )
+            evidence = _store_evidence_items(
+                graph_result.display_items,
+                datasets,
+            )
+            previous_results = _register_previous_results(
+                graph_result.display_items,
+                datasets,
+            )
             return WorkerOutcome(
                 summary=str(
                     graph_result.gap
                     or "Worker исчерпал лимит reroute без результата."
                 ),
+                status=("partial" if evidence else "failed"),
+                stop_reason=(graph_result.stop_reason or "missing_capability"),
+                unmet_requirements=(
+                    list(graph_result.unmet_requirements)
+                    or [
+                        str(
+                            graph_result.gap
+                            or "Не удалось закрыть worker task."
+                        )
+                    ]
+                ),
+                facts=list(graph_result.facts),
+                evidence=evidence,
+                datasets=datasets,
+                previous_results=previous_results,
             )
 
         reroute_count += 1
+        typed_capabilities = _required_reroute_capabilities(graph_result)
+        reason = str(graph_result.reroute_reason or "").strip()
+        required_capabilities = (
+            typed_capabilities
+            if _capability_reroute_enabled()
+            or reason in {"wrong_arguments", "tool_error"}
+            else ["general_read"]
+        )
         reroute_context = {
             "gap": str(graph_result.gap or ""),
+            "reason": str(
+                graph_result.reroute_reason or "missing_capability"
+            ),
+            "required_capabilities": list(required_capabilities),
             "previous_tool_palettes": [
                 list(item) for item in attempted_palettes
             ],
@@ -463,6 +580,8 @@ def worker_chat(
 __all__ = [
     "WORKER_MAX_STEPS",
     "WORKER_MAX_REROUTES",
+    "WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV",
+    "WORKER_SPLIT_TOOL_CALL_EXPERIMENT_ENV",
     "WORKER_TOOL_MESSAGE_PREVIEW_CHARS",
     "EvidenceArtifact",
     "WorkerOutcome",

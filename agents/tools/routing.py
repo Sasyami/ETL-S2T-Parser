@@ -13,7 +13,10 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from ..contracts import parse_worker_request
 from ..run_metrics import llm_stage
 from .context import SCHEMA_CATALOG
-from .registry import WORKER_GENERAL_FALLBACK_TOOL_NAMES
+from .registry import (
+    WORKER_GENERAL_FALLBACK_TOOL_NAMES,
+    get_worker_tool_names_for_capabilities,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +117,17 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
             "и фильтры колонок."
         ),
         "not_for": "Подстрока, точное имя, Excel-значения, S2T или lineage.",
+    },
+    "resolve_entities": {
+        "use_when": (
+            "Опечатка, частичное имя, смысловое описание или неоднозначный "
+            "mention файла либо ролевой source/target S2T-таблицы; все mentions "
+            "передавай одним batch-вызовом."
+        ),
+        "not_for": (
+            "Уже подтверждённое полное каноническое имя: его передавай сразу "
+            "ролевому exact reader; resolver не заменяет чтение фактов."
+        ),
     },
     "list_s2t_transformations": {
         "use_when": (
@@ -414,32 +428,31 @@ _TOOL_ROUTER_PROMPT = """
 Ты router read-only worker. Выбери необходимую planner-палитру `tools`,
 `skills`, `schemas`. Используй точные имена из каталогов.
 
-`current_task` — операция, `stable_context` и `operation_context` — ограничения.
+`current_task` — самодостаточная операция с материализованными downstream
+ограничениями; `operation_context` — профиль выполнения.
 `previous_results` содержит result_id, description и result_schema. Внутренний
-reader уже доступен planner; внешние tools выбирай для дальнейших операций, а
-не из-за самого наличия result_id.
+reader уже доступен planner; не выбирай внешний tool лишь из-за result_id.
 
-Для каждой операции выбери все необходимые tools с совпавшим `use_when`;
-`not_for` — запрет. Покрой разные операции и обязательные входы. Полнота
-палитры важнее компактности, но не дублируй одну операцию перекрывающимися
-специализированным и общим tools.
-`catalog_stage=general_fallback` означает: после двух reroute доступны также
-общие tools. Добавляй такой tool только для gap, который не выражается точным
-специализированным контрактом. Не добавляй явно нерелевантные tools.
-Сохраняй тип поиска из task: смысл/назначение/описание — semantic; явно данный
-буквальный фрагмент — substring. Не заменяй один тип другим.
-Tool выбирай, только если вход дан или будет получен выбранным tool. Обязательный
-opaque ID должен уже быть в принятом результате; числа из task или имени не
-являются ID. Не придумывай входы.
+Выбери все необходимые tools с совпавшим `use_when`; `not_for` — запрет. Покрой
+обязательные входы, не дублируя одну операцию общим и специализированным tools.
+`catalog_stage=capability_expansion` означает, что после typed reroute добавлены
+только tools недостающей возможности. Выбери минимум один tool для каждой
+возможности из `required_capabilities`; не расширяй палитру по числу попыток.
+Тип поиска сохраняй: смысл/назначение — semantic, явно данный фрагмент —
+substring. Tool выбирай, только если вход дан или получается выбранным tool;
+opaque ID берётся только из принятого результата. Не придумывай входы.
 
 Если description даёт фильтр нового чтения, выбери источник этого чтения.
 `query_saved_result` — только для строк сохранённого dataset с совместимой schema.
 
-Tools, skills и schemas выбирай независимо; каждый список может быть пустым.
-Для уже данных фактов оставляй `tools=[]`.
+Списки выбирай независимо; каждый может быть пустым. Для уже данных фактов
+оставляй `tools=[]`.
 
-При `reroute_context` сохрани последнюю палитру и добавь tool, закрывающий
-указанный `gap`; не сокращай и не повторяй палитру без изменения.
+При `reroute_context` следуй `reason` и `required_capabilities`. Для
+`missing_capability`, `unresolved_entity` или `truncated_result` сохрани нужные
+прежние tools и добавь нужную capability. При `wrong_arguments` палитру не
+меняй: аргументы исправляет planner. При `tool_error` без новой capability
+также оставь прежнюю палитру для исправленного/повторного вызова.
 
 Не отвечай и не вызывай tools. Верни только structured-поля `tools`, `skills`,
 `schemas`.
@@ -472,6 +485,7 @@ def _tool_catalog(
     tools: Sequence[BaseTool],
     *,
     mark_general_fallback: bool = False,
+    mark_capability_expansion: bool = False,
 ) -> List[Dict[str, Any]]:
     catalog: List[Dict[str, Any]] = []
     for tool in tools:
@@ -484,11 +498,15 @@ def _tool_catalog(
                 f"Для зарегистрированного tool отсутствует routing contract: {tool.name}"
             )
         if (
-            mark_general_fallback
+            (mark_general_fallback or mark_capability_expansion)
             and tool.name in WORKER_GENERAL_FALLBACK_TOOL_NAMES
         ):
             contract = {
-                "use_when": "Общий fallback: " + contract["use_when"],
+                "use_when": (
+                    "Capability expansion: "
+                    if mark_capability_expansion
+                    else "Общий fallback: "
+                ) + contract["use_when"],
                 "not_for": contract["not_for"],
             }
         catalog.append({"name": tool.name, **contract})
@@ -557,16 +575,39 @@ def _validated_route(
             if str(name).strip()
         }
         selected_set = set(selected_tools)
-        removed = sorted(previous_tools - selected_set)
-        if removed:
-            raise ToolRoutingError(
-                "Tool-router при reroute удалил tools прошлой палитры: "
-                + ", ".join(removed)
-            )
-        if not selected_set - previous_tools:
-            raise ToolRoutingError(
-                "Tool-router при reroute не добавил новый tool для gap"
-            )
+        reason = str(reroute_context.get("reason") or "").strip()
+        required_capabilities = list(
+            reroute_context.get("required_capabilities") or []
+        )
+        if reason in {"wrong_arguments", "tool_error"} and not (
+            required_capabilities
+        ):
+            if selected_set != previous_tools:
+                raise ToolRoutingError(
+                    "Tool-router изменил палитру без missing capability"
+                )
+        else:
+            removed = sorted(previous_tools - selected_set)
+            if removed:
+                raise ToolRoutingError(
+                    "Tool-router при capability reroute удалил tools прошлой "
+                    "палитры: " + ", ".join(removed)
+                )
+            uncovered_capabilities = [
+                str(capability)
+                for capability in dict.fromkeys(required_capabilities)
+                if not selected_set
+                & get_worker_tool_names_for_capabilities([capability])
+            ]
+            if uncovered_capabilities:
+                raise ToolRoutingError(
+                    "Tool-router не выбрал tool для каждой требуемой "
+                    "capability: " + ", ".join(uncovered_capabilities)
+                )
+            if not required_capabilities and not selected_set - previous_tools:
+                raise ToolRoutingError(
+                    "Tool-router при legacy reroute не добавил новый tool для gap"
+                )
     return ToolRoute(
         tools=selected_tools,
         skills=selected_skills,
@@ -581,6 +622,7 @@ def _general_fallback_route(
     """Return a bounded read-only palette after two invalid router outputs."""
     available_names = {tool.name for tool in available_tools}
     selected_tools: List[str] = []
+    reason = str((reroute_context or {}).get("reason") or "").strip()
     if reroute_context is not None:
         previous_palettes = list(
             reroute_context.get("previous_tool_palettes") or []
@@ -591,12 +633,37 @@ def _general_fallback_route(
                 for name in previous_palettes[-1]
                 if str(name).strip() in available_names
             )
-    selected_tools.extend(
-        name
-        for name in GENERAL_FALLBACK_TOOL_NAMES
-        if name in available_names
+    required_capabilities = list(
+        (reroute_context or {}).get("required_capabilities") or []
     )
+    capability_names = get_worker_tool_names_for_capabilities(
+        required_capabilities
+    )
+    if not (
+        reason in {"wrong_arguments", "tool_error"}
+        and not required_capabilities
+    ):
+        selected_tools.extend(
+            name
+            for name in (
+                capability_names
+                if required_capabilities
+                else GENERAL_FALLBACK_TOOL_NAMES
+            )
+            if name in available_names
+        )
     selected_tools = list(dict.fromkeys(selected_tools))
+    uncovered_capabilities = [
+        str(capability)
+        for capability in dict.fromkeys(required_capabilities)
+        if not set(selected_tools)
+        & get_worker_tool_names_for_capabilities([capability])
+    ]
+    if uncovered_capabilities:
+        raise ToolRoutingError(
+            "Fallback palette не покрывает capabilities: "
+            + ", ".join(uncovered_capabilities)
+        )
     if not selected_tools:
         raise ToolRoutingError(
             "Tool-router не выбрал маршрут, а общие fallback tools недоступны"
@@ -624,6 +691,8 @@ def select_chat_route(
         "unrestricted",
         "specialized_only",
         "general_fallback",
+        "capability_expansion",
+        "reroute_palette",
     }:
         raise ToolRoutingError(
             f"Tool-router получил неизвестный catalog_stage: {catalog_stage}"
@@ -639,6 +708,9 @@ def select_chat_route(
         "available_tools": _tool_catalog(
             available_tools,
             mark_general_fallback=(catalog_stage == "general_fallback"),
+            mark_capability_expansion=(
+                catalog_stage == "capability_expansion"
+            ),
         ),
         "catalog_stage": catalog_stage,
         "available_skills": _named_catalog(SKILL_CATALOG),

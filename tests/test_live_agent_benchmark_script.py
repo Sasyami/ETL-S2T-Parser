@@ -11,6 +11,7 @@ from scripts.run_live_agent_benchmark import (
     _comparison_report,
     _group_pytest_args,
     _parse_transcript,
+    _selected_scenario_count,
     _scenario_mark,
     build_parser,
 )
@@ -26,6 +27,10 @@ llm_calls: 3
 tokens: input=100, output=20, total=120, cache_read=10
 stage_tokens[supervisor]: calls=1, errors=0, input=20, output=5, total=25, cache_read=2, seconds=0.250
 stage_tokens[router]: calls=2, errors=0, input=80, output=15, total=95, cache_read=8, seconds=1.000
+reader_calls: 1
+tool_errors: 0
+reroutes: 0
+pipelines: agentic
 tools: run_sql
 
 ### Ответ — HTTP 500
@@ -34,6 +39,10 @@ llm_calls: 5
 tokens: input=200, output=30, total=230, cache_read=15
 stage_tokens[supervisor]: calls=1, errors=0, input=30, output=5, total=35, cache_read=3, seconds=0.500
 stage_tokens[upstream]: calls=4, errors=1, input=170, output=25, total=195, cache_read=12, seconds=2.000
+reader_calls: 2
+tool_errors: 1
+reroutes: 2
+pipelines: validation_protocol, agentic
 tools: run_sql, run_cypher
 <!-- LIVE_WARNING {"category":"presentation","scenario":"test_live_agent_path","message":"missing display"} -->
 <!-- LIVE_WARNING {"category":"efficiency","scenario":"test_live_agent_path","message":"llm_calls=14 exceeds budget=12"} -->
@@ -54,6 +63,10 @@ tools: run_sql, run_cypher
     assert result.agent_seconds == 4.0
     assert result.llm_calls == 8
     assert result.tool_calls == 3
+    assert result.reader_calls == 3
+    assert result.tool_errors == 1
+    assert result.reroutes == 2
+    assert result.pipelines == {"agentic": 2, "validation_protocol": 1}
     assert result.input_tokens == 300
     assert result.output_tokens == 50
     assert result.total_tokens == 350
@@ -122,6 +135,10 @@ def test_benchmark_report_marks_semantics_as_not_evaluated(tmp_path):
         semantic_statuses={"test_live_agent_path": "not_evaluated"},
         presentation_warnings=1,
         efficiency_warnings=1,
+        reader_calls=3,
+        tool_errors=1,
+        reroutes=2,
+        pipelines={"agentic": 1},
         warning_details=[
             {
                 "category": "presentation",
@@ -167,6 +184,12 @@ def test_benchmark_report_marks_semantics_as_not_evaluated(tmp_path):
     assert "LLM-as-judge" in text
     assert "сценарий в failed" in text
     assert "## Расход LLM по этапам" in text
+    assert "Accuracy" in text
+    assert "Reroutes" in text
+    assert "Tool errors" in text
+    assert "Reader calls" in text
+    assert "agentic×1" in text
+    assert "100.0%" in text
     assert "| multiagent | upstream | 2 | 0 | 100 | 20 | 120 | 10 | 1.250 |" in text
 
 
@@ -193,6 +216,21 @@ def test_benchmark_mark_uses_llm_judge_verdict():
     assert _scenario_mark(result, "judge-error") == "💥"
 
 
+def test_mode_result_accuracy_counts_every_selected_scenario():
+    result = ModeResult(
+        mode="multiagent",
+        return_code=1,
+        transcript_path=Path("run.md"),
+        junit_path=Path("run.xml"),
+        passed=3,
+        failed=1,
+        skipped=1,
+    )
+
+    assert result.selected_scenarios == 5
+    assert result.accuracy == pytest.approx(0.6)
+
+
 def test_live_group_filter_builds_stable_or_expression():
     assert _group_pytest_args([]) == []
     assert _group_pytest_args(["history", "catalog", "history"]) == [
@@ -212,6 +250,177 @@ def test_benchmark_parser_accepts_only_named_live_groups():
     with pytest.raises(SystemExit) as exc_info:
         parser.parse_args(["--group", "missing"])
     assert exc_info.value.code == 2
+
+
+def test_benchmark_parser_accepts_resolution_group():
+    args = build_parser().parse_args(["--group", "resolution"])
+
+    assert args.group == ["resolution"]
+    assert _group_pytest_args(args.group) == ["-m", "live_resolution"]
+
+
+def test_run_mode_applies_extra_environment_last(monkeypatch, tmp_path):
+    observed = {}
+
+    def fake_run(command, *, cwd, env, check):
+        observed.update({"command": command, "cwd": cwd, "env": env, "check": check})
+
+        class Completed:
+            returncode = 0
+
+        return Completed()
+
+    monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
+
+    benchmark._run_mode(
+        mode="multiagent",
+        provider="ollama",
+        model="base-model",
+        targets=[str(SCENARIO_FILE)],
+        pytest_args=[],
+        output_dir=tmp_path,
+        run_label="extra-env",
+        llm_judge=False,
+        extra_env={"OLLAMA_MODEL": "experiment-model", "E1_VARIANT": "capability"},
+    )
+
+    assert observed["env"]["OLLAMA_MODEL"] == "experiment-model"
+    assert observed["env"]["E1_VARIANT"] == "capability"
+
+
+def test_benchmark_ultra_budget_defaults_are_fail_closed(monkeypatch):
+    monkeypatch.delenv("GIGACHAT_ULTRA_TOKEN_FLOOR", raising=False)
+    monkeypatch.delenv(
+        "GIGACHAT_ULTRA_RESERVE_PER_SCENARIO",
+        raising=False,
+    )
+
+    args = build_parser().parse_args([])
+
+    assert args.ultra_token_floor == 15_000_000
+    assert args.ultra_reserve_per_scenario == 250_000
+
+
+def test_benchmark_loads_dotenv_before_resolving_ultra_model(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+    monkeypatch.delenv("GIGACHAT_MODEL", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
+
+    def fake_load_dotenv(path, *, override):
+        events.append(("dotenv", path, override))
+        # The runtime factory supports legacy MODEL as a GigaChat fallback;
+        # the parent guard must resolve the same effective model.
+        monkeypatch.setenv("MODEL", "GigaChat-3-Ultra")
+
+    def fake_guard(**kwargs):
+        events.append(("guard", kwargs["model"]))
+
+    def fake_run_mode(**kwargs):
+        events.append(("run", kwargs["model"]))
+        return ModeResult(
+            mode=kwargs["mode"],
+            return_code=0,
+            transcript_path=tmp_path / "run.md",
+            junit_path=tmp_path / "run.xml",
+        )
+
+    monkeypatch.setattr(benchmark, "load_dotenv", fake_load_dotenv)
+    monkeypatch.setattr(benchmark, "guard_ultra_budget", fake_guard)
+    monkeypatch.setattr(benchmark, "_run_mode", fake_run_mode)
+    monkeypatch.setattr(benchmark, "_comparison_report", lambda **kwargs: None)
+
+    assert benchmark.main(
+        [
+            "--provider",
+            "gigachat",
+            "--modes",
+            "multiagent",
+            "--scenario",
+            "test_live_agent_resolves_history_reference_into_task",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    ) == 0
+
+    assert events[0] == ("dotenv", benchmark.PROJECT_ROOT / ".env", False)
+    assert events[1:] == [
+        ("guard", "GigaChat-3-Ultra"),
+        ("run", "GigaChat-3-Ultra"),
+        ("guard", "GigaChat-3-Ultra"),
+    ]
+
+
+def test_benchmark_guards_ultra_judge_with_retry_reserve(
+    monkeypatch,
+    tmp_path,
+):
+    guards = []
+    monkeypatch.setenv("GIGACHAT_JUDGE_MODEL", "GigaChat-3-Ultra")
+
+    def fake_guard(**kwargs):
+        guards.append((kwargs["model"], kwargs["reserved_tokens"]))
+
+    monkeypatch.setattr(benchmark, "guard_ultra_budget", fake_guard)
+    monkeypatch.setattr(
+        benchmark,
+        "_run_mode",
+        lambda **kwargs: ModeResult(
+            mode=kwargs["mode"],
+            return_code=0,
+            transcript_path=tmp_path / "run.md",
+            junit_path=tmp_path / "run.xml",
+        ),
+    )
+    monkeypatch.setattr(benchmark, "_comparison_report", lambda **kwargs: None)
+
+    assert benchmark.main(
+        [
+            "--provider",
+            "gigachat",
+            "--model",
+            "GigaChat-2-Pro",
+            "--modes",
+            "multiagent",
+            "--scenario",
+            "test_live_agent_resolves_history_reference_into_task",
+            "--llm-judge",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    ) == 0
+
+    assert guards == [
+        ("GigaChat-3-Ultra", 6 * 250_000),
+        ("GigaChat-3-Ultra", 0),
+    ]
+
+
+def test_selected_scenario_count_supports_group_and_exact_target():
+    all_count = _selected_scenario_count([], [])
+    whole_file_count = _selected_scenario_count(
+        ["tests/test_live_agent_scenarios.py"],
+        [],
+    )
+    history_count = _selected_scenario_count([], ["history"])
+    one_count = _selected_scenario_count(
+        ["test_live_agent_resolves_history_reference_into_task"],
+        ["history"],
+    )
+    shared_resolution_count = _selected_scenario_count(
+        ["test_live_validation_and_agentic_use_same_resolution_semantics"],
+        ["resolution"],
+    )
+
+    assert whole_file_count == all_count
+    assert all_count >= history_count >= 1
+    assert one_count == 1
+    assert shared_resolution_count == 2
+
+    with pytest.raises(ValueError, match="supports only tests"):
+        _selected_scenario_count(["tests/test_worker.py"], [])
 
 
 def test_benchmark_main_combines_exact_scenario_with_group(
@@ -234,6 +443,8 @@ def test_benchmark_main_combines_exact_scenario_with_group(
 
     return_code = benchmark.main(
         [
+            "--provider",
+            "ollama",
             "--modes",
             "multiagent",
             "--scenario",
@@ -288,7 +499,7 @@ def test_every_live_scenario_belongs_to_exactly_one_semantic_group():
     for node in tree.body:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if not node.name.startswith("test_live_agent_"):
+        if not node.name.startswith("test_live_"):
             continue
         markers = [
             marker
@@ -300,3 +511,49 @@ def test_every_live_scenario_belongs_to_exactly_one_semantic_group():
     assert assignments
     assert all(len(markers) == 1 for markers in assignments.values()), assignments
     assert {markers[0] for markers in assignments.values()} == group_markers
+
+
+def test_improvement_plan_live_scenarios_are_named_and_grouped_exactly():
+    validation_names = {
+        "test_live_validation_protocol_standard_mode",
+        "test_live_validation_protocol_exhaustive_mode",
+        "test_live_validation_protocol_key_reconciliation",
+        "test_live_validation_protocol_field_level_reconciliation",
+        "test_live_validation_protocol_preload_constraint_checks",
+        "test_live_validation_protocol_expression_projection",
+        "test_live_validation_protocol_explicit_key_without_catalog_pk",
+        "test_live_validation_protocol_separate_load_scopes",
+        "test_live_validation_protocol_minimal_readers",
+        "test_live_validation_protocol_table_typo_resolution",
+        "test_live_validation_protocol_ambiguous_typo",
+        "test_live_validation_protocol_semantic_file_resolution",
+        "test_live_validation_protocol_without_file",
+        "test_live_validation_protocol_without_file_no_catalog_dependency",
+        "test_live_validation_protocol_source_catalog_dependency",
+    }
+    resolution_names = {
+        "test_live_agent_resolves_table_typo_before_exact_reader",
+        "test_live_agent_skips_resolution_for_exact_table",
+        "test_live_agent_resolves_partial_table_name",
+        "test_live_agent_resolves_semantic_table_mention",
+        "test_live_agent_does_not_guess_ambiguous_entity",
+        "test_live_entity_resolution_preserves_source_target_role",
+        "test_live_validation_and_agentic_use_same_resolution_semantics",
+    }
+    assert len(validation_names | resolution_names) == 22
+
+    tree = ast.parse(SCENARIO_FILE.read_text(encoding="utf-8"))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert validation_names | resolution_names <= set(functions)
+    for name in validation_names:
+        markers = {_pytest_marker_name(item) for item in functions[name].decorator_list}
+        assert "live_validation" in markers, name
+        assert "live_resolution" not in markers, name
+    for name in resolution_names:
+        markers = {_pytest_marker_name(item) for item in functions[name].decorator_list}
+        assert "live_resolution" in markers, name
+        assert "live_validation" not in markers, name

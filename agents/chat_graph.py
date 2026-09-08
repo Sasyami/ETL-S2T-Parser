@@ -45,6 +45,9 @@ from pydantic import (
 from .contracts import (
     EvidenceFact,
     Observation,
+    RerouteReason,
+    WorkerCapability,
+    WorkerStopReason,
     WORKER_PREVIOUS_RESULTS_MARKER,
     WORKER_STABLE_CONTEXT_MARKER,
     parse_worker_request,
@@ -163,17 +166,15 @@ _OBSERVER_PROMPT = """
 Сверь `user_request`, `prior_state`, текущий tool call и result. Не выполняй
 производный анализ: upstream сделает его.
 
-Выбери ровно один `status`:
-- `complete` — принятые результаты содержат все исходные данные для task;
-- `continue` — остаётся `gap`, который можно закрыть текущей палитрой tools;
-- `reroute` — остаётся `gap`, но ни один available tool его не закрывает.
+`status`: `complete` — все данные task приняты; `continue` — gap закрывается
+текущей палитрой; `reroute` — ни один available tool gap не закрывает.
 
 `gap` — одна консолидированная строка незакрытых требований. При `complete`
 верни JSON null. Не повторяй одну причину и её следствия.
 
-`accepted_tool_call_ids` — накопительный список подтверждающих task успешных
-results без ошибочных, нерелевантных и заменённых. В `facts` оставь только
-подтверждённые факты с `evidence_ids`; `limitations` — только ограничения.
+`accepted_tool_call_ids` накапливает только релевантные успешные results.
+`facts` содержат подтверждённые факты с `evidence_ids`, `limitations` —
+ограничения.
 Результат внутреннего `analyze_known_facts` не является новым evidence.
 
 Вызов не подтверждает task, если его аргументы потеряли или изменили объект,
@@ -190,6 +191,10 @@ transport references, не database/group IDs; не схлопывай отде�
 
 Выбирай `reroute`, только если ни один `available_tools` не закрывает gap. Если
 достаточно изменить аргументы текущего tool, выбери `continue`.
+
+При `reroute` заполни `reroute_reason` и только недостающие
+`required_capabilities` из schema. Исправление аргументов — `continue`, не
+reroute; обрезанный result — `truncated_result` с read/aggregate capability.
 
 {{PRIOR_STATE_RULE}}
 
@@ -613,6 +618,8 @@ def _compact_observation(observation: Observation) -> Observation:
                 :_OBSERVATION_LIMITATIONS_MAX_COUNT
             ]
         ],
+        reroute_reason=observation.reroute_reason,
+        required_capabilities=list(observation.required_capabilities),
     )
 
 
@@ -658,6 +665,13 @@ class WorkerRunResult(BaseModel):
         exclude=True,
     )
     gap: Optional[str] = Field(default=None, exclude=True)
+    stop_reason: Optional[WorkerStopReason] = Field(default=None, exclude=True)
+    reroute_reason: Optional[RerouteReason] = Field(default=None, exclude=True)
+    required_capabilities: List[WorkerCapability] = Field(
+        default_factory=list,
+        exclude=True,
+    )
+    unmet_requirements: List[str] = Field(default_factory=list, exclude=True)
     facts: List[EvidenceFact] = Field(default_factory=list, exclude=True)
     accepted_tool_call_ids: List[str] = Field(
         default_factory=list,
@@ -2108,26 +2122,6 @@ def run_worker_graph(
         if final_state.get("observations")
         else None
     )
-    if latest_observation is not None and latest_observation.status == "reroute":
-        reroute_gap = str(latest_observation.gap or "").strip()
-        logger.info(
-            "Worker graph finished with reroute request: gap=%s",
-            reroute_gap,
-        )
-        return WorkerRunResult(
-            answer=reroute_gap,
-            display_items=[],
-            cycle_history=list(final_state.get("cycle_history") or []),
-            status="reroute",
-            gap=reroute_gap,
-            facts=list(latest_observation.facts),
-            accepted_tool_call_ids=(
-                list(latest_observation.accepted_tool_call_ids)
-                if latest_observation is not None
-                else []
-            ),
-        )
-
     accepted_tool_call_ids = (
         list(latest_observation.accepted_tool_call_ids)
         if latest_observation is not None
@@ -2171,8 +2165,60 @@ def run_worker_graph(
             )
         )
 
+    if latest_observation is not None and latest_observation.status == "reroute":
+        reroute_gap = str(latest_observation.gap or "").strip()
+        logger.info(
+            "Worker graph finished with reroute request: gap=%s",
+            reroute_gap,
+        )
+        return WorkerRunResult(
+            answer=reroute_gap,
+            display_items=display_items,
+            cycle_history=list(final_state.get("cycle_history") or []),
+            status="reroute",
+            gap=reroute_gap,
+            stop_reason=(
+                "unresolved_entity"
+                if latest_observation.reroute_reason == "unresolved_entity"
+                else "tool_error"
+                if latest_observation.reroute_reason == "tool_error"
+                else "truncated_source"
+                if latest_observation.reroute_reason == "truncated_result"
+                else "wrong_arguments"
+                if latest_observation.reroute_reason == "wrong_arguments"
+                else "missing_capability"
+            ),
+            reroute_reason=latest_observation.reroute_reason,
+            required_capabilities=list(
+                latest_observation.required_capabilities
+            ),
+            unmet_requirements=[reroute_gap] if reroute_gap else [],
+            facts=list(latest_observation.facts),
+            accepted_tool_call_ids=accepted_tool_call_ids,
+        )
+
     terminal_gap = str(final_state.get("terminal_gap") or "").strip()
     if terminal_gap:
+        if accepted_tool_call_ids:
+            # A later observer-format failure must not erase evidence that an
+            # earlier valid cumulative observation already accepted.  Return
+            # the normal internal result shape with a typed gap so the public
+            # worker can expose a partial outcome and retain those artifacts.
+            return WorkerRunResult(
+                answer=terminal_gap,
+                display_items=display_items,
+                cycle_history=list(final_state.get("cycle_history") or []),
+                status="complete",
+                gap=terminal_gap,
+                stop_reason="observer_error",
+                unmet_requirements=[terminal_gap],
+                facts=(
+                    list(latest_observation.facts)
+                    if latest_observation is not None
+                    else []
+                ),
+                accepted_tool_call_ids=accepted_tool_call_ids,
+            )
         raise WorkerResponseError(terminal_gap)
 
     planner_message = final_state.get("planner_message")
@@ -2210,6 +2256,8 @@ def run_worker_graph(
         cycle_history=list(final_state.get("cycle_history") or []),
         status="complete",
         gap=gap,
+        stop_reason="budget_exhausted" if gap else None,
+        unmet_requirements=[str(gap)] if gap else [],
         facts=(
             list(latest_observation.facts)
             if latest_observation is not None

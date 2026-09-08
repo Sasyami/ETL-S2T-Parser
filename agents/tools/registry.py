@@ -5,6 +5,8 @@ from typing import Dict, Iterable, Tuple
 
 from langchain_core.tools import BaseTool
 
+from ..contracts import WorkerCapability
+
 from .additional_objects import list_additional_objects, search_additional_objects
 from .files import (
     get_file_description,
@@ -24,6 +26,7 @@ from .columns import (
 )
 from .planning import show_plan
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
+from .entity_resolution import resolve_entities
 from .neo4j import (
     run_cypher,
     trace_neo4j_lineage,
@@ -72,6 +75,7 @@ READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     search_excel_values,
     get_excel_row,
     semantic_search_descriptions,
+    resolve_entities,
     list_additional_objects,
     search_additional_objects,
     list_column_catalog,
@@ -155,14 +159,15 @@ _REGISTERED_READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
 )
 
 # Worker routing starts with one unambiguous tool per common read operation.
-# Broad query tools and compatibility aliases remain executable, but are
-# exposed to the router only after the second observer-requested reroute.
+# Broad query tools and compatibility aliases remain executable and are added
+# to the router only for an explicitly requested missing capability.
 _WORKER_SPECIALIZED_TOOL_NAMES = frozenset(
     {
         "show_plan",
         "search_excel_values",
         "get_excel_row",
         "semantic_search_descriptions",
+        "resolve_entities",
         "list_additional_objects",
         "search_additional_objects",
         "search_column_catalog",
@@ -200,6 +205,56 @@ WORKER_GENERAL_FALLBACK_TOOL_NAMES = frozenset(
     for tool in _REGISTERED_READ_ONLY_TOOLS
     if tool.name not in _WORKER_SPECIALIZED_TOOL_NAMES
 )
+WORKER_CAPABILITY_TOOL_NAMES: Dict[WorkerCapability, frozenset[str]] = {
+    "sql_read": frozenset({"run_sql"}),
+    "saved_result_read": frozenset({"query_saved_result"}),
+    "saved_result_aggregate": frozenset({"query_saved_result"}),
+    "entity_resolution": frozenset({"resolve_entities"}),
+    "semantic_search": frozenset({"semantic_search_descriptions"}),
+    "s2t_search": frozenset({"search_s2t_transformations"}),
+    "s2t_read": frozenset(
+        {
+            "read_s2t_source_to_target",
+            "read_s2t_by_source_table",
+            "read_s2t_by_target_table",
+            "read_s2t_mapping",
+            "list_s2t_occurrences",
+        }
+    ),
+    "column_catalog_read": frozenset(
+        {
+            "get_source_target_column_pair",
+            "list_column_metadata",
+            "list_source_column_catalog",
+            "list_target_column_catalog",
+            "list_column_catalog",
+            "filter_column_catalog",
+            "search_column_catalog",
+        }
+    ),
+    "graph_read": frozenset(
+        {
+            "run_cypher",
+            "trace_neo4j_lineage",
+            "trace_neo4j_table_lineage",
+            "trace_neo4j_table_path",
+            "trace_transformation_path",
+        }
+    ),
+    "excel_read": frozenset(
+        {
+            "search_excel_values",
+            "get_excel_row",
+            "list_files",
+            "resolve_file",
+            "get_file_description",
+            "list_sheets",
+            "list_file_sheet_headers",
+            "list_columns",
+        }
+    ),
+    "general_read": WORKER_GENERAL_FALLBACK_TOOL_NAMES,
+}
 _WORKER_SPECIALIZED_TOOLS: Tuple[BaseTool, ...] = tuple(
     tool
     for tool in _REGISTERED_READ_ONLY_TOOLS
@@ -234,17 +289,39 @@ def get_tools() -> Tuple[BaseTool, ...]:
     )
 
 
-def get_worker_tools(*, include_general: bool = False) -> Tuple[BaseTool, ...]:
-    """Return the staged read-only catalog used by the worker router.
+def get_worker_tool_names_for_capabilities(
+    capabilities: Iterable[WorkerCapability],
+) -> frozenset[str]:
+    """Return the exact registered tool names for requested capabilities."""
+    names: set[str] = set()
+    for capability in dict.fromkeys(capabilities):
+        names.update(WORKER_CAPABILITY_TOOL_NAMES.get(capability, ()))
+    return frozenset(names)
 
-    The initial route and first reroute receive only specialized contracts.
-    The worker sets ``include_general`` after the second reroute to expose the
-    full registry, including broad query tools and compatibility aliases.
+
+def get_worker_tools(
+    *,
+    include_general: bool = False,
+    required_capabilities: Iterable[WorkerCapability] = (),
+) -> Tuple[BaseTool, ...]:
+    """Return the initial or explicitly capability-expanded worker catalog.
+
+    ``include_general`` remains as a compatibility/debug switch. Runtime
+    rerouting uses ``required_capabilities`` and never opens general tools merely
+    because an attempt counter reached a threshold.
     """
-    return (
-        _REGISTERED_READ_ONLY_TOOLS
-        if include_general
-        else _WORKER_SPECIALIZED_TOOLS
+    if include_general:
+        return _REGISTERED_READ_ONLY_TOOLS
+    additional_names = get_worker_tool_names_for_capabilities(
+        required_capabilities
+    )
+    if not additional_names:
+        return _WORKER_SPECIALIZED_TOOLS
+    selected_names = set(_WORKER_SPECIALIZED_TOOL_NAMES) | set(additional_names)
+    return tuple(
+        tool
+        for tool in _REGISTERED_READ_ONLY_TOOLS
+        if tool.name in selected_names
     )
 
 

@@ -17,6 +17,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool
 
 from ..contracts import (
+    CandidateSet,
     PreviousResultReference,
     PreviousResultSchema,
     SavedResultColumn,
@@ -198,7 +199,7 @@ def _tabular_payload(payload: Any) -> Optional[Dict[str, Any]]:
         return None
 
     source_total: Optional[int] = None
-    for key in ("total", "total_matches", "row_count"):
+    for key in ("total", "total_matches", "total_candidates", "row_count"):
         value = metadata.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             source_total = value
@@ -320,11 +321,42 @@ class SavedResultStore:
             }
         content = payload["content"]
         decoded = _decode_tool_content(content)
-        return {
+        result = {
             "result_id": clean_id,
             "source_tool": payload["source_tool"],
             "result": decoded if decoded is not None else content,
         }
+        if (
+            payload["source_tool"] == "semantic_search_descriptions"
+            and isinstance(decoded, Mapping)
+            and isinstance(decoded.get("rows"), list)
+        ):
+            rows = [
+                dict(item)
+                for item in decoded["rows"]
+                if isinstance(item, Mapping)
+            ]
+            truncated = bool(decoded.get("truncated"))
+            total_candidates = decoded.get("total_candidates")
+            if (
+                isinstance(total_candidates, int)
+                and not isinstance(total_candidates, bool)
+                and total_candidates > len(rows)
+            ):
+                truncated = True
+            candidate_set = CandidateSet(
+                candidates=rows,
+                coverage="truncated" if truncated else "complete",
+                source_result_id=clean_id,
+            )
+            # Candidate rows have one canonical typed representation. Keeping
+            # them in both ``result.rows`` and ``candidate_set.candidates``
+            # doubles a potentially large planner prompt without adding facts.
+            result["result"] = {
+                key: value for key, value in decoded.items() if key != "rows"
+            }
+            result["candidate_set"] = candidate_set.model_dump(mode="json")
+        return result
 
     def descriptors_for_result_ids(
         self,
@@ -664,7 +696,10 @@ def read_previous_result(
     """Прочитать один или несколько результатов прошлых workers по ID.
 
     Используй только точные ID из блока `previous_results`, когда краткого
-    description недостаточно для текущей task. Если нужны несколько результатов,
+    description недостаточно для текущей task. Semantic-result дополнительно
+    возвращается как typed `candidate_set`: сохрани все строки и роли, затем
+    передай различающиеся технические имена одним batch-вызовом следующего
+    search tool. Не перебирай кандидатов по одному. Если нужны несколько результатов,
     передай их одним вызовом в `result_ids`. Инструмент не читает новые внешние
     данные и лениво возвращает только принятые tool results текущего запуска.
 

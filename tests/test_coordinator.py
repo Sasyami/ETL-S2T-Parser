@@ -1,6 +1,6 @@
 import json
 from contextlib import nullcontext
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -10,7 +10,6 @@ from agents.contracts import (
     EvidenceFact,
     PreviousResultReference,
     WORKER_PREVIOUS_RESULTS_MARKER,
-    WORKER_STABLE_CONTEXT_MARKER,
     WorkerOutcome,
     WorkerPlan,
     parse_worker_request,
@@ -69,6 +68,9 @@ def _artifact(
 def _outcome(
     summary,
     *,
+    status="complete",
+    stop_reason=None,
+    unmet_requirements=(),
     evidence=(),
     datasets=(),
     previous_results=(),
@@ -85,6 +87,9 @@ def _outcome(
         ]
     return WorkerOutcome(
         summary=summary,
+        status=status,
+        stop_reason=stop_reason,
+        unmet_requirements=list(unmet_requirements),
         facts=list(fact_items or []),
         evidence=evidence_items,
         datasets=list(datasets),
@@ -236,14 +241,23 @@ def test_coordinator_graph_routes_tasks_downstream_and_one_result_upstream():
     assert ("upstream", "__end__") in edges
 
 
-def test_operation_skill_is_selected_once_and_applied_by_stage():
+def test_operation_skill_is_selected_once_and_applied_by_stage(monkeypatch):
     from agents.coordinator import coordinator_chat
+    from agents.tools.context import (
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    )
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "0")
 
     responses = _responses(answer="Риск оценён.", plan_task="Прочитай правило.")
     responses["select_operation_skills"] = [
         _tool_message(
             "select_operation_skills",
-            {"skills": ["Анализ SQL-рисков"]},
+            {
+                "pipeline": "agentic",
+                "skills": ["Анализ SQL-рисков"],
+                "sql_risk_aspects": [],
+            },
             "operation-skills-risk",
         )
     ]
@@ -311,58 +325,221 @@ def test_operation_skill_is_selected_once_and_applied_by_stage():
     assert "Нулевой mapping подтверждает отсутствие" not in answer_system
 
 
-def test_operation_router_can_launch_typed_validation_pipeline():
+def test_sql_risk_router_propagates_only_requested_aspect(monkeypatch):
+    from agents.coordinator import (
+        OperationSkillSelection,
+        _OPERATION_SKILL_PROMPT,
+        _operation_skill_prompt,
+        _operation_skill_tool_schema,
+        coordinator_chat,
+    )
+    from agents.tools.context import (
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    )
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+
+    responses = _responses(answer="JOIN может размножить строки.")
+    responses["select_operation_skills"] = [
+        _tool_message(
+            "select_operation_skills",
+            {
+                "pipeline": "agentic",
+                "skills": ["Анализ SQL-рисков"],
+                "sql_risk_aspects": ["cardinality"],
+            },
+            "operation-cardinality",
+        )
+    ]
+    model = _CoordinatorModel(responses)
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            return_value=_outcome("Mapping прочитан."),
+        ) as worker,
+    ):
+        result = coordinator_chat("Может ли JOIN размножить строки?")
+
+    assert result.answer == "JOIN может размножить строки."
+    operation_schema = _operation_skill_tool_schema()["function"][
+        "parameters"
+    ]
+    assert operation_schema["properties"]["sql_risk_aspects"]["items"][
+        "enum"
+    ] == [
+        "row_filtering",
+        "cardinality",
+        "constraint_rejection",
+        "value_changes",
+        "write_semantics",
+    ]
+    assert operation_schema["properties"]["sql_risk_aspects"][
+        "maxItems"
+    ] == 5
+    assert "sql_risk_aspects=[\"cardinality\"]" in _OPERATION_SKILL_PROMPT
+    assert _operation_skill_prompt() == _OPERATION_SKILL_PROMPT
+    for forbidden_aspect in (
+        "row_filtering",
+        "constraint_rejection",
+        "value_changes",
+        "write_semantics",
+    ):
+        assert forbidden_aspect not in worker.call_args.args[0]
+
+    worker_parts = parse_worker_request(worker.call_args.args[0])
+    assert "`cardinality`" in worker_parts.operation_execution_context
+    assert "`cardinality`" in worker_parts.operation_completeness_context
+    for tool_name in (
+        "submit_worker_plan",
+        "submit_upstream_data_decision",
+        "submit_upstream_answer",
+    ):
+        system_prompt = next(
+            messages[0].content
+            for name, messages in model.messages
+            if name == tool_name
+        )
+        assert "`cardinality`" in system_prompt
+        assert "`row_filtering`" not in system_prompt
+
+    with pytest.raises(ValueError, match="sql_risk_aspects require"):
+        OperationSkillSelection(
+            pipeline="agentic",
+            skills=[],
+            sql_risk_aspects=["cardinality"],
+        )
+    with pytest.raises(ValueError, match="requires at least one"):
+        OperationSkillSelection(
+            pipeline="agentic",
+            skills=["Анализ SQL-рисков"],
+            sql_risk_aspects=[],
+        )
+
+
+def test_sql_risk_aspect_experiment_can_load_legacy_full_profile(monkeypatch):
+    from agents.coordinator import (
+        OperationSkillSelection,
+        _operation_skill_prompt,
+        _operation_skill_repair_prompt,
+        _operation_skill_tool_schema,
+    )
+    from agents.tools.context import (
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+        load_operation_skills,
+    )
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "0")
+    selection = OperationSkillSelection(
+        pipeline="agentic",
+        skills=["Анализ SQL-рисков"],
+        sql_risk_aspects=["cardinality"],
+    )
+    context = load_operation_skills(
+        selection.skills,
+        stage="upstream",
+        sql_risk_aspects=selection.sql_risk_aspects,
+    )
+
+    assert selection.sql_risk_aspects == []
+    assert _operation_skill_tool_schema()["function"]["parameters"][
+        "properties"
+    ]["sql_risk_aspects"]["maxItems"] == 0
+    assert "всегда верни\n`sql_risk_aspects=[]`" in _operation_skill_prompt()
+    assert "всегда верни `sql_risk_aspects=[]`" in (
+        _operation_skill_repair_prompt()
+    )
+    assert "sql_risk_aspects=[\"cardinality\"]" not in (
+        _operation_skill_prompt()
+    )
+    assert "JOIN размножает строку" in context
+    assert "rejection" in context
+    assert "write semantics" in context
+
+
+def test_operation_router_repairs_removed_s2t_pipeline_to_agentic():
     from agents.coordinator import coordinator_chat
 
-    task = (
-        "Для file_id=41 по saved_source → saved_target оцени риск потери "
-        "строк, риск дубликатов и согласованность только по сохранённому S2T."
+    responses = _responses(
+        answer="Mapping прочитан.",
+        plan_task="Прочитай сохранённый mapping.",
     )
+    responses["select_operation_skills"] = [
+        _tool_message(
+            "select_operation_skills",
+            {
+                "pipeline": "s2t_analysis",
+                "skills": ["Проектирование проверки"],
+                "sql_risk_aspects": [],
+            },
+            "removed-route",
+        ),
+        _tool_message(
+            "select_operation_skills",
+            {
+                "pipeline": "agentic",
+                "skills": [],
+                "sql_risk_aspects": [],
+            },
+            "repaired-route",
+        ),
+    ]
+    model = _CoordinatorModel(responses)
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            return_value=_outcome("Mapping прочитан."),
+        ) as worker,
+    ):
+        result = coordinator_chat("Покажи сохранённый mapping.")
+
+    assert result.answer == "Mapping прочитан."
+    worker.assert_called_once()
+    invoked = [name for name, _ in model.messages]
+    assert invoked == [
+        "select_operation_skills",
+        "select_operation_skills",
+        "submit_worker_plan",
+        "submit_upstream_data_decision",
+        "submit_upstream_answer",
+    ]
+    repair_messages = model.messages[1][1]
+    assert any(
+        "исправленный call" in str(message.content)
+        and "validation_protocol" in str(message.content)
+        for message in repair_messages
+    )
+
+
+def test_operation_router_never_silently_falls_back_after_failed_repair():
+    from agents.coordinator import CoordinatorResponseError, coordinator_chat
+
+    invalid_route = {
+        "pipeline": "s2t_analysis",
+        "skills": [],
+        "sql_risk_aspects": [],
+    }
     model = _CoordinatorModel(
         {
             "select_operation_skills": [
                 _tool_message(
                     "select_operation_skills",
-                    {
-                        "pipeline": "s2t_analysis",
-                        "skills": ["Проектирование проверки"],
-                    },
-                    "operation-validation",
-                )
-            ],
-            "submit_s2t_analysis_contract": [
+                    invalid_route,
+                    "removed-route-1",
+                ),
                 _tool_message(
-                    "submit_s2t_analysis_contract",
-                    {
-                        "file_id": 41,
-                        "source_tables": ["saved_source"],
-                        "target_tables": ["saved_target"],
-                        "requested_analyses": [
-                            "row_loss_risk",
-                            "duplicate_risk",
-                            "transformation_consistency",
-                        ],
-                    },
-                    "validation-contract",
-                )
-            ],
-            "submit_s2t_analysis": [
-                _tool_message(
-                    "submit_s2t_analysis",
-                    {
-                        "analyses": [
-                            {
-                                "target_table": "saved_target",
-                                "kind": "transformation_consistency",
-                                "conclusion": "S2T-источники согласованы.",
-                                "evidence": ["Роли совпадают"],
-                                "limitations": [],
-                            }
-                        ]
-                    },
-                    "s2t-analysis",
-                )
-            ],
+                    "select_operation_skills",
+                    invalid_route,
+                    "removed-route-2",
+                ),
+            ]
         }
     )
     model_patch, callback_patch, trace_patch = _patches(model)
@@ -370,60 +547,25 @@ def test_operation_router_can_launch_typed_validation_pipeline():
         model_patch,
         callback_patch,
         trace_patch,
-        patch(
-            "agents.coordinator.read_validation_protocol_inputs",
-            return_value=[],
-        ) as readers,
-        patch(
-            "agents.coordinator.build_s2t_analysis_display_payloads",
-            return_value=[
-                {
-                    "name": "read_s2t_by_target_table",
-                    "content": '{"rows":[]}',
-                }
-            ],
-        ) as build_displays,
-        patch(
-            "agents.coordinator.register_worker_display_items",
-            return_value=["display-analysis"],
-        ) as register_displays,
         patch("agents.coordinator.worker_chat") as worker,
+        pytest.raises(CoordinatorResponseError),
     ):
-        result = coordinator_chat(task)
+        coordinator_chat("Проанализируй сохранённый S2T.")
 
-    assert "sources [`saved_source`] → targets [`saved_target`]" in result.answer
-    assert "S2T-источники согласованы" in result.answer
-    assert "определить нельзя" in result.answer
-    assert "Физические данные логических ETL-таблиц не запрашивались" in (
-        result.answer
-    )
-    assert result.display_refs == ["display-analysis"]
-    readers.assert_called_once()
-    build_displays.assert_called_once_with([])
-    register_displays.assert_called_once()
-    contract = readers.call_args.args[0]
-    assert contract.model_dump() == {
-        "file_id": 41,
-        "filename": None,
-        "source_tables": ["saved_source"],
-        "target_tables": ["saved_target"],
-        "requested_analyses": [
-            "row_loss_risk",
-            "duplicate_risk",
-            "transformation_consistency",
-        ],
-    }
     worker.assert_not_called()
-    invoked = [name for name, _ in model.messages]
-    assert invoked == [
+    assert [name for name, _ in model.messages] == [
         "select_operation_skills",
-        "submit_s2t_analysis_contract",
-        "submit_s2t_analysis",
+        "select_operation_skills",
     ]
 
 
 def test_operation_router_can_compile_external_sql_test_protocol():
     from agents.coordinator import coordinator_chat
+    from agents.test_protocol import (
+        ResolvedTestProtocolContract,
+        TestProtocolLoad,
+    )
+    from agents.test_protocol_resolution import TestProtocolResolutionResult
 
     task = (
         "Для file_id=41 по saved_source → saved_target составь тест-протокол "
@@ -447,11 +589,13 @@ def test_operation_router_can_compile_external_sql_test_protocol():
                     "submit_validation_protocol_contract",
                     {
                         "file_id": 41,
+                        "mode": "explicit",
+                        "requested_checks": [],
                         "loads": [
                             {
-                                "sources": ["saved_source"],
-                                "target": "saved_target",
-                                "checks": [
+                                "source_mentions": ["saved_source"],
+                                "target_mention": "saved_target",
+                                "requested_checks": [
                                     "row_count",
                                     "key_uniqueness",
                                     "required_null_rate",
@@ -471,9 +615,33 @@ def test_operation_router_can_compile_external_sql_test_protocol():
         callback_patch,
         trace_patch,
         patch(
-            "agents.coordinator.read_validation_protocol_inputs",
+            "agents.coordinator.resolve_test_protocol_contract",
+            return_value=TestProtocolResolutionResult(
+                status="resolved",
+                contract=ResolvedTestProtocolContract(
+                    file_id=41,
+                    mode="explicit",
+                    loads=[
+                        TestProtocolLoad(
+                            sources=["saved_source"],
+                            target="saved_target",
+                            checks=[
+                                "row_count",
+                                "key_uniqueness",
+                                "required_null_rate",
+                                "transformation_correctness",
+                            ],
+                        )
+                    ],
+                ),
+                exact_bypass_count=2,
+            ),
+        ),
+        patch(
+            "agents.coordinator.read_test_protocol_inputs",
             return_value=[],
         ) as readers,
+        patch("agents.coordinator.record_validation_protocol") as record_protocol,
         patch("agents.coordinator.worker_chat") as worker,
     ):
         result = coordinator_chat(task)
@@ -482,10 +650,251 @@ def test_operation_router_can_compile_external_sql_test_protocol():
     assert result.answer.count("SQL-шаблон:") == 4
     assert "фактические метрики не вычислялись" in result.answer
     readers.assert_called_once()
+    trace = record_protocol.call_args.args[0]
+    assert trace["mode"] == "explicit"
+    assert trace["status"] == "unavailable"
+    assert trace["silent_fallback"] is False
+    assert trace["exact_bypass_count"] == 2
+    assert trace["reader_calls"] == []
     worker.assert_not_called()
     assert [name for name, _ in model.messages] == [
         "select_operation_skills",
         "submit_validation_protocol_contract",
+    ]
+
+
+def test_validation_reader_exception_returns_structured_protocol_without_fallback():
+    from agents.coordinator import coordinator_chat
+    from agents.test_protocol import (
+        ResolvedTestProtocolContract,
+        TestProtocolLoad,
+    )
+    from agents.test_protocol_resolution import TestProtocolResolutionResult
+
+    task = (
+        "Составь explicit тест-протокол saved_source → "
+        "saved_target только с check=row_count."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "validation_protocol",
+                        "skills": [],
+                        "sql_risk_aspects": [],
+                    },
+                    "operation-validation",
+                )
+            ],
+            "submit_validation_protocol_contract": [
+                _tool_message(
+                    "submit_validation_protocol_contract",
+                    {
+                        "mode": "explicit",
+                        "requested_checks": [],
+                        "loads": [
+                            {
+                                "source_mentions": ["saved_source"],
+                                "target_mention": "saved_target",
+                                "requested_checks": ["row_count"],
+                            }
+                        ],
+                    },
+                    "protocol-contract",
+                )
+            ],
+        }
+    )
+    resolution = TestProtocolResolutionResult(
+        status="resolved",
+        contract=ResolvedTestProtocolContract(
+            mode="explicit",
+            loads=[
+                TestProtocolLoad(
+                    sources=["saved_source"],
+                    target="saved_target",
+                    checks=["row_count"],
+                )
+            ],
+        ),
+        exact_bypass_count=2,
+    )
+    raising_reader = MagicMock()
+    raising_reader.invoke.side_effect = RuntimeError(
+        "database is temporarily unavailable"
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.resolve_test_protocol_contract",
+            return_value=resolution,
+        ),
+        patch(
+            "agents.validation_protocol.read_s2t_source_to_target",
+            raising_reader,
+        ),
+        patch("agents.coordinator.record_validation_protocol") as record_protocol,
+        patch("agents.coordinator.worker_chat") as worker,
+    ):
+        result = coordinator_chat(task)
+
+    assert "статус: unavailable" in result.answer
+    assert "SQL-шаблон не сформирован" in result.answer
+    assert result.display_refs == []
+    worker.assert_not_called()
+    assert "submit_worker_plan" not in [name for name, _ in model.messages]
+    trace = record_protocol.call_args.args[0]
+    assert trace["status"] == "unavailable"
+    assert trace["silent_fallback"] is False
+    assert trace["reader_calls"] == [
+        {
+            "kind": "reader_issue",
+            "tool_name": "read_s2t_source_to_target",
+            "args": {
+                "source_table": "saved_source",
+                "target_table": "saved_target",
+            },
+            "error": "RuntimeError: database is temporarily unavailable",
+        },
+        {
+            "kind": "s2t_pair",
+            "tool_name": "read_s2t_source_to_target",
+            "args": {
+                "source_table": "saved_source",
+                "target_table": "saved_target",
+            },
+        },
+    ]
+
+
+def test_invalid_validation_contract_returns_structured_state_without_fallback():
+    from agents.coordinator import coordinator_chat
+
+    task = "Составь тест-протокол для source → target."
+    invalid = {
+        "mode": "explicit",
+        "requested_checks": ["row_count"],
+        "loads": [],
+    }
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {"pipeline": "validation_protocol", "skills": []},
+                    "operation-validation",
+                )
+            ],
+            "submit_validation_protocol_contract": [
+                _tool_message(
+                    "submit_validation_protocol_contract",
+                    invalid,
+                    "invalid-1",
+                ),
+                _tool_message(
+                    "submit_validation_protocol_contract",
+                    invalid,
+                    "invalid-2",
+                ),
+            ],
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.coordinator.record_validation_protocol") as record_protocol,
+        patch("agents.coordinator.worker_chat") as worker,
+    ):
+        result = coordinator_chat(task)
+
+    assert "Статус: missing_parameter" in result.answer
+    assert result.display_refs == []
+    worker.assert_not_called()
+    assert "submit_worker_plan" not in [name for name, _ in model.messages]
+    trace = record_protocol.call_args.args[0]
+    assert trace["status"] == "missing_parameter"
+    assert trace["silent_fallback"] is False
+    assert trace["targets"] == []
+
+
+def test_ambiguous_validation_entity_stops_before_readers_and_workers():
+    from agents.coordinator import coordinator_chat
+    from agents.test_protocol import ProtocolIssue
+    from agents.test_protocol_resolution import TestProtocolResolutionResult
+
+    task = "Для stage.order_ → mart.orders составь стандартный тест-протокол."
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {"pipeline": "validation_protocol", "skills": []},
+                    "operation-validation",
+                )
+            ],
+            "submit_validation_protocol_contract": [
+                _tool_message(
+                    "submit_validation_protocol_contract",
+                    {
+                        "mode": "standard",
+                        "requested_checks": [],
+                        "loads": [
+                            {
+                                "source_mentions": ["stage.order_"],
+                                "target_mention": "mart.orders",
+                                "requested_checks": [],
+                            }
+                        ],
+                    },
+                    "protocol-contract",
+                )
+            ],
+        }
+    )
+    resolution = TestProtocolResolutionResult(
+        status="ambiguous_entity",
+        issues=[
+            ProtocolIssue(
+                code="ambiguous_entity",
+                message="Найдено несколько кандидатов.",
+                load_index=1,
+                candidates=["stage.order_items", "stage.order_lines"],
+            )
+        ],
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.resolve_test_protocol_contract",
+            return_value=resolution,
+        ),
+        patch("agents.coordinator.read_test_protocol_inputs") as readers,
+        patch("agents.coordinator.record_validation_protocol") as record_protocol,
+        patch("agents.coordinator.worker_chat") as worker,
+    ):
+        result = coordinator_chat(task)
+
+    assert "Статус: ambiguous_entity" in result.answer
+    assert "stage.order_items" in result.answer
+    assert "stage.order_lines" in result.answer
+    readers.assert_not_called()
+    worker.assert_not_called()
+    trace = record_protocol.call_args.args[0]
+    assert trace["status"] == "ambiguous_entity"
+    assert trace["silent_fallback"] is False
+    assert trace["issues"][0]["candidates"] == [
+        "stage.order_items",
+        "stage.order_lines",
     ]
 
 
@@ -585,6 +994,18 @@ def test_plan_requires_only_self_contained_task():
                 },
                 {
                     "task": "Второй шаг.",
+                    "constraints": ["Только подтверждённые строки"],
+                    "entity": {
+                        "role": "source",
+                        "table": "src_orders",
+                        "field": "order_id",
+                    },
+                    "scope": {
+                        "file_id": 7,
+                        "filters": {"active": True},
+                    },
+                    "coverage": "all_matches",
+                    "dependencies": [1],
                 },
             ]
         }
@@ -593,6 +1014,13 @@ def test_plan_requires_only_self_contained_task():
         "Первый шаг.",
         "Второй шаг.",
     ]
+    assert plan.steps[1].constraints == ["Только подтверждённые строки"]
+    assert plan.steps[1].entity is not None
+    assert plan.steps[1].entity.role == "source"
+    assert plan.steps[1].scope is not None
+    assert plan.steps[1].scope.filters == {"active": True}
+    assert plan.steps[1].coverage == "all_matches"
+    assert plan.steps[1].dependencies == [1]
 
     with pytest.raises(ValueError, match="needs_from_previous"):
         WorkerPlan.model_validate(
@@ -632,6 +1060,15 @@ def test_plan_requires_only_self_contained_task():
 
     with pytest.raises(ValueError, match="task"):
         WorkerPlan.model_validate({"steps": [{}]})
+
+    with pytest.raises(ValueError, match="earlier 1-based steps"):
+        WorkerPlan.model_validate(
+            {
+                "steps": [
+                    {"task": "Первый шаг.", "dependencies": [1]},
+                ]
+            }
+        )
 
 
 def test_contracts_keep_runtime_refs_out_of_llm_payloads():
@@ -683,6 +1120,9 @@ def test_contracts_keep_runtime_refs_out_of_llm_payloads():
     assert "dataset_ref" not in json.dumps(upstream)
     assert "display_ref" not in json.dumps(upstream)
     assert upstream == {
+        "status": "complete",
+        "stop_reason": None,
+        "unmet_requirements": [],
         "evidence": [
             {
                 "evidence_id": "evidence-first",
@@ -707,6 +1147,29 @@ def test_contracts_keep_runtime_refs_out_of_llm_payloads():
     ).upstream_payload()
     assert nondisplayable["evidence"][0]["displayable"] is False
     assert "display_id" not in nondisplayable["evidence"][0]
+
+    failed = WorkerOutcome(
+        summary="Имя не разрешено.",
+        status="failed",
+        stop_reason="unresolved_entity",
+        unmet_requirements=["Нужно каноническое имя target_table."],
+    )
+    assert failed.upstream_payload() == {
+        "status": "failed",
+        "stop_reason": "unresolved_entity",
+        "unmet_requirements": [
+            "Нужно каноническое имя target_table."
+        ],
+        "evidence": [],
+    }
+    with pytest.raises(ValueError, match="requires stop_reason"):
+        WorkerOutcome(summary="Не завершено.", status="partial")
+    with pytest.raises(ValueError, match="cannot have unmet_requirements"):
+        WorkerOutcome(
+            summary="Ошибочно complete.",
+            status="complete",
+            unmet_requirements=["Факт не получен."],
+        )
 
     with pytest.raises(ValueError, match="unknown evidence_id"):
         _outcome(
@@ -787,6 +1250,21 @@ def test_coordinator_prompts_and_schemas_match_contracts():
         "validation_protocol",
     ]
     assert "s2t_analysis" not in _OPERATION_SKILL_PROMPT
+    operation_parameters = _operation_skill_tool_schema()["function"][
+        "parameters"
+    ]
+    assert "sql_risk_aspects" in operation_parameters["required"]
+    assert set(
+        operation_parameters["properties"]["sql_risk_aspects"]["items"][
+            "enum"
+        ]
+    ) == {
+        "row_filtering",
+        "cardinality",
+        "constraint_rejection",
+        "value_changes",
+        "write_semantics",
+    }
     assert (
         "row_format=named_records_with_dictionary_refs"
         in _UPSTREAM_ANALYSIS_CONTEXT
@@ -801,12 +1279,13 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert "не выбирай tools/skills" in (
         _DOWNSTREAM_PLAN_PROMPT.lower().replace("\n", " ")
     )
-    assert "прямо необходимых фактов" in _DOWNSTREAM_PLAN_PROMPT
+    assert "task читает необходимые факты" in _DOWNSTREAM_PLAN_PROMPT
     assert "Каждый step обязан быть незаменимым" in _DOWNSTREAM_PLAN_PROMPT
     assert "`file_id` допустим лишь из original_task либо принятого" in (
         _DOWNSTREAM_PLAN_PROMPT
     )
-    assert "Worker не получает `original_task`" in _DOWNSTREAM_PLAN_PROMPT
+    assert "Context заканчивается здесь" in _DOWNSTREAM_PLAN_PROMPT
+    assert "перенеси нужные условия" in _DOWNSTREAM_PLAN_PROMPT
     normalized_downstream_prompt = " ".join(_DOWNSTREAM_PLAN_PROMPT.split())
     assert "`filename` даёт `file_id`, но не определяет и не заменяет `table_name`" in (
         normalized_downstream_prompt
@@ -914,6 +1393,18 @@ def test_coordinator_prompts_and_schemas_match_contracts():
     assert _plan_tool_schema()["function"]["parameters"]["properties"][
         "steps"
     ]["items"]["required"] == ["task"]
+    assert set(
+        _plan_tool_schema()["function"]["parameters"]["properties"][
+            "steps"
+        ]["items"]["properties"]
+    ) == {
+        "task",
+        "constraints",
+        "entity",
+        "scope",
+        "coverage",
+        "dependencies",
+    }
     worker_plan_schema_text = str(WorkerPlan.model_json_schema())
     assert "По умолчанию один шаг" not in worker_plan_schema_text
     assert "лениво использовать принятые результаты" in worker_plan_schema_text
@@ -1139,6 +1630,15 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
                         "steps": [
                             {
                                 "task": "Найди точное имя.",
+                                "constraints": [
+                                    "Учитывай только подтверждённые имена."
+                                ],
+                                "entity": {
+                                    "role": "target",
+                                    "table": "t_example",
+                                },
+                                "scope": {"file_id": 7},
+                                "coverage": "single",
                             },
                             {
                                 "task": "Проверь найденное имя.",
@@ -1205,12 +1705,31 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
     assert worker.call_count == 2
     assert worker.call_args_list[0].kwargs == {}
     assert worker.call_args_list[1].kwargs == {}
-    context_suffix = WORKER_STABLE_CONTEXT_MARKER + "Общий фон"
-    assert worker.call_args_list[0].args[0] == "Найди точное имя." + context_suffix
+    first_task = worker.call_args_list[0].args[0]
+    assert first_task.startswith(
+        "Найди точное имя.\n\nСтруктурированные ограничения шага:\n"
+    )
+    first_structured = json.loads(
+        first_task.split("Структурированные ограничения шага:\n", 1)[1]
+    )
+    assert first_structured == {
+        "constraints": ["Учитывай только подтверждённые имена."],
+        "entity": {"role": "target", "table": "t_example"},
+        "scope": {"file_id": 7},
+        "coverage": "single",
+    }
     second_task = worker.call_args_list[1].args[0]
     second_parts = parse_worker_request(second_task)
     assert second_parts.current_task == "Проверь найденное имя."
-    assert second_parts.stable_context == "Общий фон"
+    assert second_parts.stable_context == ""
+    assert "Общий фон" not in first_task
+    assert "Общий фон" not in second_task
+    operation_payload = _payload(model, "select_operation_skills")
+    assert operation_payload == {
+        "original_task": "Найди имя и проверь его.",
+    }
+    plan_payload = _payload(model, "submit_worker_plan")
+    assert plan_payload["context"] == "Общий фон"
     assert [
         item.model_dump(mode="json", exclude_none=True)
         for item in (second_parts.previous_results or [])
@@ -1225,8 +1744,30 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
 
     upstream = _payload(model, "submit_upstream_answer")
     serialized_upstream = json.dumps(upstream, ensure_ascii=False)
-    assert set(upstream) == {"original_task", "evidence"}
+    assert set(upstream) == {
+        "original_task",
+        "worker_outcomes",
+        "evidence",
+    }
     assert upstream["original_task"] == "Найди имя и проверь его."
+    assert upstream["worker_outcomes"] == [
+        {
+            "cycle": 1,
+            "step": 1,
+            "status": "complete",
+            "stop_reason": None,
+            "unmet_requirements": [],
+            "evidence_ids": ["evidence-first"],
+        },
+        {
+            "cycle": 1,
+            "step": 2,
+            "status": "complete",
+            "stop_reason": None,
+            "unmet_requirements": [],
+            "evidence_ids": ["evidence-second"],
+        },
+    ]
     assert upstream["evidence"] == [
         {
             "evidence_id": "evidence-first",
@@ -1249,7 +1790,6 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
         "summary",
         "facts",
         "limitations",
-        "status",
         "observation",
         "cycle_history",
         "display_ref",
@@ -1423,6 +1963,81 @@ def test_coordinator_passes_lazy_result_references_between_workers():
     ] == ["result-first", "result-second"]
 
 
+def test_coordinator_passes_only_explicit_plan_dependencies():
+    from agents.coordinator import coordinator_chat
+
+    model = _CoordinatorModel(
+        {
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {"task": "Получи A."},
+                            {"task": "Получи B.", "dependencies": []},
+                            {"task": "Проверь A.", "dependencies": [1]},
+                        ]
+                    },
+                    "plan-selective-dependencies",
+                )
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Проверка завершена.",
+                        "used_evidence_ids": [],
+                        "display_evidence_ids": [],
+                    },
+                    "upstream-selective-dependencies",
+                )
+            ],
+        }
+    )
+    worker_results = [
+        _outcome(
+            "A",
+            previous_results=[
+                PreviousResultReference(
+                    result_id="result-a",
+                    description="first_lookup: A.",
+                )
+            ],
+        ),
+        _outcome(
+            "B",
+            previous_results=[
+                PreviousResultReference(
+                    result_id="result-b",
+                    description="second_lookup: B.",
+                )
+            ],
+        ),
+        _outcome("A проверен"),
+    ]
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=worker_results,
+        ) as worker,
+    ):
+        result = coordinator_chat("Получи A и B, затем проверь A.")
+
+    assert result.answer == "Проверка завершена."
+    first, second, third = [
+        parse_worker_request(call.args[0]) for call in worker.call_args_list
+    ]
+    assert first.previous_results is None
+    assert second.previous_results is None
+    assert [
+        item.result_id for item in (third.previous_results or [])
+    ] == ["result-a"]
+
+
 def test_upstream_receives_partial_worker_evidence():
     from agents.coordinator import coordinator_chat
 
@@ -1430,6 +2045,9 @@ def test_upstream_receives_partial_worker_evidence():
     model = _CoordinatorModel(_responses(answer=answer))
     worker_result = _outcome(
         "Tool вернул данные не по той сущности; факт не подтверждён.",
+        status="partial",
+        stop_reason="truncated_source",
+        unmet_requirements=["Не подтверждена полная выборка сущности."],
         evidence=[
             _artifact(
                 "display-partial",
@@ -1445,13 +2063,30 @@ def test_upstream_receives_partial_worker_evidence():
         callback_patch,
         trace_patch,
         patch("agents.coordinator.worker_chat", return_value=worker_result),
+        patch("agents.coordinator.record_worker_outcome") as record_outcome,
         patch("agents.coordinator.discard_worker_display_refs") as discard,
     ):
         result = coordinator_chat("Получи факт.")
 
     assert result == CoordinatorAnswer(answer=answer, display_refs=[])
     upstream = _payload(model, "submit_upstream_answer")
-    assert set(upstream) == {"original_task", "evidence"}
+    assert set(upstream) == {
+        "original_task",
+        "worker_outcomes",
+        "evidence",
+    }
+    assert upstream["worker_outcomes"] == [
+        {
+            "cycle": 1,
+            "step": 1,
+            "status": "partial",
+            "stop_reason": "truncated_source",
+            "unmet_requirements": [
+                "Не подтверждена полная выборка сущности."
+            ],
+            "evidence_ids": ["evidence-partial"],
+        }
+    ]
     assert upstream["evidence"] == [
         {
             "evidence_id": "evidence-partial",
@@ -1462,6 +2097,15 @@ def test_upstream_receives_partial_worker_evidence():
             "displayable": True,
         }
     ]
+    record_outcome.assert_called_once_with(
+        cycle=1,
+        step=1,
+        status="partial",
+        stop_reason="truncated_source",
+        unmet_requirements=["Не подтверждена полная выборка сущности."],
+        evidence_count=1,
+        dataset_count=0,
+    )
     discard.assert_called_once_with(["display-partial"])
 
 
@@ -1744,7 +2388,21 @@ def test_upstream_restarts_cleanly_with_only_problem():
     second_worker_task = worker.call_args_list[1].args[0]
     assert "target_table=t_example; строк=42" not in second_worker_task
     final_upstream_payload = _payload(model, "submit_upstream_answer")
-    assert set(final_upstream_payload) == {"original_task", "evidence"}
+    assert set(final_upstream_payload) == {
+        "original_task",
+        "worker_outcomes",
+        "evidence",
+    }
+    assert final_upstream_payload["worker_outcomes"] == [
+        {
+            "cycle": 2,
+            "step": 1,
+            "status": "complete",
+            "stop_reason": None,
+            "unmet_requirements": [],
+            "evidence_ids": ["evidence-complete"],
+        }
+    ]
     assert [
         item["evidence_id"] for item in final_upstream_payload["evidence"]
     ] == ["evidence-complete"]

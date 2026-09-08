@@ -9,6 +9,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -18,7 +19,26 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
+
+from dotenv import load_dotenv
+
+try:
+    from scripts.gigachat_budget import (
+        DEFAULT_ULTRA_RESERVE_PER_SCENARIO,
+        DEFAULT_ULTRA_TOKEN_FLOOR,
+        UltraBudgetError,
+        guard_ultra_budget,
+        ultra_budget_reservations,
+    )
+except ModuleNotFoundError:  # direct ``python scripts/...`` execution
+    from gigachat_budget import (  # type: ignore[no-redef]
+        DEFAULT_ULTRA_RESERVE_PER_SCENARIO,
+        DEFAULT_ULTRA_TOKEN_FLOOR,
+        UltraBudgetError,
+        guard_ultra_budget,
+        ultra_budget_reservations,
+    )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +56,7 @@ LIVE_SCENARIO_GROUP_MARKERS = {
     "handoff": "live_handoff",
     "graph": "live_graph",
     "validation": "live_validation",
+    "resolution": "live_resolution",
     "catalog": "live_catalog",
 }
 
@@ -56,6 +77,10 @@ class ModeResult:
     agent_seconds: float = 0.0
     llm_calls: int = 0
     tool_calls: int = 0
+    reader_calls: int = 0
+    tool_errors: int = 0
+    reroutes: int = 0
+    pipelines: dict[str, int] = field(default_factory=dict)
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -68,10 +93,37 @@ class ModeResult:
     scenario_warnings: dict[str, list[str]] = field(default_factory=dict)
     semantic_statuses: dict[str, str] = field(default_factory=dict)
 
+    @property
+    def selected_scenarios(self) -> int:
+        return self.passed + self.failed + self.errors + self.skipped
+
+    @property
+    def accuracy(self) -> float:
+        return (
+            self.passed / self.selected_scenarios
+            if self.selected_scenarios
+            else 0.0
+        )
+
 
 def _slug(value: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return clean.strip("._-") or "default"
+
+
+def _configured_model(provider: str, explicit_model: str = "") -> str:
+    """Resolve the model exactly as the runtime factory will resolve it."""
+    explicit = str(explicit_model or "").strip()
+    if explicit:
+        return explicit
+    configured = str(os.getenv(MODEL_ENV_BY_PROVIDER[provider], "")).strip()
+    if configured:
+        return configured
+    # ``agents.llm_factory.get_chat_model_name`` keeps this compatibility
+    # fallback for GigaChat.  The parent budget guard must see it too.
+    if provider == "gigachat":
+        return str(os.getenv("MODEL", "")).strip()
+    return ""
 
 
 def _scenario_targets(names: Sequence[str]) -> list[str]:
@@ -109,6 +161,85 @@ def _group_pytest_args(groups: Sequence[str]) -> list[str]:
 
 def _has_pytest_marker_expression(arguments: Sequence[str]) -> bool:
     return any(argument.startswith("-m") for argument in arguments)
+
+
+def _pytest_marker_name(decorator: ast.expr) -> str | None:
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    if not isinstance(target, ast.Attribute):
+        return None
+    mark = target.value
+    if not isinstance(mark, ast.Attribute) or mark.attr != "mark":
+        return None
+    if not isinstance(mark.value, ast.Name) or mark.value.id != "pytest":
+        return None
+    return target.attr
+
+
+def _selected_scenario_count(
+    scenario_names: Sequence[str],
+    groups: Sequence[str],
+) -> int:
+    """Count selected live HTTP exchanges for a conservative Ultra reserve."""
+    tree = ast.parse(SCENARIO_FILE.read_text(encoding="utf-8"))
+    requested_names: set[str] = set()
+    whole_scenario_file = False
+    for value in scenario_names:
+        clean = str(value).strip()
+        if not clean:
+            continue
+        path_part, separator, function_name = clean.rpartition("::")
+        if separator:
+            if path_part.endswith(".py"):
+                candidate_path = Path(path_part)
+                if not candidate_path.is_absolute():
+                    candidate_path = PROJECT_ROOT / candidate_path
+                if candidate_path.resolve() != SCENARIO_FILE.resolve():
+                    raise ValueError(
+                        "--scenario supports only tests from "
+                        f"{SCENARIO_FILE}"
+                    )
+            requested_names.add(function_name.strip())
+            continue
+        if clean.endswith(".py"):
+            candidate_path = Path(clean)
+            if not candidate_path.is_absolute():
+                candidate_path = PROJECT_ROOT / candidate_path
+            if candidate_path.resolve() != SCENARIO_FILE.resolve():
+                raise ValueError(
+                    "--scenario supports only tests from "
+                    f"{SCENARIO_FILE}"
+                )
+            whole_scenario_file = True
+            continue
+        requested_names.add(clean)
+    if whole_scenario_file:
+        requested_names.clear()
+    requested_markers = {
+        LIVE_SCENARIO_GROUP_MARKERS[group] for group in dict.fromkeys(groups)
+    }
+    count = 0
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_live_"):
+            continue
+        if requested_names and node.name not in requested_names:
+            continue
+        markers = {
+            marker
+            for decorator in node.decorator_list
+            if (marker := _pytest_marker_name(decorator)) is not None
+        }
+        if requested_markers and not (markers & requested_markers):
+            continue
+        exchange_count = sum(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "_chat"
+            for child in ast.walk(node)
+        )
+        count += max(1, exchange_count)
+    return max(1, count)
 
 
 def _parse_junit(result: ModeResult) -> None:
@@ -156,6 +287,20 @@ def _parse_transcript(result: ModeResult) -> None:
     result.llm_calls = sum(
         _metric_values(text, r"^llm_calls: (\d+)$")
     )
+    result.reader_calls = sum(
+        _metric_values(text, r"^reader_calls: (\d+)$")
+    )
+    result.tool_errors = sum(
+        _metric_values(text, r"^tool_errors: (\d+)$")
+    )
+    result.reroutes = sum(_metric_values(text, r"^reroutes: (\d+)$"))
+    for pipelines_line in re.findall(r"^pipelines: (.+)$", text, re.MULTILINE):
+        for pipeline in pipelines_line.split(","):
+            clean_pipeline = pipeline.strip()
+            if clean_pipeline and clean_pipeline != "Нет":
+                result.pipelines[clean_pipeline] = (
+                    result.pipelines.get(clean_pipeline, 0) + 1
+                )
     token_rows = re.findall(
         r"^tokens: input=(\d+), output=(\d+), total=(\d+), cache_read=(\d+)$",
         text,
@@ -310,20 +455,28 @@ def _comparison_report(
         "",
         "| Режим | Pytest passed | Pytest failures | Semantic failures | "
         "Skipped | HTTP 500 | Presentation warnings | Efficiency warnings | "
+        "Accuracy | Reroutes | Tool errors | Reader calls | Pipelines | "
         "Agent, с | LLM calls | Tool calls | Total tokens |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "---|---:|---:|---:|---:|",
     ]
     for result in results:
         semantic_failures = sum(
             status in {"failed", "judge_error"}
             for status in result.semantic_statuses.values()
         )
+        pipeline_summary = ", ".join(
+            f"{name}×{count}" for name, count in sorted(result.pipelines.items())
+        ) or "—"
         lines.append(
             f"| {result.mode} | {result.passed} | "
             f"{result.failed + result.errors} | {semantic_failures} | "
             f"{result.skipped} | "
             f"{result.http_500} | {result.presentation_warnings} | "
-            f"{result.efficiency_warnings} | {result.agent_seconds:.3f} | "
+            f"{result.efficiency_warnings} | {result.accuracy:.1%} | "
+            f"{result.reroutes} | {result.tool_errors} | "
+            f"{result.reader_calls} | {pipeline_summary} | "
+            f"{result.agent_seconds:.3f} | "
             f"{result.llm_calls} | {result.tool_calls} | "
             f"{result.total_tokens} |"
         )
@@ -423,6 +576,7 @@ def _run_mode(
     output_dir: Path,
     run_label: str,
     llm_judge: bool,
+    extra_env: Mapping[str, str] | None = None,
 ) -> ModeResult:
     transcript_path = output_dir / f"{run_label}_{mode}.md"
     junit_path = output_dir / f"{run_label}_{mode}.xml"
@@ -439,6 +593,8 @@ def _run_mode(
     )
     if model:
         env[MODEL_ENV_BY_PROVIDER[provider]] = model
+    if extra_env:
+        env.update({str(key): str(value) for key, value in extra_env.items()})
 
     command = [
         sys.executable,
@@ -529,10 +685,42 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Вернуть код 0 после benchmark, даже если acceptance-тесты упали.",
     )
+    parser.add_argument(
+        "--ultra-token-floor",
+        type=int,
+        default=int(
+            os.getenv(
+                "GIGACHAT_ULTRA_TOKEN_FLOOR",
+                str(DEFAULT_ULTRA_TOKEN_FLOOR),
+            )
+        ),
+        help=(
+            "Минимальный подтверждённый остаток после GigaChat Ultra run; "
+            "значение можно только поднять выше жёсткого floor 15 000 000."
+        ),
+    )
+    parser.add_argument(
+        "--ultra-reserve-per-scenario",
+        type=int,
+        default=int(
+            os.getenv(
+                "GIGACHAT_ULTRA_RESERVE_PER_SCENARIO",
+                str(DEFAULT_ULTRA_RESERVE_PER_SCENARIO),
+            )
+        ),
+        help=(
+            "Консервативный резерв токенов на один Ultra-сценарий; значение "
+            "можно только поднять выше жёсткого минимума 250 000."
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Resolve the same project-local configuration that the Flask subprocess
+    # will use.  In particular, an Ultra model selected only in ``.env`` must
+    # never bypass the parent-process balance guard.
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.group and _has_pytest_marker_expression(args.pytest_arg):
@@ -542,7 +730,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    model = str(args.model or os.getenv(MODEL_ENV_BY_PROVIDER[args.provider], ""))
+    model = _configured_model(args.provider, args.model)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_label = "_".join(
         (
@@ -557,8 +745,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         *_group_pytest_args(args.group),
         *args.pytest_arg,
     ]
-    results = [
-        _run_mode(
+    try:
+        selected_scenarios = _selected_scenario_count(
+            args.scenario,
+            args.group,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    results = []
+    for mode in args.modes:
+        if args.provider == "gigachat":
+            reservations = ultra_budget_reservations(
+                chat_model=model,
+                exchange_count=selected_scenarios,
+                reserve_per_exchange=args.ultra_reserve_per_scenario,
+                judge_enabled=args.llm_judge,
+            )
+            for reservation in reservations:
+                try:
+                    budget = guard_ultra_budget(
+                        model=reservation.model,
+                        floor_tokens=args.ultra_token_floor,
+                        reserved_tokens=reservation.reserved_tokens,
+                    )
+                except UltraBudgetError as exc:
+                    parser.error(str(exc))
+                if budget is not None:
+                    print(
+                        "Ultra budget verified: "
+                        f"model={reservation.model}, "
+                        f"remaining={budget.remaining_tokens}, "
+                        f"reserved={budget.reserved_tokens}, "
+                        f"projected={budget.projected_remaining_tokens}, "
+                        f"floor={budget.floor_tokens}",
+                        flush=True,
+                    )
+        result = _run_mode(
             mode=mode,
             provider=args.provider,
             model=model,
@@ -568,8 +790,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_label=run_label,
             llm_judge=args.llm_judge,
         )
-        for mode in args.modes
-    ]
+        results.append(result)
+        if args.provider == "gigachat":
+            for reservation in ultra_budget_reservations(
+                chat_model=model,
+                exchange_count=0,
+                reserve_per_exchange=args.ultra_reserve_per_scenario,
+                judge_enabled=args.llm_judge,
+            ):
+                try:
+                    guard_ultra_budget(
+                        model=reservation.model,
+                        floor_tokens=args.ultra_token_floor,
+                        reserved_tokens=0,
+                    )
+                except UltraBudgetError as exc:
+                    parser.error(
+                        "Post-run Ultra balance check failed; further runs stopped: "
+                        + str(exc)
+                    )
     report_path = output_dir / f"{run_label}_comparison.md"
     _comparison_report(
         provider=args.provider,

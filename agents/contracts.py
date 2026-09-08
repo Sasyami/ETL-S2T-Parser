@@ -10,6 +10,46 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 ObservationStatus = Literal["complete", "continue", "reroute"]
 UpstreamAction = Literal["pass", "reroute"]
+WorkerOutcomeStatus = Literal["complete", "partial", "failed"]
+WorkerStopReason = Literal[
+    "no_results",
+    "unresolved_entity",
+    "ambiguous_entity",
+    "missing_input",
+    "missing_capability",
+    "wrong_arguments",
+    "tool_error",
+    "budget_exhausted",
+    "truncated_source",
+    "observer_error",
+]
+WorkerCapability = Literal[
+    "sql_read",
+    "saved_result_read",
+    "saved_result_aggregate",
+    "entity_resolution",
+    "semantic_search",
+    "s2t_search",
+    "s2t_read",
+    "column_catalog_read",
+    "graph_read",
+    "excel_read",
+    "general_read",
+]
+RerouteReason = Literal[
+    "missing_capability",
+    "unresolved_entity",
+    "wrong_arguments",
+    "truncated_result",
+    "tool_error",
+]
+SqlRiskAspect = Literal[
+    "row_filtering",
+    "cardinality",
+    "constraint_rejection",
+    "value_changes",
+    "write_semantics",
+]
 MAX_PLAN_STEPS = 8
 WORKER_STABLE_CONTEXT_MARKER = "\n\nУстойчивые правила контекста:\n"
 WORKER_PREVIOUS_RESULTS_MARKER = "\n\nРезультаты прошлых workers."
@@ -54,6 +94,24 @@ class PreviousResultReference(BaseModel):
         clean_value = str(value or "").strip()
         if not clean_value:
             raise ValueError("previous result fields must not be blank")
+        return clean_value
+
+
+class CandidateSet(BaseModel):
+    """Typed candidates produced by discovery before batch verification."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    coverage: Literal["complete", "truncated"]
+    source_result_id: str = Field(min_length=1)
+
+    @field_validator("source_result_id")
+    @classmethod
+    def _strip_source_result_id(cls, value: str) -> str:
+        clean_value = str(value or "").strip()
+        if not clean_value:
+            raise ValueError("source_result_id must not be blank")
         return clean_value
 
 
@@ -201,8 +259,27 @@ class Observation(BaseModel):
             "результата. Не выбирай следующий инструмент."
         ),
     )
+    reroute_reason: Optional[RerouteReason] = Field(
+        default=None,
+        description=(
+            "Структурированная причина смены маршрута. Для исправления "
+            "аргументов используй continue, а не reroute."
+        ),
+    )
+    required_capabilities: List[WorkerCapability] = Field(
+        default_factory=list,
+        description=(
+            "Недостающие возможности новой палитры; заполняются только когда "
+            "текущие available_tools не могут закрыть gap."
+        ),
+    )
 
-    @field_validator("accepted_tool_call_ids", "limitations", mode="before")
+    @field_validator(
+        "accepted_tool_call_ids",
+        "limitations",
+        "required_capabilities",
+        mode="before",
+    )
     @classmethod
     def _remove_blank_list_items(cls, value: Any) -> List[str]:
         if value is None:
@@ -240,6 +317,19 @@ class Observation(BaseModel):
         if self.status != "complete" and self.gap is None:
             raise ValueError(
                 "gap must describe why observation is not complete"
+            )
+        if self.status != "reroute" and (
+            self.reroute_reason is not None or self.required_capabilities
+        ):
+            raise ValueError(
+                "reroute metadata is allowed only when status is reroute"
+            )
+        if (
+            self.reroute_reason == "missing_capability"
+            and not self.required_capabilities
+        ):
+            raise ValueError(
+                "missing_capability requires required_capabilities"
             )
         return self
 
@@ -294,6 +384,9 @@ class WorkerOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     summary: str
+    status: WorkerOutcomeStatus = "complete"
+    stop_reason: Optional[WorkerStopReason] = None
+    unmet_requirements: List[str] = Field(default_factory=list)
     facts: List[EvidenceFact] = Field(default_factory=list)
     evidence: List[EvidenceArtifact] = Field(default_factory=list)
     datasets: List[SavedResultDescriptor] = Field(
@@ -313,8 +406,31 @@ class WorkerOutcome(BaseModel):
             raise ValueError("worker summary must not be blank")
         return clean_value
 
+    @field_validator("unmet_requirements", mode="before")
+    @classmethod
+    def _clean_unmet_requirements(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("unmet_requirements must be an array")
+        return list(
+            dict.fromkeys(
+                clean_item
+                for item in value
+                if (clean_item := str(item or "").strip())
+            )
+        )
+
     @model_validator(mode="after")
     def _validate_status_and_provenance(self) -> "WorkerOutcome":
+        if self.status == "complete" and self.unmet_requirements:
+            raise ValueError(
+                "complete worker outcome cannot have unmet_requirements"
+            )
+        if self.status != "complete" and self.stop_reason is None:
+            raise ValueError(
+                "partial or failed worker outcome requires stop_reason"
+            )
         evidence_ids = [item.evidence_id for item in self.evidence]
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("worker evidence_id values must be unique")
@@ -358,6 +474,9 @@ class WorkerOutcome(BaseModel):
     def upstream_payload(self) -> Dict[str, Any]:
         """Serialize accepted evidence without worker interpretations."""
         return {
+            "status": self.status,
+            "stop_reason": self.stop_reason,
+            "unmet_requirements": list(self.unmet_requirements),
             "evidence": [
                 {
                     "evidence_id": item.evidence_id,
@@ -393,6 +512,21 @@ class PlanStep(BaseModel):
             "Производный анализ выполняет upstream coordinator."
         ),
     )
+    constraints: List[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            "Только релевантные текущему чтению ограничения, "
+            "материализованные downstream из conversation context."
+        ),
+    )
+    entity: Optional["PlanEntity"] = None
+    scope: Optional["PlanScope"] = None
+    coverage: Optional[
+        Literal["single", "all_matches", "top_k", "aggregate"]
+    ] = None
+    dependencies: Optional[List[int]] = Field(default=None, max_length=7)
+
     @field_validator("task")
     @classmethod
     def _strip_task(cls, value: str) -> str:
@@ -400,6 +534,71 @@ class PlanStep(BaseModel):
         if not clean_value:
             raise ValueError("task must not be blank")
         return clean_value
+
+    @field_validator("constraints", mode="before")
+    @classmethod
+    def _clean_constraints(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("constraints must be an array")
+        return list(
+            dict.fromkeys(
+                clean_item
+                for item in value
+                if (clean_item := str(item or "").strip())
+            )
+        )
+
+    @field_validator("dependencies", mode="before")
+    @classmethod
+    def _clean_dependencies(cls, value: Any) -> Optional[List[int]]:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError("dependencies must be an array")
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+            raise ValueError("dependencies must contain integer step numbers")
+        return list(dict.fromkeys(value))
+
+
+class PlanEntity(BaseModel):
+    """Primary ETL entity addressed by one worker step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Optional[Literal["source", "target", "unknown"]] = None
+    table: Optional[str] = None
+    field: Optional[str] = None
+
+    @field_validator("table", "field", mode="before")
+    @classmethod
+    def _normalize_optional_entity_text(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        return str(value).strip() or None
+
+
+class PlanScope(BaseModel):
+    """Structured file/sheet/filter scope for one worker read."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_id: Optional[int] = Field(default=None, ge=1)
+    filename: Optional[str] = None
+    sheet_name: Optional[str] = None
+    filters: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("filename", "sheet_name", mode="before")
+    @classmethod
+    def _normalize_optional_scope_text(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        return str(value).strip() or None
+
+
+PlanStep.model_rebuild()
+
 
 class WorkerPlan(BaseModel):
     """Validated linear sequence of downstream worker steps."""
@@ -414,6 +613,23 @@ class WorkerPlan(BaseModel):
             "task может лениво использовать принятые результаты предыдущих."
         ),
     )
+
+    @model_validator(mode="after")
+    def _dependencies_reference_prior_steps(self) -> "WorkerPlan":
+        for step_number, step in enumerate(self.steps, start=1):
+            if step.dependencies is None:
+                continue
+            invalid = [
+                dependency
+                for dependency in step.dependencies
+                if dependency < 1 or dependency >= step_number
+            ]
+            if invalid:
+                raise ValueError(
+                    "dependencies must reference earlier 1-based steps: "
+                    + ", ".join(str(item) for item in invalid)
+                )
+        return self
 
 
 class UpstreamOutput(BaseModel):
@@ -504,23 +720,30 @@ class UpstreamDecision(BaseModel):
 
 
 __all__ = [
+    "CandidateSet",
     "EvidenceArtifact",
     "EvidenceFact",
     "MAX_PLAN_STEPS",
     "Observation",
     "ObservationStatus",
+    "PlanEntity",
+    "PlanScope",
     "PlanStep",
     "PreviousResultReference",
     "PreviousResultSchema",
     "SavedResultColumn",
     "SavedResultDescriptor",
+    "SqlRiskAspect",
     "UpstreamOutput",
     "UpstreamAction",
     "UpstreamDecision",
     "WorkerRequestParts",
+    "WorkerCapability",
     "WorkerOutcome",
     "WorkerOutcomeStatus",
+    "WorkerStopReason",
     "WorkerPlan",
+    "RerouteReason",
     "WORKER_PREVIOUS_RESULTS_MARKER",
     "WORKER_OPERATION_COMPLETENESS_MARKER",
     "WORKER_OPERATION_EXECUTION_MARKER",

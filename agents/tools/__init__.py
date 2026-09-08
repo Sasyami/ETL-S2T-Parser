@@ -4,6 +4,7 @@ from .common import PROJECT_ROOT
 from .additional_objects import list_additional_objects, search_additional_objects
 from .context import (
     OPERATION_SKILL_CATALOG,
+    OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
     SCHEMA_CATALOG,
     get_sqlite_schema_cheatsheet,
     load_chat_agent_context,
@@ -29,6 +30,7 @@ from .columns import (
     search_column_catalog,
 )
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
+from .entity_resolution import resolve_entities
 from .planning import show_plan
 from .neo4j import (
     run_cypher,
@@ -42,6 +44,7 @@ from .registry import (
     READ_ONLY_TOOLS,
     TOOLS,
     TOOLS_BY_NAME,
+    WORKER_CAPABILITY_TOOL_NAMES,
     WORKER_GENERAL_FALLBACK_TOOL_NAMES,
     WRITE_TOOLS,
     WRITE_TOOLS_BY_NAME,
@@ -50,6 +53,7 @@ from .registry import (
     get_tools_by_name,
     get_tools_for_names,
     get_worker_tools,
+    get_worker_tool_names_for_capabilities,
     get_write_tools,
 )
 from .s2t import (
@@ -108,6 +112,7 @@ __all__ = [
     "ALL_TOOLS_BY_NAME",
     "PROJECT_ROOT",
     "OPERATION_SKILL_CATALOG",
+    "OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV",
     "READ_ONLY_TOOLS",
     "SCHEMA_CATALOG",
     "SQL_EXPORT_DIR",
@@ -118,6 +123,7 @@ __all__ = [
     "TOOLS",
     "TOOLS_BY_NAME",
     "WORKER_GENERAL_FALLBACK_TOOL_NAMES",
+    "WORKER_CAPABILITY_TOOL_NAMES",
     "WRITE_TOOLS",
     "WRITE_TOOLS_BY_NAME",
     "get_all_tools",
@@ -130,6 +136,7 @@ __all__ = [
     "get_tools_by_name",
     "get_tools_for_names",
     "get_worker_tools",
+    "get_worker_tool_names_for_capabilities",
     "get_write_tools",
     "filter_column_catalog",
     "list_columns",
@@ -157,6 +164,7 @@ __all__ = [
     "load_skills",
     "load_upstream_analysis_context",
     "resolve_file",
+    "resolve_entities",
     "parse_sql_column_lineage",
     "parse_sql_table_lineage",
     "visualize_sql_lineage",

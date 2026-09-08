@@ -78,7 +78,9 @@ flowchart TD
     U -->|reroute, максимум один раз| C
     U -->|pass| UA["Upstream answer + display selection"]
     OR -.->|ОТКЛЮЧЁН| SC["S2T analysis<br/>(экспериментальный резерв)"]
-    OR -->|тест-протокол| VC["Typed contract → readers → compiler"]
+    OR -->|тест-протокол| VRAW["LLM: RawTestProtocolContract"]
+    VRAW --> VRES["Shared entity resolution"]
+    VRES --> VC["Resolved contract → dependency readers → Phase 0–3"]
     SC -.->|не используется| UI["Ответ + scrollable results"]
     VC --> UI
     UA --> UI
@@ -118,9 +120,55 @@ Worker завершается самим planner только через native 
   быть выбран в штатном запросе. Реализация сохранена только как
   экспериментальный резерв; обычные запросы анализа идут через общий
   agentic-поток и operation-skills;
-- `validation_protocol`: typed contract задаёт загрузки и проверки,
-  детерминированные readers получают S2T и метаданные колонок, а compiler строит
-  Greenplum SQL-шаблоны и критерии прохождения без исполнения SQL во внешней БД.
+- `validation_protocol`: LLM извлекает только пользовательский
+  `RawTestProtocolContract`; общий resolver подтверждает роли source/target и
+  формирует канонический `ResolvedTestProtocolContract`, после чего
+  dependency-based readers и deterministic compiler строят Greenplum
+  SQL-шаблоны без исполнения SQL во внешней БД. Ошибка extraction, unresolved
+  или ambiguous entity возвращается как структурированный validation-status и
+  не переключает запрос молча в agentic-поток.
+
+### Validation protocol
+
+Специализированный pipeline отделяет пользовательские упоминания от
+канонических сущностей:
+
+```text
+RawTestProtocolContract
+→ shared entity resolution
+→ ResolvedTestProtocolContract
+→ dependency-based exact readers
+→ SQLGlot NormalizedTransformation
+→ declarative check registry
+→ Phase 0–3 protocol
+```
+
+Exact identifier сначала проверяется без approximate search. Общий resolver
+запускается только для неподтверждённого typo, partial или semantic mention;
+неоднозначный кандидат не выбирается автоматически. Файл необязателен: S2T-only
+checks компилируются без него, а check, которому нужен file-scoped catalog,
+получает `partial`/`unavailable`, не обрушая весь протокол.
+
+Режимы протокола:
+
+- `explicit` — только явно запрошенные checks;
+- `standard` — `row_count`, `key_uniqueness`, `required_null_rate` и
+  `transformation_correctness`;
+- `exhaustive` — все 13 checks.
+
+| Фаза | Содержимое |
+|---|---|
+| Phase 0 — static/preflight | mapping coverage, наличие target fields, mapped fields вне каталога, unmapped required fields, requested sources, разбор transformation SQL, ambiguity и согласованность projection |
+| Phase 1 — smoke | `row_count`, `key_uniqueness`, `required_null_rate`, `schema_compatibility`, `expected_required_nulls`, `duplicate_actual` |
+| Phase 2 — reconciliation | `transformation_correctness`, `key_reconciliation`, `aggregate_reconciliation` |
+| Phase 3 — diagnostics | `missing_rows`, `extra_rows`, `field_mismatch`, `duplicate_expected` |
+
+Явный comparison key имеет приоритет над target PK. Expression projections
+(`COALESCE`, `CASE`, `CAST`, арифметика и aliases) нормализуются через SQLGlot.
+Шаблоны разделяют `{{SOURCE_SCOPE_PREDICATE}}` и
+`{{TARGET_SCOPE_PREDICATE}}`. Output содержит статусы checks
+`ready|partial|unavailable`, общий статус
+`ready|partial_protocol|unavailable`, issues, preflight и сводку фаз.
 
 Для impact по колонке `trace_neo4j_lineage` возвращает точные
 `transformation_id`, а `get_s2t_rules_by_ids` одним параметризованным чтением
@@ -287,7 +335,12 @@ pytest tests/ --cov=. --cov-config=.coveragerc
 
 ### Live-сценарии
 
-Live-тесты используют реальный Flask `/chat`, текущую `excel_data.db`, выбранный provider и запущенный Neo4j для графовых сценариев. Supervisor, coordinator, workers, router, tools, observer и aggregator не подменяются. Запросы выполняются строго последовательно, без batching и параллельного pytest.
+Live-тесты используют реальный Flask `/chat`, выбранный provider и запущенный
+Neo4j для графовых сценариев. SQLite берётся из `LIVE_AGENT_DB_PATH`, если
+переменная задана, иначе из workspace `excel_data.db`; путь должен указывать на
+существующий файл. Supervisor, coordinator, workers, router, tools, observer и
+aggregator не подменяются. Запросы выполняются строго последовательно, без
+batching и параллельного pytest.
 
 Опциональный `--llm-judge` после каждого ответа отдельным LLM-вызовом оценивает текущий запрос, role-aware историю, публичный answer и display-results, записывает semantic verdict в transcript/comparison report и валидирует сценарий: `failed` или ошибка judge переводят pytest-тест в failed после выполнения его обычных проверок. Пользовательские сообщения истории считаются условиями задачи, а неподтверждённый текст assistant — нет.
 
@@ -296,13 +349,15 @@ $env:RUN_LIVE_AGENT_SCENARIOS = "1"
 $env:LIVE_AGENT_MODE = "multiagent"
 $env:LLM_PROVIDER = "ollama"
 $env:OLLAMA_MODEL = "qwen3.5:9b"
+$env:LIVE_AGENT_DB_PATH = "C:\path\to\live-excel-data.db"
 $env:LIVE_AGENT_TRANSCRIPT_PATH = ".test_runs/live-agent.md"
 pytest tests/test_live_agent_scenarios.py -q
 ```
 
 Live-сценарии проверяют обычный диалог, SQLite-count, историю supervisor,
 scrollable-результаты, последовательную передачу между workers, точные S2T-пары,
-Neo4j-пути, validation-протоколы и каталоговые вопросы. History-набор отдельно
+Neo4j-пути, validation-протоколы, shared entity resolution и каталоговые
+вопросы. History-набор отдельно
 проверяет однозначную ссылку, отказ от неоднозначной ссылки, недоверие к
 неподтверждённому предположению assistant и приоритет последнего пользовательского
 правила. Неверные или неполные факты, отсутствие требуемого источника и
@@ -320,6 +375,7 @@ Neo4j-пути, validation-протоколы и каталоговые вопр
 | `handoff` | `live_handoff` | зависимые workers и передача результатов |
 | `graph` | `live_graph` | Neo4j lineage и точные пути |
 | `validation` | `live_validation` | анализ рисков и validation-протоколы |
+| `resolution` | `live_resolution` | общий resolver в validation и agentic flows, exact bypass, typo/partial/semantic и ambiguity |
 | `catalog` | `live_catalog` | S2T-каталог, semantic search и impact analysis |
 
 Локально группу можно выбрать обычным pytest marker:
@@ -346,6 +402,49 @@ uv run python scripts/run_live_agent_benchmark.py \
 
 Отчёты записываются в `.test_runs/` и не попадают в git.
 
+### Эксперименты E1–E5
+
+`scripts/run_multiagent_experiments.py` последовательно запускает ограниченную
+матрицу сценариев поверх того же real-HTTP benchmark и сохраняет transcript,
+JUnit и сводный Markdown-отчёт.
+Матрица считается неполной и возвращает ненулевой exit code, если хотя бы один
+её сценарий пропущен либо не выполнен (например, из-за отсутствующей live DB).
+
+| Эксперимент | Что сравнивается | Управляющие flags/env |
+|---|---|---|
+| E1 | capability-based reroute и разделение selector/arguments | `WORKER_CAPABILITY_REROUTE_EXPERIMENT`, `WORKER_SPLIT_TOOL_CALL_EXPERIMENT` |
+| E2 | typed SQL-risk aspects | `OPERATION_SQL_RISK_ASPECTS_EXPERIMENT` |
+| E3 | modes, preflight, 13 checks, expressions, keys и phases | текущий deterministic compiler |
+| E4 | минимальные dependency-based readers | текущий dependency planner |
+| E5 | единый entity resolver для validation и agentic flows | текущий shared resolver |
+
+```bash
+uv run python scripts/run_multiagent_experiments.py \
+  --experiment E1 \
+  --experiment E5 \
+  --provider gigachat \
+  --model GigaChat-3-Ultra \
+  --llm-judge
+```
+
+`--experiment` можно повторять; без него запускаются E1–E5. Доступны также
+`--pytest-arg`, `--output-dir`, `--dry-run`, `--ultra-token-floor` и
+`--ultra-reserve-per-scenario`. `scripts/run_live_agent_benchmark.py`
+дополнительно принимает `--modes`, `--scenario`, `--group` и
+`--allow-failures`.
+
+Для модели GigaChat с `Ultra` в имени оба runner-а используют fail-closed
+token guard до и после запуска. По умолчанию подтверждённый прогнозируемый
+остаток не должен опуститься ниже **15 000 000** токенов; дополнительно
+резервируется 250 000 токенов на каждый фактический HTTP `/chat`-обмен (в том
+числе несколько обменов внутри одного сценария). Если balance API не
+подтвердил остаток или `remaining - reserve < floor`, запуск блокируется.
+Если `--llm-judge` настроен на Ultra отдельно, его баланс также проверяется;
+резерв учитывает обе structured стадии judge и до трёх попыток каждой.
+Порог и резерв можно только повысить одноимёнными CLI-флагами; жёсткие
+минимумы 15 000 000 и 250 000 на `/chat`-обмен понизить нельзя. Live benchmark также читает
+`GIGACHAT_ULTRA_TOKEN_FLOOR` и `GIGACHAT_ULTRA_RESERVE_PER_SCENARIO`.
+
 ## Структура проекта
 
 ```text
@@ -361,8 +460,11 @@ agents/supervisor.py           верхний LangGraph
 agents/coordinator.py          выбор pipeline, downstream/workers/upstream
 agents/worker.py               worker runtime и работа с зависимостями
 agents/chat_graph.py           planner/tool/observer loop
-agents/validation_protocol.py  typed S2T readers и анализ
-agents/test_protocol.py        compiler SQL тест-протоколов
+agents/entity_resolution.py    общий exact/partial/fuzzy/semantic resolver
+agents/test_protocol_resolution.py  Raw → Resolved validation contract
+agents/validation_protocol.py  dependency-based readers и S2T-анализ
+agents/transformation_ast.py   SQLGlot-нормализация transformation
+agents/test_protocol.py        phased compiler 13 SQL checks
 agents/tools/routing.py        LLM router tools и skills
 agents/tools/saved_results.py  run-scoped результаты и read-only relation
 agents/tools/                  read-only/write registries и tools
@@ -370,7 +472,7 @@ agents/prompts/                runtime prompts и skills
 agents/run_metrics.py          метрики live-запусков
 config/                        JSON-конфигурации извлечения
 templates/chat_app.html        единый интерфейс
-scripts/                       benchmark-скрипты
+scripts/                       live benchmark, E1–E5 runner и Ultra guard
 docs/history/                  архив старых демонстраций и live-отчётов
 tests/                         unit, integration и live tests
 samples/                       примеры S2T Excel

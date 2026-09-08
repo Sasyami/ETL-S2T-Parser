@@ -18,6 +18,7 @@ import urllib.request
 import warnings
 from csv import DictReader
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from io import StringIO
 from pathlib import Path
 from time import perf_counter
@@ -33,7 +34,12 @@ from services.sql_dialects import GREENPLUM_DIALECT  # noqa: F401
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LIVE_DB_PATH = PROJECT_ROOT / "excel_data.db"
+_configured_live_db_path = os.getenv("LIVE_AGENT_DB_PATH", "").strip()
+LIVE_DB_PATH = (
+    Path(_configured_live_db_path).expanduser().resolve()
+    if _configured_live_db_path
+    else PROJECT_ROOT / "excel_data.db"
+)
 LIVE_TRANSCRIPT_PATH = os.getenv("LIVE_AGENT_TRANSCRIPT_PATH", "").strip()
 LIVE_AGENT_MODE = (
     os.getenv("LIVE_AGENT_MODE", "multiagent").strip().lower()
@@ -249,6 +255,35 @@ def _record_live_exchange(
     metrics_block = "Метрики недоступны"
     trace_block = "Трасса недоступна"
     if metrics is not None:
+        tool_errors = sum(item.has_error for item in metrics.tool_calls)
+        worker_reroutes = sum(
+            item.routing_attempt > 1 for item in metrics.worker_routes
+        )
+        observed_cycles = [
+            int(item.cycle)
+            for item in metrics.observations
+            if int(item.cycle) > 0
+        ]
+        for step in metrics.coordinator_plan:
+            try:
+                cycle = int(step.get("cycle") or 0)
+            except (TypeError, ValueError):
+                cycle = 0
+            if cycle > 0:
+                observed_cycles.append(cycle)
+        upstream_reroutes = max(0, max(observed_cycles, default=1) - 1)
+        pipelines = list(
+            dict.fromkeys(
+                str(step.get("pipeline") or "").strip()
+                for step in metrics.coordinator_plan
+                if str(step.get("pipeline") or "").strip()
+            )
+        )
+        if not pipelines:
+            if metrics.worker_tasks:
+                pipelines = ["agentic"]
+            elif metrics.supervisor_decision is not None:
+                pipelines = ["direct"]
         stage_lines = "\n".join(
             (
                 f"stage_tokens[{item.stage}]: calls={item.calls}, "
@@ -263,6 +298,10 @@ def _record_live_exchange(
             f"agent_seconds: {metrics.elapsed_seconds:.3f}\n"
             f"http_seconds: {http_elapsed_seconds:.3f}\n"
             f"llm_calls: {len(metrics.llm_calls)}\n"
+            f"reader_calls: {len(metrics.tool_calls)}\n"
+            f"tool_errors: {tool_errors}\n"
+            f"reroutes: {worker_reroutes + upstream_reroutes}\n"
+            f"pipelines: {', '.join(pipelines) or 'Нет'}\n"
             f"tokens: input={metrics.input_tokens}, "
             f"output={metrics.output_tokens}, total={metrics.total_tokens}, "
             f"cache_read={metrics.cache_read_tokens}\n"
@@ -307,6 +346,9 @@ def _record_live_exchange(
                     item.model_dump(mode="json")
                     for item in metrics.observations
                 ],
+                "worker_outcomes": metrics.worker_outcomes,
+                "entity_resolution": metrics.entity_resolution,
+                "validation_protocol": metrics.validation_protocol,
                 "upstream_output": metrics.upstream_output,
             },
             ensure_ascii=False,
@@ -626,7 +668,10 @@ def validate_llm_judge_verdict() -> Iterator[None]:
 @pytest.fixture
 def live_workspace_db(monkeypatch) -> Iterator[Path]:
     if not LIVE_DB_PATH.is_file():
-        pytest.skip("workspace excel_data.db is absent")
+        pytest.skip(
+            "live SQLite database is absent; set LIVE_AGENT_DB_PATH "
+            "or provide workspace excel_data.db"
+        )
     monkeypatch.setattr(db_storage, "DB_PATH", str(LIVE_DB_PATH))
     yield LIVE_DB_PATH
 
@@ -691,6 +736,387 @@ def _fetch_one(query: str, parameters: tuple[object, ...] = ()) -> tuple:
     if row is None:
         pytest.skip("workspace database has no row required by the scenario")
     return tuple(row)
+
+
+@dataclass(frozen=True)
+class _ProtocolLiveCase:
+    file_id: int
+    filename: str
+    source_table: str
+    target_table: str
+    source_field: str
+    target_field: str
+    transformation_rule: str
+
+
+def _protocol_live_case(
+    *,
+    expression: bool = False,
+    min_mapped_fields: int = 1,
+    require_target_catalog: bool = False,
+    require_primary_key: bool = False,
+) -> _ProtocolLiveCase:
+    expression_filter = ""
+    if expression:
+        expression_filter = """
+          AND (
+                LOWER(s2t.transformation_rule) LIKE '%coalesce(%'
+             OR LOWER(s2t.transformation_rule) LIKE '%case %'
+             OR LOWER(s2t.transformation_rule) LIKE '%cast(%'
+          )
+        """
+    catalog_filter = ""
+    if require_target_catalog:
+        catalog_filter += """
+          AND EXISTS (
+              SELECT 1 FROM target_columns AS tc
+              WHERE tc.file_id = s2t.file_id
+                AND TRIM(tc.table_name) = TRIM(s2t.target_table) COLLATE NOCASE
+          )
+        """
+    if require_primary_key:
+        catalog_filter += """
+          AND EXISTS (
+              SELECT 1 FROM target_columns AS pk
+              WHERE pk.file_id = s2t.file_id
+                AND TRIM(pk.table_name) = TRIM(s2t.target_table) COLLATE NOCASE
+                AND pk.primary_key = 1
+          )
+        """
+    conn = db_storage.get_db_connection()
+    try:
+        rows = conn.execute(
+            f"""
+        SELECT s2t.file_id, files.filename,
+               TRIM(s2t.source_table), TRIM(s2t.target_table),
+               TRIM(s2t.source_field), TRIM(s2t.target_field),
+               TRIM(s2t.transformation_rule)
+        FROM s2t_transformations AS s2t
+        JOIN files ON files.file_id = s2t.file_id
+        WHERE NULLIF(TRIM(s2t.source_table), '') IS NOT NULL
+          AND NULLIF(TRIM(s2t.target_table), '') IS NOT NULL
+          AND NULLIF(TRIM(s2t.source_field), '') IS NOT NULL
+          AND NULLIF(TRIM(s2t.target_field), '') IS NOT NULL
+          AND NULLIF(TRIM(s2t.transformation_rule), '') IS NOT NULL
+          AND (
+                LOWER(LTRIM(s2t.transformation_rule)) LIKE 'select%'
+             OR LOWER(LTRIM(s2t.transformation_rule)) LIKE 'with%'
+          )
+          AND (
+              SELECT COUNT(DISTINCT TRIM(pair_rule.transformation_rule))
+              FROM s2t_transformations AS pair_rule
+              WHERE TRIM(pair_rule.source_table) = TRIM(s2t.source_table)
+                    COLLATE NOCASE
+                AND TRIM(pair_rule.target_table) = TRIM(s2t.target_table)
+                    COLLATE NOCASE
+                AND (
+                      LOWER(LTRIM(pair_rule.transformation_rule)) LIKE 'select%'
+                   OR LOWER(LTRIM(pair_rule.transformation_rule)) LIKE 'with%'
+                )
+          ) = 1
+          AND (
+              SELECT COUNT(DISTINCT LOWER(TRIM(peer.target_field)))
+              FROM s2t_transformations AS peer
+              WHERE peer.file_id = s2t.file_id
+                AND TRIM(peer.source_table) = TRIM(s2t.source_table)
+                    COLLATE NOCASE
+                AND TRIM(peer.target_table) = TRIM(s2t.target_table)
+                    COLLATE NOCASE
+                AND TRIM(peer.transformation_rule) =
+                    TRIM(s2t.transformation_rule)
+          ) >= {max(1, int(min_mapped_fields))}
+          {expression_filter}
+          {catalog_filter}
+        ORDER BY LENGTH(s2t.transformation_rule), s2t.id
+        LIMIT 200
+        """
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        pytest.skip("workspace has no complete transformation fixture")
+    from agents.transformation_ast import normalize_transformation
+
+    row = None
+    for candidate in rows:
+        normalized = normalize_transformation(str(candidate[6]))
+        if normalized.parse_status != "ok":
+            continue
+        conn = db_storage.get_db_connection()
+        try:
+            mappings = conn.execute(
+                """
+                SELECT TRIM(source_field), TRIM(target_field)
+                FROM s2t_transformations
+                WHERE file_id = ?
+                  AND TRIM(target_table) = ? COLLATE NOCASE
+                  AND TRIM(transformation_rule) = ?
+                  AND NULLIF(TRIM(source_field), '') IS NOT NULL
+                  AND NULLIF(TRIM(target_field), '') IS NOT NULL
+                """,
+                (int(candidate[0]), str(candidate[3]), str(candidate[6])),
+            ).fetchall()
+        finally:
+            conn.close()
+        outputs = {name.casefold() for name in normalized.projections}
+        projected_targets = {
+            str(target_field).casefold()
+            for source_field, target_field in mappings
+            if str(target_field).casefold() in outputs
+            or str(source_field).casefold() in outputs
+            or normalized.has_wildcard
+        }
+        if len(projected_targets) < max(1, int(min_mapped_fields)):
+            continue
+        if expression and not any(
+            token in json.dumps(
+                normalized.projections,
+                ensure_ascii=False,
+            ).casefold()
+            for token in ("coalesce", "case", "cast")
+        ):
+            continue
+        row = candidate
+        break
+    if row is None:
+        fixture = "expression projection" if expression else "projection"
+        pytest.skip(f"workspace has no complete {fixture} fixture")
+    return _ProtocolLiveCase(
+        file_id=int(row[0]),
+        filename=str(row[1]),
+        source_table=str(row[2]),
+        target_table=str(row[3]),
+        source_field=str(row[4]),
+        target_field=str(row[5]),
+        transformation_rule=str(row[6]),
+    )
+
+
+def _role_table_names(role: str) -> list[str]:
+    assert role in {"source", "target"}
+    column = f"{role}_table"
+    conn = db_storage.get_db_connection()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT TRIM({column})
+            FROM s2t_transformations
+            WHERE NULLIF(TRIM({column}), '') IS NOT NULL
+            ORDER BY TRIM({column}) COLLATE NOCASE
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    names = [str(row[0]) for row in rows]
+    if not names:
+        pytest.skip(f"workspace has no {role} S2T table names")
+    return names
+
+
+def _unique_typo_case(role: str) -> tuple[str, str]:
+    from agents.entity_resolution import normalize_entity_name
+
+    names = _role_table_names(role)
+    normalized_names = {
+        name: normalize_entity_name(name)
+        for name in names
+    }
+    for canonical in sorted(names, key=lambda value: (-len(value), value)):
+        normalized_canonical = normalized_names[canonical]
+        for index, character in enumerate(canonical):
+            if not character.isalnum() or index in {0, len(canonical) - 1}:
+                continue
+            mention = canonical[:index] + canonical[index + 1 :]
+            normalized_mention = normalize_entity_name(mention)
+            if not normalized_mention or any(
+                normalized_mention in candidate
+                for candidate in normalized_names.values()
+            ):
+                continue
+            scores = sorted(
+                (
+                    SequenceMatcher(None, normalized_mention, candidate).ratio(),
+                    name,
+                )
+                for name, candidate in normalized_names.items()
+            )
+            top_score, top_name = scores[-1]
+            runner_up = scores[-2][0] if len(scores) > 1 else 0.0
+            if (
+                top_name == canonical
+                and top_score >= 0.84
+                and top_score - runner_up >= 0.06
+            ):
+                return mention, canonical
+    pytest.skip(f"workspace has no unambiguous fuzzy {role} fixture")
+
+
+def _unique_partial_case(role: str) -> tuple[str, str]:
+    from agents.entity_resolution import normalize_entity_name
+
+    names = _role_table_names(role)
+    normalized = {
+        name: normalize_entity_name(name)
+        for name in names
+    }
+    for canonical in sorted(names, key=lambda value: (-len(value), value)):
+        for cut in range(1, max(2, len(canonical) - 4)):
+            mention = canonical[:-cut]
+            if not mention or not mention[-1].isalnum():
+                continue
+            token = normalize_entity_name(mention)
+            matches = [
+                name for name, value in normalized.items() if token in value
+            ]
+            if len(token) >= 5 and matches == [canonical]:
+                return mention, canonical
+    pytest.skip(f"workspace has no unique partial {role} fixture")
+
+
+def _ambiguous_partial_case(role: str) -> tuple[str, list[str]]:
+    from agents.entity_resolution import normalize_entity_name
+
+    names = _role_table_names(role)
+    normalized = {
+        name: normalize_entity_name(name)
+        for name in names
+    }
+    prefixes: dict[str, list[str]] = {}
+    for name, value in normalized.items():
+        for length in range(5, len(value)):
+            prefixes.setdefault(value[:length], []).append(name)
+    candidates = [
+        (prefix, sorted(set(matched)))
+        for prefix, matched in prefixes.items()
+        if 2 <= len(set(matched)) <= 20
+    ]
+    if not candidates:
+        pytest.skip(f"workspace has no ambiguous partial {role} fixture")
+    mention, matched = max(candidates, key=lambda item: len(item[0]))
+    return mention, matched
+
+
+def _semantic_file_case() -> tuple[int, str, str, str, str]:
+    row = _fetch_one(
+        """
+        SELECT file_id, filename,
+               TRIM(COALESCE(NULLIF(description, ''), NULLIF(summary, ''))),
+               (
+                   SELECT TRIM(s2t.source_table)
+                   FROM s2t_transformations AS s2t
+                   WHERE s2t.file_id = files.file_id
+                     AND NULLIF(TRIM(s2t.source_table), '') IS NOT NULL
+                     AND NULLIF(TRIM(s2t.target_table), '') IS NOT NULL
+                   ORDER BY s2t.id
+                   LIMIT 1
+               ),
+               (
+                   SELECT TRIM(s2t.target_table)
+                   FROM s2t_transformations AS s2t
+                   WHERE s2t.file_id = files.file_id
+                     AND NULLIF(TRIM(s2t.source_table), '') IS NOT NULL
+                     AND NULLIF(TRIM(s2t.target_table), '') IS NOT NULL
+                   ORDER BY s2t.id
+                   LIMIT 1
+               )
+        FROM files
+        WHERE NULLIF(
+            TRIM(COALESCE(NULLIF(description, ''), NULLIF(summary, ''))),
+            ''
+        ) IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM s2t_transformations AS s2t
+              WHERE s2t.file_id = files.file_id
+                AND NULLIF(TRIM(s2t.source_table), '') IS NOT NULL
+                AND NULLIF(TRIM(s2t.target_table), '') IS NOT NULL
+          )
+          AND (
+              SELECT COUNT(DISTINCT peer.file_id)
+              FROM files AS peer
+              WHERE LOWER(TRIM(COALESCE(
+                  NULLIF(peer.description, ''), NULLIF(peer.summary, '')
+              ))) = LOWER(TRIM(COALESCE(
+                  NULLIF(files.description, ''), NULLIF(files.summary, '')
+              )))
+          ) = 1
+        ORDER BY file_id
+        LIMIT 1
+        """
+    )
+    description = re.sub(r"\s+", " ", str(row[2])).strip()[:240]
+    if len(description) < 12:
+        pytest.skip("workspace has no meaningful semantic file description")
+    return int(row[0]), str(row[1]), description, str(row[3]), str(row[4])
+
+
+def _semantic_table_case(role: str) -> tuple[str, str]:
+    assert role in {"source", "target"}
+    catalog = f"{role}_tables"
+    s2t_column = f"{role}_table"
+    row = _fetch_one(
+        f"""
+        SELECT TRIM(catalog.table_name), TRIM(catalog.description)
+        FROM {catalog} AS catalog
+        WHERE NULLIF(TRIM(catalog.table_name), '') IS NOT NULL
+          AND NULLIF(TRIM(catalog.description), '') IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM s2t_transformations AS s2t
+              WHERE TRIM(s2t.{s2t_column}) = TRIM(catalog.table_name)
+                    COLLATE NOCASE
+          )
+          AND (
+              SELECT COUNT(DISTINCT LOWER(TRIM(peer.table_name)))
+              FROM {catalog} AS peer
+              WHERE LOWER(TRIM(peer.description)) =
+                    LOWER(TRIM(catalog.description))
+          ) = 1
+        ORDER BY LENGTH(catalog.description) DESC, catalog.id
+        LIMIT 1
+        """
+    )
+    description = re.sub(r"\s+", " ", str(row[1])).strip()[:240]
+    if len(description) < 12:
+        pytest.skip(f"workspace has no semantic {role} table description")
+    return str(row[0]), description
+
+
+def _semantic_batch_column_case() -> str:
+    candidate_count = int(
+        _fetch_one(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT id FROM source_columns
+                WHERE description_embedding IS NOT NULL
+                UNION ALL
+                SELECT id FROM target_columns
+                WHERE description_embedding IS NOT NULL
+            )
+            """
+        )[0]
+    )
+    if candidate_count < 2:
+        pytest.skip("workspace has fewer than two semantic column candidates")
+    row = _fetch_one(
+        """
+        SELECT TRIM(description)
+        FROM (
+            SELECT description, description_embedding FROM source_columns
+            UNION ALL
+            SELECT description, description_embedding FROM target_columns
+        )
+        WHERE description_embedding IS NOT NULL
+          AND NULLIF(TRIM(description), '') IS NOT NULL
+        ORDER BY LENGTH(TRIM(description)) DESC
+        LIMIT 1
+        """
+    )
+    description = re.sub(r"\s+", " ", str(row[0])).strip()[:240]
+    if len(description) < 8:
+        pytest.skip("workspace has no meaningful semantic column description")
+    return description
 
 
 def _s2t_work_case_fixture() -> tuple[int, str, str, str, str]:
@@ -988,7 +1414,13 @@ def _assert_compiled_test_protocol(
     sql_blocks = re.findall(r"```sql\n(.*?)\n```", answer, flags=re.DOTALL)
     assert len(sql_blocks) == 4 * expected_protocol_count, answer
     for sql_template in sql_blocks:
-        parseable = sql_template.replace("{{LOAD_SCOPE_PREDICATE}}", "TRUE")
+        parseable = sql_template
+        for placeholder in (
+            "{{LOAD_SCOPE_PREDICATE}}",
+            "{{SOURCE_SCOPE_PREDICATE}}",
+            "{{TARGET_SCOPE_PREDICATE}}",
+        ):
+            parseable = parseable.replace(placeholder, "TRUE")
         parseable = re.sub(
             r"(?<![\w$])\$\$([A-Za-z0-9_]+)(?=\.)",
             lambda match: f'"$${match.group(1)}"',
@@ -1014,6 +1446,360 @@ def _assert_compiled_test_protocol(
     assert display_names.count("read_s2t_source_to_target") == len(target_tables)
     assert display_names.count("list_target_column_catalog") == len(target_tables)
     assert len(_display_payloads(exchange.result)) == 2 * len(target_tables)
+
+
+_ALL_PROTOCOL_CHECKS = {
+    "row_count",
+    "key_uniqueness",
+    "required_null_rate",
+    "transformation_correctness",
+    "key_reconciliation",
+    "missing_rows",
+    "extra_rows",
+    "field_mismatch",
+    "schema_compatibility",
+    "expected_required_nulls",
+    "aggregate_reconciliation",
+    "duplicate_expected",
+    "duplicate_actual",
+}
+_EXACT_S2T_READERS = {
+    "read_s2t_source_to_target",
+    "read_s2t_by_source_table",
+    "read_s2t_by_target_table",
+    "list_s2t_source_table",
+    "list_s2t_target_table",
+    "list_s2t_table_mapping",
+}
+_CATALOG_READERS = {
+    "list_column_catalog",
+    "list_source_column_catalog",
+    "list_target_column_catalog",
+}
+
+
+def _nested_mappings(value) -> Iterator[dict]:
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _nested_mappings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _nested_mappings(child)
+
+
+def _assert_validation_pipeline(exchange: _LiveExchange) -> dict:
+    metrics = exchange.metrics
+    _assert_public_answer(exchange.result.answer)
+    assert metrics.error is None, metrics.error
+    assert not [item for item in metrics.tool_calls if item.has_error], metrics.tool_calls
+    assert any(
+        str(step.get("pipeline") or "") == "validation_protocol"
+        for step in metrics.coordinator_plan
+    ), metrics.coordinator_plan
+    assert metrics.validation_protocol is not None, metrics
+    assert metrics.worker_tasks == [], metrics.worker_tasks
+    assert metrics.worker_routes == [], metrics.worker_routes
+    assert metrics.observations == [], metrics.observations
+    return dict(metrics.validation_protocol)
+
+
+def _assert_agentic_pipeline(exchange: _LiveExchange) -> None:
+    metrics = exchange.metrics
+    _assert_public_answer(exchange.result.answer)
+    assert metrics.error is None, metrics.error
+    assert not [item for item in metrics.tool_calls if item.has_error], metrics.tool_calls
+    assert any(
+        str(step.get("pipeline") or "") == "agentic"
+        for step in metrics.coordinator_plan
+    ), metrics.coordinator_plan
+    assert metrics.worker_tasks, metrics.worker_tasks
+    assert metrics.validation_protocol is None, metrics.validation_protocol
+
+
+def _assert_sql_risk_aspect(
+    exchange: _LiveExchange,
+    expected_aspect: str,
+) -> None:
+    """Hard-check the E2 route without making baseline runs incomparable."""
+    if LIVE_AGENT_MODE != "multiagent":
+        return
+    configured = os.getenv("OPERATION_SQL_RISK_ASPECTS_EXPERIMENT")
+    typed_enabled = configured is None or configured.strip().casefold() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    expected = [expected_aspect] if typed_enabled else []
+    routed_steps = [
+        step
+        for step in exchange.metrics.coordinator_plan
+        if str(step.get("pipeline") or "") == "agentic"
+    ]
+    assert routed_steps, exchange.metrics.coordinator_plan
+    actual = [list(step.get("sql_risk_aspects") or []) for step in routed_steps]
+    assert actual == [expected] * len(routed_steps), {
+        "expected": expected,
+        "actual": actual,
+        "plan": routed_steps,
+    }
+    assert all(
+        "Анализ SQL-рисков" in (step.get("operation_skills") or [])
+        for step in routed_steps
+    ), routed_steps
+
+
+def _assert_no_sql_risk_route(exchange: _LiveExchange) -> None:
+    if LIVE_AGENT_MODE != "multiagent":
+        return
+    routed_steps = [
+        step
+        for step in exchange.metrics.coordinator_plan
+        if str(step.get("pipeline") or "") == "agentic"
+    ]
+    assert routed_steps, exchange.metrics.coordinator_plan
+    assert all(
+        "Анализ SQL-рисков" not in (step.get("operation_skills") or [])
+        and list(step.get("sql_risk_aspects") or []) == []
+        for step in routed_steps
+    ), routed_steps
+
+
+def _trace_values(trace: dict, key: str) -> list:
+    return [
+        mapping[key]
+        for mapping in _nested_mappings(trace)
+        if key in mapping
+    ]
+
+
+def _assert_protocol_mode(trace: dict, expected: str) -> None:
+    modes = {
+        str(value).casefold()
+        for value in _trace_values(trace, "mode")
+        if value is not None
+    }
+    assert expected in modes, {"expected": expected, "modes": sorted(modes)}
+
+
+def _protocol_check_records(trace: dict, kind: str) -> list[dict]:
+    records: list[dict] = []
+    for mapping in _nested_mappings(trace):
+        discriminator = next(
+            (
+                mapping.get(key)
+                for key in ("kind", "check", "check_id", "name")
+                if mapping.get(key) is not None
+            ),
+            None,
+        )
+        if str(discriminator or "").casefold() == kind.casefold():
+            records.append(mapping)
+        checks = mapping.get("checks")
+        if isinstance(checks, dict) and kind in checks:
+            child = checks[kind]
+            records.append(child if isinstance(child, dict) else {"status": child})
+        elif isinstance(checks, list) and kind in checks:
+            records.append({"kind": kind, "status": "selected"})
+    return records
+
+
+def _assert_protocol_check(
+    trace: dict,
+    kind: str,
+    *,
+    statuses: set[str] | None = None,
+) -> dict:
+    records = _protocol_check_records(trace, kind)
+    assert records, {"missing_check": kind, "trace": trace}
+    if statuses is None:
+        return records[-1]
+    matching = [
+        record
+        for record in records
+        if str(record.get("status") or "").casefold() in statuses
+    ]
+    assert matching, {
+        "check": kind,
+        "expected_statuses": sorted(statuses),
+        "records": records,
+    }
+    return matching[-1]
+
+
+def _assert_protocol_status(trace: dict, *expected: str) -> str:
+    status = str(trace.get("status") or "").casefold()
+    assert status in set(expected), {"status": status, "trace": trace}
+    return status
+
+
+def _assert_protocol_phases(trace: dict, expected: set[int]) -> None:
+    phases = {
+        int(value)
+        for value in _trace_values(trace, "phase")
+        if isinstance(value, int) or str(value).isdigit()
+    }
+    assert expected <= phases, {"expected": sorted(expected), "phases": sorted(phases)}
+
+
+def _trace_target(trace: dict, target_table: str) -> dict:
+    targets = [
+        mapping
+        for mapping in _nested_mappings(trace.get("targets", []))
+        if str(mapping.get("target_table") or "").casefold()
+        == target_table.casefold()
+    ]
+    assert targets, {"target_table": target_table, "trace": trace}
+    return targets[0]
+
+
+def _trace_issue_codes(trace: dict) -> set[str]:
+    issues = trace.get("issues")
+    if not isinstance(issues, list):
+        return set()
+    return {
+        str(issue.get("code") or "")
+        for issue in issues
+        if isinstance(issue, dict) and issue.get("code")
+    }
+
+
+def _assert_protocol_sql_parseable(
+    exchange: _LiveExchange,
+    *,
+    minimum_blocks: int = 1,
+) -> list[str]:
+    sql_blocks = re.findall(
+        r"```sql\s*\n(.*?)\n```",
+        exchange.result.answer,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    executable_blocks = [
+        block
+        for block in sql_blocks
+        if not block.lstrip().startswith("-- SQL-шаблон не сформирован:")
+        and re.search(r"\b(select|with)\b", block, re.I)
+    ]
+    assert len(executable_blocks) >= minimum_blocks, exchange.result.answer
+    for sql_template in executable_blocks:
+        parseable = sql_template
+        for placeholder in (
+            "{{LOAD_SCOPE_PREDICATE}}",
+            "{{SOURCE_SCOPE_PREDICATE}}",
+            "{{TARGET_SCOPE_PREDICATE}}",
+        ):
+            parseable = parseable.replace(placeholder, "TRUE")
+        parseable = re.sub(
+            r"(?<![\w$])\$\$([A-Za-z0-9_]+)(?=\.)",
+            lambda match: f'"$${match.group(1)}"',
+            parseable,
+        )
+        statements = sqlglot.parse(parseable, read=GREENPLUM_DIALECT)
+        assert len(statements) == 1 and statements[0] is not None, sql_template
+    return executable_blocks
+
+
+def _resolution_events(exchange: _LiveExchange) -> list[dict]:
+    events: list[dict] = []
+    seen: set[str] = set()
+    for mapping in _nested_mappings(exchange.metrics.entity_resolution):
+        required = {"mention", "role", "status", "method"}
+        if not required <= set(mapping):
+            continue
+        serialized = json.dumps(mapping, ensure_ascii=False, sort_keys=True)
+        if serialized not in seen:
+            seen.add(serialized)
+            events.append(mapping)
+    return events
+
+
+def _resolution_event(
+    exchange: _LiveExchange,
+    *,
+    mention: str,
+    role: str,
+) -> dict:
+    from agents.entity_resolution import normalize_entity_name
+
+    normalized_mention = normalize_entity_name(mention)
+    exact = [
+        event
+        for event in _resolution_events(exchange)
+        if normalize_entity_name(event.get("mention")) == normalized_mention
+        and str(event.get("role") or "").casefold() == role.casefold()
+    ]
+    assert exact, {
+        "mention": mention,
+        "role": role,
+        "events": _resolution_events(exchange),
+    }
+    return exact[-1]
+
+
+def _candidate_names(event: dict) -> list[str]:
+    candidate_set = event.get("candidate_set")
+    assert isinstance(candidate_set, dict), event
+    candidates = candidate_set.get("candidates")
+    assert isinstance(candidates, list), candidate_set
+    return [
+        str(candidate.get("canonical_name") or "")
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("canonical_name")
+    ]
+
+
+def _assert_resolved_event(
+    exchange: _LiveExchange,
+    *,
+    mention: str,
+    role: str,
+    canonical: str,
+    method: str,
+) -> dict:
+    event = _resolution_event(exchange, mention=mention, role=role)
+    assert event.get("status") == "resolved", event
+    assert event.get("method") == method, event
+    assert str(event.get("canonical_name") or "").casefold() == canonical.casefold(), event
+    assert str(event.get("role") or "") == role, event
+    assert canonical.casefold() in {
+        name.casefold() for name in _candidate_names(event)
+    }, event
+    return event
+
+
+def _tool_names(exchange: _LiveExchange) -> list[str]:
+    return [item.name for item in exchange.metrics.tool_calls]
+
+
+def _assert_no_worker_reroute(exchange: _LiveExchange) -> None:
+    reroutes = [
+        item
+        for item in exchange.metrics.worker_routes
+        if item.routing_attempt > 1
+    ]
+    assert reroutes == [], reroutes
+
+
+def _assert_exact_reader_uses_canonical(
+    exchange: _LiveExchange,
+    *,
+    canonical: str,
+    rejected_mention: str | None = None,
+) -> None:
+    exact_calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name in _EXACT_S2T_READERS
+    ]
+    assert exact_calls, exchange.metrics.tool_calls
+    serialized = json.dumps(
+        [item.arguments for item in exact_calls],
+        ensure_ascii=False,
+    ).casefold()
+    assert canonical.casefold() in serialized, exact_calls
+    if rejected_mention is not None:
+        assert rejected_mention.casefold() not in serialized, exact_calls
 
 
 @pytest.mark.live_smoke
@@ -1749,7 +2535,8 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
     )
     exchange = _chat(
         live_chat_client,
-        f"Для файла {filename!r} оцени совместимость nullable-ограничений "
+        f"Для файла {filename!r} оцени только SQL-риск constraint "
+        "rejection из-за nullable-ограничений "
         f"{source_table}.{source_field} → {target_table}.{target_field}. Верни "
         "source_not_null=<0|1>, target_not_null=<0|1> и вывод.",
     )
@@ -1765,6 +2552,7 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
         },
         require_analysis=True,
     )
+    _assert_sql_risk_aspect(exchange, "constraint_rejection")
 
 
 @pytest.mark.live_validation
@@ -1812,6 +2600,7 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
         ),
         require_analysis=True,
     )
+    _assert_sql_risk_aspect(exchange, "cardinality")
 
 
 @pytest.mark.live_validation
@@ -1865,6 +2654,57 @@ def test_live_agent_checks_row_loss_risk(live_chat_client):
         ),
         require_analysis=True,
     )
+    _assert_sql_risk_aspect(exchange, "row_filtering")
+
+
+@pytest.mark.live_validation
+def test_live_agent_checks_value_change_risk(live_chat_client):
+    _, target_table, source_table, target_field, source_field = (
+        _s2t_work_case_fixture()
+    )
+    exchange = _chat(
+        live_chat_client,
+        "Оцени только SQL-аспект value changes: может ли "
+        f"сохранённая S2T-трансформация {source_table}.{source_field} "
+        f"→ {target_table}.{target_field} изменить значение? Остальные "
+        "SQL-риски не анализируй.",
+    )
+
+    _assert_public_answer(exchange.result.answer)
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools=(
+            {"read_s2t_source_to_target"}
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
+        require_analysis=True,
+    )
+    _assert_sql_risk_aspect(exchange, "value_changes")
+
+
+@pytest.mark.live_validation
+def test_live_agent_checks_write_semantics_risk(live_chat_client):
+    _, target_table, source_table, _, _ = _s2t_work_case_fixture()
+    exchange = _chat(
+        live_chat_client,
+        "Оцени только SQL-аспект write semantics для сохранённой "
+        f"S2T-загрузки {source_table} → {target_table}: append, overwrite, "
+        "MERGE/UPSERT или conflict handling. Если write statement не "
+        "сохранён, честно отметь «не оценено» и не выводи режим из PK.",
+    )
+
+    _assert_public_answer(exchange.result.answer)
+    _assert_s2t_work_case_execution(
+        exchange,
+        required_tools=(
+            {"read_s2t_source_to_target"}
+            if STRICT_RETRIEVAL_ENABLED
+            else None
+        ),
+        require_analysis=True,
+    )
+    _assert_sql_risk_aspect(exchange, "write_semantics")
 
 
 @pytest.mark.live_validation
@@ -1889,6 +2729,7 @@ def test_live_agent_explains_table_transformation(live_chat_client):
         ),
         require_analysis=True,
     )
+    _assert_no_sql_risk_route(exchange)
 
 
 @pytest.mark.live_validation
@@ -2396,3 +3237,777 @@ def test_live_agent_catalog_25_finds_conflicting_s2t(live_chat_client):
         "или объясни, почему mappings дополняют друг друга.",
     )
     _assert_s2t_catalog_scenario(exchange)
+
+
+# Extended deterministic protocol scenarios from the multiagent improvement
+# plan. They remain opt-in real-HTTP tests, but assert the execution trace and
+# generated SQL directly instead of delegating correctness to LLM-as-judge.
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_standard_mode(live_chat_client):
+    case = _protocol_live_case(
+        min_mapped_fields=2,
+        require_target_catalog=True,
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"Для file_id={case.file_id} составь стандартный тест-протокол "
+        f"проверки загрузки {case.source_table} → {case.target_table}. "
+        "SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_protocol_mode(trace, "standard")
+    _assert_protocol_status(trace, "ready", "partial_protocol")
+    for check in (
+        "row_count",
+        "key_uniqueness",
+        "required_null_rate",
+        "transformation_correctness",
+    ):
+        _assert_protocol_check(trace, check)
+    _assert_protocol_phases(trace, {0, 1, 2, 3})
+    _assert_protocol_sql_parseable(exchange, minimum_blocks=2)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_exhaustive_mode(live_chat_client):
+    case = _protocol_live_case(
+        min_mapped_fields=2,
+        require_target_catalog=True,
+        require_primary_key=True,
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"Для file_id={case.file_id} составь максимально полный exhaustive "
+        f"тест-протокол загрузки {case.source_table} → {case.target_table}; "
+        f"comparison key явно {case.target_field}. Включи все поддерживаемые "
+        "статические и SQL-проверки, но не выполняй их.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_protocol_mode(trace, "exhaustive")
+    assert _ALL_PROTOCOL_CHECKS <= {
+        kind
+        for kind in _ALL_PROTOCOL_CHECKS
+        if _protocol_check_records(trace, kind)
+    }, trace
+    _assert_protocol_phases(trace, {0, 1, 2, 3})
+    _assert_protocol_sql_parseable(exchange, minimum_blocks=4)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_key_reconciliation(live_chat_client):
+    case = _protocol_live_case()
+    exchange = _chat(
+        live_chat_client,
+        f"Для загрузки {case.source_table} → {case.target_table} составь explicit "
+        f"protocol только с check=key_reconciliation; comparison key явно "
+        f"задаю {case.target_field}. Файл не указываю, SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    check = _assert_protocol_check(trace, "key_reconciliation", statuses={"ready"})
+    target = _trace_target(trace, case.target_table)
+    assert [
+        str(value).casefold() for value in target.get("comparison_key") or []
+    ] == [case.target_field.casefold()], target
+    assert target.get("comparison_key_source") == "explicit", target
+    assert "expected" in json.dumps(check, ensure_ascii=False).casefold()
+    _assert_protocol_sql_parseable(exchange)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_field_level_reconciliation(live_chat_client):
+    case = _protocol_live_case(min_mapped_fields=2)
+    exchange = _chat(
+        live_chat_client,
+        f"Составь explicit тест-протокол {case.source_table} → "
+        f"{case.target_table} только для check=field_mismatch. Сравни поле "
+        f"{case.target_field} по сохранённой transformation; comparison key "
+        f"явно задаю {case.target_field}. SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_protocol_check(trace, "field_mismatch", statuses={"ready"})
+    sql_blocks = _assert_protocol_sql_parseable(exchange)
+    combined = "\n".join(sql_blocks).casefold()
+    assert case.target_field.casefold() in combined
+    assert "expected" in combined and "actual" in combined
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_preload_constraint_checks(live_chat_client):
+    file_id, target, source, _, _ = _s2t_work_case_fixture()
+    exchange = _chat(
+        live_chat_client,
+        f"Для file_id={file_id} и загрузки {source} → {target} составь explicit "
+        "protocol с check=expected_required_nulls и check=schema_compatibility. "
+        "Сначала выведи Phase 0 preflight; SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_protocol_check(trace, "expected_required_nulls", statuses={"ready"})
+    _assert_protocol_check(trace, "schema_compatibility", statuses={"ready", "partial"})
+    _assert_protocol_phases(trace, {0})
+    preflight = _trace_values(_trace_target(trace, target), "preflight")
+    assert preflight and any(preflight), trace
+    tools = _tool_names(exchange)
+    assert "list_source_column_catalog" in tools, tools
+    assert "list_target_column_catalog" in tools, tools
+    _assert_protocol_sql_parseable(exchange)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_expression_projection(live_chat_client):
+    case = _protocol_live_case(expression=True, min_mapped_fields=2)
+    exchange = _chat(
+        live_chat_client,
+        f"Для file_id={case.file_id} составь explicit protocol "
+        f"{case.source_table} → {case.target_table} с checks=field_mismatch и "
+        f"transformation_correctness. Comparison key явно {case.target_field}. "
+        "Сохрани expression projections из S2T; SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_protocol_check(trace, "field_mismatch", statuses={"ready"})
+    target = _trace_target(trace, case.target_table)
+    normalized = target.get("normalized_transformation")
+    assert isinstance(normalized, dict), target
+    assert normalized.get("parse_status") == "ok", normalized
+    projections = normalized.get("projections")
+    assert projections, normalized
+    serialized = json.dumps(projections, ensure_ascii=False).casefold()
+    assert any(token in serialized for token in ("coalesce", "case", "cast")), normalized
+    _assert_protocol_sql_parseable(exchange)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_explicit_key_without_catalog_pk(live_chat_client):
+    case = _protocol_live_case()
+    exchange = _chat(
+        live_chat_client,
+        f"Без file selector составь explicit protocol {case.source_table} → "
+        f"{case.target_table} с checks=key_uniqueness,key_reconciliation. "
+        f"Явный comparison key={case.target_field}; PK каталога не используй. "
+        "SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    target = _trace_target(trace, case.target_table)
+    assert target.get("comparison_key_source") == "explicit", target
+    assert [
+        str(value).casefold() for value in target.get("comparison_key") or []
+    ] == [case.target_field.casefold()], target
+    _assert_protocol_check(trace, "key_uniqueness", statuses={"ready"})
+    _assert_protocol_check(trace, "key_reconciliation", statuses={"ready"})
+    assert not (set(_tool_names(exchange)) & _CATALOG_READERS), exchange.metrics.tool_calls
+    _assert_protocol_sql_parseable(exchange, minimum_blocks=2)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_separate_load_scopes(live_chat_client):
+    case = _protocol_live_case()
+    exchange = _chat(
+        live_chat_client,
+        f"Составь explicit protocol {case.source_table} → {case.target_table} "
+        "с checks=row_count,missing_rows,extra_rows. В каждом SQL оставь "
+        f"comparison key={case.target_field}. "
+        "раздельные {{SOURCE_SCOPE_PREDICATE}} и {{TARGET_SCOPE_PREDICATE}}; "
+        "не заменяй их общим load scope и ничего не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    for check in ("row_count", "missing_rows", "extra_rows"):
+        _assert_protocol_check(trace, check, statuses={"ready"})
+    sql_blocks = _assert_protocol_sql_parseable(exchange, minimum_blocks=3)
+    combined = "\n".join(sql_blocks)
+    assert "{{SOURCE_SCOPE_PREDICATE}}" in combined
+    assert "{{TARGET_SCOPE_PREDICATE}}" in combined
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_minimal_readers(live_chat_client):
+    case = _protocol_live_case()
+    exchange = _chat(
+        live_chat_client,
+        f"Без файла составь explicit protocol {case.source_table} → "
+        f"{case.target_table} только с check=row_count. SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_protocol_check(trace, "row_count", statuses={"ready"})
+    tools = _tool_names(exchange)
+    assert tools.count("read_s2t_source_to_target") == 1, tools
+    assert not (set(tools) & _CATALOG_READERS), tools
+    assert set(tools) <= {"read_s2t_source_to_target"}, tools
+    _assert_protocol_sql_parseable(exchange)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_table_typo_resolution(live_chat_client):
+    target_mention, canonical_target = _unique_typo_case("target")
+    source = str(
+        _fetch_one(
+            """
+            SELECT TRIM(source_table)
+            FROM s2t_transformations
+            WHERE TRIM(target_table) = ? COLLATE NOCASE
+              AND NULLIF(TRIM(source_table), '') IS NOT NULL
+            ORDER BY id LIMIT 1
+            """,
+            (canonical_target,),
+        )[0]
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"Составь explicit protocol {source} → {target_mention} только с "
+        "check=row_count. В target есть опечатка: разреши имя до exact reader; "
+        "SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_resolved_event(
+        exchange,
+        mention=target_mention,
+        role="target",
+        canonical=canonical_target,
+        method="fuzzy",
+    )
+    _assert_exact_reader_uses_canonical(
+        exchange,
+        canonical=canonical_target,
+        rejected_mention=target_mention,
+    )
+    _assert_protocol_check(trace, "row_count", statuses={"ready"})
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_ambiguous_typo(live_chat_client):
+    mention, expected_candidates = _ambiguous_partial_case("target")
+    source = str(
+        _fetch_one(
+            """
+            SELECT TRIM(source_table)
+            FROM s2t_transformations
+            WHERE TRIM(target_table) = ? COLLATE NOCASE
+              AND NULLIF(TRIM(source_table), '') IS NOT NULL
+            ORDER BY id LIMIT 1
+            """,
+            (expected_candidates[0],),
+        )[0]
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"Составь explicit protocol для source {source!r} и target "
+        f"mention={mention!r} только с check=row_count. Это неточное имя: "
+        "не угадывай между кандидатами.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    event = _resolution_event(exchange, mention=mention, role="target")
+    assert event.get("status") == "ambiguous", event
+    assert event.get("method") == "partial", event
+    assert event.get("canonical_name") in {None, ""}, event
+    actual_candidates = _candidate_names(event)
+    assert len(actual_candidates) >= 2, event
+    assert {name.casefold() for name in expected_candidates} <= {
+        name.casefold() for name in actual_candidates
+    }, event
+    assert event["candidate_set"].get("coverage") == "complete", event
+    _assert_protocol_status(trace, "ambiguous_entity")
+    assert "ambiguous_entity" in _trace_issue_codes(trace), trace
+    exact_arguments = json.dumps(
+        [
+            item.arguments
+            for item in exchange.metrics.tool_calls
+            if item.name in _EXACT_S2T_READERS
+        ],
+        ensure_ascii=False,
+    ).casefold()
+    assert not any(name.casefold() in exact_arguments for name in expected_candidates)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_semantic_file_resolution(live_chat_client):
+    file_id, filename, description, source, target = _semantic_file_case()
+    exchange = _chat(
+        live_chat_client,
+        f"Для файла по смысловому описанию {description!r} составь explicit "
+        f"protocol {source} → {target} только с check=row_count. Не используй "
+        "filename как подсказку и не выполняй SQL.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    semantic_events = [
+        event
+        for event in _resolution_events(exchange)
+        if event.get("role") == "file" and event.get("method") == "semantic"
+    ]
+    assert semantic_events, _resolution_events(exchange)
+    event = semantic_events[-1]
+    assert event.get("status") == "resolved", event
+    assert int(event.get("file_id") or 0) == file_id, event
+    assert str(event.get("canonical_name") or "").casefold() == filename.casefold(), event
+    assert event["candidate_set"].get("source") == "semantic_search_descriptions", event
+    assert "semantic_search_descriptions" in _tool_names(exchange)
+    _assert_protocol_check(trace, "row_count", statuses={"ready"})
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_without_file(live_chat_client):
+    case = _protocol_live_case()
+    exchange = _chat(
+        live_chat_client,
+        f"Без file_id и filename составь standard protocol "
+        f"{case.source_table} → {case.target_table}. Доступные проверки "
+        "сформируй, catalog-dependent явно отметь unavailable; SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_protocol_mode(trace, "standard")
+    _assert_protocol_status(trace, "partial_protocol")
+    _assert_protocol_check(trace, "row_count", statuses={"ready"})
+    unavailable = [
+        record
+        for kind in _ALL_PROTOCOL_CHECKS
+        for record in _protocol_check_records(trace, kind)
+        if record.get("status") == "unavailable"
+    ]
+    assert unavailable, trace
+    assert not (set(_tool_names(exchange)) & _CATALOG_READERS), exchange.metrics.tool_calls
+    _assert_protocol_sql_parseable(exchange)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_without_file_no_catalog_dependency(live_chat_client):
+    case = _protocol_live_case()
+    exchange = _chat(
+        live_chat_client,
+        f"Без file selector составь explicit protocol {case.source_table} → "
+        f"{case.target_table} только с checks=row_count,transformation_correctness. "
+        "SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_protocol_status(trace, "ready")
+    _assert_protocol_check(trace, "row_count", statuses={"ready"})
+    _assert_protocol_check(trace, "transformation_correctness", statuses={"ready"})
+    assert not (set(_tool_names(exchange)) & _CATALOG_READERS), exchange.metrics.tool_calls
+    _assert_protocol_sql_parseable(exchange, minimum_blocks=2)
+
+
+@pytest.mark.live_validation
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="deterministic validation_protocol exists only in multiagent mode",
+)
+def test_live_validation_protocol_source_catalog_dependency(live_chat_client):
+    file_id, target, source, _, _ = _s2t_work_case_fixture()
+    exchange = _chat(
+        live_chat_client,
+        f"Для file_id={file_id} составь explicit protocol {source} → {target} "
+        "только с check=schema_compatibility. Прочитай source и target catalog, "
+        "SQL не выполняй.",
+    )
+
+    trace = _assert_validation_pipeline(exchange)
+    _assert_protocol_check(trace, "schema_compatibility", statuses={"ready", "partial"})
+    tools = _tool_names(exchange)
+    assert tools.count("list_source_column_catalog") == 1, tools
+    assert tools.count("list_target_column_catalog") == 1, tools
+    assert tools.count("read_s2t_source_to_target") == 1, tools
+    assert tools.count("read_s2t_by_target_table") == 1, tools
+    source_call = next(
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "list_source_column_catalog"
+    )
+    target_call = next(
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "list_target_column_catalog"
+    )
+    assert source_call.arguments.get("file_id") == file_id, source_call
+    assert source_call.arguments.get("table_name") == source, source_call
+    assert target_call.arguments.get("file_id") == file_id, target_call
+    assert target_call.arguments.get("table_name") == target, target_call
+    _assert_protocol_sql_parseable(exchange)
+
+
+@pytest.mark.live_resolution
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies the multiagent entity resolver",
+)
+def test_live_agent_resolves_table_typo_before_exact_reader(live_chat_client):
+    mention, canonical = _unique_typo_case("target")
+    exchange = _chat(
+        live_chat_client,
+        f"Покажи сохранённые S2T mappings для target table {mention!r}. "
+        "В имени опечатка: сначала разреши её, затем используй exact reader.",
+    )
+
+    _assert_agentic_pipeline(exchange)
+    _assert_resolved_event(
+        exchange,
+        mention=mention,
+        role="target",
+        canonical=canonical,
+        method="fuzzy",
+    )
+    _assert_exact_reader_uses_canonical(
+        exchange,
+        canonical=canonical,
+        rejected_mention=mention,
+    )
+    _assert_no_worker_reroute(exchange)
+
+
+@pytest.mark.live_resolution
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies the multiagent entity resolver",
+)
+def test_live_agent_skips_resolution_for_exact_table(live_chat_client):
+    canonical = _role_table_names("target")[0]
+    exchange = _chat(
+        live_chat_client,
+        f"Покажи сохранённые S2T mappings для точной canonical target table "
+        f"{canonical!r}; используй ролевой exact reader.",
+    )
+
+    _assert_agentic_pipeline(exchange)
+    assert "resolve_entities" not in _tool_names(exchange), exchange.metrics.tool_calls
+    assert not [
+        event
+        for event in _resolution_events(exchange)
+        if str(event.get("mention") or "").casefold() == canonical.casefold()
+    ], _resolution_events(exchange)
+    _assert_exact_reader_uses_canonical(exchange, canonical=canonical)
+    _assert_no_worker_reroute(exchange)
+
+
+@pytest.mark.live_resolution
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies the multiagent entity resolver",
+)
+def test_live_agent_resolves_partial_table_name(live_chat_client):
+    mention, canonical = _unique_partial_case("source")
+    exchange = _chat(
+        live_chat_client,
+        f"Покажи сохранённые S2T mappings для неполного source table mention "
+        f"{mention!r}; сначала разреши каноническое имя, затем вызови exact reader.",
+    )
+
+    _assert_agentic_pipeline(exchange)
+    _assert_resolved_event(
+        exchange,
+        mention=mention,
+        role="source",
+        canonical=canonical,
+        method="partial",
+    )
+    _assert_exact_reader_uses_canonical(
+        exchange,
+        canonical=canonical,
+        rejected_mention=mention,
+    )
+    _assert_no_worker_reroute(exchange)
+
+
+@pytest.mark.live_resolution
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies the multiagent entity resolver",
+)
+def test_live_agent_resolves_semantic_table_mention(live_chat_client):
+    canonical, description = _semantic_table_case("target")
+    exchange = _chat(
+        live_chat_client,
+        f"Найди target table по бизнес-смыслу {description!r}, затем покажи "
+        "её сохранённые S2T mappings ролевым exact reader. Имя таблицы в "
+        "запросе намеренно не указано.",
+    )
+
+    _assert_agentic_pipeline(exchange)
+    semantic_events = [
+        event
+        for event in _resolution_events(exchange)
+        if event.get("role") == "target" and event.get("method") == "semantic"
+    ]
+    assert semantic_events, _resolution_events(exchange)
+    event = semantic_events[-1]
+    assert event.get("status") == "resolved", event
+    assert str(event.get("canonical_name") or "").casefold() == canonical.casefold(), event
+    assert event["candidate_set"].get("coverage") in {"complete", "truncated"}, event
+    assert event["candidate_set"].get("source") == "semantic_search_descriptions", event
+    assert "resolve_entities" in _tool_names(exchange)
+    _assert_exact_reader_uses_canonical(exchange, canonical=canonical)
+    _assert_no_worker_reroute(exchange)
+
+
+@pytest.mark.live_resolution
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies lossless semantic candidate handoff",
+)
+def test_live_agent_batches_all_semantic_candidates_into_s2t_search(
+    live_chat_client,
+):
+    description = _semantic_batch_column_case()
+    exchange = _chat(
+        live_chat_client,
+        f"Найди по бизнес-смыслу {description!r} до пяти колонок "
+        "через semantic_search_descriptions с scope=columns. Не выбирай "
+        "один лучший кандидат: для всех различающихся "
+        "технических имён найди S2T одним batch-вызовом. Отдельно "
+        "покажи и semantic candidates, и S2T-result.",
+    )
+
+    _assert_agentic_pipeline(exchange)
+    calls = exchange.metrics.tool_calls
+    semantic_calls = [
+        (index, item)
+        for index, item in enumerate(calls)
+        if item.name == "semantic_search_descriptions"
+    ]
+    previous_calls = [
+        (index, item)
+        for index, item in enumerate(calls)
+        if item.name == "read_previous_result"
+    ]
+    search_calls = [
+        (index, item)
+        for index, item in enumerate(calls)
+        if item.name == "search_s2t_transformations"
+    ]
+    assert len(semantic_calls) == len(previous_calls) == len(search_calls) == 1, [
+        item.name for item in calls
+    ]
+    assert semantic_calls[0][0] < previous_calls[0][0] < search_calls[0][0], [
+        item.name for item in calls
+    ]
+    semantic_args = semantic_calls[0][1].arguments
+    assert semantic_args.get("scope") == "columns", semantic_args
+    assert 2 <= int(semantic_args.get("limit") or 10) <= 5, semantic_args
+    batch_args = search_calls[0][1].arguments
+    needles = [str(value) for value in batch_args.get("needles") or []]
+    assert batch_args.get("needle") in {None, ""}, batch_args
+    assert len(needles) >= 2, batch_args
+    assert len(needles) == len({value.casefold() for value in needles}), batch_args
+
+    semantic_payloads = []
+    for item in exchange.result.display_items:
+        if item.name != "semantic_search_descriptions":
+            continue
+        try:
+            payload = json.loads(item.content)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            semantic_payloads.append(payload)
+    assert semantic_payloads, exchange.result.display_items
+    displayed_names = {
+        str(mapping.get("column_name") or mapping.get("name") or "").strip()
+        for payload in semantic_payloads
+        for mapping in _nested_mappings(payload)
+        if str(mapping.get("scope") or "")
+        in {"source_columns", "target_columns"}
+        and str(mapping.get("column_name") or mapping.get("name") or "").strip()
+    }
+    assert len(displayed_names) >= 2, semantic_payloads
+    assert {value.casefold() for value in displayed_names} == {
+        value.casefold() for value in needles
+    }, {"displayed_names": displayed_names, "needles": needles}
+    _assert_no_worker_reroute(exchange)
+
+
+@pytest.mark.live_resolution
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies the multiagent entity resolver",
+)
+def test_live_agent_does_not_guess_ambiguous_entity(live_chat_client):
+    mention, expected_candidates = _ambiguous_partial_case("source")
+    exchange = _chat(
+        live_chat_client,
+        f"Покажи S2T mappings для неточного source table mention {mention!r}. "
+        "Если кандидатов несколько, не выбирай один и явно запроси уточнение.",
+    )
+
+    _assert_agentic_pipeline(exchange)
+    event = _resolution_event(exchange, mention=mention, role="source")
+    assert event.get("status") == "ambiguous", event
+    assert event.get("canonical_name") in {None, ""}, event
+    actual_candidates = _candidate_names(event)
+    assert len(actual_candidates) >= 2, event
+    assert {name.casefold() for name in expected_candidates} <= {
+        name.casefold() for name in actual_candidates
+    }, event
+    exact_arguments = json.dumps(
+        [
+            item.arguments
+            for item in exchange.metrics.tool_calls
+            if item.name in _EXACT_S2T_READERS
+        ],
+        ensure_ascii=False,
+    ).casefold()
+    assert not any(name.casefold() in exact_arguments for name in expected_candidates)
+    assert "?" in exchange.result.answer or "уточн" in exchange.result.answer.casefold()
+    _assert_no_worker_reroute(exchange)
+
+
+@pytest.mark.live_resolution
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies the multiagent entity resolver",
+)
+def test_live_entity_resolution_preserves_source_target_role(live_chat_client):
+    source_mention, source = _unique_typo_case("source")
+    target_mention, target = _unique_typo_case("target")
+    exchange = _chat(
+        live_chat_client,
+        f"Отдельно прочитай mappings для source mention {source_mention!r} и "
+        f"для target mention {target_mention!r}. В обоих именах опечатки; "
+        "не смешивай роли и используй соответствующие exact readers.",
+    )
+
+    _assert_agentic_pipeline(exchange)
+    source_event = _assert_resolved_event(
+        exchange,
+        mention=source_mention,
+        role="source",
+        canonical=source,
+        method="fuzzy",
+    )
+    target_event = _assert_resolved_event(
+        exchange,
+        mention=target_mention,
+        role="target",
+        canonical=target,
+        method="fuzzy",
+    )
+    assert all(
+        candidate.get("role") == "source"
+        for candidate in source_event["candidate_set"]["candidates"]
+    ), source_event
+    assert all(
+        candidate.get("role") == "target"
+        for candidate in target_event["candidate_set"]["candidates"]
+    ), target_event
+    _assert_exact_reader_uses_canonical(exchange, canonical=source)
+    _assert_exact_reader_uses_canonical(exchange, canonical=target)
+    _assert_no_worker_reroute(exchange)
+
+
+@pytest.mark.live_resolution
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies shared validation/agentic resolution semantics",
+)
+def test_live_validation_and_agentic_use_same_resolution_semantics(live_chat_client):
+    mention, canonical = _unique_typo_case("target")
+    source = str(
+        _fetch_one(
+            """
+            SELECT TRIM(source_table)
+            FROM s2t_transformations
+            WHERE TRIM(target_table) = ? COLLATE NOCASE
+              AND NULLIF(TRIM(source_table), '') IS NOT NULL
+            ORDER BY id LIMIT 1
+            """,
+            (canonical,),
+        )[0]
+    )
+    validation_exchange = _chat(
+        live_chat_client,
+        f"Составь explicit protocol {source} → {mention} только с "
+        "check=row_count. Target mention содержит опечатку; SQL не выполняй.",
+    )
+    agentic_exchange = _chat(
+        live_chat_client,
+        f"Покажи S2T mappings для target table mention {mention!r}; в имени "
+        "опечатка, поэтому разреши его перед exact reader.",
+    )
+
+    _assert_validation_pipeline(validation_exchange)
+    _assert_agentic_pipeline(agentic_exchange)
+    validation_event = _resolution_event(
+        validation_exchange,
+        mention=mention,
+        role="target",
+    )
+    agentic_event = _resolution_event(
+        agentic_exchange,
+        mention=mention,
+        role="target",
+    )
+    for event in (validation_event, agentic_event):
+        assert event.get("status") == "resolved", event
+        assert event.get("method") == "fuzzy", event
+        assert str(event.get("canonical_name") or "").casefold() == canonical.casefold(), event
+    assert {
+        name.casefold() for name in _candidate_names(validation_event)
+    } == {
+        name.casefold() for name in _candidate_names(agentic_event)
+    }
+    _assert_no_worker_reroute(agentic_exchange)

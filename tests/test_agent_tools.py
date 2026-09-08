@@ -529,6 +529,71 @@ def test_previous_result_is_lazy_and_scoped_to_coordinator_run():
     assert missing["error"] == "No active saved-result store"
 
 
+def test_semantic_previous_result_exposes_lossless_candidate_set():
+    from agents.tools.saved_results import (
+        read_previous_result,
+        saved_result_store_scope,
+    )
+
+    rows = [
+        {
+            "scope": "source_columns",
+            "record_id": 11,
+            "file_id": 7,
+            "table_name": "src_orders",
+            "column_name": "customer_id",
+            "name": "customer_id",
+            "score": 0.91,
+        },
+        {
+            "scope": "target_columns",
+            "record_id": 21,
+            "file_id": 7,
+            "table_name": "t_orders",
+            "column_name": "customer_id",
+            "name": "customer_id",
+            "score": 0.89,
+        },
+        {
+            "scope": "source_columns",
+            "record_id": 12,
+            "file_id": 8,
+            "table_name": "src_orders",
+            "column_name": "customer_id",
+            "name": "customer_id",
+            "score": 0.88,
+        },
+    ]
+    payload = {
+        "query": "идентификатор клиента",
+        "scope": "columns",
+        "total_candidates": 10,
+        "returned_rows": len(rows),
+        "truncated": True,
+        "rows": rows,
+    }
+
+    with saved_result_store_scope() as store:
+        reference = store.register_previous_result(
+            source_tool="semantic_search_descriptions",
+            source_tool_call_id="semantic-call",
+            content=json.dumps(payload, ensure_ascii=False),
+            description="Семантические кандидаты колонок.",
+        )
+        resolved = read_previous_result.invoke(
+            {"result_id": reference.result_id}
+        )
+
+    assert "rows" not in resolved["result"]
+    assert resolved["result"]["total_candidates"] == 10
+    assert resolved["candidate_set"] == {
+        "candidates": rows,
+        "coverage": "truncated",
+        "source_result_id": reference.result_id,
+    }
+    assert "одним batch" in read_previous_result.description
+
+
 def test_search_excel_values_and_restore_source_row():
     from agents.tools import get_excel_row, search_excel_values
 
@@ -685,6 +750,9 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
     )
     assert result["embedding_model"] == "test-model"
     assert result["total_candidates"] == 5
+    assert result["returned_rows"] == 3
+    assert result["coverage"] == "truncated"
+    assert result["truncated"] is True
     assert result["rows"][0]["scope"] == "source_tables"
     assert result["rows"][0]["name"] == "src_contract"
     assert result["rows"][0]["score"] == 1.0
@@ -705,6 +773,8 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
         assert scoped["scope"] == scope
         assert {row["scope"] for row in scoped["rows"]} == row_scopes
         assert scoped["total_candidates"] == len(row_scopes)
+        assert scoped["coverage"] == "complete"
+        assert scoped["truncated"] is False
     columns = semantic_search_descriptions.invoke(
         {"query": "номер договора", "scope": "source_columns", "limit": 10}
     )
@@ -3444,6 +3514,7 @@ def test_narrow_s2t_experiment_uses_strict_public_retrieval_surface(monkeypatch)
 
 def test_worker_tool_catalog_stages_general_fallback_tools():
     from agents.tools.registry import (
+        WORKER_CAPABILITY_TOOL_NAMES,
         WORKER_GENERAL_FALLBACK_TOOL_NAMES,
         get_worker_tools,
     )
@@ -3461,6 +3532,7 @@ def test_worker_tool_catalog_stages_general_fallback_tools():
         "read_s2t_by_target_table",
         "get_source_target_column_pair",
         "list_column_metadata",
+        "resolve_entities",
     }.issubset(specialized_names)
     assert {
         "list_s2t_transformations",
@@ -3470,6 +3542,14 @@ def test_worker_tool_catalog_stages_general_fallback_tools():
     }.issubset(WORKER_GENERAL_FALLBACK_TOOL_NAMES)
     assert full_names == (
         specialized_names | WORKER_GENERAL_FALLBACK_TOOL_NAMES
+    )
+    sql_expanded = {
+        tool.name
+        for tool in get_worker_tools(required_capabilities=["sql_read"])
+    }
+    assert sql_expanded - specialized_names == {"run_sql"}
+    assert WORKER_CAPABILITY_TOOL_NAMES["entity_resolution"] == frozenset(
+        {"resolve_entities"}
     )
 
 

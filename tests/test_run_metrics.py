@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -8,8 +9,11 @@ from agents.run_metrics import (
     llm_stage,
     record_coordinator_plan,
     record_display_tools,
+    record_entity_resolution,
     record_supervisor_decision,
+    record_validation_protocol,
     record_worker_observation,
+    record_worker_outcome,
     record_worker_route,
     record_worker_task,
     record_upstream_output,
@@ -107,6 +111,56 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
                 "limitations": [],
             },
         )
+        record_worker_observation(
+            worker_task="Прочитай SQL и граф",
+            cycle=2,
+            routing_attempt=2,
+            observation={
+                "status": "reroute",
+                "gap": "Не хватает двух источников.",
+                "accepted_tool_call_ids": [],
+                "facts": [],
+                "limitations": [],
+                "reroute_reason": "missing_capability",
+                "required_capabilities": ["sql_read", "graph_read"],
+            },
+        )
+        record_worker_outcome(
+            cycle=1,
+            step=1,
+            status="partial",
+            stop_reason="missing_capability",
+            unmet_requirements=["Нужен graph_read."],
+            evidence_count=1,
+            dataset_count=1,
+        )
+        record_entity_resolution(
+            [
+                {
+                    "role": "target",
+                    "mention": "t_targte",
+                    "status": "resolved",
+                    "method": "fuzzy",
+                    "canonical_name": "t_target",
+                    "candidates": ["t_target"],
+                }
+            ]
+        )
+        record_validation_protocol(
+            {
+                "mode": "explicit",
+                "status": "partial_protocol",
+                "readers": ["read_s2t_source_to_target"],
+                "checks": [
+                    {"kind": "row_count", "status": "ready", "phase": 1},
+                    {
+                        "kind": "required_null_rate",
+                        "status": "unavailable",
+                        "phase": 1,
+                    },
+                ],
+            }
+        )
         record_upstream_output(
             {
                 "answer": "Единица получена.",
@@ -163,7 +217,7 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     assert reroute.skills == ["S2T-строки"]
     assert reroute.schemas == ["S2T-маппинг"]
     assert reroute.gap == "Нужен точный S2T-фильтр."
-    assert len(metrics.observations) == 1
+    assert len(metrics.observations) == 2
     observation = metrics.observations[0]
     assert observation.worker_task == "Выполни SELECT 1"
     assert observation.cycle == 1
@@ -177,6 +231,49 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
             "evidence_ids": ["evidence-sql"],
         }
     ]
+    assert observation.reroute_reason is None
+    assert observation.required_capabilities == []
+    reroute_observation = metrics.observations[1]
+    assert reroute_observation.status == "reroute"
+    assert reroute_observation.reroute_reason == "missing_capability"
+    assert reroute_observation.required_capabilities == [
+        "sql_read",
+        "graph_read",
+    ]
+    assert metrics.worker_outcomes == [
+        {
+            "cycle": 1,
+            "step": 1,
+            "status": "partial",
+            "stop_reason": "missing_capability",
+            "unmet_requirements": ["Нужен graph_read."],
+            "evidence_count": 1,
+            "dataset_count": 1,
+        }
+    ]
+    assert metrics.entity_resolution == [
+        {
+            "role": "target",
+            "mention": "t_targte",
+            "status": "resolved",
+            "method": "fuzzy",
+            "canonical_name": "t_target",
+            "candidates": ["t_target"],
+        }
+    ]
+    assert metrics.validation_protocol == {
+        "mode": "explicit",
+        "status": "partial_protocol",
+        "readers": ["read_s2t_source_to_target"],
+        "checks": [
+            {"kind": "row_count", "status": "ready", "phase": 1},
+            {
+                "kind": "required_null_rate",
+                "status": "unavailable",
+                "phase": 1,
+            },
+        ],
+    }
     assert metrics.upstream_output == {
         "answer": "Единица получена.",
         "used_evidence_ids": ["evidence-sql"],
@@ -206,6 +303,74 @@ def test_run_metrics_parse_python_repr_tool_arguments(monkeypatch):
         "source_table": "source_name",
         "target_table": "target_name",
     }
+
+
+def test_entity_resolution_metrics_are_bounded_without_provenance(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    session_id = f"metrics-{uuid4()}"
+    candidates = [
+        {
+            "canonical_name": f"t_candidate_{index}",
+            "entity_type": "table",
+            "role": "target",
+            "file_id": index + 1,
+            "score": 0.9,
+            "method": "semantic",
+            "provenance": [
+                {"record_id": index, "full_row": "SECRET" * 1000},
+                {"record_id": index + 100, "full_row": "SECRET" * 1000},
+            ],
+        }
+        for index in range(25)
+    ]
+    event = {
+        "mention": "таблица клиентов",
+        "entity_type": "table",
+        "role": "target",
+        "status": "ambiguous",
+        "method": "semantic",
+        "error_code": "ambiguous_entity",
+        "reason": "неоднозначно " * 200,
+        "resolver_invoked": True,
+        "candidate_set": {
+            "coverage": "truncated",
+            "source": "semantic_search_descriptions",
+            "total_candidates": 90,
+            "threshold": 0.6,
+            "minimum_gap": 0.05,
+            "candidates": candidates,
+        },
+    }
+
+    with capture_agent_run(session_id):
+        record_entity_resolution([event] * 30)
+        record_entity_resolution([event] * 30)
+
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    assert len(metrics.entity_resolution) == 50
+    recorded = metrics.entity_resolution[0]
+    assert recorded["status"] == "ambiguous"
+    assert recorded["method"] == "semantic"
+    assert len(recorded["reason"]) <= 600
+    candidate_set = recorded["candidate_set"]
+    assert candidate_set["coverage"] == "truncated"
+    assert candidate_set["total_candidates"] == 90
+    assert candidate_set["candidate_count"] == 25
+    assert candidate_set["candidates_truncated"] is True
+    assert len(candidate_set["candidates"]) == 20
+    assert candidate_set["candidates"][0] == {
+        "canonical_name": "t_candidate_0",
+        "entity_type": "table",
+        "role": "target",
+        "file_id": 1,
+        "score": 0.9,
+        "method": "semantic",
+        "provenance_count": 2,
+    }
+    serialized = json.dumps(metrics.entity_resolution, ensure_ascii=False)
+    assert '"provenance"' not in serialized
+    assert "SECRET" not in serialized
 
 
 def test_run_metrics_are_disabled_by_default(monkeypatch):

@@ -30,6 +30,8 @@ def Observation(
     status=None,
     gap=None,
     facts=None,
+    reroute_reason=None,
+    required_capabilities=None,
 ):
     """Build the new Observation contract from concise test fixtures."""
     selected_status = status or (
@@ -52,6 +54,8 @@ def Observation(
         accepted_tool_call_ids=list(accepted_tool_call_ids or []),
         facts=selected_facts,
         limitations=list(limitations or []),
+        reroute_reason=reroute_reason,
+        required_capabilities=list(required_capabilities or []),
     )
 
 
@@ -67,6 +71,10 @@ def WorkerRunResult(
     gap=None,
     facts=None,
     accepted_tool_call_ids=None,
+    stop_reason=None,
+    reroute_reason=None,
+    required_capabilities=None,
+    unmet_requirements=None,
 ):
     selected_status = status or (
         "complete"
@@ -82,6 +90,10 @@ def WorkerRunResult(
         gap=selected_gap,
         facts=list(facts or []),
         accepted_tool_call_ids=list(accepted_tool_call_ids or []),
+        stop_reason=stop_reason,
+        reroute_reason=reroute_reason,
+        required_capabilities=list(required_capabilities or []),
+        unmet_requirements=list(unmet_requirements or []),
     )
 
 
@@ -692,6 +704,97 @@ def test_worker_raises_after_five_observer_retries_without_repeating_tool():
         )
     assert tool_calls == ["lookup"]
     assert len(model.observer.messages) == 6
+
+
+def test_public_worker_keeps_prior_evidence_after_observer_exhaustion():
+    from agents.worker import resolve_worker_display_refs, worker_chat
+
+    tool_calls = []
+
+    def accepted_lookup():
+        tool_calls.append("accepted")
+        return {"rows": [{"value": 42}]}
+
+    def unobserved_lookup():
+        tool_calls.append("unobserved")
+        return {"rows": [{"value": 99}]}
+
+    tools = (_as_tool(accepted_lookup), _as_tool(unobserved_lookup))
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "accepted_lookup",
+                        "args": {},
+                        "id": "call-accepted",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "unobserved_lookup",
+                        "args": {},
+                        "id": "call-unobserved",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        ],
+        observer_responses=[
+            Observation(
+                status="continue",
+                gap="Нужно проверить второе значение.",
+                accepted_tool_call_ids=["call-accepted"],
+                important_facts=["Первое значение равно 42."],
+            ),
+            *[
+                {
+                    "status": "continue",
+                    "gap": None,
+                    "accepted_tool_call_ids": ["call-accepted"],
+                }
+                for _ in range(6)
+            ],
+        ],
+    )
+    route = ToolRoute(
+        tools=["accepted_lookup", "unobserved_lookup"],
+        skills=[],
+        schemas=[],
+    )
+
+    with (
+        patch("agents.worker.chat_model", model),
+        patch("agents.worker.get_worker_tools", return_value=tools),
+        patch("agents.worker.select_chat_route", return_value=route),
+    ):
+        outcome = worker_chat("Получи и проверь два значения.")
+
+    assert tool_calls == ["accepted", "unobserved"]
+    assert len(model.observer.messages) == 7
+    assert outcome.status == "partial"
+    assert outcome.stop_reason == "observer_error"
+    assert outcome.unmet_requirements == [
+        "Observer не смог вернуть валидную структуру после 6 попыток; "
+        "data tool не повторялся."
+    ]
+    assert [fact.text for fact in outcome.facts] == [
+        "Первое значение равно 42."
+    ]
+    assert len(outcome.evidence) == 1
+    evidence = outcome.evidence[0]
+    assert evidence.tool_name == "accepted_lookup"
+    assert evidence.evidence_id == outcome.facts[0].evidence_ids[0]
+    assert '"value": 42' in evidence.preview
+    assert '"value": 99' not in evidence.preview
+    assert evidence.display_ref is not None
+    retained = resolve_worker_display_refs([evidence.display_ref])
+    assert [item.tool_call_id for item in retained] == ["call-accepted"]
 
 
 def test_worker_rejects_complete_when_exact_lineage_scope_was_shortened():
@@ -2668,6 +2771,85 @@ def test_worker_graph_returns_reroute_after_current_palette_cannot_repair():
     assert '"name": "list_names"' in observer_payload
 
 
+def test_worker_reroute_retains_accepted_evidence_for_partial_outcome():
+    from agents.worker import resolve_worker_display_refs, worker_chat
+
+    def lookup(table_name: str):
+        return {"rows": [{"table_name": table_name, "row_count": 55}]}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {"table_name": "t_example"},
+                        "id": "call-accepted-before-reroute",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ],
+        observer_responses=[
+            Observation(
+                status="reroute",
+                gap="Нужен другой tool для проверки контрольной суммы.",
+                accepted_tool_call_ids=["call-accepted-before-reroute"],
+                reroute_reason="missing_capability",
+                required_capabilities=["sql_read"],
+            )
+        ],
+    )
+
+    graph_result = run_worker_graph(
+        task="Получи число строк и проверь контрольную сумму.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+    )
+
+    assert graph_result.status == "reroute"
+    assert graph_result.accepted_tool_call_ids == [
+        "call-accepted-before-reroute"
+    ]
+    assert len(graph_result.display_items) == 1
+    accepted_item = graph_result.display_items[0]
+    assert accepted_item.name == "lookup"
+    assert accepted_item.tool_call_id == "call-accepted-before-reroute"
+    assert accepted_item.arguments == {"table_name": "t_example"}
+    assert '"row_count": 55' in accepted_item.content
+    assert accepted_item.evidence_id
+
+    route = ToolRoute(tools=[], skills=[], schemas=[])
+    with (
+        patch("agents.worker.WORKER_MAX_REROUTES", 0),
+        patch("agents.worker.select_chat_route", return_value=route),
+        patch(
+            "agents.worker.run_worker_graph",
+            return_value=graph_result,
+        ),
+    ):
+        outcome = worker_chat(
+            "Получи число строк и проверь контрольную сумму."
+        )
+
+    assert outcome.status == "partial"
+    assert outcome.unmet_requirements == [
+        "Нужен другой tool для проверки контрольной суммы."
+    ]
+    assert len(outcome.evidence) == 1
+    assert outcome.evidence[0].evidence_id == accepted_item.evidence_id
+    assert outcome.evidence[0].tool_name == "lookup"
+    assert outcome.evidence[0].compact_args == {
+        "table_name": "t_example"
+    }
+    display_ref = outcome.evidence[0].display_ref
+    assert display_ref is not None
+    assert resolve_worker_display_refs([display_ref]) == [accepted_item]
+
+
 def test_native_finish_after_semantic_mismatch_does_not_invent_reroute():
     lookup_calls = []
 
@@ -3052,6 +3234,12 @@ def test_public_worker_reroutes_original_task_after_observer_request():
             goal_satisfied=False,
             problem="Текущий tool не строит многошаговый путь с rules.",
             reroute_required=True,
+            stop_reason="missing_capability",
+            reroute_reason="missing_capability",
+            required_capabilities=["graph_read"],
+            unmet_requirements=[
+                "Текущий tool не строит многошаговый путь с rules."
+            ],
         ),
         WorkerRunResult(
             answer="Максимум: t_example, 55 строк.",
@@ -3095,6 +3283,8 @@ def test_public_worker_reroutes_original_task_after_observer_request():
     reroute_context = router.call_args_list[1].kwargs["reroute_context"]
     assert reroute_context == {
         "gap": "Текущий tool не строит многошаговый путь с rules.",
+        "reason": "missing_capability",
+        "required_capabilities": ["graph_read"],
         "previous_tool_palettes": [["list_s2t_transformations"]],
         "attempt": 1,
     }
@@ -3109,7 +3299,7 @@ def test_public_worker_reroutes_original_task_after_observer_request():
     }
 
 
-def test_public_worker_exposes_general_tools_only_after_second_reroute():
+def test_public_worker_adds_only_required_capability_on_first_reroute():
     from agents.tools import WORKER_GENERAL_FALLBACK_TOOL_NAMES
     from agents.worker import worker_chat
 
@@ -3122,15 +3312,6 @@ def test_public_worker_exposes_general_tools_only_after_second_reroute():
         ToolRoute(
             tools=[
                 "read_s2t_by_target_table",
-                "search_s2t_transformations",
-            ],
-            skills=[],
-            schemas=[],
-        ),
-        ToolRoute(
-            tools=[
-                "read_s2t_by_target_table",
-                "search_s2t_transformations",
                 "run_sql",
             ],
             skills=[],
@@ -3139,16 +3320,14 @@ def test_public_worker_exposes_general_tools_only_after_second_reroute():
     ]
     graph_results = [
         WorkerRunResult(
-            answer="Нужно другое точное чтение.",
-            goal_satisfied=False,
-            reroute_required=True,
-            problem="Не получены необходимые строки.",
-        ),
-        WorkerRunResult(
             answer="Точных контрактов недостаточно.",
             goal_satisfied=False,
             reroute_required=True,
             problem="Нужен нестандартный срез данных.",
+            stop_reason="missing_capability",
+            reroute_reason="missing_capability",
+            required_capabilities=["sql_read"],
+            unmet_requirements=["Нужен нестандартный срез данных."],
         ),
         WorkerRunResult(answer="Срез получен."),
     ]
@@ -3166,26 +3345,87 @@ def test_public_worker_exposes_general_tools_only_after_second_reroute():
         result = worker_chat("Получи нестандартный срез S2T-данных")
 
     assert result.summary == "Срез получен."
-    assert router.call_count == 3
+    assert router.call_count == 2
     routed_names = [
         {tool.name for tool in call.kwargs["available_tools"]}
         for call in router.call_args_list
     ]
-    assert routed_names[0] == routed_names[1]
     assert routed_names[0].isdisjoint(WORKER_GENERAL_FALLBACK_TOOL_NAMES)
     assert "read_s2t_by_target_table" in routed_names[0]
     assert "run_sql" not in routed_names[0]
-    assert "run_sql" in routed_names[2]
-    assert WORKER_GENERAL_FALLBACK_TOOL_NAMES.issubset(routed_names[2])
+    assert "run_sql" in routed_names[1]
+    assert (
+        routed_names[1] & WORKER_GENERAL_FALLBACK_TOOL_NAMES
+    ) == {"run_sql"}
     assert router.call_args_list[0].kwargs["catalog_stage"] == "specialized_only"
-    assert router.call_args_list[1].kwargs["catalog_stage"] == "specialized_only"
-    assert router.call_args_list[2].kwargs["catalog_stage"] == "general_fallback"
+    assert router.call_args_list[1].kwargs["catalog_stage"] == (
+        "capability_expansion"
+    )
     assert "reroute_context" not in router.call_args_list[0].kwargs
     assert router.call_args_list[1].kwargs["reroute_context"]["attempt"] == 1
-    assert router.call_args_list[2].kwargs["reroute_context"]["attempt"] == 2
+    assert router.call_args_list[1].kwargs["reroute_context"][
+        "required_capabilities"
+    ] == ["sql_read"]
     assert "run_sql" in {
-        tool.name for tool in run_graph.call_args_list[2].kwargs["tools"]
+        tool.name for tool in run_graph.call_args_list[1].kwargs["tools"]
     }
+
+
+def test_capability_reroute_experiment_has_immediate_general_baseline(
+    monkeypatch,
+):
+    from agents.tools import WORKER_GENERAL_FALLBACK_TOOL_NAMES
+    from agents.worker import (
+        WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
+        worker_chat,
+    )
+
+    monkeypatch.setenv(WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV, "0")
+    routes = [
+        ToolRoute(
+            tools=["read_s2t_by_target_table"],
+            skills=[],
+            schemas=[],
+        ),
+        ToolRoute(
+            tools=["read_s2t_by_target_table", "run_sql"],
+            skills=[],
+            schemas=[],
+        ),
+    ]
+    graph_results = [
+        WorkerRunResult(
+            answer="Нужна SQL capability.",
+            goal_satisfied=False,
+            reroute_required=True,
+            problem="Нужен SQL срез.",
+            stop_reason="missing_capability",
+            reroute_reason="missing_capability",
+            required_capabilities=["sql_read"],
+        ),
+        WorkerRunResult(answer="Готово."),
+    ]
+
+    with (
+        patch(
+            "agents.worker.select_chat_route",
+            side_effect=routes,
+        ) as router,
+        patch(
+            "agents.worker.run_worker_graph",
+            side_effect=graph_results,
+        ),
+    ):
+        result = worker_chat("Получи нестандартный срез")
+
+    assert result.status == "complete"
+    second_catalog = {
+        tool.name for tool in router.call_args_list[1].kwargs["available_tools"]
+    }
+    assert WORKER_GENERAL_FALLBACK_TOOL_NAMES.issubset(second_catalog)
+    assert router.call_args_list[1].kwargs["reroute_context"][
+        "required_capabilities"
+    ] == ["general_read"]
 
 
 def test_public_worker_can_execute_repeated_reroute_palette():
@@ -3202,6 +3442,9 @@ def test_public_worker_can_execute_repeated_reroute_palette():
             goal_satisfied=False,
             problem="SQL не учитывает нужный фильтр.",
             reroute_required=True,
+            stop_reason="wrong_arguments",
+            reroute_reason="wrong_arguments",
+            unmet_requirements=["Нужно исправить фильтр SQL."],
         ),
         WorkerRunResult(
             answer="Максимум: t_example, 55 строк.",
@@ -3231,9 +3474,79 @@ def test_public_worker_can_execute_repeated_reroute_palette():
     second_system_prompt = run_graph.call_args_list[1].kwargs["system_prompt"]
     assert "<reroute_feedback>" in second_system_prompt
     assert "SQL не учитывает нужный фильтр." in second_system_prompt
-    assert "с помощью расширенной палитры" in second_system_prompt
+    assert "палитры требуемых возможностей" in second_system_prompt
     assert router.call_args_list[1].kwargs["reroute_context"] == {
         "gap": "SQL не учитывает нужный фильтр.",
+        "reason": "wrong_arguments",
+        "required_capabilities": [],
         "previous_tool_palettes": [["list_s2t_transformations"]],
         "attempt": 1,
     }
+
+
+def test_wrong_arguments_retains_previously_expanded_general_tool():
+    from agents.worker import worker_chat
+
+    routes = [
+        ToolRoute(
+            tools=["read_s2t_by_target_table"],
+            skills=[],
+            schemas=[],
+        ),
+        ToolRoute(
+            tools=["read_s2t_by_target_table", "run_sql"],
+            skills=[],
+            schemas=[],
+        ),
+        ToolRoute(
+            tools=["read_s2t_by_target_table", "run_sql"],
+            skills=[],
+            schemas=[],
+        ),
+    ]
+    graph_results = [
+        WorkerRunResult(
+            answer="Нужен SQL.",
+            goal_satisfied=False,
+            reroute_required=True,
+            problem="Нужен нестандартный SQL срез.",
+            stop_reason="missing_capability",
+            reroute_reason="missing_capability",
+            required_capabilities=["sql_read"],
+        ),
+        WorkerRunResult(
+            answer="Исправь SQL args.",
+            goal_satisfied=False,
+            reroute_required=True,
+            problem="SQL потерял фильтр.",
+            stop_reason="wrong_arguments",
+            reroute_reason="wrong_arguments",
+        ),
+        WorkerRunResult(answer="Готово."),
+    ]
+
+    with (
+        patch(
+            "agents.worker.select_chat_route",
+            side_effect=routes,
+        ) as router,
+        patch(
+            "agents.worker.run_worker_graph",
+            side_effect=graph_results,
+        ),
+    ):
+        result = worker_chat("Получи SQL-срез с фильтром")
+
+    assert result.status == "complete"
+    assert router.call_args_list[2].kwargs["catalog_stage"] == (
+        "reroute_palette"
+    )
+    assert "run_sql" in {
+        tool.name for tool in router.call_args_list[2].kwargs["available_tools"]
+    }
+    assert router.call_args_list[2].kwargs["reroute_context"]["reason"] == (
+        "wrong_arguments"
+    )
+    assert router.call_args_list[2].kwargs["reroute_context"][
+        "required_capabilities"
+    ] == []

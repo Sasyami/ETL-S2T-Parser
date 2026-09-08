@@ -483,6 +483,12 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "source/target" in semantic_description
     assert "фильтры колонок" in semantic_description
     assert "Подстрока" in contracts["semantic_search_descriptions"]["not_for"]
+    resolver_contract = contracts["resolve_entities"]
+    assert "Опечатка" in resolver_contract["use_when"]
+    assert "source/target" in resolver_contract["use_when"]
+    assert "одним batch-вызовом" in resolver_contract["use_when"]
+    assert "каноническое имя" in resolver_contract["not_for"]
+    assert "exact reader" in resolver_contract["not_for"]
     list_columns_contract = contracts["list_column_catalog"]
     assert "атрибуты" in (
         list_columns_contract["use_when"]
@@ -524,7 +530,7 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert sum(
         len(item["use_when"]) + len(item["not_for"])
         for item in payload["available_tools"]
-    ) < 4800
+    ) < 5200
     assert payload["available_skills"] == [
         {"name": name, "description": description}
         for name, description in SKILL_CATALOG.items()
@@ -542,17 +548,16 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     router_prompt = " ".join(model.messages[0].content.split())
     assert "необходимую planner-палитру" in router_prompt
     assert "точные имена из каталогов" in router_prompt
-    assert "Для каждой операции выбери все необходимые tools" in router_prompt
     assert "`not_for` — запрет" in router_prompt
     assert "все необходимые tools" in router_prompt
     assert "обязательные входы" in router_prompt
-    assert "будет получен выбранным tool" in router_prompt
+    assert "получается выбранным tool" in router_prompt
     assert "Не придумывай входы" in router_prompt
-    assert "Полнота палитры важнее компактности" in router_prompt
-    assert "после двух reroute" in router_prompt
-    assert "перекрывающимися" in router_prompt
-    assert "Tools, skills и schemas выбирай независимо" in router_prompt
-    assert "каждый список может быть пустым" in router_prompt
+    assert "не расширяй палитру по числу попыток" in router_prompt
+    assert "catalog_stage=capability_expansion" in router_prompt
+    assert "следуй `reason` и `required_capabilities`" in router_prompt
+    assert "Списки выбирай независимо" in router_prompt
+    assert "каждый может быть пустым" in router_prompt
     assert "оставляй `tools=[]`" in router_prompt
     assert len(model.messages[0].content) < 1750
     assert "COUNT, DISTINCT, GROUP BY" not in router_prompt
@@ -616,6 +621,8 @@ def test_chat_tool_router_receives_explicit_reroute_context():
     )
     reroute_context = {
         "gap": "Нужен многошаговый S2T-путь с правилами.",
+        "reason": "missing_capability",
+        "required_capabilities": ["graph_read"],
         "previous_tool_palettes": [["list_s2t_transformations"]],
         "attempt": 1,
     }
@@ -638,9 +645,54 @@ def test_chat_tool_router_receives_explicit_reroute_context():
     assert payload["reroute_context"] == reroute_context
     router_prompt = " ".join(model.messages[0].content.split())
     assert "при `reroute_context`" in router_prompt.lower()
-    assert "сохрани последнюю палитру" in router_prompt.lower()
-    assert "добавь tool, закрывающий" in router_prompt.lower()
-    assert "не сокращай и не повторяй палитру" in router_prompt.lower()
+    assert "следуй `reason` и `required_capabilities`" in router_prompt.lower()
+    assert "сохрани нужные прежние tools" in router_prompt.lower()
+    assert "добавь нужную capability" in router_prompt.lower()
+
+
+def test_chat_tool_rerouter_requires_a_tool_for_each_required_capability():
+    model = _SequenceToolRouterModel(
+        [
+            ToolRoute(
+                tools=["list_s2t_transformations", "run_sql"],
+                skills=[],
+                schemas=[],
+            ),
+            ToolRoute(
+                tools=[
+                    "list_s2t_transformations",
+                    "run_sql",
+                    "trace_transformation_path",
+                ],
+                skills=[],
+                schemas=[],
+            ),
+        ]
+    )
+    reroute_context = {
+        "gap": "Нужны нестандартный SQL-срез и графовый путь.",
+        "reason": "missing_capability",
+        "required_capabilities": ["sql_read", "graph_read"],
+        "previous_tool_palettes": [["list_s2t_transformations"]],
+        "attempt": 1,
+    }
+
+    route = _select_chat_route(
+        "Получи SQL-срез и графовый путь.",
+        model=model,
+        available_tools=get_tools(),
+        reroute_context=reroute_context,
+    )
+
+    assert route.tools == [
+        "list_s2t_transformations",
+        "run_sql",
+        "trace_transformation_path",
+    ]
+    assert len(model.calls) == 2
+    repair_prompt = str(model.calls[1][0][-1].content)
+    assert "graph_read" in repair_prompt
+    assert "для каждой требуемой capability" in repair_prompt
 
 
 def test_chat_tool_router_separates_current_task_from_previous_results():
@@ -1292,6 +1344,32 @@ def test_observation_normalizes_gigachat_string_null_gap():
         Observation(status="continue", gap="null")
 
 
+def test_observation_carries_typed_capability_reroute_metadata():
+    from agents.chat_graph import Observation
+
+    reroute = Observation(
+        status="reroute",
+        gap="Нужна SQL-агрегация.",
+        reroute_reason="missing_capability",
+        required_capabilities=["sql_read"],
+    )
+
+    assert reroute.reroute_reason == "missing_capability"
+    assert reroute.required_capabilities == ["sql_read"]
+    with pytest.raises(ValueError, match="requires required_capabilities"):
+        Observation(
+            status="reroute",
+            gap="Нужна новая палитра.",
+            reroute_reason="missing_capability",
+        )
+    with pytest.raises(ValueError, match="only when status is reroute"):
+        Observation(
+            status="continue",
+            gap="Исправить аргументы.",
+            reroute_reason="wrong_arguments",
+        )
+
+
 def test_observer_prompt_requires_semantic_task_comparison():
     from agents.chat_graph import (
         Observation,
@@ -1627,15 +1705,14 @@ def test_tool_router_prompt_is_generic_and_catalog_driven():
     normalized_prompt = " ".join(_TOOL_ROUTER_PROMPT.split())
     assert "точные имена из каталогов" in normalized_prompt
     assert "необходимую planner-палитру" in normalized_prompt
-    assert "каждый список может быть пустым" in normalized_prompt
+    assert "каждый может быть пустым" in normalized_prompt
     assert "оставляй `tools=[]`" in normalized_prompt
-    assert "Покрой разные операции" in normalized_prompt
-    assert "будет получен выбранным tool" in normalized_prompt
+    assert "Покрой обязательные входы" in normalized_prompt
+    assert "получается выбранным tool" in normalized_prompt
     assert "`not_for` — запрет" in normalized_prompt
-    assert "Полнота палитры важнее компактности" in normalized_prompt
-    assert "Не добавляй явно нерелевантные tools" in normalized_prompt
-    assert "после двух reroute" in normalized_prompt
-    assert "точным специализированным контрактом" in normalized_prompt
+    assert "catalog_stage=capability_expansion" in normalized_prompt
+    assert "не расширяй палитру по числу попыток" in normalized_prompt
+    assert "При `wrong_arguments` палитру не меняй" in normalized_prompt
     assert len(_TOOL_ROUTER_PROMPT) < 1750
     for domain_detail in (
         "trace_neo4j_table_lineage",

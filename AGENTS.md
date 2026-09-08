@@ -4,7 +4,7 @@
 
 ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниями, сохраняет исходные данные и каталоги в SQLite, строит Neo4j-lineage и отвечает на вопросы через read-only инструментального агента.
 
-## Текущее состояние — 2026-09-03
+## Текущее состояние — 2026-09-08
 
 - Рабочая ветка может отличаться. Перед изменениями проверять `git status`;
   незакоммиченные пользовательские изменения и каталог `artifacts/` не удалять
@@ -15,6 +15,11 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 - Router одновременно выбирает tools, retrieval-skills и schemas; planner вызывает выбранные tools; observer проверяет каждый data-tool result и возвращает только `complete`, `continue` или `reroute`.
 - Upstream получает исходную задачу и принятые evidence, решает `pass/reroute`, затем анализирует данные, формирует ответ и выбирает display-results.
 - Полные tool-results живут только в run-scoped хранилище; последующим workers передаются короткие `result_id`/schema references. SQLite проекта не изменяется.
+- Специализированный `validation_protocol` использует поток `RawTestProtocolContract → shared entity resolution → ResolvedTestProtocolContract → dependency-based exact readers → deterministic compiler`. Ошибки extraction/resolution возвращают структурированные состояния и не вызывают silent fallback в agentic.
+- Validation compiler поддерживает режимы `explicit`, `standard`, `exhaustive`, Phase 0 preflight и 13 SQL checks в Phase 1–3. Файл необязателен: без него доступны S2T-only checks, а зависимые от catalog checks помечаются `partial`/`unavailable`.
+- `agents/entity_resolution.py` общий для validation и agentic flows: already-canonical identifier проходит exact bypass, а typo/partial/semantic mention разрешается с сохранением source/target role. Ambiguity не угадывается.
+- Live-набор разделён на `smoke`, `history`, `display`, `handoff`, `graph`, `validation`, `resolution`, `catalog`; внешнюю SQLite-базу можно явно задать через `LIVE_AGENT_DB_PATH`.
+- `scripts/run_multiagent_experiments.py` запускает bounded E1–E5. GigaChat Ultra runs (включая отдельно настроенный Ultra judge) защищены fail-closed проверкой баланса с floor 15 000 000 токенов и консервативным резервом на фактические HTTP `/chat`-обмены и judge retries.
 - Расширения handoff-схемы `source_total`, 3 и 8 sample rows проверены на GigaChat-2-Max и отклонены: они увеличивали prompt, но не решали последовательный перебор кандидатов. Handoff остаётся компактным; planner читает полный результат через `read_previous_result`.
 - `search_s2t_transformations` принимает совместимый одиночный `needle` и batch `needles` до 50 технических имён. Для набора из прошлого результата planner должен сделать один batch-вызов; исходные S2T-дубликаты сохраняются.
 - Downstream prompt содержит компактные возможности чтения и краткие описания публичных таблиц. Эксперимент с сильно сокращёнными правилами и полными списками колонок откатан: на GigaChat-2-Max он заменил семантический поиск лексическим S2T-поиском.
@@ -36,7 +41,12 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 - `agents/tools/routing.py` — компактные каталоги и structured selection tools/skills/schemas.
 - `agents/tools/saved_results.py` — временные полные результаты, `read_previous_result` и read-only SQL над сохранённой relation `result`.
 - `agents/tools/s2t.py` — точные S2T-фильтры и ролево-нейтральный batch-поиск по техническим именам из предыдущих результатов.
+- `agents/entity_resolution.py` — общий exact/normalized/partial/fuzzy/semantic resolver с явными resolved/ambiguous/unresolved outcomes.
+- `agents/test_protocol_resolution.py` — разрешение пользовательского `RawTestProtocolContract` в канонический `ResolvedTestProtocolContract`.
+- `agents/validation_protocol.py` — exact S2T и dependency-based catalog readers; legacy S2T-analysis readers остаются отдельно.
+- `agents/transformation_ast.py`, `agents/test_protocol.py` — SQLGlot-нормализация и declarative phased compiler validation protocol.
 - `agents/run_metrics.py`, `scripts/run_live_agent_benchmark.py` — пассивная трассировка и последовательные real-HTTP live-сценарии.
+- `scripts/run_multiagent_experiments.py`, `scripts/gigachat_budget.py` — E1–E5 matrix (skipped делает run неполным и ненулевым) и fail-closed token guard для Ultra.
 
 ## Поток агентного запроса
 
@@ -49,12 +59,24 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 7. После всех workers upstream получает только `original_task` и evidence: `evidence_id`, tool name, точные args, preview, `truncated` и булевый признак `displayable`. Внутренний `display_ref`, worker observations, summaries и runtime refs туда не передаются.
 8. `submit_upstream_data_decision` выбирает `pass` или `reroute`. Reroute сбрасывает результаты текущего цикла и передаёт следующему downstream только краткий `problem`; максимум два полных цикла. После `pass` отдельный `submit_upstream_answer` анализирует evidence, формирует ответ и выбирает display evidence.
 
+## Поток validation protocol
+
+1. Operation router выбирает `validation_protocol`; LLM извлекает только literal mentions, requested checks/mode и optional explicit key в `RawTestProtocolContract`.
+2. Origin validation запрещает добавлять в raw contract идентификаторы, которых нет в исходной task. Exact verifier пропускает подтверждённые canonical names без approximate resolution; остальные mentions обрабатывает общий resolver с сохранением file/source/target role.
+3. Ambiguous или unresolved entity возвращает `ambiguous_entity`/`unresolved_entity`, а повторно невалидный extraction — структурированный failure. В этих случаях `silent_fallback=false`; agentic pipeline автоматически не запускается.
+4. `ResolvedTestProtocolContract` содержит canonical loads, optional `file_id`, checks, mode, explicit key и resolution metadata. Файл не обязателен.
+5. `read_test_protocol_inputs` всегда подтверждает направленные source→target S2T-пары, а target/source catalogs читает только по зависимостям выбранных checks. Для единственного `row_count` полный target read и catalogs не нужны.
+6. Transformation SQL нормализуется через SQLGlot. Phase 0 проверяет mapping coverage, catalog/projection consistency, required fields, requested sources, parseability и ambiguity.
+7. Declarative `CHECKS` registry компилирует Phase 1 smoke, Phase 2 reconciliation и Phase 3 diagnostics. Поддержаны `row_count`, `key_uniqueness`, `required_null_rate`, `transformation_correctness`, `key_reconciliation`, `missing_rows`, `extra_rows`, `field_mismatch`, `schema_compatibility`, `expected_required_nulls`, `aggregate_reconciliation`, `duplicate_expected`, `duplicate_actual`.
+8. `explicit` использует только запрошенные checks, `standard` — четыре базовых, `exhaustive` — все 13. Explicit comparison key имеет приоритет над target PK; без обоих key-based checks становятся unavailable. SQL templates используют разные `{{SOURCE_SCOPE_PREDICATE}}` и `{{TARGET_SCOPE_PREDICATE}}`.
+9. Compiler возвращает machine-readable check statuses `ready|partial|unavailable`, protocol status `ready|partial_protocol|unavailable`, issues, preflight и phase summaries; SQL во внешней Greenplum не исполняется.
+
 ## Результаты tools и наблюдаемость
 
 - Каждый принятый полный tool-result сохраняется на время coordinator-запуска под непрозрачным `result_id`; `display_ref` хранится отдельно от текстового preview.
 - Табличный результат дополнительно получает `result_ref`, список колонок и `truncated`; `query_saved_result` исполняет read-only SQL только над выбранной relation `result`.
 - Хранилище удаляется после coordinator и не пишет во внешнюю `excel_data.db`.
-- `agents/run_metrics.py` пишет этапы `supervisor`, `downstream_plan`, `router`, `worker_planner`, `observer`, `finish_worker`, `upstream`, bounded-решение supervisor, планы, маршруты, observations, display-tools, время и provider tokens. Полные tool-results в метрики не копируются.
+- `agents/run_metrics.py` пишет этапы `supervisor`, `downstream_plan`, `router`, `worker_planner`, `observer`, `finish_worker`, `upstream`, bounded-решение supervisor, планы, маршруты, observations, display-tools, entity-resolution events, validation contract/status/phases/reader calls, время и provider tokens. Полные tool-results в метрики не копируются.
 - `agents/observability.py` содержит необязательную Langfuse-интеграцию; `logs/agent.log` — ротационный UTF-8 лог.
 
 ## SQLite-данные
@@ -85,6 +107,11 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 - Чат read-only по умолчанию. Загрузка, refresh и очистка требуют явного действия пользователя.
 - Не придумывать `file_id`, листы, таблицы, колонки, S2T-строки и роли source/target; получать их из tools/SQL/evidence.
 - Не хранить неявный активный `file_id`. Глобальную `s2t_transformations` никогда не ограничивать файловым `file_id`.
+- В validation pipeline не передавать typo/partial/semantic mentions напрямую в exact readers: сначала общий resolver. Already-canonical identifier проверять exact bypass; ambiguity сохранять и не угадывать.
+- Не смешивать raw пользовательские mentions и canonical identifiers: LLM формирует `RawTestProtocolContract`, readers/compiler получают только `ResolvedTestProtocolContract`.
+- Не делать silent fallback `validation_protocol → agentic` после ошибки extraction или entity resolution. Возвращать structured `unresolved_entity`, `ambiguous_entity`, `missing_parameter`, `unsupported_check`, `partial_protocol` или `unavailable_check`.
+- Не требовать файл для S2T-only validation checks. Catalog читать только по declarative dependencies; отсутствие file scope делает недоступными только зависимые checks.
+- Validation SQL не исполнять. Явный comparison key приоритетнее catalog PK; source и target scope не объединять в один predicate.
 - Логические ETL-таблицы вида `t_*` искать в S2T, а не через SQLite `PRAGMA`.
 - Точную пару `source_table.source_field → target_table.target_field` сначала читать через точные ролевые S2T-фильтры; Neo4j использовать для lineage, а не вместо S2T.
 - Для колонок: точный поиск — каталог, одна явно данная буквальная подстрока — каталоговый search, бизнес-смысл/назначение/описание при неизвестном имени — semantic search; при неизвестной роли искать source и target. Не заменять смысловой запрос набором подстрок, синонимов или переводов.
@@ -104,6 +131,8 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 - Tools и агентная логика: `tests/test_agent_tools.py`, `tests/test_agent.py`, `tests/test_worker.py`, `tests/test_coordinator.py`.
 - Хранение и S2T: `tests/test_database.py`, `tests/test_s2t_transformations.py`.
 - Unit: `pytest tests/ -q`; покрытие: `pytest tests/ --cov=. --cov-config=.coveragerc`.
-- Live quality проверяется отдельно через `scripts/run_live_agent_benchmark.py`: real-HTTP сценарии идут последовательно, сохраняют transcript/JUnit/comparison report; `--group` с именем `smoke`, `history`, `display`, `handoff`, `graph`, `validation` или `catalog` запускает только выбранную смысловую группу. Mock-тесты не оценивают качество модели.
+- Live quality проверяется отдельно через `scripts/run_live_agent_benchmark.py`: real-HTTP сценарии идут последовательно, сохраняют transcript/JUnit/comparison report; `--group` с именем `smoke`, `history`, `display`, `handoff`, `graph`, `validation`, `resolution` или `catalog` запускает только выбранную смысловую группу. `LIVE_AGENT_DB_PATH` задаёт существующую внешнюю SQLite-базу; без него используется workspace `excel_data.db`. Mock-тесты не оценивают качество модели.
+- Bounded E1–E5 запускаются `scripts/run_multiagent_experiments.py`; `--experiment` можно повторять, без него выполняется вся матрица. Основные flags: `--provider`, `--model`, `--llm-judge`, `--pytest-arg`, `--output-dir`, `--dry-run`, `--ultra-token-floor`, `--ultra-reserve-per-scenario`. E1 переключает `WORKER_CAPABILITY_REROUTE_EXPERIMENT`/`WORKER_SPLIT_TOOL_CALL_EXPERIMENT`, E2 — `OPERATION_SQL_RISK_ASPECTS_EXPERIMENT`; E3–E5 проверяют текущие compiler/readers/resolver.
+- Для GigaChat Ultra benchmark и experiment runner обязаны fail-closed проверить баланс до и после run. Жёсткий floor 15 000 000 и базовый резерв 250 000 токенов на фактический HTTP `/chat`-обмен нельзя понизить CLI/env, только повысить; Ultra judge резервируется отдельно с учётом двух стадий и retries. Невозможность подтвердить balance или прогноз ниже floor блокирует дальнейший запуск. Benchmark допускает env overrides `GIGACHAT_ULTRA_TOKEN_FLOOR` и `GIGACHAT_ULTRA_RESERVE_PER_SCENARIO` в этих границах.
 - `--llm-judge` оценивает текущий запрос, role-aware историю, публичный answer и ограниченные display-results. Пользовательские сообщения истории являются условиями, неподтверждённый текст assistant — нет. Новые физические идентификаторы в основанном на сохранённых данных SQL требуют подтверждения display либо явного placeholder; маршрут `A → B` должен достигать точного `B`. Не использовать judge как замену ручному разбору плана и evidence.
 - Запуск UI: `uv run python app.py`.

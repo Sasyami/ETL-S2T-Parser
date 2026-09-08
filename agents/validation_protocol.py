@@ -14,10 +14,15 @@ from sqlglot.errors import SqlglotError
 from services.sql_dialects import GREENPLUM_DIALECT  # noqa: F401
 
 from .tools import (
+    list_source_column_catalog,
     list_target_column_catalog,
     read_s2t_by_target_table,
     read_s2t_source_to_target,
     resolve_file,
+)
+from .test_protocol import (
+    ResolvedTestProtocolContract,
+    check_dependencies,
 )
 from .tools.saved_results import (
     _tabular_payload,
@@ -573,6 +578,162 @@ def read_validation_protocol_inputs(
     return results
 
 
+def read_test_protocol_inputs(
+    contract: ResolvedTestProtocolContract,
+    *,
+    callbacks: Sequence[Any] = (),
+) -> List[Dict[str, Any]]:
+    """Read only dependencies required by a resolved deterministic protocol.
+
+    Exact global S2T readers establish every directed load and feed the static
+    preflight.  File-scoped catalogs are added only when a selected check needs
+    them.  A missing file selector therefore makes only catalog-dependent
+    checks unavailable; it never aborts the whole protocol.
+    """
+
+    results: List[Dict[str, Any]] = []
+
+    def append_read(
+        *,
+        load_index: int,
+        kind: str,
+        tool_name: str,
+        call_id: str,
+        args: Dict[str, Any],
+        tool: Any,
+    ) -> None:
+        try:
+            payload = _invoke(tool, args, callbacks)
+        except Exception as exc:
+            # LangChain tools may raise before they can return their normal
+            # ``{"error": ...}`` envelope (provider callbacks, database
+            # adapters and custom tool wrappers can all do this).  A reader
+            # outage is an unavailable dependency of this deterministic
+            # protocol, not a reason to crash /chat or switch to agentic.
+            payload = {
+                "error": f"{type(exc).__name__}: {exc}",
+                "rows": [],
+            }
+        if not isinstance(payload, dict):
+            payload = {
+                "error": f"{tool_name} вернул результат неизвестного формата.",
+                "rows": [],
+            }
+        if payload.get("error"):
+            # Keep the failure structured without making a catalog look
+            # available to the compiler and without switching pipelines.
+            results.append(
+                {
+                    "kind": "reader_issue",
+                    "load_index": load_index,
+                    "args": args,
+                    "tool_name": tool_name,
+                    "call_id": call_id,
+                    "error": str(payload.get("error")),
+                }
+            )
+            if kind not in {"source_column_catalog", "target_column_catalog"}:
+                results.append(
+                    {
+                        "kind": kind,
+                        "load_index": load_index,
+                        "args": args,
+                        "tool_name": tool_name,
+                        "call_id": call_id,
+                        "payload": {
+                            "columns": [],
+                            "rows": [],
+                            "returned_rows": 0,
+                            "truncated": False,
+                        },
+                    }
+                )
+            return
+        result = {
+            "kind": kind,
+            "load_index": load_index,
+            "args": args,
+            "tool_name": tool_name,
+            "call_id": call_id,
+            "payload": payload,
+        }
+        results.append(result)
+        _persist_full_result(
+            tool_name=tool_name,
+            call_id=call_id,
+            payload=payload,
+        )
+
+    for load_index, load in enumerate(contract.loads, start=1):
+        checks = contract.checks_for_load(load)
+        dependencies = set(check_dependencies(checks))
+        explicit_key = contract.explicit_key_for_load(load)
+
+        # The directed pair reads prove each requested edge.  The target read
+        # supplies complete mapping/preflight coverage without file scoping.
+        for source_index, source_table in enumerate(load.sources, start=1):
+            append_read(
+                load_index=load_index,
+                kind="s2t_pair",
+                tool_name="read_s2t_source_to_target",
+                call_id=f"test_protocol_pair_{load_index}_{source_index}",
+                args={
+                    "source_table": source_table,
+                    "target_table": load.target,
+                },
+                tool=read_s2t_source_to_target,
+            )
+        # A sole row-count check needs only the exact directed mapping.  Other
+        # protocols retain the complete target mapping for phase-zero coverage.
+        if checks != ["row_count"]:
+            append_read(
+                load_index=load_index,
+                kind="s2t_target",
+                tool_name="read_s2t_by_target_table",
+                call_id=f"test_protocol_target_{load_index}",
+                args={"target_table": load.target},
+                tool=read_s2t_by_target_table,
+            )
+
+        needs_target_catalog = bool(
+            dependencies & {"target_catalog", "required_fields"}
+        ) or ("comparison_key" in dependencies and not explicit_key)
+        needs_source_catalog = "source_catalog" in dependencies
+        if contract.file_id is None:
+            # Omission is intentional. _load_results then exposes catalog
+            # availability=False and the relevant compilers emit unavailable.
+            continue
+        if needs_target_catalog:
+            append_read(
+                load_index=load_index,
+                kind="target_column_catalog",
+                tool_name="list_target_column_catalog",
+                call_id=f"test_protocol_target_catalog_{load_index}",
+                args={
+                    "file_id": contract.file_id,
+                    "table_name": load.target,
+                },
+                tool=list_target_column_catalog,
+            )
+        if needs_source_catalog:
+            for source_index, source_table in enumerate(load.sources, start=1):
+                append_read(
+                    load_index=load_index,
+                    kind="source_column_catalog",
+                    tool_name="list_source_column_catalog",
+                    call_id=(
+                        "test_protocol_source_catalog_"
+                        f"{load_index}_{source_index}"
+                    ),
+                    args={
+                        "file_id": contract.file_id,
+                        "table_name": source_table,
+                    },
+                    tool=list_source_column_catalog,
+                )
+    return results
+
+
 def build_s2t_analysis_payload(
     contract: ValidationProtocolContract,
     *,
@@ -900,6 +1061,7 @@ __all__ = [
     "build_s2t_analysis_payload",
     "build_deterministic_analysis_items",
     "merge_s2t_analysis_output",
+    "read_test_protocol_inputs",
     "read_validation_protocol_inputs",
     "render_s2t_analysis_answer",
     "validate_s2t_analysis_output",

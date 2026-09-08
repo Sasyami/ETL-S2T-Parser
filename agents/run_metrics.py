@@ -19,6 +19,9 @@ from pydantic import BaseModel, ConfigDict, Field
 _METRICS_REGISTRY_LIMIT = 100
 _VALUE_PREVIEW_CHARS = 2000
 _SUPERVISOR_CONTEXT_PREVIEW_CHARS = 4000
+_ENTITY_RESOLUTION_EVENT_LIMIT = 50
+_ENTITY_RESOLUTION_CANDIDATE_LIMIT = 20
+_ENTITY_RESOLUTION_REASON_CHARS = 600
 _ACTIVE_RUN: ContextVar[Optional["_RunCollector"]] = ContextVar(
     "agent_run_metrics",
     default=None,
@@ -88,6 +91,8 @@ class ObservationMetric(BaseModel):
     accepted_tool_call_ids: List[str] = Field(default_factory=list)
     facts: List[Dict[str, Any]] = Field(default_factory=list)
     limitations: List[str] = Field(default_factory=list)
+    reroute_reason: Optional[str] = None
+    required_capabilities: List[str] = Field(default_factory=list)
 
 
 class WorkerRouteMetric(BaseModel):
@@ -128,6 +133,9 @@ class AgentRunMetrics(BaseModel):
     coordinator_plan: List[Dict[str, Any]] = Field(default_factory=list)
     worker_routes: List[WorkerRouteMetric] = Field(default_factory=list)
     observations: List[ObservationMetric] = Field(default_factory=list)
+    worker_outcomes: List[Dict[str, Any]] = Field(default_factory=list)
+    entity_resolution: List[Dict[str, Any]] = Field(default_factory=list)
+    validation_protocol: Optional[Dict[str, Any]] = None
     upstream_output: Optional[Dict[str, Any]] = None
     display_tools: List[str] = Field(default_factory=list)
     input_tokens: int = 0
@@ -163,6 +171,27 @@ def _tool_arguments(value: Any) -> Any:
                 return parsed
             return {"raw": value}
     return {"raw": str(value)}
+
+
+def _bounded_json_value(value: Any, *, depth: int = 0) -> Any:
+    """Keep structured diagnostics bounded without flattening their contract."""
+    if depth >= 8:
+        return _clip(value)
+    if isinstance(value, Mapping):
+        return {
+            _clip(key, max_chars=120): _bounded_json_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:100]
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _bounded_json_value(item, depth=depth + 1)
+            for item in list(value)[:100]
+        ]
+    if isinstance(value, str):
+        return _clip(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _clip(value)
 
 
 def _metrics_enabled() -> bool:
@@ -257,6 +286,9 @@ class _RunCollector:
         self.coordinator_plan: List[Dict[str, Any]] = []
         self.worker_routes: List[WorkerRouteMetric] = []
         self.observations: List[ObservationMetric] = []
+        self.worker_outcomes: List[Dict[str, Any]] = []
+        self.entity_resolution: List[Dict[str, Any]] = []
+        self.validation_protocol: Optional[Dict[str, Any]] = None
         self.upstream_output: Optional[Dict[str, Any]] = None
         self.display_tools: List[str] = []
         self.error: Optional[str] = None
@@ -379,6 +411,15 @@ class _RunCollector:
                 coordinator_plan=[dict(item) for item in self.coordinator_plan],
                 worker_routes=list(self.worker_routes),
                 observations=list(self.observations),
+                worker_outcomes=[dict(item) for item in self.worker_outcomes],
+                entity_resolution=[
+                    dict(item) for item in self.entity_resolution
+                ],
+                validation_protocol=(
+                    dict(self.validation_protocol)
+                    if self.validation_protocol is not None
+                    else None
+                ),
                 upstream_output=(
                     dict(self.upstream_output)
                     if self.upstream_output is not None
@@ -608,9 +649,152 @@ def record_worker_observation(
             limitations=[
                 _clip(item) for item in observation.get("limitations", [])
             ],
+            reroute_reason=(
+                _clip(observation.get("reroute_reason")) or None
+            ),
+            required_capabilities=[
+                _clip(item)
+                for item in observation.get("required_capabilities", [])
+            ],
         )
         with collector.lock:
             collector.observations.append(metric)
+
+
+def record_worker_outcome(
+    *,
+    cycle: int,
+    step: int,
+    status: str,
+    stop_reason: Optional[str],
+    unmet_requirements: List[str],
+    evidence_count: int,
+    dataset_count: int,
+) -> None:
+    """Retain the typed worker completion state without copying evidence."""
+    if collector := _ACTIVE_RUN.get():
+        payload = {
+            "cycle": max(1, int(cycle)),
+            "step": max(1, int(step)),
+            "status": _clip(status),
+            "stop_reason": _clip(stop_reason) or None,
+            "unmet_requirements": [
+                _clip(item) for item in unmet_requirements
+            ],
+            "evidence_count": max(0, int(evidence_count)),
+            "dataset_count": max(0, int(dataset_count)),
+        }
+        with collector.lock:
+            collector.worker_outcomes.append(payload)
+
+
+def _resolution_candidate_identity(value: Any) -> Dict[str, Any]:
+    """Project one resolver candidate without copying source-row provenance."""
+    if not isinstance(value, Mapping):
+        return {"canonical_name": _clip(value, max_chars=500)}
+    identity = {
+        key: _bounded_json_value(value[key])
+        for key in (
+            "canonical_name",
+            "entity_type",
+            "role",
+            "file_id",
+            "score",
+            "method",
+        )
+        if key in value and value[key] is not None
+    }
+    provenance = value.get("provenance")
+    if isinstance(provenance, (list, tuple)):
+        identity["provenance_count"] = len(provenance)
+    return identity
+
+
+def _entity_resolution_summary(event: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep resolver decisions useful for assertions and globally compact."""
+    summary: Dict[str, Any] = {}
+    for key in (
+        "mention",
+        "entity_type",
+        "role",
+        "status",
+        "method",
+        "canonical_name",
+        "file_id",
+        "error_code",
+        "resolver_invoked",
+    ):
+        if key in event and event[key] is not None:
+            summary[key] = _bounded_json_value(event[key])
+    if event.get("reason") is not None:
+        summary["reason"] = _clip(
+            event.get("reason"),
+            max_chars=_ENTITY_RESOLUTION_REASON_CHARS,
+        )
+
+    candidate_set = event.get("candidate_set")
+    if isinstance(candidate_set, Mapping):
+        raw_candidates = candidate_set.get("candidates")
+        candidates = (
+            list(raw_candidates)
+            if isinstance(raw_candidates, (list, tuple))
+            else []
+        )
+        candidate_summary: Dict[str, Any] = {
+            key: _bounded_json_value(candidate_set[key])
+            for key in (
+                "coverage",
+                "source",
+                "total_candidates",
+                "source_result_id",
+                "threshold",
+                "minimum_gap",
+            )
+            if key in candidate_set and candidate_set[key] is not None
+        }
+        candidate_summary["candidate_count"] = len(candidates)
+        candidate_summary["candidates"] = [
+            _resolution_candidate_identity(item)
+            for item in candidates[:_ENTITY_RESOLUTION_CANDIDATE_LIMIT]
+        ]
+        candidate_summary["candidates_truncated"] = (
+            len(candidates) > _ENTITY_RESOLUTION_CANDIDATE_LIMIT
+        )
+        summary["candidate_set"] = candidate_summary
+    elif isinstance(event.get("candidates"), (list, tuple)):
+        # Retain the compact pre-CandidateSet trace shape for compatibility.
+        summary["candidates"] = [
+            _bounded_json_value(item)
+            for item in list(event["candidates"])[
+                :_ENTITY_RESOLUTION_CANDIDATE_LIMIT
+            ]
+        ]
+    return summary
+
+
+def record_entity_resolution(events: List[Mapping[str, Any]]) -> None:
+    """Append bounded resolver summaries without full candidate provenance."""
+    if collector := _ACTIVE_RUN.get():
+        payload = [
+            _entity_resolution_summary(event)
+            for event in events
+            if isinstance(event, Mapping)
+        ]
+        with collector.lock:
+            remaining = max(
+                0,
+                _ENTITY_RESOLUTION_EVENT_LIMIT
+                - len(collector.entity_resolution),
+            )
+            collector.entity_resolution.extend(payload[:remaining])
+
+
+def record_validation_protocol(result: Mapping[str, Any]) -> None:
+    """Retain bounded contracts/check SQL and readiness, never reader rows."""
+    if collector := _ACTIVE_RUN.get():
+        payload = dict(_bounded_json_value(result))
+        with collector.lock:
+            collector.validation_protocol = payload
 
 
 def record_upstream_output(result: Mapping[str, Any]) -> None:
@@ -657,8 +841,11 @@ __all__ = [
     "record_upstream_output",
     "record_coordinator_plan",
     "record_display_tools",
+    "record_entity_resolution",
     "record_supervisor_decision",
+    "record_validation_protocol",
     "record_worker_observation",
+    "record_worker_outcome",
     "record_worker_route",
     "record_worker_task",
 ]

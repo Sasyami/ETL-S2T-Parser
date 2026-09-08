@@ -1,12 +1,17 @@
 """Runtime skills and lazily selected data schemas for the chat agent."""
 
 import json
+import os
 from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
+from ..contracts import SqlRiskAspect
 from .common import PROJECT_ROOT
 
 PROMPTS_DIR = PROJECT_ROOT / "agents" / "prompts"
 CONFIG_DIR = PROJECT_ROOT / "config"
+OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV = (
+    "OPERATION_SQL_RISK_ASPECTS_EXPERIMENT"
+)
 
 SchemaName = Literal[
     "SQLite ETL",
@@ -44,8 +49,9 @@ OPERATION_SKILL_CATALOG: Dict[str, str] = {
         "source/target-колонок."
     ),
     "Анализ SQL-рисков": (
-        "Явная оценка размножения либо потери строк по сохранённому "
-        "SQL/S2T-правилу."
+        "Явная оценка одного или нескольких SQL-аспектов: фильтрация "
+        "строк, кардинальность, отклонение constraints, изменение "
+        "значений или write semantics по сохранённому SQL/S2T-правилу."
     ),
     "Покрытие маппинга": (
         "Явный поиск разности между ограниченным каталогом колонок и "
@@ -56,6 +62,156 @@ OPERATION_SKILL_CATALOG: Dict[str, str] = {
         "подтверждённым правилам и метаданным."
     ),
 }
+
+
+_SQL_RISK_ASPECT_RULES: Dict[
+    SqlRiskAspect,
+    Dict[str, str],
+] = {
+    "row_filtering": {
+        "plan": (
+            "Запроси полный точный directed S2T mapping с фактическим SQL; "
+            "не добавляй catalog metadata только ради оценки predicates."
+        ),
+        "planner": (
+            "Прочитай mapping точной source→target пары без field/ID/file "
+            "narrowing и сохрани полный SQL."
+        ),
+        "observer": (
+            "Принимай только полный untruncated mapping обеих точных таблиц "
+            "с фактическим правилом; безопасность не оценивай."
+        ),
+        "upstream_decision": (
+            "Полного exact mapping достаточно для фактического или условного "
+            "вывода об отсечении строк; не требуй metadata ради уверенности."
+        ),
+        "upstream": (
+            "Оцени WHERE/HAVING/QUALIFY, JOIN ON и set/limit predicates; "
+            "FALSE/UNKNOWN удаляет строку или группу, WHERE 1=1 не фильтрует."
+        ),
+    },
+    "cardinality": {
+        "plan": (
+            "Запроси полный точный directed mapping; metadata читай только "
+            "если пользователь явно запросил вывод по ключам."
+        ),
+        "planner": (
+            "Прочитай mapping точной source→target пары без сужения по полю "
+            "или предполагаемому механизму риска."
+        ),
+        "observer": (
+            "Принимай только полный untruncated mapping с обеими таблицами и "
+            "полным правилом; не назначай уровень риска."
+        ),
+        "upstream_decision": (
+            "Exact mapping достаточен для структурного либо условного вывода "
+            "о размножении/схлопывании; неизвестную уникальность назови границей."
+        ),
+        "upstream": (
+            "Оцени JOIN multiplicity, DISTINCT, GROUP BY и дедупликацию. "
+            "Без уникальности полных join keys размножение условно; прямой "
+            "field mapping не доказывает 1:1."
+        ),
+    },
+    "constraint_rejection": {
+        "plan": (
+            "Помимо точного mapping запроси полные column metadata обеих "
+            "endpoint-таблиц и ролей в заданном file scope."
+        ),
+        "planner": (
+            "Прочитай endpoint metadata одним batch без фильтра по ожидаемым "
+            "type/PK/not_null и не теряй source/target role или file scope."
+        ),
+        "observer": (
+            "Metadata полна только для обеих ролей, всех endpoint-таблиц и "
+            "точного scope; пустой каталог не доказывает отсутствие constraints."
+        ),
+        "upstream_decision": (
+            "Для подтверждённого rejection нужны target constraint и точная "
+            "source metadata либо выражение; target-only не доказывает безопасность."
+        ),
+        "upstream": (
+            "Сопоставь точную field-пару: nullable→NOT NULL и несовпадение "
+            "типов дают условный rejection/conversion до проверки значений."
+        ),
+    },
+    "value_changes": {
+        "plan": (
+            "Запроси полный точный directed mapping с выражениями значений; "
+            "не добавляй catalog metadata без явной зависимости ответа."
+        ),
+        "planner": (
+            "Сохрани полный SQL/правило точной пары без сужения по одному полю "
+            "или предполагаемому выражению."
+        ),
+        "observer": (
+            "Принимай полный untruncated mapping с фактическими expressions; "
+            "не подменяй отсутствующее выражение предположением."
+        ),
+        "upstream_decision": (
+            "Exact mapping достаточен для вывода об изменениях, видимых в "
+            "правиле; неизвестные внешние функции оставь границей evidence."
+        ),
+        "upstream": (
+            "Оцени CASE, COALESCE, CAST, арифметику и функции как изменения "
+            "значений; сами по себе они не фильтруют строки."
+        ),
+    },
+    "write_semantics": {
+        "plan": (
+            "Планируй чтение стратегии записи только из явно доступного "
+            "источника; не выводи INSERT/MERGE/UPSERT/overwrite из target PK."
+        ),
+        "planner": (
+            "Прочитай явный write statement или стратегию; не заменяй её "
+            "каталожным ключом и не придумывай режим записи."
+        ),
+        "observer": (
+            "Принимай только фактически прочитанную write strategy; наличие "
+            "PK/UNIQUE без statement не закрывает task."
+        ),
+        "upstream_decision": (
+            "Для write semantics нужен явный statement/strategy; без него "
+            "аспект остаётся не оценён, но это не снижает риск."
+        ),
+        "upstream": (
+            "Различай append, overwrite, merge/upsert и conflict handling; "
+            "PK/UNIQUE не доказывает идемпотентность или дедупликацию."
+        ),
+    },
+}
+
+
+def _sql_risk_aspects_enabled() -> bool:
+    value = os.getenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV)
+    if value is None:
+        return True
+    return value.strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def _sql_risk_aspect_context(
+    aspects: Iterable[SqlRiskAspect],
+    *,
+    stage: str,
+) -> str:
+    selected = [
+        aspect
+        for aspect in dict.fromkeys(aspects)
+        if aspect in _SQL_RISK_ASPECT_RULES
+    ]
+    if not selected or not _sql_risk_aspects_enabled():
+        return ""
+    rules = [
+        f"- `{aspect}`: {_SQL_RISK_ASPECT_RULES[aspect][stage]}"
+        for aspect in selected
+    ]
+    return (
+        "## Анализ SQL-рисков\n"
+        "Выбранные аспекты (не анализируй остальные): "
+        + ", ".join(f"`{aspect}`" for aspect in selected)
+        + "\n"
+        + "\n".join(rules)
+    )
 
 
 _DOWNSTREAM_TABLE_DESCRIPTIONS: Dict[str, str] = {
@@ -304,6 +460,7 @@ def load_operation_skills(
         "upstream_decision",
         "upstream",
     ],
+    sql_risk_aspects: Optional[Iterable[SqlRiskAspect]] = None,
 ) -> str:
     """Load only the selected operation-skill rules for one LLM stage."""
     text = _prompt_text("operation_skills.md")
@@ -311,11 +468,11 @@ def load_operation_skills(
         return ""
 
     stage_titles = {
-        "plan": "Downstream plan",
-        "planner": "Planner",
-        "observer": "Observer",
-        "upstream_decision": "Upstream decision",
-        "upstream": "Upstream answer",
+        "plan": "План данных",
+        "planner": "Выполнение чтения",
+        "observer": "Приёмка результата",
+        "upstream_decision": "Проверка достаточности",
+        "upstream": "Итоговый анализ",
     }
     requested = {
         str(section).strip().casefold()
@@ -324,6 +481,15 @@ def load_operation_skills(
     }
     if not requested:
         return ""
+
+    aspect_context = ""
+    if "анализ sql-рисков" in requested:
+        aspect_context = _sql_risk_aspect_context(
+            sql_risk_aspects or (),
+            stage=stage,
+        )
+        if aspect_context:
+            requested.remove("анализ sql-рисков")
 
     selected: List[str] = []
     current_skill: Optional[str] = None
@@ -353,6 +519,9 @@ def load_operation_skills(
         elif current_stage is not None:
             stage_lines.append(line)
     flush_stage()
+
+    if aspect_context:
+        selected.append(aspect_context)
 
     if not selected:
         return ""

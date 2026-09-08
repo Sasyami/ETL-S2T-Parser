@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Literal, Optional, Sequence, TypedDict
 
 from langchain_core.messages import (
@@ -19,18 +20,19 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    model_validator,
 )
 
 from .agent import chat_model
 from .contracts import (
     MAX_PLAN_STEPS,
     PlanStep,
+    SqlRiskAspect,
     UpstreamDecision,
     UpstreamOutput,
     WORKER_OPERATION_COMPLETENESS_MARKER,
     WORKER_OPERATION_EXECUTION_MARKER,
     WORKER_PREVIOUS_RESULTS_MARKER,
-    WORKER_STABLE_CONTEXT_MARKER,
     WorkerOutcome,
     WorkerPlan,
 )
@@ -40,9 +42,13 @@ from .run_metrics import (
     get_run_metrics_callback,
     llm_stage,
     record_coordinator_plan,
+    record_entity_resolution,
     record_upstream_output,
+    record_validation_protocol,
+    record_worker_outcome,
 )
 from .tools.context import (
+    OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
     OPERATION_SKILL_CATALOG,
     get_downstream_capability_context,
     get_downstream_table_context,
@@ -58,10 +64,14 @@ from .tools.saved_results import saved_result_store_scope
 from .test_protocol import (
     MAX_PROTOCOL_OBJECTS,
     PROTOCOL_CHECKS,
-    TestProtocolContract,
+    RawTestProtocolContract,
     build_test_protocol_display_payloads,
     compile_test_protocol,
     render_test_protocol_answer,
+)
+from .test_protocol_resolution import (
+    resolve_test_protocol_contract,
+    validate_raw_contract_origin,
 )
 from .validation_protocol import (
     LLM_ANALYSES,
@@ -74,6 +84,7 @@ from .validation_protocol import (
     build_s2t_analysis_display_payloads,
     build_s2t_analysis_payload,
     merge_s2t_analysis_output,
+    read_test_protocol_inputs,
     read_validation_protocol_inputs,
     render_s2t_analysis_answer,
     validate_s2t_analysis_output,
@@ -94,6 +105,16 @@ _UPSTREAM_DATA_DECISION_TOOL_NAME = "submit_upstream_data_decision"
 _UPSTREAM_ANALYSIS_CONTEXT = load_upstream_analysis_context()
 _DOWNSTREAM_CAPABILITY_CONTEXT = get_downstream_capability_context()
 _DOWNSTREAM_TABLE_CONTEXT = get_downstream_table_context()
+
+
+def _typed_sql_risk_aspects_enabled() -> bool:
+    """Return whether E2 routes only explicitly selected SQL-risk aspects."""
+    value = os.getenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV)
+    if value is None:
+        return True
+    return value.strip().casefold() not in {"0", "false", "no", "off"}
+
+
 class CoordinatorAnswer(BaseModel):
     """Coordinator output consumed by the top-level supervisor."""
 
@@ -110,10 +131,34 @@ class OperationSkillSelection(BaseModel):
 
     pipeline: Literal[
         "agentic",
-        "s2t_analysis",
         "validation_protocol",
     ] = "agentic"
     skills: List[str]
+    sql_risk_aspects: List[SqlRiskAspect] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _aspects_match_selected_skill(self) -> "OperationSkillSelection":
+        self.skills = list(dict.fromkeys(self.skills))
+        self.sql_risk_aspects = list(dict.fromkeys(self.sql_risk_aspects))
+        if not _typed_sql_risk_aspects_enabled():
+            # E2 baseline deliberately loads the complete legacy profile.
+            self.sql_risk_aspects = []
+            return self
+        if (
+            self.sql_risk_aspects
+            and "Анализ SQL-рисков" not in self.skills
+        ):
+            raise ValueError(
+                "sql_risk_aspects require Анализ SQL-рисков skill"
+            )
+        if (
+            "Анализ SQL-рисков" in self.skills
+            and not self.sql_risk_aspects
+        ):
+            raise ValueError(
+                "Анализ SQL-рисков requires at least one sql_risk_aspect"
+            )
+        return self
 
 
 class CoordinatorWorkerRun(TypedDict):
@@ -126,6 +171,7 @@ class CoordinatorGraphState(TypedDict):
     task: str
     context: str
     operation_skills: Optional[List[str]]
+    operation_sql_risk_aspects: Optional[List[SqlRiskAspect]]
     operation_pipeline: Optional[
         Literal["agentic", "s2t_analysis", "validation_protocol"]
     ]
@@ -144,29 +190,69 @@ _OPERATION_SKILL_CATALOG_CONTEXT = "\n".join(
     for name, description in OPERATION_SKILL_CATALOG.items()
 )
 
+_SQL_RISK_TYPED_ROUTER_GUIDANCE = """
+Если выбрана `Анализ SQL-рисков`, заполни `sql_risk_aspects` только аспектами,
+которые прямо нужны результату: `row_filtering`, `cardinality`,
+`constraint_rejection`, `value_changes`, `write_semantics`. Для остальных
+skills и при `skills=[]` верни `sql_risk_aspects=[]`. Не добавляй все аспекты
+автоматически.
+""".strip()
+
+_SQL_RISK_TYPED_ROUTER_EXAMPLES = """
+- «Может ли этот JOIN размножить строки?» → `Анализ SQL-рисков`,
+  `sql_risk_aspects=["cardinality"]`;
+- «Отфильтрует ли WHERE строки?» → `sql_risk_aspects=["row_filtering"]`;
+- «Может ли NOT NULL отклонить загрузку?» →
+  `sql_risk_aspects=["constraint_rejection"]`;
+- «Меняет ли CASE значение?» → `sql_risk_aspects=["value_changes"]`;
+- «Это MERGE или append?» → `sql_risk_aspects=["write_semantics"]`;
+""".strip()
+
+_SQL_RISK_LEGACY_ROUTER_GUIDANCE = """
+Эксперимент выбора аспектов отключён: для любого маршрута всегда верни
+`sql_risk_aspects=[]`. При выборе `Анализ SQL-рисков` код загрузит полный
+legacy-профиль риска; не перечисляй отдельные аспекты.
+""".strip()
+
+_SQL_RISK_LEGACY_ROUTER_EXAMPLES = """
+- «Может ли этот JOIN размножить строки?» → `Анализ SQL-рисков`,
+  `sql_risk_aspects=[]`;
+""".strip()
+
 _OPERATION_SKILL_PROMPT = f"""
 Ты operation router. Один раз для всей `original_task` выбери исполнительный
 `pipeline` и operation-skills. Верни ровно один native call
 `{_OPERATION_SKILL_TOOL_NAME}`.
 
-`pipeline="validation_protocol"` выбирай для явной просьбы составить SQL
-тест-протокол внешней Greenplum-проверки по заданному файлу и
-source→target S2T-загрузкам: row count, уникальность ключа, NULL обязательных
-полей или корректность трансформаций. SQL только проектируется и не исполняется.
+`pipeline="validation_protocol"` выбирай для явной просьбы составить explicit,
+standard либо exhaustive SQL test protocol внешней Greenplum-проверки
+source→target S2T-загрузки. Файл необязателен: без него catalog-dependent checks
+будут помечены unavailable, а остальные всё равно компилируются. Сюда относятся
+row/key/field/schema/aggregate reconciliation, uniqueness, NULL и статический
+preflight. SQL только проектируется и не исполняется.
 
 Во всех остальных случаях выбирай `pipeline="agentic"`; выбранные
 operation-skills направят downstream, workers и upstream внутри общего потока.
 
-Operation-skill — профиль выполнения явно запрошенной операции, а не источник
-данных, тип объекта или retrieval-skill. Выбирай профиль только при точном
-совпадении операции с его назначением. Несколько профилей допустимы, только если
-исходная задача явно содержит несколько таких операций.
+Operation-skill — профиль результата, которого добивается пользователь, а не
+источник данных, тип объекта или retrieval-skill. Выбирай профиль по intent и
+однозначно требуемому результату: буквальное название профиля в запросе не
+требуется. Не выбирай профиль только из-за связанных терминов. Несколько
+профилей допустимы, только если для ответа действительно нужны несколько
+разных видов анализа; не добавляй смежный анализ «на всякий случай».
+
+{_SQL_RISK_TYPED_ROUTER_GUIDANCE}
 
 `skills=[]` — нормальный вариант по умолчанию. Оставляй массив пустым для
 простого чтения, списка либо объяснения одной сохранённой трансформации, если
 пользователь не просит сравнение атрибутов, оценку риска строк, разность покрытия
 маппинга или проектирование проверки. Само наличие SQL, S2T, пары source→target,
 колонок либо слова «трансформация» не является основанием выбрать профиль.
+
+Примеры:
+- «Покажи SQL transformation A → B» → `skills=[]`;
+{_SQL_RISK_TYPED_ROUTER_EXAMPLES}
+- «Какие mandatory target fields не замаплены?» → `Покрытие маппинга`.
 
 Доступные operation-skills:
 {_OPERATION_SKILL_CATALOG_CONTEXT}
@@ -176,11 +262,40 @@ Operation-skill — профиль выполнения явно запроше�
 
 _OPERATION_SKILL_REPAIR_PROMPT = f"""
 Предыдущий native call `{_OPERATION_SKILL_TOOL_NAME}` нарушает схему или содержит
-имя вне каталога. Верни ровно один исправленный call с полями `pipeline` и
-`skills`. Pipeline — `agentic` либо `validation_protocol`;
-массив skills может быть пустым. Используй только дословные имена профилей из
-каталога.
+имя вне каталога. Верни ровно один исправленный call с полями `pipeline`,
+`skills` и `sql_risk_aspects`. Pipeline — `agentic` либо
+`validation_protocol`; массив skills может быть пустым. Аспекты допустимы только
+для `Анализ SQL-рисков`; при выборе этого профиля верни хотя бы один нужный
+аспект, иначе верни пустой массив. Используй только дословные имена из каталогов.
 """.strip()
+
+
+def _operation_skill_prompt() -> str:
+    """Build an E2-consistent router prompt for the active variant."""
+    if _typed_sql_risk_aspects_enabled():
+        return _OPERATION_SKILL_PROMPT
+    return _OPERATION_SKILL_PROMPT.replace(
+        _SQL_RISK_TYPED_ROUTER_GUIDANCE,
+        _SQL_RISK_LEGACY_ROUTER_GUIDANCE,
+    ).replace(
+        _SQL_RISK_TYPED_ROUTER_EXAMPLES,
+        _SQL_RISK_LEGACY_ROUTER_EXAMPLES,
+    )
+
+
+def _operation_skill_repair_prompt() -> str:
+    """Build repair instructions that match the active E2 schema."""
+    if _typed_sql_risk_aspects_enabled():
+        return _OPERATION_SKILL_REPAIR_PROMPT
+    return (
+        f"Предыдущий native call `{_OPERATION_SKILL_TOOL_NAME}` нарушает "
+        "схему или содержит имя вне каталога. Верни ровно один исправленный "
+        "call с полями `pipeline`, `skills` и `sql_risk_aspects`. Pipeline — "
+        "`agentic` либо `validation_protocol`; массив skills может быть "
+        "пустым. Эксперимент выбора SQL-risk aspects отключён, поэтому всегда "
+        "верни `sql_risk_aspects=[]`. Используй только дословные имена из "
+        "каталога."
+    )
 
 _S2T_ANALYSIS_CONTRACT_PROMPT = f"""
 Извлеки только явно заданный контракт S2T-анализа из `original_task`. Верни
@@ -208,20 +323,28 @@ _VALIDATION_PROTOCOL_CONTRACT_PROMPT = f"""
 Извлеки только явно заданный контракт SQL test protocol из `original_task`.
 Верни ровно один native call `{_VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME}`.
 
-- Файл копируй как `file_id` либо полное `filename`; идентификаторы копируй
-  дословно и не заполняй оба варианта одновременно.
+- Файл необязателен. Явный числовой идентификатор копируй как `file_id`, а
+  буквальное имя или смысловое описание — как `file_mention`; не заполняй оба.
 - `loads` содержит отдельный элемент для каждой явно заданной загрузки;
-  `sources` — все источники именно этого `target`, `target` — один приёмник.
-- `checks` каждого load содержит только явно запрошенные классы: `row_count`,
-  `key_uniqueness`, `required_null_rate`, `transformation_correctness`.
+  `source_mentions` — все исходные mentions именно этого `target_mention`.
+  Копируй mention дословно, включая опечатку, неполное или смысловое имя:
+  канонизацию выполнит код после этого native call.
+- `mode="explicit"`, когда пользователь перечислил проверки; сохрани их в
+  `requested_checks` всего contract либо конкретного load. `mode="standard"`
+  для общей просьбы о тест-протоколе, `mode="exhaustive"` для максимально
+  полного протокола. Не добавляй не запрошенные checks в explicit mode.
+- Допустимые checks: {', '.join(PROTOCOL_CHECKS)}.
+- Явно заданные поля ключа копируй в `explicit_key` contract/load.
 - Не придумывай таблицы, колонки, SQL, проверки и scope-поля.
 """.strip()
 
 _VALIDATION_PROTOCOL_CONTRACT_REPAIR_PROMPT = f"""
 Предыдущий `{_VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME}` нарушает строгую схему.
-Верни один исправленный native call: укажи исходный `file_id` либо `filename` и
-непустой `loads`; в каждом load нужны непустые точные `sources`, один `target` и
-непустой `checks` из разрешённого enum. Копируй только из `original_task`.
+Верни один исправленный native call с `mode`, `requested_checks` и непустым
+`loads`; в каждом load нужны непустые literal `source_mentions`, один
+`target_mention`, `requested_checks` и при наличии `explicit_key`. Файл
+необязателен; допустим только исходный `file_id` либо `file_mention`. Копируй
+только значения из `original_task`, не исправляй mentions самостоятельно.
 """.strip()
 
 _S2T_ANALYSIS_PROMPT = f"""
@@ -263,11 +386,11 @@ class CoordinatorResponseError(RuntimeError):
 
 
 _DOWNSTREAM_PLAN_PROMPT = f"""
-Ты downstream planner. Верни один native call `{_PLAN_TOOL_NAME}` с 1–{COORDINATOR_MAX_WORKERS}
-`steps`. Каждая task — чтение прямо необходимых фактов.
+Ты downstream planner. Верни native call `{_PLAN_TOOL_NAME}` с 1–{COORDINATOR_MAX_WORKERS}
+`steps`. Каждая task читает необходимые факты.
 
 Каждый step обязан быть незаменимым: без него нельзя ответить на original_task.
-Удали не запрошенные проверки, обогащение и физическую реализацию. Наличие
+Удали незапрошенные проверки, обогащение и реализацию. Наличие
 таблицы в справочнике не требует её чтения.
 
 Сохрани сущность, направление, scope и фильтры. Роль source/target известна,
@@ -280,13 +403,16 @@ S2T-строкой; роль результата не задаёт роль к�
 нужен внутренний `file_id`, сначала запланируй точное разрешение всех имён и
 только затем зависимые чтения с соответствующими принятыми результатами.
 `file_id` допустим лишь из original_task либо принятого результата разрешения.
-Worker не получает `original_task`, поэтому каждая task должна быть
-самодостаточной: дословно повторяй в ней все нужные точные идентификаторы, роли,
-scope и фильтры из original_task/context. Результат предыдущего worker может
+Каждая task самодостаточна: повторяй нужные идентификаторы, роли, scope и
+фильтры. Результат предыдущего worker может
 добавить ранее неизвестное значение, но не заменить уже заданный идентификатор
 другой сущности: `filename` даёт `file_id`, но не определяет и не заменяет
 `table_name`. Не используй вместо известного имени ссылки «эта таблица»,
 «разрешённый объект», «та же target_table» или «найденное имя».
+
+Context заканчивается здесь: перенеси нужные условия в `constraints`,
+сущность/scope/полноту — в `entity`/`scope`/`coverage`, зависимости — в
+`dependencies` (1-based номера прошлых steps).
 
 Сохраняй тип поиска из original_task:
 - смысл/бизнес-смысл/описание/назначение/«наиболее вероятный» при неизвестном
@@ -334,7 +460,8 @@ _DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
 Предыдущий native call `{_PLAN_TOOL_NAME}` нарушает схему или смысловой контракт.
 Верни исправленный native call ровно один раз. Массив `steps` должен содержать
 от 1 до {COORDINATOR_MAX_WORKERS} элементов; каждый элемент должен иметь
-только одну непустую `task`.
+непустую `task` и может содержать только разрешённые structured-поля
+`constraints`, `entity`, `scope`, `coverage`, `dependencies`.
 Сохрани запрошенные роли, объекты, фильтры и результаты. Не придумывай
 идентификаторы, функции, tools или требования. Используй только реальные таблицы
 хранилища из system prompt; неизвестные бизнес-объекты оставляй текстом поиска.
@@ -346,7 +473,10 @@ _DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
 """.strip()
 
 _UPSTREAM_DATA_DECISION_PROMPT = f"""
-Ты проверяешь достаточность `evidence` для `original_task`. Верни один native call
+Ты проверяешь достаточность `evidence` для `original_task`. `worker_outcomes`
+различает complete, partial и failed чтения, причины остановки и
+незакрытые требования. Partial evidence можно использовать только в его
+подтверждённой границе; failed/unavailable нельзя считать полным. Верни один native call
 `{_UPSTREAM_DATA_DECISION_TOOL_NAME}`:
 
 - `decision="pass"`, если можно дать конечный ответ;
@@ -373,7 +503,8 @@ lineage. Если original_task требует следующего источн
 
 _UPSTREAM_ANSWER_PROMPT = f"""
 Ты upstream answer coordinator. Предварительная проверка уже вернула `pass`.
-Вход содержит `original_task` и принятые `evidence`. Сам выполни запрошенный
+Вход содержит `original_task`, состояния `worker_outcomes` и принятые
+`evidence`. Сам выполни запрошенный
 анализ и верни ровно один native call `{_UPSTREAM_ANSWER_TOOL_NAME}` с готовым
 `answer`. При наличии подтверждающих evidence передай `used_evidence_ids` и
 нужные `display_evidence_ids`.
@@ -412,6 +543,31 @@ IDs. Используй только доступные evidence_id и не до
 
 
 def _operation_skill_tool_schema() -> Dict[str, Any]:
+    typed_sql_risk_aspects = _typed_sql_risk_aspects_enabled()
+    sql_risk_aspects_schema: Dict[str, Any] = {
+        "type": "array",
+        "maxItems": 5 if typed_sql_risk_aspects else 0,
+        "uniqueItems": True,
+        "items": {
+            "type": "string",
+            "enum": [
+                "row_filtering",
+                "cardinality",
+                "constraint_rejection",
+                "value_changes",
+                "write_semantics",
+            ],
+        },
+        "description": (
+            "Только явно нужные аспекты профиля Анализ SQL-рисков; "
+            "при выборе этого профиля нужен хотя бы один аспект."
+            if typed_sql_risk_aspects
+            else (
+                "E2 baseline: массив всегда пуст; полный legacy-профиль "
+                "SQL-рисков загружается кодом."
+            )
+        ),
+    }
     return {
         "type": "function",
         "function": {
@@ -444,9 +600,10 @@ def _operation_skill_tool_schema() -> Dict[str, Any]:
                             "Точные имена применимых профилей; пустой массив "
                             "означает, что специальный профиль не нужен."
                         ),
-                    }
+                    },
+                    "sql_risk_aspects": sql_risk_aspects_schema,
                 },
-                "required": ["pipeline", "skills"],
+                "required": ["pipeline", "skills", "sql_risk_aspects"],
                 "additionalProperties": False,
             },
         },
@@ -522,6 +679,19 @@ def _s2t_analysis_contract_tool_schema() -> Dict[str, Any]:
 
 
 def _validation_protocol_contract_tool_schema() -> Dict[str, Any]:
+    key_schema = {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 32,
+        "uniqueItems": True,
+        "items": {"type": "string", "minLength": 1, "maxLength": 300},
+    }
+    checks_schema = {
+        "type": "array",
+        "maxItems": len(PROTOCOL_CHECKS),
+        "uniqueItems": True,
+        "items": {"type": "string", "enum": list(PROTOCOL_CHECKS)},
+    }
     return {
         "type": "function",
         "function": {
@@ -533,14 +703,23 @@ def _validation_protocol_contract_tool_schema() -> Dict[str, Any]:
                     "file_id": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Явный file_id каталога метаданных.",
+                        "description": "Только явно указанный file_id.",
                     },
-                    "filename": {
+                    "file_mention": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 500,
-                        "description": "Точное имя загруженного файла.",
+                        "description": (
+                            "Дословное имя либо смысловое описание файла; "
+                            "канонизацию выполняет deterministic resolver."
+                        ),
                     },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["explicit", "standard", "exhaustive"],
+                    },
+                    "requested_checks": checks_schema,
+                    "explicit_key": key_schema,
                     "loads": {
                         "type": "array",
                         "minItems": 1,
@@ -548,34 +727,35 @@ def _validation_protocol_contract_tool_schema() -> Dict[str, Any]:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "sources": {
+                                "source_mentions": {
                                     "type": "array",
                                     "minItems": 1,
                                     "maxItems": MAX_PROTOCOL_OBJECTS,
                                     "uniqueItems": True,
-                                    "items": {"type": "string"},
-                                },
-                                "target": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                },
-                                "checks": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "maxItems": len(PROTOCOL_CHECKS),
-                                    "uniqueItems": True,
                                     "items": {
                                         "type": "string",
-                                        "enum": list(PROTOCOL_CHECKS),
+                                        "minLength": 1,
+                                        "maxLength": 300,
                                     },
                                 },
+                                "target_mention": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 300,
+                                },
+                                "requested_checks": checks_schema,
+                                "explicit_key": key_schema,
                             },
-                            "required": ["sources", "target", "checks"],
+                            "required": [
+                                "source_mentions",
+                                "target_mention",
+                                "requested_checks",
+                            ],
                             "additionalProperties": False,
                         },
                     },
                 },
-                "required": ["loads"],
+                "required": ["mode", "requested_checks", "loads"],
                 "additionalProperties": False,
             },
         },
@@ -672,6 +852,65 @@ def _plan_tool_schema() -> Dict[str, Any]:
                                         "данных; производный анализ выполняется "
                                         "upstream"
                                     ),
+                                },
+                                "constraints": {
+                                    "type": "array",
+                                    "maxItems": 20,
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Релевантные ограничения из context, "
+                                        "материализованные для этого worker."
+                                    ),
+                                },
+                                "entity": {
+                                    "type": "object",
+                                    "properties": {
+                                        "role": {
+                                            "type": "string",
+                                            "enum": [
+                                                "source",
+                                                "target",
+                                                "unknown",
+                                            ],
+                                        },
+                                        "table": {"type": "string"},
+                                        "field": {"type": "string"},
+                                    },
+                                    "additionalProperties": False,
+                                },
+                                "scope": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file_id": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                        },
+                                        "filename": {"type": "string"},
+                                        "sheet_name": {"type": "string"},
+                                        "filters": {
+                                            "type": "object",
+                                            "additionalProperties": True,
+                                        },
+                                    },
+                                    "additionalProperties": False,
+                                },
+                                "coverage": {
+                                    "type": "string",
+                                    "enum": [
+                                        "single",
+                                        "all_matches",
+                                        "top_k",
+                                        "aggregate",
+                                    ],
+                                },
+                                "dependencies": {
+                                    "type": "array",
+                                    "maxItems": COORDINATOR_MAX_WORKERS - 1,
+                                    "uniqueItems": True,
+                                    "items": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                    },
                                 },
                             },
                             "required": ["task"],
@@ -833,13 +1072,13 @@ def _native_s2t_analysis_contract(message: Any) -> ValidationProtocolContract:
     return contract
 
 
-def _native_validation_protocol_contract(message: Any) -> TestProtocolContract:
+def _native_validation_protocol_contract(message: Any) -> RawTestProtocolContract:
     contract = _native_payload(
         message,
         _VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME,
-        TestProtocolContract,
+        RawTestProtocolContract,
     )
-    assert isinstance(contract, TestProtocolContract)
+    assert isinstance(contract, RawTestProtocolContract)
     return contract
 
 
@@ -884,6 +1123,57 @@ def _validate_contract_origin(
             "Typed contract содержит идентификатор не из original_task: "
             + details
         )
+
+
+def _validation_contract_issue(error: Exception) -> Dict[str, Any]:
+    """Turn a failed extraction into a stable no-fallback public state."""
+
+    detail = str(error).strip()[:1200]
+    lowered = detail.casefold()
+    code = (
+        "unsupported_check"
+        if "requested_checks" in lowered
+        and ("input should be" in lowered or "literal" in lowered)
+        else "missing_parameter"
+    )
+    return {
+        "code": code,
+        "message": detail or "Строгий validation contract не сформирован.",
+        "candidates": [],
+    }
+
+
+def _render_validation_failure(
+    status: str,
+    issues: Sequence[Dict[str, Any]],
+) -> str:
+    """Render a machine-readable validation failure without an agentic retry."""
+
+    titles = {
+        "missing_parameter": "Не хватает обязательных параметров",
+        "unsupported_check": "Запрошена неподдерживаемая проверка",
+        "unresolved_entity": "Сущность не разрешена",
+        "ambiguous_entity": "Сущность неоднозначна",
+    }
+    lines = [
+        "Тест-протокол не сформирован.",
+        f"Статус: {status}.",
+        titles.get(status, "Validation contract недоступен") + ".",
+    ]
+    for issue in issues:
+        message = str(issue.get("message") or "").strip()
+        candidates = [
+            str(value)
+            for value in issue.get("candidates", [])
+            if str(value).strip()
+        ]
+        if message:
+            lines.append(f"- {message}")
+        if candidates:
+            lines.append("  Кандидаты: " + ", ".join(candidates))
+    if status == "ambiguous_entity":
+        lines.append("Уточните один точный вариант из списка кандидатов.")
+    return "\n".join(lines)
 
 
 def _native_upstream_answer(message: Any) -> UpstreamOutput:
@@ -979,14 +1269,16 @@ def build_coordinator_graph(
 
     def downstream_plan_node(state: CoordinatorGraphState) -> Dict[str, Any]:
         operation_skills = state.get("operation_skills")
+        operation_sql_risk_aspects = (
+            state.get("operation_sql_risk_aspects") or []
+        )
         operation_pipeline = state.get("operation_pipeline")
         if operation_skills is None:
             operation_payload = {
                 "original_task": state["task"],
-                "context": state["context"],
             }
             operation_messages: List[BaseMessage] = [
-                SystemMessage(content=_OPERATION_SKILL_PROMPT),
+                SystemMessage(content=_operation_skill_prompt()),
                 HumanMessage(
                     content=json.dumps(operation_payload, ensure_ascii=False)
                 ),
@@ -1009,7 +1301,7 @@ def build_coordinator_graph(
                     _repair_messages(
                         operation_messages,
                         operation_result,
-                        _OPERATION_SKILL_REPAIR_PROMPT
+                        _operation_skill_repair_prompt()
                         + "\nОшибка: "
                         + str(first_error),
                     ),
@@ -1017,12 +1309,17 @@ def build_coordinator_graph(
                 )
                 operation_route = _native_operation_route(operation_result)
             operation_skills = operation_route.skills
+            operation_sql_risk_aspects = (
+                operation_route.sql_risk_aspects
+            )
             operation_pipeline = operation_route.pipeline
         if operation_pipeline is None:
             operation_pipeline = "agentic"
 
         if operation_pipeline == "validation_protocol":
             protocol_display_refs: List[str] = []
+            protocol_reader_results: List[Dict[str, Any]] = []
+            protocol_trace: Dict[str, Any]
             protocol_contract_model = bind_required_tool(
                 _validation_protocol_contract_tool_schema(),
                 _VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME,
@@ -1039,12 +1336,17 @@ def build_coordinator_graph(
                 protocol_messages,
                 stage="validation_protocol_contract",
             )
+            raw_protocol_contract: Optional[RawTestProtocolContract] = None
+            extraction_issue: Optional[Dict[str, Any]] = None
             try:
-                protocol_contract = _native_validation_protocol_contract(
+                raw_protocol_contract = _native_validation_protocol_contract(
                     protocol_result
                 )
-                _validate_contract_origin(protocol_contract, state["task"])
-            except CoordinatorResponseError as first_error:
+                validate_raw_contract_origin(
+                    raw_protocol_contract,
+                    state["task"],
+                )
+            except (CoordinatorResponseError, ValueError) as first_error:
                 logger.warning(
                     "Typed test protocol contract was invalid; requesting "
                     "one LLM repair: %s",
@@ -1062,79 +1364,197 @@ def build_coordinator_graph(
                     stage="validation_protocol_contract",
                 )
                 try:
-                    protocol_contract = _native_validation_protocol_contract(
+                    raw_protocol_contract = _native_validation_protocol_contract(
                         protocol_result
                     )
-                    _validate_contract_origin(protocol_contract, state["task"])
-                except CoordinatorResponseError as second_error:
+                    validate_raw_contract_origin(
+                        raw_protocol_contract,
+                        state["task"],
+                    )
+                except (CoordinatorResponseError, ValueError) as second_error:
                     logger.warning(
                         "Typed test protocol contract remained invalid; "
-                        "falling back to agentic: %s",
+                        "returning structured validation state: %s",
                         second_error,
                     )
-                    operation_pipeline = "agentic"
+                    raw_protocol_contract = None
+                    extraction_issue = _validation_contract_issue(second_error)
 
-            if operation_pipeline == "validation_protocol":
+            if raw_protocol_contract is None:
+                assert extraction_issue is not None
+                failure_status = str(extraction_issue["code"])
+                failure_issues = [extraction_issue]
+                answer = _render_validation_failure(
+                    failure_status,
+                    failure_issues,
+                )
+                protocol_trace = {
+                    "mode": None,
+                    "status": failure_status,
+                    "issues": failure_issues,
+                    "phases": [],
+                    "targets": [],
+                    "reader_calls": [],
+                    "silent_fallback": False,
+                }
+            else:
                 try:
-                    protocol_reader_results = read_validation_protocol_inputs(
-                        protocol_contract,
+                    resolution = resolve_test_protocol_contract(
+                        raw_protocol_contract,
                         callbacks=callback_list,
                     )
-                except ValidationProtocolDataError as exc:
-                    answer = (
-                        "Тест-протокол не сформирован: подтверждённые S2T-данные "
-                        f"недостаточны ({exc})."
+                except Exception as exc:
+                    logger.warning(
+                        "Test protocol entity resolution failed safely: %s",
+                        exc,
                     )
+                    failure_status = "unresolved_entity"
+                    failure_issues = [
+                        {
+                            "code": failure_status,
+                            "message": (
+                                "Entity resolution недоступен: "
+                                f"{type(exc).__name__}."
+                            ),
+                            "candidates": [],
+                        }
+                    ]
+                    answer = _render_validation_failure(
+                        failure_status,
+                        failure_issues,
+                    )
+                    protocol_trace = {
+                        "mode": raw_protocol_contract.mode,
+                        "status": failure_status,
+                        "issues": failure_issues,
+                        "phases": [],
+                        "targets": [],
+                        "reader_calls": [],
+                        "silent_fallback": False,
+                    }
                 else:
-                    compiled_protocol = compile_test_protocol(
-                        protocol_contract,
-                        reader_results=protocol_reader_results,
-                    )
-                    answer = render_test_protocol_answer(
-                        protocol_contract,
-                        compiled_protocol,
-                    )
-                    protocol_display_refs = register_worker_display_items(
+                    record_entity_resolution(
                         [
-                            WorkerDisplayItem(**item)
-                            for item in build_test_protocol_display_payloads(
-                                compiled_protocol
-                            )
+                            {
+                                **item.model_dump(mode="json"),
+                                "resolver_invoked": item.method != "exact",
+                            }
+                            for item in resolution.resolutions
                         ]
                     )
-                    if collected_display_refs is not None:
-                        collected_display_refs.extend(protocol_display_refs)
-                direct_plan = [
-                    {
-                        "cycle": state["cycle"],
-                        "step": index,
-                        "task": task,
-                        "operation_skills": list(operation_skills),
-                        "pipeline": "validation_protocol",
-                    }
-                    for index, task in enumerate(
-                        (
-                            "Прочитать S2T и target-каталог каждого target.",
-                            "Скомпилировать Greenplum SQL test protocol.",
-                        ),
-                        start=1,
-                    )
-                ]
-                record_coordinator_plan(direct_plan)
-                direct_output = {
-                    "answer": answer,
+                    if resolution.status != "resolved":
+                        failure_issues = [
+                            item.model_dump(mode="json")
+                            for item in resolution.issues
+                        ]
+                        answer = _render_validation_failure(
+                            resolution.status,
+                            failure_issues,
+                        )
+                        protocol_trace = {
+                            "mode": raw_protocol_contract.mode,
+                            "status": resolution.status,
+                            "issues": failure_issues,
+                            "phases": [],
+                            "targets": [],
+                            "reader_calls": [],
+                            "exact_bypass_count": (
+                                resolution.exact_bypass_count
+                            ),
+                            "silent_fallback": False,
+                        }
+                    else:
+                        protocol_contract = resolution.contract
+                        assert protocol_contract is not None
+                        protocol_reader_results = read_test_protocol_inputs(
+                            protocol_contract,
+                            callbacks=callback_list,
+                        )
+                        compiled_protocol = compile_test_protocol(
+                            protocol_contract,
+                            reader_results=protocol_reader_results,
+                        )
+                        answer = render_test_protocol_answer(
+                            protocol_contract,
+                            compiled_protocol,
+                        )
+                        protocol_display_refs = register_worker_display_items(
+                            [
+                                WorkerDisplayItem(**item)
+                                for item in build_test_protocol_display_payloads(
+                                    compiled_protocol
+                                )
+                            ]
+                        )
+                        if collected_display_refs is not None:
+                            collected_display_refs.extend(protocol_display_refs)
+                        protocol_trace = compiled_protocol.model_dump(mode="json")
+                        protocol_trace.update(
+                            {
+                                "contract": protocol_contract.model_dump(
+                                    mode="json"
+                                ),
+                                "reader_calls": [
+                                    {
+                                        key: item.get(key)
+                                        for key in (
+                                            "kind",
+                                            "tool_name",
+                                            "args",
+                                            "error",
+                                        )
+                                        if item.get(key) is not None
+                                    }
+                                    for item in protocol_reader_results
+                                ],
+                                "exact_bypass_count": (
+                                    resolution.exact_bypass_count
+                                ),
+                                "silent_fallback": False,
+                            }
+                        )
+
+            record_validation_protocol(protocol_trace)
+            direct_plan = [
+                {
+                    "cycle": state["cycle"],
+                    "step": index,
+                    "task": task,
+                    "operation_skills": list(operation_skills),
+                    "sql_risk_aspects": list(
+                        operation_sql_risk_aspects
+                    ),
                     "pipeline": "validation_protocol",
                 }
-                record_upstream_output(direct_output)
-                return {
-                    "operation_skills": list(operation_skills),
-                    "operation_pipeline": "validation_protocol",
-                    "plan": [],
-                    "next_step": 0,
-                    "upstream_output": direct_output,
-                    "final_answer": answer,
-                    "selected_display_refs": protocol_display_refs,
-                }
+                for index, task in enumerate(
+                    (
+                        "Извлечь RawTestProtocolContract из запроса.",
+                        "Разрешить неподтверждённые сущности и прочитать "
+                        "только зависимости checks.",
+                        "Выполнить static preflight и скомпилировать Phase 0–3.",
+                    ),
+                    start=1,
+                )
+            ]
+            record_coordinator_plan(direct_plan)
+            direct_output = {
+                "answer": answer,
+                "pipeline": "validation_protocol",
+                "protocol_status": protocol_trace.get("status"),
+            }
+            record_upstream_output(direct_output)
+            return {
+                "operation_skills": list(operation_skills),
+                "operation_sql_risk_aspects": list(
+                    operation_sql_risk_aspects
+                ),
+                "operation_pipeline": "validation_protocol",
+                "plan": [],
+                "next_step": 0,
+                "upstream_output": direct_output,
+                "final_answer": answer,
+                "selected_display_refs": protocol_display_refs,
+            }
 
         if operation_pipeline == "s2t_analysis":
             analysis_display_refs: List[str] = []
@@ -1179,11 +1599,14 @@ def build_coordinator_graph(
                     _validate_contract_origin(contract, state["task"])
                 except CoordinatorResponseError as second_error:
                     logger.warning(
-                        "Typed validation contract remained invalid; falling "
-                        "back to the agentic pipeline: %s",
+                        "Typed legacy S2T contract remained invalid; refusing "
+                        "an implicit pipeline change: %s",
                         second_error,
                     )
-                    operation_pipeline = "agentic"
+                    raise CoordinatorResponseError(
+                        "Невалидный контракт legacy S2T pipeline после repair; "
+                        "agentic fallback запрещён."
+                    ) from second_error
                 else:
                     operation_pipeline = "s2t_analysis"
 
@@ -1279,6 +1702,9 @@ def build_coordinator_graph(
                         "step": index,
                         "task": task,
                         "operation_skills": list(operation_skills),
+                        "sql_risk_aspects": list(
+                            operation_sql_risk_aspects
+                        ),
                         "pipeline": "s2t_analysis",
                     }
                     for index, task in enumerate(
@@ -1298,6 +1724,9 @@ def build_coordinator_graph(
                 record_upstream_output(direct_output)
                 return {
                     "operation_skills": list(operation_skills),
+                    "operation_sql_risk_aspects": list(
+                        operation_sql_risk_aspects
+                    ),
                     "operation_pipeline": "s2t_analysis",
                     "plan": [],
                     "next_step": 0,
@@ -1309,6 +1738,7 @@ def build_coordinator_graph(
         plan_operation_context = load_operation_skills(
             operation_skills,
             stage="plan",
+            sql_risk_aspects=operation_sql_risk_aspects,
         )
         plan_payload: Dict[str, Any] = {
             "original_task": state["task"],
@@ -1376,8 +1806,10 @@ def build_coordinator_graph(
             {
                 "cycle": state["cycle"],
                 "step": index,
-                "task": step.task,
+                **step.model_dump(mode="json", exclude_none=True),
                 "operation_skills": list(operation_skills),
+                "sql_risk_aspects": list(operation_sql_risk_aspects),
+                "pipeline": operation_pipeline,
             }
             for index, step in enumerate(plan.steps, start=1)
         ]
@@ -1389,6 +1821,9 @@ def build_coordinator_graph(
         record_coordinator_plan(recorded_plan)
         return {
             "operation_skills": list(operation_skills),
+            "operation_sql_risk_aspects": list(
+                operation_sql_risk_aspects
+            ),
             "operation_pipeline": operation_pipeline,
             "plan": [step.model_dump() for step in plan.steps],
             "next_step": 0,
@@ -1396,21 +1831,37 @@ def build_coordinator_graph(
 
     def worker_node(state: CoordinatorGraphState) -> Dict[str, Any]:
         step_index = state["next_step"]
-        plan_step = state["plan"][step_index]
-        planned_task = str(plan_step["task"] or "").strip()
+        plan_step = PlanStep.model_validate(state["plan"][step_index])
+        planned_task = plan_step.task
         if not planned_task:
             raise CoordinatorResponseError(
                 "Coordinator вызвал worker с пустой task из плана."
             )
         worker_task = planned_task
+        structured_constraints = plan_step.model_dump(
+            mode="json",
+            exclude={"task", "dependencies"},
+            exclude_none=True,
+            exclude_defaults=True,
+        )
+        if structured_constraints:
+            worker_task += (
+                "\n\nСтруктурированные ограничения шага:\n"
+                + json.dumps(structured_constraints, ensure_ascii=False)
+            )
         selected_operation_skills = state.get("operation_skills") or []
+        selected_sql_risk_aspects = (
+            state.get("operation_sql_risk_aspects") or []
+        )
         planner_context = load_operation_skills(
             selected_operation_skills,
             stage="planner",
+            sql_risk_aspects=selected_sql_risk_aspects,
         )
         observer_context = load_operation_skills(
             selected_operation_skills,
             stage="observer",
+            sql_risk_aspects=selected_sql_risk_aspects,
         )
         if planner_context:
             worker_task += (
@@ -1421,12 +1872,19 @@ def build_coordinator_graph(
                 WORKER_OPERATION_COMPLETENESS_MARKER
                 + observer_context
             )
-        context = state["context"].strip()
-        if context:
-            worker_task += WORKER_STABLE_CONTEXT_MARKER + context
+        dependency_steps = (
+            None
+            if plan_step.dependencies is None
+            else set(plan_step.dependencies)
+        )
         previous_results = [
             reference
             for run in state["worker_runs"]
+            if run["cycle"] == state["cycle"]
+            and (
+                dependency_steps is None
+                or run["step"] in dependency_steps
+            )
             for reference in run["outcome"].previous_results
         ]
         if previous_results:
@@ -1449,6 +1907,15 @@ def build_coordinator_graph(
             worker_task[:1000],
         )
         outcome = worker_chat(worker_task)
+        record_worker_outcome(
+            cycle=state["cycle"],
+            step=step_index + 1,
+            status=outcome.status,
+            stop_reason=outcome.stop_reason,
+            unmet_requirements=list(outcome.unmet_requirements),
+            evidence_count=len(outcome.evidence),
+            dataset_count=len(outcome.datasets),
+        )
         for artifact in outcome.evidence:
             if artifact.display_ref and collected_display_refs is not None:
                 collected_display_refs.append(artifact.display_ref)
@@ -1500,20 +1967,40 @@ def build_coordinator_graph(
 
     def upstream_node(state: CoordinatorGraphState) -> Dict[str, Any]:
         selected_operation_skills = state.get("operation_skills") or []
+        selected_sql_risk_aspects = (
+            state.get("operation_sql_risk_aspects") or []
+        )
         decision_context = load_operation_skills(
             selected_operation_skills,
             stage="upstream_decision",
+            sql_risk_aspects=selected_sql_risk_aspects,
         )
         analysis_context = load_operation_skills(
             selected_operation_skills,
             stage="upstream",
+            sql_risk_aspects=selected_sql_risk_aspects,
         )
         available_evidence_ids: set[str] = set()
         available_display_refs: Dict[str, str] = {}
         evidence_payload: List[Dict[str, Any]] = []
+        worker_outcomes: List[Dict[str, Any]] = []
         for run in state["worker_runs"]:
-            evidence_payload.extend(
-                run["outcome"].upstream_payload()["evidence"]
+            outcome_payload = run["outcome"].upstream_payload()
+            evidence_payload.extend(outcome_payload["evidence"])
+            worker_outcomes.append(
+                {
+                    "cycle": run["cycle"],
+                    "step": run["step"],
+                    "status": outcome_payload["status"],
+                    "stop_reason": outcome_payload["stop_reason"],
+                    "unmet_requirements": outcome_payload[
+                        "unmet_requirements"
+                    ],
+                    "evidence_ids": [
+                        item["evidence_id"]
+                        for item in outcome_payload["evidence"]
+                    ],
+                }
             )
             for artifact in run["outcome"].evidence:
                 if artifact.evidence_id in available_evidence_ids:
@@ -1528,6 +2015,7 @@ def build_coordinator_graph(
                     ] = artifact.display_ref
         upstream_payload = {
             "original_task": state["task"],
+            "worker_outcomes": worker_outcomes,
             "evidence": evidence_payload,
         }
         decision_messages: List[BaseMessage] = [
@@ -1790,6 +2278,7 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
         "task": clean_task,
         "context": clean_context,
         "operation_skills": None,
+        "operation_sql_risk_aspects": None,
         "operation_pipeline": None,
         "cycle": 1,
         "plan": [],
