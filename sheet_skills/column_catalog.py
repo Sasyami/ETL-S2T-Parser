@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config.column_mapping import get_field_aliases, normalize_column_alias
 from config.useful_columns import get_usefull_col_extraction_target

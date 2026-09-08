@@ -29,6 +29,15 @@ MODEL_ENV_BY_PROVIDER = {
     "ollama": "OLLAMA_MODEL",
     "openrouter": "OPENROUTER_MODEL",
 }
+LIVE_SCENARIO_GROUP_MARKERS = {
+    "smoke": "live_smoke",
+    "history": "live_history",
+    "display": "live_display",
+    "handoff": "live_handoff",
+    "graph": "live_graph",
+    "validation": "live_validation",
+    "catalog": "live_catalog",
+}
 
 
 @dataclass
@@ -78,6 +87,28 @@ def _scenario_targets(names: Sequence[str]) -> list[str]:
         else:
             targets.append(f"{SCENARIO_FILE}::{clean}")
     return targets or [str(SCENARIO_FILE)]
+
+
+def _group_pytest_args(groups: Sequence[str]) -> list[str]:
+    """Translate stable live-suite group names into one pytest expression."""
+    unique_groups = list(dict.fromkeys(groups))
+    unknown = [
+        group
+        for group in unique_groups
+        if group not in LIVE_SCENARIO_GROUP_MARKERS
+    ]
+    if unknown:
+        raise ValueError(f"unknown live scenario group: {unknown[0]}")
+    if not unique_groups:
+        return []
+    expression = " or ".join(
+        LIVE_SCENARIO_GROUP_MARKERS[group] for group in unique_groups
+    )
+    return ["-m", expression]
+
+
+def _has_pytest_marker_expression(arguments: Sequence[str]) -> bool:
+    return any(argument.startswith("-m") for argument in arguments)
 
 
 def _parse_junit(result: ModeResult) -> None:
@@ -465,6 +496,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--group",
+        action="append",
+        choices=tuple(LIVE_SCENARIO_GROUP_MARKERS),
+        default=[],
+        help=(
+            "Смысловая группа live-сценариев. Можно повторять; группы "
+            "объединяются через OR. Вместе с --scenario действует как фильтр."
+        ),
+    )
+    parser.add_argument(
         "--pytest-arg",
         action="append",
         default=[],
@@ -492,7 +533,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.group and _has_pytest_marker_expression(args.pytest_arg):
+        parser.error(
+            "--group нельзя сочетать с pytest marker expression через "
+            "--pytest-arg=-m"
+        )
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     model = str(args.model or os.getenv(MODEL_ENV_BY_PROVIDER[args.provider], ""))
@@ -506,13 +553,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     targets = _scenario_targets(args.scenario)
+    pytest_args = [
+        *_group_pytest_args(args.group),
+        *args.pytest_arg,
+    ]
     results = [
         _run_mode(
             mode=mode,
             provider=args.provider,
             model=model,
             targets=targets,
-            pytest_args=args.pytest_arg,
+            pytest_args=pytest_args,
             output_dir=output_dir,
             run_label=run_label,
             llm_judge=args.llm_judge,

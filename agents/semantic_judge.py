@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -12,6 +12,9 @@ from .llm_factory import create_judge_chat_model
 
 
 JUDGE_MAX_DISPLAY_CHARS = 24_000
+JUDGE_MAX_HISTORY_MESSAGES = 12
+JUDGE_MAX_HISTORY_MESSAGE_CHARS = 8_000
+JUDGE_MAX_HISTORY_CHARS = 16_000
 
 
 class SemanticJudgeVerdict(BaseModel):
@@ -38,7 +41,8 @@ class IdentifierEvidenceAudit(BaseModel):
         default_factory=list,
         description=(
             "Все конкретные физические идентификаторы answer, которых дословно "
-            "нет в query и display_results.content."
+            "нет в query, пользовательских сообщениях history и "
+            "display_results.content."
         ),
     )
 
@@ -47,19 +51,31 @@ _IDENTIFIER_AUDIT_PROMPT = """
 Ты выполняешь только evidence-аудит физических идентификаторов, без оценки полноты
 или полезности ответа. Извлеки все конкретные имена таблиц, колонок, ключей,
 справочников и полей фильтра, которые встречаются в answer, но дословно отсутствуют
-и в query, и в `display_results[*].content`.
+в query, пользовательских сообщениях history и `display_results[*].content`.
+
+History передана в хронологическом порядке с явными ролями. Сообщение assistant
+само по себе не подтверждает физический идентификатор; подтверждением считается
+только query, сообщение user либо display-result.
 
 `display_results=[]` означает ноль evidence. Сам answer не подтверждает собственные
 утверждения. SQL-шаблон, план и тест-протокол не являются исключениями. Не считай
 логическое продолжение или правдоподобие подтверждением. Не включай SQL-ключевые
-слова, псевдонимы и placeholders в угловых скобках. Ничего не объясняй: верни только
-структурированный список unconfirmed_identifiers.
+слова, псевдонимы и placeholders в угловых скобках. Не включай имя, если answer
+явно предлагает его только как неподтверждённый вариант в уточняющем вопросе и не
+использует как факт. Ничего не объясняй: верни только структурированный список
+unconfirmed_identifiers.
 """.strip()
 
 
 _JUDGE_PROMPT = """
-Ты независимый LLM-as-judge. Оцени только выполнение дословного query
-по пользовательским answer и display_results.
+Ты независимый LLM-as-judge. Оцени выполнение текущего query с учётом
+role-aware history по пользовательским answer и display_results.
+
+History передана в хронологическом порядке. Явные факты, определения и правила
+user считаются условиями задачи; текст assistant сам по себе не делает факт
+подтверждённым. Более позднее явное сообщение user отменяет противоречащее раннее.
+Если query зависит от неоднозначной либо только предположенной assistant ссылки,
+краткий уточняющий вопрос является корректным ответом, а догадка — failed.
 
 Evidence-аудит новых физических идентификаторов уже выполнен отдельным LLM-вызовом.
 Здесь не повторяй его. Следуй оставшимся проверкам строго по порядку.
@@ -99,8 +115,13 @@ source→target-пара, правило либо явный результат 
 """.strip()
 
 
-def _needs_identifier_audit(query: str) -> bool:
-    normalized = str(query or "").casefold()
+def _needs_identifier_audit(
+    query: str,
+    history: Sequence[Mapping[str, str]],
+) -> bool:
+    normalized = "\n".join(
+        [str(query or ""), *(item["content"] for item in history)]
+    ).casefold()
     markers = ("file_id", "s2t", "mapping", "маппинг", "схем", "каталог", "sql")
     return any(marker in normalized for marker in markers)
 
@@ -131,33 +152,74 @@ def _compact_display_items(display_items: Sequence[Any]) -> list[dict[str, str]]
     return compact
 
 
+def _compact_history(history: Sequence[Any]) -> list[dict[str, str]]:
+    compact: list[dict[str, str]] = []
+    for item in history:
+        if not isinstance(item, Mapping):
+            continue
+        role = str(item.get("role") or "").strip()
+        content = str(item.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        compact.append(
+            {
+                "role": role,
+                "content": content[:JUDGE_MAX_HISTORY_MESSAGE_CHARS],
+            }
+        )
+
+    compact = compact[-JUDGE_MAX_HISTORY_MESSAGES:]
+    while (
+        len(compact) > 1
+        and sum(len(item["content"]) for item in compact)
+        > JUDGE_MAX_HISTORY_CHARS
+    ):
+        compact.pop(0)
+    if compact:
+        compact[-1]["content"] = compact[-1]["content"][:JUDGE_MAX_HISTORY_CHARS]
+    return compact
+
+
 def judge_agent_response(
     *,
     query: str,
     answer: Any,
     display_items: Sequence[Any],
+    history: Sequence[Any] = (),
     model: Any = None,
 ) -> SemanticJudgeVerdict:
     """Judge one completed exchange using the configured real chat model."""
     judge_model = model or create_judge_chat_model(timeout=180)
     compact_display = _compact_display_items(display_items)
+    compact_history = _compact_history(history)
     payload = {
         "query": str(query or ""),
         "answer": answer,
         "display_results": compact_display,
     }
+    if compact_history:
+        payload["history"] = compact_history
     human_message = HumanMessage(
         content=json.dumps(payload, ensure_ascii=False)
     )
 
-    if _needs_identifier_audit(str(query or "")):
+    if _needs_identifier_audit(str(query or ""), compact_history):
         audit_result = _invoke_structured(
             judge_model,
             IdentifierEvidenceAudit,
             [SystemMessage(content=_IDENTIFIER_AUDIT_PROMPT), human_message],
         )
         audit = IdentifierEvidenceAudit.model_validate(audit_result)
-        query_text = str(query or "").casefold()
+        confirmed_request_text = "\n".join(
+            [
+                str(query or ""),
+                *(
+                    item["content"]
+                    for item in compact_history
+                    if item["role"] == "user"
+                ),
+            ]
+        ).casefold()
         answer_text = str(answer or "").casefold()
         display_text = "\n".join(
             item.get("content", "") for item in compact_display
@@ -169,7 +231,7 @@ def judge_agent_response(
             and "<" not in name
             and ">" not in name
             and f"<{name.strip().casefold()}>" not in answer_text
-            and name.strip().casefold() not in query_text
+            and name.strip().casefold() not in confirmed_request_text
             and name.strip().casefold() not in display_text
         ]
         if unconfirmed:

@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import Lock
 from time import perf_counter
-from typing import Any, Dict, Iterator, List, Mapping, Optional
+from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional
 
 from langchain_core.callbacks import BaseCallbackHandler
 from pydantic import BaseModel, ConfigDict, Field
@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 _METRICS_REGISTRY_LIMIT = 100
 _VALUE_PREVIEW_CHARS = 2000
+_SUPERVISOR_CONTEXT_PREVIEW_CHARS = 4000
 _ACTIVE_RUN: ContextVar[Optional["_RunCollector"]] = ContextVar(
     "agent_run_metrics",
     default=None,
@@ -102,6 +103,16 @@ class WorkerRouteMetric(BaseModel):
     gap: Optional[str] = None
 
 
+class SupervisorDecisionMetric(BaseModel):
+    """Bounded supervisor route and handoff fields for live diagnostics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    route: Literal["direct", "delegate"]
+    resolved_references: str = ""
+    context: str = ""
+
+
 class AgentRunMetrics(BaseModel):
     """Completed metrics snapshot retained by session id for test inspection."""
 
@@ -112,6 +123,7 @@ class AgentRunMetrics(BaseModel):
     llm_calls: List[LLMCallMetric] = Field(default_factory=list)
     llm_stages: List[LLMStageMetric] = Field(default_factory=list)
     tool_calls: List[ToolCallMetric] = Field(default_factory=list)
+    supervisor_decision: Optional[SupervisorDecisionMetric] = None
     worker_tasks: List[str] = Field(default_factory=list)
     coordinator_plan: List[Dict[str, Any]] = Field(default_factory=list)
     worker_routes: List[WorkerRouteMetric] = Field(default_factory=list)
@@ -125,11 +137,11 @@ class AgentRunMetrics(BaseModel):
     error: Optional[str] = None
 
 
-def _clip(value: Any) -> str:
+def _clip(value: Any, *, max_chars: int = _VALUE_PREVIEW_CHARS) -> str:
     text = str(value or "").strip()
-    if len(text) <= _VALUE_PREVIEW_CHARS:
+    if len(text) <= max_chars:
         return text
-    return text[: _VALUE_PREVIEW_CHARS - 1].rstrip() + "…"
+    return text[: max_chars - 1].rstrip() + "…"
 
 
 def _tool_arguments(value: Any) -> Any:
@@ -240,6 +252,7 @@ class _RunCollector:
         self.lock = Lock()
         self.llm_calls: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.tool_calls: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self.supervisor_decision: Optional[SupervisorDecisionMetric] = None
         self.worker_tasks: List[str] = []
         self.coordinator_plan: List[Dict[str, Any]] = []
         self.worker_routes: List[WorkerRouteMetric] = []
@@ -361,6 +374,7 @@ class _RunCollector:
                 llm_calls=llm_calls,
                 llm_stages=_stage_metrics(llm_calls),
                 tool_calls=tool_calls,
+                supervisor_decision=self.supervisor_decision,
                 worker_tasks=list(self.worker_tasks),
                 coordinator_plan=[dict(item) for item in self.coordinator_plan],
                 worker_routes=list(self.worker_routes),
@@ -505,6 +519,26 @@ def get_run_metrics_callback() -> Optional[BaseCallbackHandler]:
     return _CALLBACK if _ACTIVE_RUN.get() is not None else None
 
 
+def record_supervisor_decision(
+    *,
+    route: Literal["direct", "delegate"],
+    resolved_references: str = "",
+    context: str = "",
+) -> None:
+    """Retain the bounded native supervisor handoff used by this run."""
+    if collector := _ACTIVE_RUN.get():
+        metric = SupervisorDecisionMetric(
+            route=route,
+            resolved_references=_clip(resolved_references),
+            context=_clip(
+                context,
+                max_chars=_SUPERVISOR_CONTEXT_PREVIEW_CHARS,
+            ),
+        )
+        with collector.lock:
+            collector.supervisor_decision = metric
+
+
 def record_worker_task(task: str) -> None:
     if collector := _ACTIVE_RUN.get():
         with collector.lock:
@@ -613,6 +647,7 @@ __all__ = [
     "LLMCallMetric",
     "LLMStageMetric",
     "ObservationMetric",
+    "SupervisorDecisionMetric",
     "ToolCallMetric",
     "WorkerRouteMetric",
     "capture_agent_run",
@@ -622,6 +657,7 @@ __all__ = [
     "record_upstream_output",
     "record_coordinator_plan",
     "record_display_tools",
+    "record_supervisor_decision",
     "record_worker_observation",
     "record_worker_route",
     "record_worker_task",

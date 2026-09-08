@@ -103,6 +103,73 @@ def test_semantic_judge_receives_only_user_visible_result():
     assert "placeholders в угловых скобках" in audit_prompt
 
 
+def test_semantic_judge_receives_role_aware_history():
+    model = _JudgeModel(
+        {"status": "passed", "reason": "Последнее правило пользователя учтено."}
+    )
+
+    verdict = judge_agent_response(
+        query="Сколько строк в рабочем объекте?",
+        history=[
+            {
+                "role": "user",
+                "content": "  Рабочий объект означает target_tables.  ",
+                "ignored": "не передавать",
+            },
+            {
+                "role": "assistant",
+                "content": "Определение принято.",
+            },
+        ],
+        answer="Строк: 3.",
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "passed"
+    payload = json.loads(model.structured.messages[1].content)
+    assert payload["history"] == [
+        {"role": "user", "content": "Рабочий объект означает target_tables."},
+        {"role": "assistant", "content": "Определение принято."},
+    ]
+    judge_prompt = model.structured.messages[0].content
+    assert "текст assistant сам по себе" in judge_prompt
+    assert "позднее явное сообщение user отменяет" in judge_prompt
+    assert (
+        "неоднозначной либо только предположенной assistant ссылки"
+        in judge_prompt
+    )
+
+
+def test_identifier_audit_does_not_trust_assistant_only_history():
+    model = _SchemaAwareJudgeModel(
+        {
+            IdentifierEvidenceAudit: {
+                "unconfirmed_identifiers": ["user_table", "assistant_table"]
+            },
+            SemanticJudgeVerdict: {
+                "status": "passed",
+                "reason": "Не должен вызываться.",
+            },
+        }
+    )
+
+    verdict = judge_agent_response(
+        query="Через SQLite посчитай строки в ней.",
+        history=[
+            {"role": "user", "content": "Подтверждаю user_table."},
+            {"role": "assistant", "content": "Буду считать assistant_table."},
+        ],
+        answer="assistant_table содержит одну строку.",
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "failed"
+    assert "assistant_table" in verdict.reason
+    assert model.calls == [IdentifierEvidenceAudit]
+
+
 def test_semantic_judge_rejects_llm_reported_unconfirmed_identifier():
     model = _SchemaAwareJudgeModel(
         {

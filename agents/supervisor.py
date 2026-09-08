@@ -18,6 +18,7 @@ from .run_metrics import (
     get_run_metrics_callback,
     llm_stage,
     record_display_tools,
+    record_supervisor_decision,
 )
 from .worker import resolve_worker_display_refs
 
@@ -205,6 +206,7 @@ def build_supervisor_graph(
         final_answer = None if decision.tool_calls else _message_text(decision)
         if final_answer is not None:
             logger.info("Supervisor answered directly")
+            record_supervisor_decision(route="direct")
         return {
             "supervisor_message": decision,
             "final_answer": final_answer,
@@ -230,6 +232,11 @@ def build_supervisor_graph(
         delegated_context = str(call["args"].get("context") or "").strip()[
             :COORDINATOR_CONTEXT_MAX_CHARS
         ]
+        record_supervisor_decision(
+            route="delegate",
+            resolved_references=resolved_references,
+            context=delegated_context,
+        )
         logger.info(
             "Supervisor delegated coordinator task=%s",
             delegated_task[:1000],

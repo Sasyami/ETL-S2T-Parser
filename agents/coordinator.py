@@ -823,11 +823,6 @@ def _native_operation_route(message: Any) -> OperationSkillSelection:
     )
 
 
-def _native_operation_skills(message: Any) -> List[str]:
-    """Backward-compatible helper returning only selected prompt profiles."""
-    return _native_operation_route(message).skills
-
-
 def _native_s2t_analysis_contract(message: Any) -> ValidationProtocolContract:
     contract = _native_payload(
         message,

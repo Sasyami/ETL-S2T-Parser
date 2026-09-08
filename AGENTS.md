@@ -4,9 +4,11 @@
 
 ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниями, сохраняет исходные данные и каталоги в SQLite, строит Neo4j-lineage и отвечает на вопросы через read-only инструментального агента.
 
-## Текущее состояние — 2026-08-27
+## Текущее состояние — 2026-09-03
 
-- Ветка: `codex/multiagent-worker-experiment`; рабочее дерево содержит незакоммиченные изменения агентной части и пользовательский каталог `artifacts/` — не удалять и не перезаписывать их.
+- Рабочая ветка может отличаться. Перед изменениями проверять `git status`;
+  незакоммиченные пользовательские изменения и каталог `artifacts/` не удалять
+  и не перезаписывать.
 - `/chat` по умолчанию использует multiagent; `CHAT_AGENT_MODE=single_agent` оставлен как baseline.
 - Актуальный поток: `supervisor → downstream plan → workers → upstream decision → upstream answer`.
 - Downstream создаёт полный план из 1–8 задач чтения; coordinator допускает максимум два цикла. Workers идут последовательно и могут лениво читать принятые результаты предыдущих workers.
@@ -52,7 +54,7 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 - Каждый принятый полный tool-result сохраняется на время coordinator-запуска под непрозрачным `result_id`; `display_ref` хранится отдельно от текстового preview.
 - Табличный результат дополнительно получает `result_ref`, список колонок и `truncated`; `query_saved_result` исполняет read-only SQL только над выбранной relation `result`.
 - Хранилище удаляется после coordinator и не пишет во внешнюю `excel_data.db`.
-- `agents/run_metrics.py` пишет этапы `supervisor`, `downstream_plan`, `router`, `worker_planner`, `observer`, `finish_worker`, `upstream`, планы, маршруты, observations, display-tools, время и provider tokens. Полные tool-results в метрики не копируются.
+- `agents/run_metrics.py` пишет этапы `supervisor`, `downstream_plan`, `router`, `worker_planner`, `observer`, `finish_worker`, `upstream`, bounded-решение supervisor, планы, маршруты, observations, display-tools, время и provider tokens. Полные tool-results в метрики не копируются.
 - `agents/observability.py` содержит необязательную Langfuse-интеграцию; `logs/agent.log` — ротационный UTF-8 лог.
 
 ## SQLite-данные
@@ -102,6 +104,6 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 - Tools и агентная логика: `tests/test_agent_tools.py`, `tests/test_agent.py`, `tests/test_worker.py`, `tests/test_coordinator.py`.
 - Хранение и S2T: `tests/test_database.py`, `tests/test_s2t_transformations.py`.
 - Unit: `pytest tests/ -q`; покрытие: `pytest tests/ --cov=. --cov-config=.coveragerc`.
-- Live quality проверяется отдельно через `scripts/run_live_agent_benchmark.py`: real-HTTP сценарии идут последовательно, сохраняют transcript/JUnit/comparison report; mock-тесты не оценивают качество модели.
-- `--llm-judge` оценивает только исходный запрос, публичный answer и ограниченные display-results. Новые физические идентификаторы в основанном на сохранённых данных SQL требуют подтверждения display либо явного placeholder; маршрут `A → B` должен достигать точного `B`. Не использовать judge как замену ручному разбору плана и evidence.
+- Live quality проверяется отдельно через `scripts/run_live_agent_benchmark.py`: real-HTTP сценарии идут последовательно, сохраняют transcript/JUnit/comparison report; `--group` с именем `smoke`, `history`, `display`, `handoff`, `graph`, `validation` или `catalog` запускает только выбранную смысловую группу. Mock-тесты не оценивают качество модели.
+- `--llm-judge` оценивает текущий запрос, role-aware историю, публичный answer и ограниченные display-results. Пользовательские сообщения истории являются условиями, неподтверждённый текст assistant — нет. Новые физические идентификаторы в основанном на сохранённых данных SQL требуют подтверждения display либо явного placeholder; маршрут `A → B` должен достигать точного `B`. Не использовать judge как замену ручному разбору плана и evidence.
 - Запуск UI: `uv run python app.py`.

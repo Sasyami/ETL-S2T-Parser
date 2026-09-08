@@ -6,7 +6,10 @@
 
 ETL S2T Agent — chat-first приложение для загрузки и анализа Excel-файлов с Source-to-Target-маппингами. Оно сохраняет исходные факты в SQLite, извлекает S2T- и SQL-lineage, при наличии Neo4j строит графовую проекцию и отвечает на вопросы через многоагентный LangGraph.
 
-> **Актуальное состояние:** [9 основных требований и 39 дополнительных live-сценариев](LIVE_AGENT_STATUS_REPORT_2026-09-03.md). Отчёт находится в корне репозитория и содержит текущую семантическую оценку, состояние загрузки и причины оставшихся провалов.
+> **Baseline качества:** [live-отчёт от 3 сентября 2026 года](LIVE_AGENT_STATUS_REPORT_2026-09-03.md). Он фиксирует последнюю сохранённую семантическую оценку, состояние загрузки и причины оставшихся провалов; текущий состав тестов описан ниже.
+
+Исторические демонстрации и отчёты предыдущих прогонов собраны в
+[`docs/history/`](docs/history/README.md) и не описывают текущее поведение.
 
 ## Возможности
 
@@ -174,7 +177,7 @@ CHAT_AGENT_MODE=single_agent
 - Neo4j 5+ — только для графовых сценариев.
 
 ```bash
-git clone https://github.com/Xpehutta/ETL-S2T-Parser.git
+git clone https://github.com/Sasyami/ETL-S2T-Parser.git
 cd ETL-S2T-Parser
 uv sync
 ```
@@ -286,7 +289,7 @@ pytest tests/ --cov=. --cov-config=.coveragerc
 
 Live-тесты используют реальный Flask `/chat`, текущую `excel_data.db`, выбранный provider и запущенный Neo4j для графовых сценариев. Supervisor, coordinator, workers, router, tools, observer и aggregator не подменяются. Запросы выполняются строго последовательно, без batching и параллельного pytest.
 
-Опциональный `--llm-judge` после каждого ответа отдельным LLM-вызовом оценивает только исходный запрос, публичный answer и display-results, записывает semantic verdict в transcript/comparison report и валидирует сценарий: `failed` или ошибка judge переводят pytest-тест в failed после выполнения его обычных проверок.
+Опциональный `--llm-judge` после каждого ответа отдельным LLM-вызовом оценивает текущий запрос, role-aware историю, публичный answer и display-results, записывает semantic verdict в transcript/comparison report и валидирует сценарий: `failed` или ошибка judge переводят pytest-тест в failed после выполнения его обычных проверок. Пользовательские сообщения истории считаются условиями задачи, а неподтверждённый текст assistant — нет.
 
 ```powershell
 $env:RUN_LIVE_AGENT_SCENARIOS = "1"
@@ -297,12 +300,35 @@ $env:LIVE_AGENT_TRANSCRIPT_PATH = ".test_runs/live-agent.md"
 pytest tests/test_live_agent_scenarios.py -q
 ```
 
-Live-сценарии проверяют обычный диалог, SQLite-count, ссылку на историю,
-scrollable-результаты, последовательную передачу между workers, точные S2T-пары, Neo4j-пути и переход
-SQLite → Neo4j. Неверные или неполные факты, отсутствие требуемого источника и
-инфраструктурные ошибки делают сценарий failed. Отклонения display/UI
-записываются как presentation warnings, а превышения времени, LLM-вызовов,
-tools и токенов — как efficiency warnings; сами по себе они сценарий не роняют.
+Live-сценарии проверяют обычный диалог, SQLite-count, историю supervisor,
+scrollable-результаты, последовательную передачу между workers, точные S2T-пары,
+Neo4j-пути, validation-протоколы и каталоговые вопросы. History-набор отдельно
+проверяет однозначную ссылку, отказ от неоднозначной ссылки, недоверие к
+неподтверждённому предположению assistant и приоритет последнего пользовательского
+правила. Неверные или неполные факты, отсутствие требуемого источника и
+инфраструктурные ошибки делают сценарий failed. Отклонения display/UI записываются
+как presentation warnings, а превышения времени, LLM-вызовов, tools и токенов —
+как efficiency warnings; сами по себе они сценарий не роняют.
+
+Каждый сценарий входит ровно в одну смысловую группу:
+
+| `--group` | Pytest marker | Что проверяет |
+|---|---|---|
+| `smoke` | `live_smoke` | прямой ответ и базовый запрос к данным |
+| `history` | `live_history` | разрешение ссылок и правила истории supervisor |
+| `display` | `live_display` | полные и scrollable результаты |
+| `handoff` | `live_handoff` | зависимые workers и передача результатов |
+| `graph` | `live_graph` | Neo4j lineage и точные пути |
+| `validation` | `live_validation` | анализ рисков и validation-протоколы |
+| `catalog` | `live_catalog` | S2T-каталог, semantic search и impact analysis |
+
+Локально группу можно выбрать обычным pytest marker:
+
+```bash
+RUN_LIVE_AGENT_SCENARIOS=1 \
+LIVE_AGENT_MODE=multiagent \
+pytest tests/test_live_agent_scenarios.py -m live_history -q
+```
 
 Для последовательного сравнения режимов:
 
@@ -310,8 +336,13 @@ tools и токенов — как efficiency warnings; сами по себе �
 uv run python scripts/run_live_agent_benchmark.py \
   --provider ollama \
   --model qwen3.5:9b \
-  --modes multiagent single_agent
+  --modes multiagent \
+  --group history
 ```
+
+`--group` можно повторять: `--group history --group handoff` объединяет группы
+через OR. Вместе с `--scenario` группа служит дополнительным фильтром точного
+сценария. Без `--group` benchmark по-прежнему запускает весь live-набор.
 
 Отчёты записываются в `.test_runs/` и не попадают в git.
 
@@ -340,6 +371,7 @@ agents/run_metrics.py          метрики live-запусков
 config/                        JSON-конфигурации извлечения
 templates/chat_app.html        единый интерфейс
 scripts/                       benchmark-скрипты
+docs/history/                  архив старых демонстраций и live-отчётов
 tests/                         unit, integration и live tests
 samples/                       примеры S2T Excel
 ```

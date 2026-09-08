@@ -1,8 +1,9 @@
 import json
+from copy import deepcopy
 from contextlib import nullcontext
 from unittest.mock import patch
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agents.chat_graph import WorkerDisplayItem, WorkerRunResult
 from agents.coordinator import CoordinatorAnswer
@@ -130,6 +131,100 @@ def test_supervisor_answers_directly_when_coordinator_is_not_needed():
     assert stages == ["supervisor"]
 
 
+def test_supervisor_keeps_last_six_history_messages_without_mutating_input():
+    from agents.supervisor import supervisor_chat
+
+    model = _SupervisorModel([AIMessage(content="Ответ без чтения данных.")])
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"history-{index}",
+            "ui_only": f"metadata-{index}",
+        }
+        for index in range(8)
+    ]
+    original_history = deepcopy(history)
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.supervisor.coordinator_chat") as coordinator,
+    ):
+        result = supervisor_chat("  Текущий запрос отдельно  ", history=history)
+
+    assert result.answer == "Ответ без чтения данных."
+    coordinator.assert_not_called()
+    assert len(model.messages) == 1
+    assert isinstance(model.messages[0][0], SystemMessage)
+    assert isinstance(model.messages[0][1], HumanMessage)
+    assert _payload(model) == {
+        "current_query": "Текущий запрос отдельно",
+        "recent_history": [
+            {"role": item["role"], "content": item["content"]}
+            for item in history[-6:]
+        ],
+    }
+    assert history == original_history
+
+
+def test_supervisor_exposes_history_to_direct_answer_model_without_coordinator():
+    from agents.supervisor import supervisor_chat
+
+    history = [
+        {"role": "user", "content": "Ранее мы договорились отвечать кратко."},
+        {"role": "assistant", "content": "Хорошо."},
+    ]
+    model = _SupervisorModel([AIMessage(content="Краткий ответ.")])
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.supervisor.coordinator_chat") as coordinator,
+    ):
+        result = supervisor_chat("Что ты умеешь?", history=history)
+
+    assert result == WorkerRunResult(answer="Краткий ответ.", display_items=[])
+    assert _payload(model) == {
+        "current_query": "Что ты умеешь?",
+        "recent_history": history,
+    }
+    coordinator.assert_not_called()
+
+
+def test_supervisor_self_contained_delegate_does_not_forward_raw_history():
+    from agents.supervisor import supervisor_chat
+
+    history = [
+        {"role": "user", "content": "HISTORY_USER_SENTINEL"},
+        {"role": "assistant", "content": "HISTORY_ASSISTANT_SENTINEL"},
+    ]
+    model = _SupervisorModel([_delegate_message()])
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(answer="Три файла.", display_refs=[]),
+        ) as coordinator,
+    ):
+        result = supervisor_chat("Сколько файлов загружено?", history=history)
+
+    assert result.answer == "Три файла."
+    coordinator.assert_called_once_with(
+        "Сколько файлов загружено?",
+        context="",
+    )
+    delegated_task = coordinator.call_args.args[0]
+    delegated_context = coordinator.call_args.kwargs["context"]
+    assert "HISTORY_USER_SENTINEL" not in delegated_task
+    assert "HISTORY_ASSISTANT_SENTINEL" not in delegated_task
+    assert delegated_context == ""
+
+
 def test_supervisor_delegates_whole_goal_and_returns_coordinator_result():
     from agents.supervisor import supervisor_chat
 
@@ -190,6 +285,57 @@ def test_supervisor_delegates_whole_goal_and_returns_coordinator_result():
         "recent_history": history,
     }
     assert len(model.messages) == 1
+
+
+def test_supervisor_data_path_forwards_only_resolved_history_and_bounded_context():
+    from agents.coordinator import COORDINATOR_CONTEXT_MAX_CHARS
+    from agents.supervisor import supervisor_chat
+
+    history = [
+        {"role": "user", "content": "Работаем с таблицей source.orders."},
+        {
+            "role": "assistant",
+            "content": "В ней есть 100 строк; неподтверждённый комментарий.",
+        },
+    ]
+    resolved_references = "  «в ней» = таблица source.orders.  "
+    context = "  " + "П" * (COORDINATOR_CONTEXT_MAX_CHARS + 5) + "  "
+    model = _SupervisorModel(
+        [
+            _delegate_message(
+                resolved_references,
+                context=context,
+            )
+        ]
+    )
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(
+                answer="В таблице 100 строк.",
+                display_refs=[],
+            ),
+        ) as coordinator,
+    ):
+        result = supervisor_chat("  Посчитай строки в ней  ", history=history)
+
+    assert result.answer == "В таблице 100 строк."
+    assert _payload(model) == {
+        "current_query": "Посчитай строки в ней",
+        "recent_history": history,
+    }
+    coordinator.assert_called_once_with(
+        "Посчитай строки в ней\n\n"
+        "Однозначно разрешённые ссылки из истории:\n"
+        "«в ней» = таблица source.orders.",
+        context="П" * COORDINATOR_CONTEXT_MAX_CHARS,
+    )
+    delegated_task = coordinator.call_args.args[0]
+    assert "неподтверждённый комментарий" not in delegated_task
 
 
 def test_supervisor_ignores_unexpected_llm_task_rewrite():

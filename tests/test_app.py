@@ -1,4 +1,5 @@
 import logging
+from copy import deepcopy
 
 import pytest
 from unittest.mock import patch
@@ -522,6 +523,46 @@ def test_chat_passes_browser_history_to_supervisor(mock_agent, client):
 
 
 @patch("app.supervisor_chat")
+def test_chat_bounds_history_before_passing_it_to_supervisor(mock_agent, client):
+    mock_agent.return_value = "Bounded answer"
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"  message-{index}  ",
+            "ui_only": True,
+        }
+        for index in range(12)
+    ]
+    history.extend(
+        [
+            {"role": "user", "content": "  " + "x" * 9000 + "  "},
+            {"role": "assistant", "content": "  " + "y" * 9000 + "  "},
+        ]
+    )
+    original_history = deepcopy(history)
+
+    response = client.post(
+        "/chat",
+        json={
+            "query": "  Follow up  ",
+            "history": history,
+            "session_id": "  bounded-session  ",
+        },
+    )
+
+    assert response.status_code == 200
+    mock_agent.assert_called_once_with(
+        "Follow up",
+        history=[
+            {"role": "user", "content": ("x" * 8000)},
+            {"role": "assistant", "content": ("y" * 8000)},
+        ],
+        session_id="bounded-session",
+    )
+    assert history == original_history
+
+
+@patch("app.supervisor_chat")
 def test_chat_passes_session_id_to_supervisor(mock_agent, client):
     mock_agent.return_value = "Scoped answer"
 
@@ -571,6 +612,32 @@ def test_chat_rejects_invalid_history(mock_agent, client):
 
     assert response.status_code == 400
     assert "role" in response.get_json()["error"]
+    mock_agent.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("invalid_payload", "error_fragment"),
+    [
+        ({"history": {}}, "history must be an array"),
+        ({"history": [1]}, "history[0] must be an object"),
+        (
+            {"history": [{"role": "user", "content": 1}]},
+            "history[0].content must be a string",
+        ),
+        ({"session_id": 7}, "session_id must be a string"),
+    ],
+)
+@patch("app.supervisor_chat")
+def test_chat_rejects_invalid_history_transport(
+    mock_agent,
+    client,
+    invalid_payload,
+    error_fragment,
+):
+    response = client.post("/chat", json={"query": "q", **invalid_payload})
+
+    assert response.status_code == 400
+    assert error_fragment in response.get_json()["error"]
     mock_agent.assert_not_called()
 
 

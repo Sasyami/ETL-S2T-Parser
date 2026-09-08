@@ -8,6 +8,7 @@ from agents.run_metrics import (
     llm_stage,
     record_coordinator_plan,
     record_display_tools,
+    record_supervisor_decision,
     record_worker_observation,
     record_worker_route,
     record_worker_task,
@@ -50,6 +51,11 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
             run_id=tool_run_id,
         )
         callback.on_tool_end("result", run_id=tool_run_id)
+        record_supervisor_decision(
+            route="delegate",
+            resolved_references="«в ней» = таблица example",
+            context="Отвечай кратко.",
+        )
         record_worker_task("Выполни SELECT 1")
         record_coordinator_plan(
             [
@@ -131,6 +137,12 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
     assert [item.name for item in metrics.tool_calls] == ["run_sql"]
     assert metrics.tool_calls[0].arguments == {"query": "SELECT 1"}
     assert metrics.tool_calls[0].input_preview == '{"query":"SELECT 1"}'
+    assert metrics.supervisor_decision is not None
+    assert metrics.supervisor_decision.model_dump() == {
+        "route": "delegate",
+        "resolved_references": "«в ней» = таблица example",
+        "context": "Отвечай кратко.",
+    }
     assert metrics.worker_tasks == ["Выполни SELECT 1"]
     assert metrics.coordinator_plan[0]["task"] == "Получить единицу"
     assert [item["cycle"] for item in metrics.coordinator_plan] == [1, 2]

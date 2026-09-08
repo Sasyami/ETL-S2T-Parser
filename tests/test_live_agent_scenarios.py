@@ -146,13 +146,14 @@ def _chat(
 ):
     from agents.chat_graph import WorkerRunResult
 
+    history_payload = list(history or [])
     session_id = f"live-agent-{uuid4()}"
     started_at = perf_counter()
     response = client.post(
         "/chat",
         json={
             "query": query,
-            "history": list(history or []),
+            "history": history_payload,
             "session_id": session_id,
         },
     )
@@ -163,6 +164,7 @@ def _chat(
         query,
         response.status_code,
         payload,
+        history=history_payload,
         metrics=metrics,
         http_elapsed_seconds=http_elapsed_seconds,
     )
@@ -181,6 +183,7 @@ def _record_live_exchange(
     status_code: int,
     payload,
     *,
+    history: list[dict] | None = None,
     metrics: AgentRunMetrics | None,
     http_elapsed_seconds: float,
 ) -> None:
@@ -214,6 +217,7 @@ def _record_live_exchange(
                 verdict = judge_agent_response(
                     query=query,
                     answer=answer,
+                    history=history or [],
                     display_items=(
                         payload.get("display_items", [])
                         if isinstance(payload, dict)
@@ -288,6 +292,11 @@ def _record_live_exchange(
                     }
                     for item in metrics.tool_calls
                 ],
+                "supervisor_decision": (
+                    metrics.supervisor_decision.model_dump(mode="json")
+                    if metrics.supervisor_decision is not None
+                    else None
+                ),
                 "coordinator_plan": metrics.coordinator_plan,
                 "worker_tasks": metrics.worker_tasks,
                 "worker_routes": [
@@ -306,9 +315,17 @@ def _record_live_exchange(
 
     with _LIVE_TRANSCRIPT_LOCK:
         _LIVE_TRANSCRIPT_INDEX += 1
+        history_block = ""
+        if history:
+            history_block = (
+                "### История\n\n```json\n"
+                + json.dumps(history, ensure_ascii=False, indent=2)
+                + "\n```\n\n"
+            )
         block = (
             f"## {_LIVE_TRANSCRIPT_INDEX}. Запрос\n\n"
             f"agent_mode: {LIVE_AGENT_MODE}\n\n"
+            f"{history_block}"
             f"{query}\n\n"
             f"### Ответ — HTTP {status_code}\n\n"
             f"{answer}\n\n"
@@ -496,6 +513,51 @@ def _assert_execution(
         metrics.total_tokens <= max_total_tokens,
         "efficiency",
         f"total_tokens={metrics.total_tokens} exceeds budget={max_total_tokens}",
+    )
+
+
+def _assert_supervisor_clarification(exchange: _LiveExchange) -> None:
+    """Require a direct clarification with no accidental data execution."""
+    result = exchange.result
+    metrics = exchange.metrics
+
+    _assert_public_answer(result.answer)
+    lowered = result.answer.casefold()
+    assert "?" in result.answer or any(
+        marker in lowered
+        for marker in (
+            "уточн",
+            "какую",
+            "какая",
+            "укажите",
+            "назовите",
+            "подтверд",
+        )
+    ), result.answer
+    assert result.display_items == [], result.display_items
+    assert metrics.tool_calls == [], metrics.tool_calls
+    assert metrics.coordinator_plan == [], metrics.coordinator_plan
+    assert metrics.worker_tasks == [], metrics.worker_tasks
+    assert metrics.worker_routes == [], metrics.worker_routes
+    assert metrics.observations == [], metrics.observations
+    assert metrics.display_tools == [], metrics.display_tools
+    assert metrics.upstream_output is None, metrics.upstream_output
+    assert metrics.supervisor_decision is not None
+    assert metrics.supervisor_decision.route == "direct", (
+        metrics.supervisor_decision
+    )
+    assert metrics.supervisor_decision.resolved_references == ""
+    assert metrics.supervisor_decision.context == ""
+    assert {item.stage for item in metrics.llm_stages} == {"supervisor"}, (
+        metrics.llm_stages
+    )
+    _assert_execution(
+        exchange,
+        expected_tools=[],
+        expected_displays=[],
+        max_seconds=None,
+        max_llm_calls=3,
+        max_total_tokens=15_000,
     )
 
 
@@ -954,6 +1016,7 @@ def _assert_compiled_test_protocol(
     assert len(_display_payloads(exchange.result)) == 2 * len(target_tables)
 
 
+@pytest.mark.live_smoke
 def test_live_agent_answers_simple_conversation_without_display_results(
     live_chat_client,
 ):
@@ -976,6 +1039,7 @@ def test_live_agent_answers_simple_conversation_without_display_results(
     )
 
 
+@pytest.mark.live_smoke
 def test_live_agent_returns_exact_global_sqlite_count(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1005,9 +1069,13 @@ def test_live_agent_returns_exact_global_sqlite_count(live_chat_client):
     )
 
 
+@pytest.mark.live_history
 def test_live_agent_resolves_history_reference_into_task(
     live_chat_client,
 ):
+    expected_count = int(
+        _fetch_one("SELECT COUNT(*) FROM s2t_transformations")[0]
+    )
     history = [
         {
             "role": "user",
@@ -1024,8 +1092,16 @@ def test_live_agent_resolves_history_reference_into_task(
         history=history,
     )
     result = exchange.result
+    supervisor_decision = exchange.metrics.supervisor_decision
 
     _assert_public_answer(result.answer)
+    assert re.findall(r"(?<!\w)\d+(?!\w)", result.answer) == [
+        str(expected_count)
+    ], result.answer
+    assert supervisor_decision is not None
+    assert supervisor_decision.route == "delegate", supervisor_decision
+    assert "s2t_transformations" in supervisor_decision.resolved_references
+    assert supervisor_decision.context == "", supervisor_decision
     _warn_unless(
         result.display_items == [],
         "presentation",
@@ -1041,6 +1117,149 @@ def test_live_agent_resolves_history_reference_into_task(
     )
 
 
+@pytest.mark.live_history
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies the multiagent supervisor",
+)
+def test_live_agent_asks_when_history_reference_is_ambiguous(
+    live_chat_client,
+):
+    exchange = _chat(
+        live_chat_client,
+        "Через SQLite посчитай в ней точное количество строк. Только число.",
+        history=[
+            {
+                "role": "user",
+                "content": (
+                    "Для следующего шага рассматриваю две физические "
+                    "SQLite-таблицы: source_tables и target_tables. "
+                    "Конкретную пока не выбрал."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Понял, выбор между двумя таблицами ещё не сделан.",
+            },
+        ],
+    )
+
+    _assert_supervisor_clarification(exchange)
+
+
+@pytest.mark.live_history
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies the multiagent supervisor",
+)
+def test_live_agent_rejects_assistant_only_history_assumption(
+    live_chat_client,
+):
+    exchange = _chat(
+        live_chat_client,
+        "Через SQLite посчитай в ней точное количество строк. Только число.",
+        history=[
+            {
+                "role": "user",
+                "content": (
+                    "Не выбирай за меня физическую SQLite-таблицу: "
+                    "я назову её сам позже."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Буду считать, что речь о source_tables.",
+            },
+        ],
+    )
+
+    _assert_supervisor_clarification(exchange)
+
+
+@pytest.mark.live_history
+@pytest.mark.skipif(
+    LIVE_AGENT_MODE != "multiagent",
+    reason="scenario verifies the multiagent supervisor",
+)
+def test_live_agent_uses_latest_user_history_rule(
+    live_chat_client,
+):
+    expected_count = int(_fetch_one("SELECT COUNT(*) FROM target_tables")[0])
+    exchange = _chat(
+        live_chat_client,
+        "Через SQLite посчитай точное количество строк в рабочем каталоге. "
+        "Только число.",
+        history=[
+            {
+                "role": "user",
+                "content": (
+                    "Для следующих задач «рабочий каталог» = source_tables."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Принял это определение рабочего каталога.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Отменяю прежнее правило. Теперь для следующих задач "
+                    "«рабочий каталог» = target_tables."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Принял новое определение рабочего каталога.",
+            },
+        ],
+    )
+    result = exchange.result
+    metrics = exchange.metrics
+    supervisor_decision = metrics.supervisor_decision
+
+    _assert_public_answer(result.answer)
+    assert re.findall(r"(?<!\w)\d+(?!\w)", result.answer) == [
+        str(expected_count)
+    ], result.answer
+    assert result.display_items == [], result.display_items
+
+    assert supervisor_decision is not None
+    assert supervisor_decision.route == "delegate", supervisor_decision
+    assert supervisor_decision.resolved_references == "", supervisor_decision
+    stable_context = supervisor_decision.context.casefold()
+    assert "target_tables" in stable_context, supervisor_decision
+    assert "source_tables" not in stable_context, supervisor_decision
+    assert "source_tables" not in "\n".join(metrics.worker_tasks).casefold(), (
+        metrics.worker_tasks
+    )
+
+    sql_calls = [item for item in metrics.tool_calls if item.name == "run_sql"]
+    assert sql_calls, metrics.tool_calls
+    assert "source_tables" not in json.dumps(
+        [item.arguments for item in metrics.tool_calls],
+        ensure_ascii=False,
+    ).casefold(), metrics.tool_calls
+    queried_tables: set[str] = set()
+    for call in sql_calls:
+        query = str(call.arguments.get("query") or "")
+        statement = sqlglot.parse_one(query, read="sqlite")
+        queried_tables.update(
+            table.name.casefold()
+            for table in statement.find_all(sqlglot.exp.Table)
+        )
+    assert "target_tables" in queried_tables, queried_tables
+    assert "source_tables" not in queried_tables, queried_tables
+    _assert_execution(
+        exchange,
+        expected_tools=["run_sql"],
+        expected_displays=[],
+        max_seconds=90,
+        max_llm_calls=12,
+        max_total_tokens=60_000,
+    )
+
+
+@pytest.mark.live_display
 def test_live_agent_selects_full_sql_result_for_scrollable_ui(
     live_chat_client,
     generated_sql_exports,
@@ -1113,6 +1332,7 @@ def test_live_agent_selects_full_sql_result_for_scrollable_ui(
     )
 
 
+@pytest.mark.live_handoff
 def test_live_agent_runs_dependent_workers_sequentially(
     live_chat_client,
 ):
@@ -1248,6 +1468,7 @@ def _neo4j_paths_between(
     return [path for path in paths if len(path) == edge_count + 1]
 
 
+@pytest.mark.live_graph
 def test_live_agent_returns_exact_neo4j_path_and_full_result(live_chat_client):
     source, middle, target = _two_hop_neo4j_path()
     exchange = _chat(
@@ -1284,6 +1505,7 @@ def test_live_agent_returns_exact_neo4j_path_and_full_result(live_chat_client):
     )
 
 
+@pytest.mark.live_graph
 def test_live_agent_returns_complete_three_edge_neo4j_path(live_chat_client):
     fixture_path = _neo4j_path(3)
     source, target = fixture_path[0], fixture_path[-1]
@@ -1337,6 +1559,7 @@ def test_live_agent_returns_complete_three_edge_neo4j_path(live_chat_client):
     )
 
 
+@pytest.mark.live_display
 def test_live_agent_preserves_exact_s2t_pairs_in_answer_and_full_result(
     live_chat_client,
     generated_sql_exports,
@@ -1418,7 +1641,8 @@ def test_live_agent_preserves_exact_s2t_pairs_in_answer_and_full_result(
     )
 
 
-def test_live_agent_runs_three_dependent_sqlite_workers(
+@pytest.mark.live_display
+def test_live_agent_returns_compound_sqlite_summary(
     live_chat_client,
 ):
     target_table = _fetch_one(
@@ -1464,7 +1688,7 @@ def test_live_agent_runs_three_dependent_sqlite_workers(
             for payload in payloads
         ),
         "presentation",
-        "third dependent-step display does not contain the leading source",
+        "compound summary display does not contain the leading source",
     )
     _assert_execution(
         exchange,
@@ -1476,7 +1700,8 @@ def test_live_agent_runs_three_dependent_sqlite_workers(
     )
 
 
-def test_live_agent_passes_sqlite_result_into_full_neo4j_path(
+@pytest.mark.live_graph
+def test_live_agent_returns_full_neo4j_path_for_known_endpoints(
     live_chat_client,
 ):
     expected_path = _neo4j_path(3)
@@ -1511,6 +1736,7 @@ def test_live_agent_passes_sqlite_result_into_full_neo4j_path(
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
@@ -1541,6 +1767,7 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client):
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
@@ -1565,6 +1792,7 @@ def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
     _, target_table, source_table, _, _ = _s2t_work_case_fixture()
     exchange = _chat(
@@ -1586,6 +1814,7 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_checks_unmapped_required_target_fields(live_chat_client):
     file_id, target_table, _, _, _ = _s2t_work_case_fixture()
     filename = str(
@@ -1616,6 +1845,7 @@ def test_live_agent_checks_unmapped_required_target_fields(live_chat_client):
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_checks_row_loss_risk(live_chat_client):
     _, target_table, source_table, _, _ = _s2t_work_case_fixture()
     exchange = _chat(
@@ -1637,6 +1867,7 @@ def test_live_agent_checks_row_loss_risk(live_chat_client):
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_explains_table_transformation(live_chat_client):
     _, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
@@ -1660,6 +1891,7 @@ def test_live_agent_explains_table_transformation(live_chat_client):
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_writes_s2t_test_protocol(live_chat_client):
     file_id, target_table, source_table, _, _ = _s2t_work_case_fixture()
     filename = str(
@@ -1701,6 +1933,7 @@ def test_live_agent_writes_s2t_test_protocol(live_chat_client):
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_writes_independent_s2t_test_protocol(live_chat_client):
     file_id, source_table, target_table = _independent_protocol_case_fixture()
     exchange = _chat(
@@ -1749,6 +1982,7 @@ def test_live_agent_writes_independent_s2t_test_protocol(live_chat_client):
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_analyzes_s2t_validation_risks(live_chat_client):
     file_id, target_table, source_table, _, _ = _s2t_work_case_fixture()
     exchange = _chat(
@@ -1772,6 +2006,7 @@ def test_live_agent_analyzes_s2t_validation_risks(live_chat_client):
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_writes_multi_source_s2t_validation_protocol(
     live_chat_client,
 ):
@@ -1806,6 +2041,7 @@ def test_live_agent_writes_multi_source_s2t_validation_protocol(
     )
 
 
+@pytest.mark.live_validation
 def test_live_agent_writes_multi_target_s2t_validation_protocol(
     live_chat_client,
 ):
@@ -1894,6 +2130,7 @@ def _assert_s2t_catalog_scenario(
     )
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_01_finds_target_field_source(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1903,6 +2140,7 @@ def test_live_agent_catalog_01_finds_target_field_source(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_02_finds_source_field_targets(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1913,6 +2151,7 @@ def test_live_agent_catalog_02_finds_source_field_targets(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_03_lists_table_mapping(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1922,6 +2161,7 @@ def test_live_agent_catalog_03_lists_table_mapping(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_04_explains_calculated_field(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1931,6 +2171,7 @@ def test_live_agent_catalog_04_explains_calculated_field(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_05_finds_business_metric_source(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1941,6 +2182,7 @@ def test_live_agent_catalog_05_finds_business_metric_source(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_06_semantic_close_date_search(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1950,6 +2192,7 @@ def test_live_agent_catalog_06_semantic_close_date_search(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_07_finds_business_filter_rule(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1959,6 +2202,7 @@ def test_live_agent_catalog_07_finds_business_filter_rule(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_08_searches_client_id_synonyms(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1968,6 +2212,7 @@ def test_live_agent_catalog_08_searches_client_id_synonyms(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_09_maps_russian_term_to_technical_field(
     live_chat_client,
 ):
@@ -1979,6 +2224,7 @@ def test_live_agent_catalog_09_maps_russian_term_to_technical_field(
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_10_builds_full_lineage(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1988,6 +2234,7 @@ def test_live_agent_catalog_10_builds_full_lineage(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_11_lists_intermediate_tables(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -1998,6 +2245,7 @@ def test_live_agent_catalog_11_lists_intermediate_tables(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_12_compares_two_field_origins(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2008,6 +2256,7 @@ def test_live_agent_catalog_12_compares_two_field_origins(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_13_finds_join_condition(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2018,6 +2267,7 @@ def test_live_agent_catalog_13_finds_join_condition(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_14_finds_filtering(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2027,6 +2277,7 @@ def test_live_agent_catalog_14_finds_filtering(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_15_finds_constant_or_default(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2037,6 +2288,7 @@ def test_live_agent_catalog_15_finds_constant_or_default(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_16_finds_case_transformation(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2047,6 +2299,7 @@ def test_live_agent_catalog_16_finds_case_transformation(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_17_finds_aggregation(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2056,6 +2309,7 @@ def test_live_agent_catalog_17_finds_aggregation(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_18_investigates_wrong_value(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2066,6 +2320,7 @@ def test_live_agent_catalog_18_investigates_wrong_value(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_19_investigates_null(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2075,6 +2330,7 @@ def test_live_agent_catalog_19_investigates_null(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_20_finds_data_loss_points(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2085,6 +2341,7 @@ def test_live_agent_catalog_20_finds_data_loss_points(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_21_traces_value_change(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2095,6 +2352,7 @@ def test_live_agent_catalog_21_traces_value_change(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_22_finds_multiple_sources(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2105,6 +2363,7 @@ def test_live_agent_catalog_22_finds_multiple_sources(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_23_performs_impact_analysis(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2116,6 +2375,7 @@ def test_live_agent_catalog_23_performs_impact_analysis(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_24_compares_two_mart_rules(live_chat_client):
     exchange = _chat(
         live_chat_client,
@@ -2126,6 +2386,7 @@ def test_live_agent_catalog_24_compares_two_mart_rules(live_chat_client):
     _assert_s2t_catalog_scenario(exchange)
 
 
+@pytest.mark.live_catalog
 def test_live_agent_catalog_25_finds_conflicting_s2t(live_chat_client):
     exchange = _chat(
         live_chat_client,

@@ -1,10 +1,18 @@
+import ast
 from pathlib import Path
 
+import pytest
+
+from scripts import run_live_agent_benchmark as benchmark
 from scripts.run_live_agent_benchmark import (
+    LIVE_SCENARIO_GROUP_MARKERS,
+    SCENARIO_FILE,
     ModeResult,
     _comparison_report,
+    _group_pytest_args,
     _parse_transcript,
     _scenario_mark,
+    build_parser,
 )
 
 
@@ -183,3 +191,112 @@ def test_benchmark_mark_uses_llm_judge_verdict():
     assert _scenario_mark(result, "semantic-pass") == "✅"
     assert _scenario_mark(result, "semantic-fail") == "❌"
     assert _scenario_mark(result, "judge-error") == "💥"
+
+
+def test_live_group_filter_builds_stable_or_expression():
+    assert _group_pytest_args([]) == []
+    assert _group_pytest_args(["history", "catalog", "history"]) == [
+        "-m",
+        "live_history or live_catalog",
+    ]
+    with pytest.raises(ValueError, match="unknown live scenario group: missing"):
+        _group_pytest_args(["missing"])
+
+
+def test_benchmark_parser_accepts_only_named_live_groups():
+    parser = build_parser()
+
+    args = parser.parse_args(["--group", "history", "--group", "handoff"])
+
+    assert args.group == ["history", "handoff"]
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--group", "missing"])
+    assert exc_info.value.code == 2
+
+
+def test_benchmark_main_combines_exact_scenario_with_group(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    def fake_run_mode(**kwargs):
+        calls.append(kwargs)
+        return ModeResult(
+            mode=kwargs["mode"],
+            return_code=0,
+            transcript_path=tmp_path / "run.md",
+            junit_path=tmp_path / "run.xml",
+        )
+
+    monkeypatch.setattr(benchmark, "_run_mode", fake_run_mode)
+    monkeypatch.setattr(benchmark, "_comparison_report", lambda **kwargs: None)
+
+    return_code = benchmark.main(
+        [
+            "--modes",
+            "multiagent",
+            "--scenario",
+            "test_live_agent_resolves_history_reference_into_task",
+            "--group",
+            "history",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert return_code == 0
+    assert len(calls) == 1
+    assert calls[0]["targets"] == [
+        f"{SCENARIO_FILE}::test_live_agent_resolves_history_reference_into_task"
+    ]
+    assert calls[0]["pytest_args"] == ["-m", "live_history"]
+
+
+def test_benchmark_rejects_competing_marker_expressions(tmp_path):
+    with pytest.raises(SystemExit) as exc_info:
+        benchmark.main(
+            [
+                "--group",
+                "history",
+                "--pytest-arg=-m",
+                "--pytest-arg=live_graph",
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def _pytest_marker_name(decorator: ast.expr) -> str | None:
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    if not isinstance(target, ast.Attribute):
+        return None
+    mark = target.value
+    if not isinstance(mark, ast.Attribute) or mark.attr != "mark":
+        return None
+    if not isinstance(mark.value, ast.Name) or mark.value.id != "pytest":
+        return None
+    return target.attr
+
+
+def test_every_live_scenario_belongs_to_exactly_one_semantic_group():
+    tree = ast.parse(SCENARIO_FILE.read_text(encoding="utf-8"))
+    group_markers = set(LIVE_SCENARIO_GROUP_MARKERS.values())
+    assignments = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_live_agent_"):
+            continue
+        markers = [
+            marker
+            for decorator in node.decorator_list
+            if (marker := _pytest_marker_name(decorator)) in group_markers
+        ]
+        assignments[node.name] = markers
+
+    assert assignments
+    assert all(len(markers) == 1 for markers in assignments.values()), assignments
+    assert {markers[0] for markers in assignments.values()} == group_markers

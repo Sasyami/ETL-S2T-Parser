@@ -6,7 +6,6 @@ import hashlib
 import html
 import json
 import re
-from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_core.tools import tool
