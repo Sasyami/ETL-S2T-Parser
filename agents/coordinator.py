@@ -44,6 +44,11 @@ from .contracts import (
 from .chat_graph import WorkerDisplayItem
 from .observability import get_callback_handler, langfuse_trace_context
 from .operation_intent import is_exclusive_value_change_request
+from .operation_protocols import (
+    OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
+    protocol_variant_sha256,
+    selected_sql_risk_protocol,
+)
 from .plan_origin import PlanOriginError, validate_worker_plan_origin
 from .plan_requirements import (
     ReroutePlanRequirementError,
@@ -148,6 +153,8 @@ COORDINATOR_MAX_WORKERS = MAX_PLAN_STEPS
 COORDINATOR_MAX_CYCLES = 2
 COORDINATOR_CONTEXT_MAX_CHARS = 4000
 _PLAN_TOOL_NAME = "submit_worker_plan"
+_SQL_RISK_OPERATION_SKILL = "Анализ SQL-рисков"
+_DEFAULT_SQL_RISK_PROTOCOL = "default/current"
 _OPERATION_SKILL_TOOL_NAME = "select_operation_skills"
 _S2T_ANALYSIS_CONTRACT_TOOL_NAME = "submit_s2t_analysis_contract"
 _VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME = "submit_validation_protocol_contract"
@@ -165,6 +172,38 @@ def _typed_sql_risk_aspects_enabled() -> bool:
     if value is None:
         return True
     return value.strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def _sql_risk_protocol_attestation(
+    operation_skills: Sequence[str],
+    sql_risk_aspects: Sequence[SqlRiskAspect],
+) -> Dict[str, Any]:
+    """Describe the exact opt-in SQL-risk protocol without changing it."""
+    if _SQL_RISK_OPERATION_SKILL not in operation_skills:
+        return {}
+
+    variant = selected_sql_risk_protocol(
+        os.getenv(OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV)
+    )
+    if variant is None:
+        return {
+            "operation_sql_risk_protocol": _DEFAULT_SQL_RISK_PROTOCOL,
+            "operation_sql_risk_protocol_sha256": None,
+        }
+
+    selected_aspects = tuple(sql_risk_aspects)
+    if selected_aspects != (variant.aspect,):
+        raise ValueError(
+            f"SQL-risk protocol candidate {variant.name!r} is for aspect "
+            f"{variant.aspect!r}, but selected aspects are "
+            f"{selected_aspects!r}"
+        )
+    return {
+        "operation_sql_risk_protocol": variant.name,
+        "operation_sql_risk_protocol_sha256": (
+            protocol_variant_sha256(variant)
+        ),
+    }
 
 
 class CoordinatorAnswer(BaseModel):
@@ -1859,6 +1898,10 @@ def build_coordinator_graph(
             stage="plan",
             sql_risk_aspects=operation_sql_risk_aspects,
         )
+        sql_risk_protocol_attestation = _sql_risk_protocol_attestation(
+            operation_skills,
+            operation_sql_risk_aspects,
+        )
         plan_payload: Dict[str, Any] = {
             "original_task": state["task"],
             "context": state["context"],
@@ -1972,6 +2015,7 @@ def build_coordinator_graph(
                 "operation_skills": list(operation_skills),
                 "sql_risk_aspects": list(operation_sql_risk_aspects),
                 "pipeline": operation_pipeline,
+                **sql_risk_protocol_attestation,
             }
             for index, step in enumerate(plan.steps, start=1)
         ]

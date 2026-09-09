@@ -477,6 +477,43 @@ uv run python scripts/run_multiagent_holdout.py \
 вызова. Отрицательный результат не даёт runner-у заменить сценарии, ослабить
 проверки или объявить экономию токенов улучшением при провале качества.
 
+### Изолированные эксперименты operation-протоколов
+
+`scripts/run_operation_protocol_experiments.py` сравнивает текущий typed
+SQL-risk protocol с 20 заранее заданными prompt-only вариантами: пять аспектов
+(`row_filtering`, `cardinality`, `constraint_rejection`, `value_changes`,
+`write_semantics`) × четыре общие protocol family (`minimal_artifact`,
+`evidence_ledger`, `epistemic_state_machine`, `decision_table`). Каждый вариант
+получает свой paired baseline на том же live-сценарии; порядок AB/BA чередуется.
+Обе руки используют только multiagent, `GigaChat-2-Max` и обязательный
+`GigaChat-2-Max` semantic judge.
+
+```bash
+# Проверка фиксированной матрицы, commit и fixture без HTTP/LLM
+uv run python scripts/run_operation_protocol_experiments.py \
+  --db-path .test_runs/synthetic_live.db \
+  --dry-run
+
+# 20 пар, то есть 40 последовательных /chat-обменов
+uv run python scripts/run_operation_protocol_experiments.py \
+  --db-path .test_runs/synthetic_live.db \
+  --output-dir .test_runs/operation-protocol-experiments
+```
+
+Перед первым вызовом runner фиксирует committed HEAD, SHA протокольного bundle,
+SQLite и synthetic plugin. Каждый эксперимент выполняется в отдельном локальном
+`--no-hardlinks` clone и на двух disposable копиях БД; в `finally` clone и копии
+удаляются, а rollback certificate сохраняется. Внешний Langfuse отключён.
+Неоткатываемы только уже потраченные provider tokens и provider-side логи.
+Runner не переносит победивший вариант в default: E2-сценарии являются
+development evidence, поэтому потенциальному победителю нужен новый независимый
+holdout.
+
+Для `value_changes` и `write_semantics` итоговый verdict формируется
+детерминированным кодом. Их восемь ячеек проверяют влияние протокола на
+plan/planner/observer и частично upstream decision, но не сравнивают модельный
+upstream answer; это ограничение записывается в preregistration и отчёт.
+
 ## Структура проекта
 
 ```text
@@ -504,7 +541,7 @@ agents/prompts/                runtime prompts и skills
 agents/run_metrics.py          метрики live-запусков
 config/                        JSON-конфигурации извлечения
 templates/chat_app.html        единый интерфейс
-scripts/                       live benchmark, E1–E5/holdout runners и Ultra guard
+scripts/                       live benchmark, E1–E5/holdout/protocol runners и Ultra guard
 docs/history/                  архив старых демонстраций и live-отчётов
 tests/                         unit, integration и live tests
 samples/                       примеры S2T Excel

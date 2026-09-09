@@ -5,6 +5,11 @@ import os
 from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
 from ..contracts import SqlRiskAspect
+from ..operation_protocols import (
+    OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
+    configured_sql_risk_protocol,
+    render_sql_risk_protocol,
+)
 from .common import PROJECT_ROOT
 
 PROMPTS_DIR = PROJECT_ROOT / "agents" / "prompts"
@@ -217,6 +222,16 @@ def _sql_risk_aspect_context(
     *,
     stage: str,
 ) -> str:
+    protocol_candidate = configured_sql_risk_protocol(
+        os.getenv(OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV)
+    )
+    if protocol_candidate is not None:
+        return render_sql_risk_protocol(
+            protocol_candidate,
+            aspects,
+            stage=stage,
+        )
+
     selected = [
         aspect
         for aspect in dict.fromkeys(aspects)

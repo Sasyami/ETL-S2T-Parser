@@ -1751,6 +1751,31 @@ def _assert_sql_risk_aspect(
         for step in routed_steps
     ), routed_steps
 
+    from agents.operation_protocols import (
+        protocol_variant_sha256,
+        selected_sql_risk_protocol,
+    )
+
+    protocol = selected_sql_risk_protocol(
+        os.getenv("OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT")
+    )
+    expected_protocol = "default/current"
+    expected_protocol_sha256 = None
+    if protocol is not None:
+        assert protocol.aspect == expected_aspect, protocol
+        expected_protocol = protocol.name
+        expected_protocol_sha256 = protocol_variant_sha256(protocol)
+    assert all(
+        step.get("operation_sql_risk_protocol") == expected_protocol
+        and step.get("operation_sql_risk_protocol_sha256")
+        == expected_protocol_sha256
+        for step in routed_steps
+    ), {
+        "expected_protocol": expected_protocol,
+        "expected_protocol_sha256": expected_protocol_sha256,
+        "plan": routed_steps,
+    }
+
 
 def _typed_sql_risk_enabled() -> bool:
     configured = os.getenv("OPERATION_SQL_RISK_ASPECTS_EXPERIMENT")

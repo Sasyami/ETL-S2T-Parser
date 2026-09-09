@@ -420,6 +420,142 @@ def test_sql_risk_router_propagates_only_requested_aspect(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("raw_setting", [None, "", "default", "current"])
+def test_sql_risk_protocol_attestation_marks_current_baseline(
+    monkeypatch,
+    raw_setting,
+):
+    from agents.coordinator import _sql_risk_protocol_attestation
+    from agents.operation_protocols import (
+        OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
+    )
+
+    if raw_setting is None:
+        monkeypatch.delenv(
+            OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
+            raising=False,
+        )
+    else:
+        monkeypatch.setenv(
+            OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
+            raw_setting,
+        )
+
+    assert _sql_risk_protocol_attestation(
+        ["Анализ SQL-рисков"],
+        ["cardinality"],
+    ) == {
+        "operation_sql_risk_protocol": "default/current",
+        "operation_sql_risk_protocol_sha256": None,
+    }
+    assert _sql_risk_protocol_attestation([], []) == {}
+
+
+def test_coordinator_records_candidate_protocol_attestation(monkeypatch):
+    from agents.coordinator import coordinator_chat
+    from agents.operation_protocols import (
+        OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
+        protocol_variant_sha256,
+    )
+
+    candidate = "cardinality__evidence_ledger"
+    monkeypatch.setenv(
+        OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
+        candidate,
+    )
+    responses = _responses(answer="JOIN может размножить строки.")
+    responses["select_operation_skills"] = [
+        _tool_message(
+            "select_operation_skills",
+            {
+                "pipeline": "agentic",
+                "skills": ["Анализ SQL-рисков"],
+                "sql_risk_aspects": ["cardinality"],
+            },
+            "operation-cardinality",
+        )
+    ]
+    model = _CoordinatorModel(responses)
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            return_value=_outcome("Mapping прочитан."),
+        ),
+        patch("agents.coordinator.record_coordinator_plan") as record_plan,
+    ):
+        result = coordinator_chat("Может ли JOIN размножить строки?")
+
+    assert result.answer == "JOIN может размножить строки."
+    recorded_step = record_plan.call_args.args[0][0]
+    assert recorded_step["operation_sql_risk_protocol"] == candidate
+    assert recorded_step["operation_sql_risk_protocol_sha256"] == (
+        protocol_variant_sha256(candidate)
+    )
+
+
+@pytest.mark.parametrize(
+    ("candidate", "selected_aspect", "error_pattern"),
+    [
+        (
+            "not-a-protocol",
+            "cardinality",
+            "Unknown OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT",
+        ),
+        (
+            "row_filtering__minimal_artifact",
+            "cardinality",
+            "is for aspect 'row_filtering'",
+        ),
+    ],
+)
+def test_invalid_protocol_fails_before_plan_attestation_is_recorded(
+    monkeypatch,
+    candidate,
+    selected_aspect,
+    error_pattern,
+):
+    from agents.coordinator import coordinator_chat
+    from agents.operation_protocols import (
+        OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
+    )
+
+    monkeypatch.setenv(
+        OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
+        candidate,
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": [selected_aspect],
+                    },
+                    "operation-risk",
+                )
+            ]
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.coordinator.record_coordinator_plan") as record_plan,
+        pytest.raises(ValueError, match=error_pattern),
+    ):
+        coordinator_chat("Оцени SQL-риск.")
+
+    record_plan.assert_not_called()
+    assert "submit_worker_plan" not in [name for name, _ in model.messages]
+
+
 def test_value_change_uses_full_saved_result_and_code_rendered_answer(
     monkeypatch,
 ):

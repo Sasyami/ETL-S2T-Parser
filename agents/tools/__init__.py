@@ -1,10 +1,16 @@
 """Decorated LangChain tools and their explicit registries."""
 
-from .common import PROJECT_ROOT
+from ..operation_protocols import (
+    protocol_sha256,
+    protocol_variant_sha256,
+    selected_sql_risk_protocol,
+)
 from .additional_objects import list_additional_objects, search_additional_objects
+from .common import PROJECT_ROOT
 from .context import (
     OPERATION_SKILL_CATALOG,
     OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
     SCHEMA_CATALOG,
     get_sqlite_schema_cheatsheet,
     load_chat_agent_context,
@@ -113,6 +119,7 @@ __all__ = [
     "PROJECT_ROOT",
     "OPERATION_SKILL_CATALOG",
     "OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV",
+    "OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV",
     "READ_ONLY_TOOLS",
     "SCHEMA_CATALOG",
     "SQL_EXPORT_DIR",
@@ -177,6 +184,8 @@ __all__ = [
     "read_s2t_mapping",
     "read_s2t_source_to_target",
     "read_previous_result",
+    "protocol_sha256",
+    "protocol_variant_sha256",
     "SavedResultColumn",
     "SavedResultDescriptor",
     "SavedResultStore",
@@ -184,6 +193,7 @@ __all__ = [
     "get_active_saved_result_store",
     "persist_sqlite_tool_message",
     "saved_result_store_scope",
+    "selected_sql_risk_protocol",
     "search_s2t_transformations",
     "search_additional_objects",
     "search_column_catalog",
