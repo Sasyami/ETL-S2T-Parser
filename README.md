@@ -8,6 +8,8 @@ ETL S2T Agent — chat-first приложение для загрузки и а�
 
 > **Baseline качества:** [live-отчёт от 3 сентября 2026 года](LIVE_AGENT_STATUS_REPORT_2026-09-03.md). Он фиксирует последнюю сохранённую семантическую оценку, состояние загрузки и причины оставшихся провалов; текущий состав тестов описан ниже.
 
+> **Последний независимый holdout:** [A/B-отчёт от 9 сентября 2026 года](LIVE_MULTIAGENT_HOLDOUT_REPORT_2026-09-09.md). Он фиксирует отрицательный результат сравнения двух multiagent-конфигураций на GigaChat-2-Max; candidate не принят.
+
 Исторические демонстрации и отчёты предыдущих прогонов собраны в
 [`docs/history/`](docs/history/README.md) и не описывают текущее поведение.
 
@@ -340,7 +342,8 @@ Neo4j для графовых сценариев. SQLite берётся из `LI
 переменная задана, иначе из workspace `excel_data.db`; путь должен указывать на
 существующий файл. Таймаут одного локального HTTP `/chat`-обмена задаётся
 положительным конечным числом секунд в `LIVE_AGENT_HTTP_TIMEOUT` (по умолчанию
-300). Supervisor, coordinator, workers, router, tools, observer и aggregator не
+300). Supervisor, coordinator, workers, router, tools, observer, upstream
+decision и upstream answer не
 подменяются. Запросы выполняются строго последовательно, без batching и
 параллельного pytest.
 
@@ -447,6 +450,33 @@ token guard до и после запуска. По умолчанию подт�
 минимумы 15 000 000 и 250 000 на `/chat`-обмен понизить нельзя. Live benchmark также читает
 `GIGACHAT_ULTRA_TOKEN_FLOOR` и `GIGACHAT_ULTRA_RESERVE_PER_SCENARIO`.
 
+### Независимый multiagent holdout
+
+`scripts/run_multiagent_holdout.py` сравнивает две заранее зафиксированные
+multiagent-конфигурации на десяти сценариях, не входящих в E1–E5. Каждый сценарий
+выполняется в обеих конфигурациях, порядок AB/BA чередуется. И агент, и
+обязательный semantic judge используют `GigaChat-2-Max`; успешным считается
+только результат, одновременно прошедший детерминированные проверки и judge.
+Runner проверяет SHA256 одной read-only SQLite-базы до и после каждого из 20
+HTTP-обменов, не запускает Neo4j и fail-closed отклоняет skip, неполную judge
+telemetry или изменение fixture.
+
+```bash
+# Проверка матрицы и fixture без HTTP/LLM
+uv run python scripts/run_multiagent_holdout.py \
+  --db-path .test_runs/synthetic_live.db \
+  --dry-run
+
+# Полный последовательный A/B-прогон
+uv run python scripts/run_multiagent_holdout.py \
+  --db-path .test_runs/synthetic_live.db \
+  --output-dir .test_runs/holdout-max
+```
+
+Набор, критерии принятия и порядок фиксируются в preregistration до первого
+вызова. Отрицательный результат не даёт runner-у заменить сценарии, ослабить
+проверки или объявить экономию токенов улучшением при провале качества.
+
 ## Структура проекта
 
 ```text
@@ -474,7 +504,7 @@ agents/prompts/                runtime prompts и skills
 agents/run_metrics.py          метрики live-запусков
 config/                        JSON-конфигурации извлечения
 templates/chat_app.html        единый интерфейс
-scripts/                       live benchmark, E1–E5 runner и Ultra guard
+scripts/                       live benchmark, E1–E5/holdout runners и Ultra guard
 docs/history/                  архив старых демонстраций и live-отчётов
 tests/                         unit, integration и live tests
 samples/                       примеры S2T Excel
