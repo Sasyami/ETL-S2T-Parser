@@ -514,6 +514,13 @@ holdout.
 plan/planner/observer и частично upstream decision, но не сравнивают модельный
 upstream answer; это ограничение записывается в preregistration и отчёт.
 
+Confirmatory Max/Max-run `20260910_021405` завершил все 20 пар и откаты, но ни
+одно семейство не прошло preregistered gate. Combined score изменился с 7/20 до
+9/20, при этом semantic score снизился с 16/20 до 15/20, candidate agent tokens
+выросли на 76,3%, а `epistemic_state_machine` дал regression с HTTP 500.
+Продвигать варианты нельзя; подробности —
+[`LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md`](LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md).
+
 ## Структура проекта
 
 ```text

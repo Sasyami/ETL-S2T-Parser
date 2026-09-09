@@ -4,7 +4,7 @@
 
 ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниями, сохраняет исходные данные и каталоги в SQLite, строит Neo4j-lineage и отвечает на вопросы через read-only инструментального агента.
 
-## Текущее состояние — 2026-09-09
+## Текущее состояние — 2026-09-10
 
 - Рабочая ветка может отличаться. Перед изменениями проверять `git status`;
   незакоммиченные пользовательские изменения и каталог `artifacts/` не удалять
@@ -23,6 +23,7 @@ ETL S2T Parser разбирает Excel-файлы с ETL/S2T-описаниям
 - `scripts/run_multiagent_holdout.py` запускает фиксированный независимый A/B из 10 сценариев и 20 последовательных `/chat`-обменов: обе конфигурации только multiagent, агент и обязательный semantic judge — GigaChat-2-Max, порядок AB/BA контрбалансирован, SQLite SHA256 проверяется до и после каждого обмена.
 - Confirmatory holdout `20260909_210753` завершён полностью без skip/HTTP 500: baseline `1/10`, candidate `0/10`, verdict `not_improved`. Candidate использовал 460 042 agent tokens против 374 431 и потерял единственный baseline-pass; конфигурацию не продвигать. Подробности — `LIVE_MULTIAGENT_HOLDOUT_REPORT_2026-09-09.md`.
 - `scripts/run_operation_protocol_experiments.py` запускает 20 prompt-only SQL-risk protocol variants (5 aspects × 4 generic families) как 40 paired Max/Max-judge multiagent exchanges. Каждый pair изолирован fresh no-hardlinks clone и disposable SQLite-копиями, имеет preregistration/journal/rollback certificate и не меняет default автоматически.
+- Confirmatory operation-protocol run `20260910_021405` завершил и откатил 20/20 пар. Ни одно семейство не прошло preregistered gate: combined baseline/candidate `7/20 → 9/20`, semantic `16/20 → 15/20`, agent tokens `195 547 → 344 818`; `epistemic_state_machine` дал regression с HTTP 500. Default не менять. Подробности — `LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md`.
 - Расширения handoff-схемы `source_total`, 3 и 8 sample rows проверены на GigaChat-2-Max и отклонены: они увеличивали prompt, но не решали последовательный перебор кандидатов. Handoff остаётся компактным; planner читает полный результат через `read_previous_result`.
 - `search_s2t_transformations` принимает совместимый одиночный `needle` и batch `needles` до 50 технических имён. Для набора из прошлого результата planner должен сделать один batch-вызов; исходные S2T-дубликаты сохраняются.
 - Downstream prompt содержит компактные возможности чтения и краткие описания публичных таблиц. Эксперимент с сильно сокращёнными правилами и полными списками колонок откатан: на GigaChat-2-Max он заменил семантический поиск лексическим S2T-поиском.
