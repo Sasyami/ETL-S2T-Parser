@@ -70,7 +70,6 @@ STRICT_RETRIEVAL_ENABLED = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 _LIVE_TRANSCRIPT_LOCK = threading.Lock()
 _LIVE_TRANSCRIPT_INDEX = 0
-_LIVE_SEMANTIC_RESULTS: list[dict[str, str]] = []
 
 pytestmark = [
     pytest.mark.integration,
@@ -311,7 +310,7 @@ def _chat(
     http_elapsed_seconds = perf_counter() - started_at
     payload = response.get_json()
     metrics = consume_agent_run_metrics(session_id)
-    _record_live_exchange(
+    semantic_evaluation = _record_live_exchange(
         query,
         response.status_code,
         payload,
@@ -321,6 +320,15 @@ def _chat(
     )
     assert response.status_code == 200, payload
     assert metrics is not None, "live run did not publish agent metrics"
+    if (
+        semantic_evaluation is not None
+        and semantic_evaluation["status"] != "passed"
+    ):
+        pytest.fail(
+            "LLM-as-judge отклонил пользовательский результат: "
+            f"{semantic_evaluation['status']}: "
+            f"{semantic_evaluation['reason']}"
+        )
     return _LiveExchange(
         query=query,
         result=WorkerRunResult.model_validate(payload),
@@ -337,8 +345,8 @@ def _record_live_exchange(
     history: list[dict] | None = None,
     metrics: AgentRunMetrics | None,
     http_elapsed_seconds: float,
-) -> None:
-    """Append a human-readable request/response pair for an opt-in live run."""
+) -> dict[str, str] | None:
+    """Record an exchange and return its completed semantic evaluation."""
     global _LIVE_TRANSCRIPT_INDEX
 
     if isinstance(payload, dict):
@@ -408,16 +416,15 @@ def _record_live_exchange(
                 judge_telemetry = telemetry_callback.snapshot(
                     model=judge_model_name,
                 )
-        if status_code == 200:
-            _LIVE_SEMANTIC_RESULTS.append(
-                {
-                    "status": semantic_status,
-                    "reason": semantic_reason,
-                }
-            )
-
     if not LIVE_TRANSCRIPT_PATH:
-        return
+        return (
+            {
+                "status": semantic_status,
+                "reason": semantic_reason,
+            }
+            if LIVE_AGENT_LLM_JUDGE and status_code == 200
+            else None
+        )
     transcript_path = Path(LIVE_TRANSCRIPT_PATH)
     if not transcript_path.is_absolute():
         transcript_path = PROJECT_ROOT / transcript_path
@@ -561,6 +568,15 @@ def _record_live_exchange(
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
         with transcript_path.open("a", encoding="utf-8", newline="\n") as transcript:
             transcript.write(block)
+
+    return (
+        {
+            "status": semantic_status,
+            "reason": semantic_reason,
+        }
+        if LIVE_AGENT_LLM_JUDGE and status_code == 200
+        else None
+    )
 
 
 def _assert_minimal_name_sequence(
@@ -814,25 +830,6 @@ class _LiveHttpClient:
 
     def get(self, path: str):
         return self._request("GET", path)
-
-
-@pytest.fixture(autouse=True)
-def validate_llm_judge_verdict() -> Iterator[None]:
-    """Fail the scenario after its normal checks when semantic judge rejects it."""
-    _LIVE_SEMANTIC_RESULTS.clear()
-    yield
-    if not LIVE_AGENT_LLM_JUDGE:
-        return
-    failures = [
-        item
-        for item in _LIVE_SEMANTIC_RESULTS
-        if item.get("status") != "passed"
-    ]
-    if failures:
-        details = "; ".join(
-            f"{item.get('status')}: {item.get('reason')}" for item in failures
-        )
-        pytest.fail("LLM-as-judge отклонил пользовательский результат: " + details)
 
 
 @pytest.fixture
