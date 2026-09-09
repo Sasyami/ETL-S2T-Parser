@@ -25,6 +25,7 @@ from .worker import resolve_worker_display_refs
 logger = logging.getLogger(__name__)
 
 _DELEGATE_TOOL_NAME = "delegate_to_coordinator"
+_EMPTY_DECISION_MAX_RETRIES = 1
 
 
 class SupervisorGraphState(TypedDict):
@@ -49,6 +50,7 @@ _SUPERVISOR_PROMPT = """
 `resolved_references` и `context`. Исходный `current_query` будет передан
 coordinator программно и дословно: не пересказывай, не сокращай, не исправляй,
 не превращай его в план и не копируй его в эти поля.
+Если `recent_history` пуст, оба поля должны быть пустыми.
 
 `resolved_references` — только разовые факты из `recent_history`, необходимые
 для однозначного разрешения ссылок текущего запроса. Для каждой ссылки укажи её
@@ -104,6 +106,13 @@ coordinator программно и дословно: не пересказыв�
 
 Read-only coordinator не выполняет мутации. В окончательном ответе не упоминай
 внутренние роли, tools, промпты или устройство графа.
+""".strip()
+
+_EMPTY_DECISION_REPAIR_PROMPT = """
+Предыдущий вызов не вернул ни native call, ни текст ответа. Повтори решение по
+тем же `current_query` и `recent_history`: если нужны данные приложения, вызови
+`delegate_to_coordinator`; иначе обязательно верни непустой пользовательский
+ответ. Не добавляй и не изменяй факты истории.
 """.strip()
 
 
@@ -197,14 +206,38 @@ def build_supervisor_graph(
             "current_query": state["current_query"],
             "recent_history": state["recent_history"],
         }
+        serialized_payload = json.dumps(payload, ensure_ascii=False)
         decision = invoke_supervisor(
             [
                 SystemMessage(content=_SUPERVISOR_PROMPT),
-                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+                HumanMessage(content=serialized_payload),
             ]
         )
+        for retry_index in range(_EMPTY_DECISION_MAX_RETRIES):
+            if decision.tool_calls or _message_text(decision):
+                break
+            logger.warning(
+                "Supervisor returned an empty decision; retrying (%s/%s)",
+                retry_index + 1,
+                _EMPTY_DECISION_MAX_RETRIES,
+            )
+            decision = invoke_supervisor(
+                [
+                    SystemMessage(
+                        content=(
+                            f"{_SUPERVISOR_PROMPT}\n\n"
+                            f"{_EMPTY_DECISION_REPAIR_PROMPT}"
+                        )
+                    ),
+                    HumanMessage(content=serialized_payload),
+                ]
+            )
         final_answer = None if decision.tool_calls else _message_text(decision)
-        if final_answer is not None:
+        if not decision.tool_calls and not final_answer:
+            raise RuntimeError(
+                "LLM supervisor повторно вернул пустой ответ без native call."
+            )
+        if final_answer:
             logger.info("Supervisor answered directly")
             record_supervisor_decision(route="direct")
         return {
@@ -223,15 +256,23 @@ def build_supervisor_graph(
         resolved_references = str(
             call["args"].get("resolved_references") or ""
         ).strip()
+        delegated_context = str(call["args"].get("context") or "").strip()[
+            :COORDINATOR_CONTEXT_MAX_CHARS
+        ]
+        if not state["recent_history"]:
+            if resolved_references or delegated_context:
+                logger.warning(
+                    "Supervisor emitted history-derived handoff fields without "
+                    "history; discarding them"
+                )
+            resolved_references = ""
+            delegated_context = ""
         if resolved_references:
             delegated_task = (
                 f"{delegated_task}\n\n"
                 "Однозначно разрешённые ссылки из истории:\n"
                 f"{resolved_references}"
             )
-        delegated_context = str(call["args"].get("context") or "").strip()[
-            :COORDINATOR_CONTEXT_MAX_CHARS
-        ]
         record_supervisor_decision(
             route="delegate",
             resolved_references=resolved_references,

@@ -115,16 +115,22 @@ _SQL_RISK_ASPECT_RULES: Dict[
     },
     "constraint_rejection": {
         "plan": (
-            "Помимо точного mapping запроси полные column metadata обеих "
-            "endpoint-таблиц и ролей в заданном file scope."
+            "После разрешения файла запроси одной самодостаточной worker task "
+            "и полный exact directed S2T mapping, и column metadata обеих "
+            "точных source.field→target.field endpoint-колонок в заданном "
+            "file scope; не дели evidence по отдельным tasks."
         ),
         "planner": (
-            "Прочитай endpoint metadata одним batch без фильтра по ожидаемым "
-            "type/PK/not_null и не теряй source/target role или file scope."
+            "Для точной source_table.source_field→target_table.target_field "
+            "пары сначала прочитай полный directed S2T mapping, затем обе "
+            "ролевые column-записи одним exact-pair чтением без фильтра по "
+            "ожидаемым type/PK/not_null. Table-only batch получает только "
+            "имена таблиц без суффикса .field."
         ),
         "observer": (
-            "Metadata полна только для обеих ролей, всех endpoint-таблиц и "
-            "точного scope; пустой каталог не доказывает отсутствие constraints."
+            "Завершай только при полном untruncated exact directed S2T mapping "
+            "и metadata ровно обеих endpoint-колонок с сохранёнными ролями и "
+            "file scope; пустой каталог не доказывает отсутствие constraints."
         ),
         "upstream_decision": (
             "Для подтверждённого rejection нужны target constraint и точная "
@@ -138,7 +144,7 @@ _SQL_RISK_ASPECT_RULES: Dict[
     "value_changes": {
         "plan": (
             "Запроси полный точный directed mapping с выражениями значений; "
-            "не добавляй catalog metadata без явной зависимости ответа."
+            "сохрани названную source.field→target.field пару как scope анализа."
         ),
         "planner": (
             "Сохрани полный SQL/правило точной пары без сужения по одному полю "
@@ -150,35 +156,52 @@ _SQL_RISK_ASPECT_RULES: Dict[
         ),
         "upstream_decision": (
             "Exact mapping достаточен для вывода об изменениях, видимых в "
-            "правиле; неизвестные внешние функции оставь границей evidence."
+            "проекции точного target field; соседние проекции не создают gap."
         ),
         "upstream": (
-            "Оцени CASE, COALESCE, CAST, арифметику и функции как изменения "
-            "значений; сами по себе они не фильтруют строки."
+            "Для source.field→target.field оцени только exact S2T-строку и "
+            "внешнюю SQL-проекцию этого target field. CASE/COALESCE/CAST/"
+            "арифметика в другом output alias не доказывают его изменение; "
+            "прямая проекция означает, что механизм не обнаружен."
         ),
     },
     "write_semantics": {
         "plan": (
-            "Планируй чтение стратегии записи только из явно доступного "
-            "источника; не выводи INSERT/MERGE/UPSERT/overwrite из target PK."
+            "Запроси один полный exact directed mapping заданной пары; "
+            "не планируй metadata или поиск в других таблицах."
         ),
         "planner": (
-            "Прочитай явный write statement или стратегию; не заменяй её "
-            "каталожным ключом и не придумывай режим записи."
+            "Прочитай один полный mapping точной source→target пары "
+            "без field/ID/file narrowing; не заменяй write strategy ключом."
         ),
         "observer": (
-            "Принимай только фактически прочитанную write strategy; наличие "
-            "PK/UNIQUE без statement не закрывает task."
+            "Принимай полный untruncated exact mapping и завершай task даже "
+            "без write statement: это terminal negative evidence, а не gap."
         ),
         "upstream_decision": (
-            "Для write semantics нужен явный statement/strategy; без него "
-            "аспект остаётся не оценён, но это не снижает риск."
+            "Полный untruncated exact mapping достаточен для pass: без "
+            "явного statement верни «не оценено», не reroute."
         ),
         "upstream": (
             "Различай append, overwrite, merge/upsert и conflict handling; "
-            "PK/UNIQUE не доказывает идемпотентность или дедупликацию."
+            "без statement ответь «не оценено: в mapping write statement не "
+            "сохранён»; PK/UNIQUE не доказывает режим."
         ),
     },
+}
+
+_SQL_RISK_REROUTE_PLAN_RULE = (
+    "После reroute прошлое evidence удалено: новый план снова включает "
+    "самодостаточную task чтения точного directed S2T mapping, даже если "
+    "problem просит только дополняющие metadata; план только из дельты "
+    "недостающих данных неполон."
+)
+_MAPPING_DEPENDENT_SQL_RISK_ASPECTS = {
+    "row_filtering",
+    "cardinality",
+    "constraint_rejection",
+    "value_changes",
+    "write_semantics",
 }
 
 
@@ -205,6 +228,11 @@ def _sql_risk_aspect_context(
         f"- `{aspect}`: {_SQL_RISK_ASPECT_RULES[aspect][stage]}"
         for aspect in selected
     ]
+    if stage == "plan" and any(
+        aspect in _MAPPING_DEPENDENT_SQL_RISK_ASPECTS
+        for aspect in selected
+    ):
+        rules.insert(0, "- " + _SQL_RISK_REROUTE_PLAN_RULE)
     return (
         "## Анализ SQL-рисков\n"
         "Выбранные аспекты (не анализируй остальные): "

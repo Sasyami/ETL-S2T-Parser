@@ -716,8 +716,6 @@ def select_chat_route(
         "available_skills": _named_catalog(SKILL_CATALOG),
         "available_schemas": _named_catalog(SCHEMA_CATALOG),
     }
-    if request_parts.stable_context:
-        payload["stable_context"] = request_parts.stable_context
     if request_parts.operation_execution_context:
         payload["operation_context"] = (
             request_parts.operation_execution_context

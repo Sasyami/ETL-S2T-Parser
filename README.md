@@ -338,9 +338,11 @@ pytest tests/ --cov=. --cov-config=.coveragerc
 Live-тесты используют реальный Flask `/chat`, выбранный provider и запущенный
 Neo4j для графовых сценариев. SQLite берётся из `LIVE_AGENT_DB_PATH`, если
 переменная задана, иначе из workspace `excel_data.db`; путь должен указывать на
-существующий файл. Supervisor, coordinator, workers, router, tools, observer и
-aggregator не подменяются. Запросы выполняются строго последовательно, без
-batching и параллельного pytest.
+существующий файл. Таймаут одного локального HTTP `/chat`-обмена задаётся
+положительным конечным числом секунд в `LIVE_AGENT_HTTP_TIMEOUT` (по умолчанию
+300). Supervisor, coordinator, workers, router, tools, observer и aggregator не
+подменяются. Запросы выполняются строго последовательно, без batching и
+параллельного pytest.
 
 Опциональный `--llm-judge` после каждого ответа отдельным LLM-вызовом оценивает текущий запрос, role-aware историю, публичный answer и display-results, записывает semantic verdict в transcript/comparison report и валидирует сценарий: `failed` или ошибка judge переводят pytest-тест в failed после выполнения его обычных проверок. Пользовательские сообщения истории считаются условиями задачи, а неподтверждённый текст assistant — нет.
 

@@ -148,6 +148,7 @@ def resolve_test_protocol_contract(
                         mention=mention,
                         entity_type="table",
                         role="source",
+                        file_id=file_id,
                     ),
                     load_index=load_index,
                 )
@@ -163,6 +164,7 @@ def resolve_test_protocol_contract(
                     mention=raw_load.target_mention,
                     entity_type="table",
                     role="target",
+                    file_id=file_id,
                 ),
                 load_index=load_index,
             )

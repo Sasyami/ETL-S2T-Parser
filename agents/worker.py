@@ -493,9 +493,16 @@ def worker_chat(
                 graph_result.display_items,
                 datasets,
             )
+            outcome_status = (
+                "failed"
+                if graph_result.stop_reason == "no_results"
+                else "partial"
+                if graph_result.gap
+                else "complete"
+            )
             return WorkerOutcome(
                 summary=summary,
-                status=("partial" if graph_result.gap else "complete"),
+                status=outcome_status,
                 stop_reason=(
                     graph_result.stop_reason or "budget_exhausted"
                     if graph_result.gap

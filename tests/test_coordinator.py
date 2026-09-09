@@ -420,6 +420,310 @@ def test_sql_risk_router_propagates_only_requested_aspect(monkeypatch):
         )
 
 
+def test_value_change_uses_full_saved_result_and_code_rendered_answer(
+    monkeypatch,
+):
+    from agents.coordinator import coordinator_chat
+    from agents.tools.context import (
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    )
+    from agents.tools.saved_results import get_active_saved_result_store
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    original_task = (
+        "Оцени только SQL-аспект value changes: меняется ли значение для "
+        "точной пары src_np.id → tgt_np.id."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["value_changes"],
+                    },
+                    "operation-value-change",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Прочитать точный полный S2T mapping "
+                                    "src_np.id → tgt_np.id."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-value-change",
+                )
+            ],
+            "submit_upstream_data_decision": [
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {"decision": "pass"},
+                    "decision-value-change",
+                )
+            ],
+        }
+    )
+
+    def worker_with_saved_mapping(_request):
+        store = get_active_saved_result_store()
+        assert store is not None
+        row = {
+            "source_table": "src_np",
+            "source_field": "id",
+            "target_table": "tgt_np",
+            "target_field": "id",
+            "transformation_rule": (
+                "SELECT s.id AS id, COALESCE(s.value, 0) AS value "
+                "FROM src_np AS s"
+            ),
+        }
+        descriptor = store.save_payload(
+            source_tool="read_s2t_source_to_target",
+            source_tool_call_id="call-exact-mapping",
+            payload={"rows": [row], "truncated": False},
+        )
+        assert descriptor is not None
+        return _outcome(
+            "Точный mapping прочитан.",
+            evidence=[
+                _artifact(
+                    None,
+                    "read_s2t_source_to_target",
+                    '{"rows":[{"target_field":"id"}]}',
+                    evidence_id="evidence-exact-id",
+                    compact_args={
+                        "source_table": "src_np",
+                        "target_table": "tgt_np",
+                    },
+                    dataset_ref=descriptor.result_ref,
+                )
+            ],
+            datasets=[descriptor],
+        )
+
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=worker_with_saved_mapping,
+        ),
+        patch("agents.coordinator.record_upstream_output") as record_upstream,
+    ):
+        result = coordinator_chat(original_task)
+
+    assert "src_np.id → tgt_np.id" in result.answer
+    assert "механизм изменения значения не обнаружен" in result.answer
+    assert "COALESCE" not in result.answer
+    assert result.display_refs == []
+    assert not any(
+        name == "submit_upstream_answer" for name, _ in model.messages
+    )
+
+    decision_payload = _payload(model, "submit_upstream_data_decision")
+    deterministic = decision_payload["deterministic_sql_risk"]
+    assert deterministic["authority"] == (
+        "deterministic_sqlglot_full_saved_result"
+    )
+    assert deterministic["facts"] == [
+        {
+            "source_table": "src_np",
+            "source_field": "id",
+            "target_table": "tgt_np",
+            "target_field": "id",
+            "conclusion": "not_detected",
+            "mechanism": "direct_column",
+            "matching_rows": 1,
+            "target_expressions": ["s.id"],
+            "evidence_ids": ["evidence-exact-id"],
+        }
+    ]
+    recorded_output = record_upstream.call_args.args[0]
+    assert recorded_output["used_evidence_ids"] == ["evidence-exact-id"]
+    assert recorded_output["display_evidence_ids"] == []
+    assert recorded_output["answer_source"] == (
+        "deterministic_value_changes"
+    )
+
+
+def test_write_semantics_terminal_negative_ignores_redundant_reroute(
+    monkeypatch,
+):
+    from agents.coordinator import coordinator_chat
+    from agents.tools.context import (
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    )
+    from agents.tools.saved_results import get_active_saved_result_store
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    original_task = (
+        "Оцени только SQL-аспект write semantics для сохранённой "
+        "S2T-загрузки src_np → tgt_np: append, overwrite, MERGE/UPSERT "
+        "или conflict handling. Если write statement не сохранён, "
+        "честно отметь «не оценено» и не выводи режим из PK."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["write_semantics"],
+                    },
+                    "operation-write-semantics",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Прочитать полный точный directed S2T "
+                                    "mapping src_np → tgt_np."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-write-semantics",
+                )
+            ],
+            "submit_upstream_data_decision": [
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {
+                        "decision": "reroute",
+                        "problem": (
+                            "Нужно ещё раз прочитать metadata для "
+                            "определения write mode."
+                        ),
+                    },
+                    "decision-write-semantics-reroute",
+                )
+            ],
+        }
+    )
+
+    def worker_with_full_select_only_mapping(_request):
+        store = get_active_saved_result_store()
+        assert store is not None
+        rule = (
+            "SELECT s.id AS id, COALESCE(s.value, 0) AS value "
+            "FROM src_np AS s"
+        )
+        rows = [
+            {
+                "source_table": "src_np",
+                "source_field": "id",
+                "target_table": "tgt_np",
+                "target_field": "id",
+                "transformation_rule": rule,
+            },
+            {
+                "source_table": "src_np",
+                "source_field": "value",
+                "target_table": "tgt_np",
+                "target_field": "value",
+                "transformation_rule": rule,
+            },
+        ]
+        descriptor = store.save_payload(
+            source_tool="read_s2t_source_to_target",
+            source_tool_call_id="call-write-mapping",
+            payload={"rows": rows, "total": len(rows), "truncated": False},
+        )
+        assert descriptor is not None
+        return _outcome(
+            "Полный SELECT-only mapping прочитан.",
+            evidence=[
+                _artifact(
+                    None,
+                    "read_s2t_source_to_target",
+                    '{"rows":[{"target_field":"id"}]}',
+                    evidence_id="evidence-write-select-only",
+                    compact_args={
+                        "source_table": "src_np",
+                        "target_table": "tgt_np",
+                    },
+                    dataset_ref=descriptor.result_ref,
+                )
+            ],
+            datasets=[descriptor],
+        )
+
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=worker_with_full_select_only_mapping,
+        ) as worker,
+        patch("agents.coordinator.record_upstream_output") as record_upstream,
+    ):
+        result = coordinator_chat(original_task)
+
+    assert "src_np → tgt_np" in result.answer
+    assert "не оценено" in result.answer.casefold()
+    assert result.display_refs == []
+    assert worker.call_count == 1
+    assert len(
+        [name for name, _ in model.messages if name == "submit_worker_plan"]
+    ) == 1
+    assert len(
+        [
+            name
+            for name, _ in model.messages
+            if name == "submit_upstream_data_decision"
+        ]
+    ) == 1
+    assert not any(
+        name == "submit_upstream_answer" for name, _ in model.messages
+    )
+
+    decision_payload = _payload(model, "submit_upstream_data_decision")
+    assert decision_payload["worker_outcomes"][0]["cycle"] == 1
+    deterministic = decision_payload["deterministic_write_semantics"]
+    assert deterministic["authority"] == (
+        "deterministic_sqlglot_full_saved_result"
+    )
+    assert deterministic["facts"] == [
+        {
+            "source_table": "src_np",
+            "target_table": "tgt_np",
+            "conclusion": "not_assessed",
+            "mechanism": "write_statement_absent",
+            "matching_rows": 2,
+            "detected_mechanisms": [],
+            "evidence_ids": ["evidence-write-select-only"],
+        }
+    ]
+    record_upstream.assert_called_once()
+    recorded_output = record_upstream.call_args.args[0]
+    assert recorded_output["used_evidence_ids"] == [
+        "evidence-write-select-only"
+    ]
+    assert recorded_output["display_evidence_ids"] == []
+    assert recorded_output["answer_source"] == (
+        "deterministic_write_semantics"
+    )
+
+
 def test_sql_risk_aspect_experiment_can_load_legacy_full_profile(monkeypatch):
     from agents.coordinator import (
         OperationSkillSelection,
@@ -660,6 +964,122 @@ def test_operation_router_can_compile_external_sql_test_protocol():
     assert [name for name, _ in model.messages] == [
         "select_operation_skills",
         "submit_validation_protocol_contract",
+    ]
+
+
+def test_validation_virtual_target_returns_unavailable_without_fallback():
+    from agents.coordinator import coordinator_chat
+    from agents.test_protocol import (
+        ResolvedTestProtocolContract,
+        TestProtocolLoad,
+    )
+    from agents.test_protocol_resolution import TestProtocolResolutionResult
+
+    source_table = "raw.orders"
+    virtual_target = "mart.result::cte::src"
+    task = (
+        f"Составь explicit test protocol {source_table} → {virtual_target} "
+        "только с check=row_count."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "validation_protocol",
+                        "skills": [],
+                        "sql_risk_aspects": [],
+                    },
+                    "operation-virtual-target",
+                )
+            ],
+            "submit_validation_protocol_contract": [
+                _tool_message(
+                    "submit_validation_protocol_contract",
+                    {
+                        "mode": "explicit",
+                        "requested_checks": [],
+                        "loads": [
+                            {
+                                "source_mentions": [source_table],
+                                "target_mention": virtual_target,
+                                "requested_checks": ["row_count"],
+                            }
+                        ],
+                    },
+                    "protocol-virtual-target",
+                )
+            ],
+        }
+    )
+    resolution = TestProtocolResolutionResult(
+        status="resolved",
+        contract=ResolvedTestProtocolContract(
+            mode="explicit",
+            loads=[
+                TestProtocolLoad(
+                    sources=[source_table],
+                    target=virtual_target,
+                    checks=["row_count"],
+                )
+            ],
+        ),
+        exact_bypass_count=2,
+    )
+    mapping_row = {
+        "source_table": source_table,
+        "source_field": "id",
+        "target_table": virtual_target,
+        "target_field": "id",
+        "transformation_rule": "SELECT o.id FROM raw.orders AS o",
+    }
+    reader_results = [
+        {
+            "kind": "s2t_pair",
+            "load_index": 1,
+            "tool_name": "read_s2t_source_to_target",
+            "args": {
+                "source_table": source_table,
+                "target_table": virtual_target,
+            },
+            "payload": {"rows": [mapping_row], "truncated": False},
+        }
+    ]
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.resolve_test_protocol_contract",
+            return_value=resolution,
+        ),
+        patch(
+            "agents.coordinator.read_test_protocol_inputs",
+            return_value=reader_results,
+        ) as readers,
+        patch(
+            "agents.coordinator.register_worker_display_items",
+            return_value=[],
+        ),
+        patch("agents.coordinator.record_validation_protocol") as record_protocol,
+        patch("agents.coordinator.worker_chat") as worker,
+    ):
+        result = coordinator_chat(task)
+
+    assert "статус: unavailable" in result.answer
+    assert "виртуальным lineage scope" in result.answer
+    assert "SQL-шаблон не сформирован" in result.answer
+    readers.assert_called_once()
+    worker.assert_not_called()
+    trace = record_protocol.call_args.args[0]
+    assert trace["status"] == "unavailable"
+    assert trace["silent_fallback"] is False
+    assert trace["targets"][0]["target_table"] == virtual_target
+    assert trace["targets"][0]["checks"][0]["status"] == "unavailable"
+    assert trace["targets"][0]["checks"][0]["missing_dependencies"] == [
+        "target_relation"
     ]
 
 
@@ -1405,6 +1825,32 @@ def test_coordinator_prompts_and_schemas_match_contracts():
         "coverage",
         "dependencies",
     }
+    plan_parameters = _plan_tool_schema()["function"]["parameters"]
+    object_schemas = []
+
+    def collect_object_schemas(schema):
+        if not isinstance(schema, dict):
+            return
+        if schema.get("type") == "object":
+            object_schemas.append(schema)
+        for value in schema.values():
+            if isinstance(value, dict):
+                collect_object_schemas(value)
+            elif isinstance(value, list):
+                for item in value:
+                    collect_object_schemas(item)
+
+    collect_object_schemas(plan_parameters)
+    assert object_schemas
+    assert all(
+        isinstance(schema.get("properties"), dict)
+        for schema in object_schemas
+    )
+    filters_schema = plan_parameters["properties"]["steps"]["items"][
+        "properties"
+    ]["scope"]["properties"]["filters"]
+    assert filters_schema["properties"] == {}
+    assert filters_schema["additionalProperties"] is True
     worker_plan_schema_text = str(WorkerPlan.model_json_schema())
     assert "По умолчанию один шаг" not in worker_plan_schema_text
     assert "лениво использовать принятые результаты" in worker_plan_schema_text
@@ -1694,8 +2140,8 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
             patch("agents.coordinator.discard_worker_display_refs") as discard,
         ):
             result = coordinator_chat(
-                "Найди имя и проверь его.",
-                context="Общий фон",
+                "Найди имя для file_id=7 и проверь его.",
+                context="Общий фон: target table t_example.",
             )
 
     assert result == CoordinatorAnswer(
@@ -1721,15 +2167,14 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
     second_task = worker.call_args_list[1].args[0]
     second_parts = parse_worker_request(second_task)
     assert second_parts.current_task == "Проверь найденное имя."
-    assert second_parts.stable_context == ""
     assert "Общий фон" not in first_task
     assert "Общий фон" not in second_task
     operation_payload = _payload(model, "select_operation_skills")
     assert operation_payload == {
-        "original_task": "Найди имя и проверь его.",
+        "original_task": "Найди имя для file_id=7 и проверь его.",
     }
     plan_payload = _payload(model, "submit_worker_plan")
-    assert plan_payload["context"] == "Общий фон"
+    assert plan_payload["context"] == "Общий фон: target table t_example."
     assert [
         item.model_dump(mode="json", exclude_none=True)
         for item in (second_parts.previous_results or [])
@@ -1749,7 +2194,9 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
         "worker_outcomes",
         "evidence",
     }
-    assert upstream["original_task"] == "Найди имя и проверь его."
+    assert upstream["original_task"] == (
+        "Найди имя для file_id=7 и проверь его."
+    )
     assert upstream["worker_outcomes"] == [
         {
             "cycle": 1,
@@ -2139,6 +2586,129 @@ def test_upstream_normalizes_structured_answer_after_data_pass():
     ]
 
 
+def test_upstream_recovers_known_ids_from_json_serialization_noise():
+    from agents.coordinator import coordinator_chat
+
+    evidence_id = "evidence_0123456789abcdef"
+    serialized_fragment = (
+        f'["{evidence_id}"], "display_evidence_ids": '
+        f'["{evidence_id}"], "displayable": true'
+    )
+    model = _CoordinatorModel(
+        _responses(
+            answer="Факт получен.",
+            used_evidence_ids=(
+                serialized_fragment,
+                "display_evidence_ids",
+                "displayable",
+            ),
+            display_evidence_ids=(serialized_fragment,),
+        )
+    )
+    worker_result = _outcome(
+        "Факт получен.",
+        evidence=[
+            _artifact(
+                "display-result",
+                "lookup",
+                '{"value":1}',
+                evidence_id=evidence_id,
+            )
+        ],
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.coordinator.worker_chat", return_value=worker_result),
+    ):
+        result = coordinator_chat("Получи факт.")
+
+    assert result == CoordinatorAnswer(
+        answer="Факт получен.",
+        display_refs=["display-result"],
+    )
+    upstream_calls = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_upstream_answer"
+    ]
+    assert len(upstream_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        (
+            '["evidence_0123456789abcdef", '
+            '"evidence_deadbeef"]'
+        ),
+        "answer says evidence_0123456789abcdef is sufficient",
+    ],
+    ids=["unknown-serialized-id", "semantic-junk"],
+)
+def test_upstream_does_not_recover_unsafe_evidence_strings(bad_value):
+    from agents.coordinator import coordinator_chat
+
+    evidence_id = "evidence_0123456789abcdef"
+    model = _CoordinatorModel(
+        {
+            "submit_worker_plan": _responses(answer="unused")[
+                "submit_worker_plan"
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Факт получен.",
+                        "used_evidence_ids": [bad_value],
+                        "display_evidence_ids": [bad_value],
+                    },
+                    "upstream-unsafe",
+                ),
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Факт получен.",
+                        "used_evidence_ids": [evidence_id],
+                        "display_evidence_ids": [evidence_id],
+                    },
+                    "upstream-repaired",
+                ),
+            ],
+        }
+    )
+    worker_result = _outcome(
+        "Факт получен.",
+        evidence=[
+            _artifact(
+                "display-result",
+                "lookup",
+                '{"value":1}',
+                evidence_id=evidence_id,
+            )
+        ],
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.coordinator.worker_chat", return_value=worker_result),
+    ):
+        result = coordinator_chat("Получи факт.")
+
+    assert result.display_refs == ["display-result"]
+    upstream_calls = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_upstream_answer"
+    ]
+    assert len(upstream_calls) == 2
+    assert "неизвестные evidence_id" in upstream_calls[1][-1].content
+
+
 def test_upstream_repairs_unknown_evidence_id():
     from agents.coordinator import coordinator_chat
 
@@ -2201,6 +2771,372 @@ def test_upstream_repairs_unknown_evidence_id():
     assert "rejected" in upstream_calls[1][-2].content
     assert "доступные evidence_id" in upstream_calls[1][-1].content
     assert '"evidence-result"' in upstream_calls[1][-1].content
+
+
+def test_sql_risk_upstream_repairs_empty_used_evidence_ids():
+    from agents.coordinator import coordinator_chat
+
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["cardinality"],
+                    },
+                    "operation-cardinality",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Прочитать полный exact S2T mapping "
+                                    "src_np → tgt_np."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-cardinality",
+                )
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "JOIN может размножить строки.",
+                        "used_evidence_ids": [],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-without-provenance",
+                ),
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "JOIN может размножить строки.",
+                        "used_evidence_ids": ["evidence-mapping"],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-with-provenance",
+                ),
+            ],
+        }
+    )
+    worker_result = _outcome(
+        "Mapping прочитан.",
+        evidence=[
+            _artifact(
+                None,
+                "read_s2t_source_to_target",
+                '{"rows":[{"transformation_rule":"SELECT ... JOIN ..."}]}',
+                evidence_id="evidence-mapping",
+                compact_args={
+                    "source_table": "src_np",
+                    "target_table": "tgt_np",
+                },
+            )
+        ],
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.coordinator.worker_chat", return_value=worker_result),
+    ):
+        result = coordinator_chat(
+            "Оцени риск появления дубликатов для src_np → tgt_np."
+        )
+
+    assert result.answer == "JOIN может размножить строки."
+    answer_calls = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_upstream_answer"
+    ]
+    assert len(answer_calls) == 2
+    assert "обязан сослаться" in answer_calls[1][-1].content
+
+
+def test_cardinality_complete_exact_mapping_ignores_redundant_reroute(
+    monkeypatch,
+):
+    from agents.coordinator import coordinator_chat
+    from agents.tools.context import (
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    )
+    from agents.tools.saved_results import get_active_saved_result_store
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    original_task = (
+        "Оцени риск появления дубликатов при сохранённой S2T-трансформации "
+        "src_np → tgt_np. Назови фактический JOIN и явно отдели "
+        "подтверждённый механизм от условия по уникальности."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["cardinality"],
+                    },
+                    "operation-cardinality",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Прочитать полный exact directed S2T "
+                                    "mapping src_np → tgt_np."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-cardinality",
+                )
+            ],
+            "submit_upstream_data_decision": [
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {
+                        "decision": "reroute",
+                        "problem": (
+                            "Нужно дополнительно прочитать ключи aux_np."
+                        ),
+                    },
+                    "decision-cardinality-reroute",
+                )
+            ],
+            "submit_upstream_answer": [
+                _tool_message(
+                    "submit_upstream_answer",
+                    {
+                        "answer": (
+                            "JOIN aux_np по id может размножить строки, если "
+                            "ключ aux_np.id не уникален."
+                        ),
+                        "used_evidence_ids": ["evidence-cardinality"],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-cardinality",
+                )
+            ],
+        }
+    )
+
+    def worker_with_complete_mapping(_request):
+        store = get_active_saved_result_store()
+        assert store is not None
+        rows = [
+            {
+                "source_table": "src_np",
+                "target_table": "tgt_np",
+                "transformation_rule": (
+                    "SELECT s.id FROM src_np s JOIN aux_np d ON d.id=s.id"
+                ),
+            }
+        ]
+        descriptor = store.save_payload(
+            source_tool="read_s2t_source_to_target",
+            source_tool_call_id="call-cardinality",
+            payload={
+                "rows": rows,
+                "total_matches": len(rows),
+                "truncated": False,
+            },
+        )
+        assert descriptor is not None
+        return _outcome(
+            "Полный exact mapping прочитан.",
+            evidence=[
+                _artifact(
+                    None,
+                    "read_s2t_source_to_target",
+                    '{"rows":[{"transformation_rule":"SELECT ..."}]}',
+                    evidence_id="evidence-cardinality",
+                    compact_args={
+                        "source_table": "src_np",
+                        "target_table": "tgt_np",
+                    },
+                    dataset_ref=descriptor.result_ref,
+                )
+            ],
+            datasets=[descriptor],
+        )
+
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=worker_with_complete_mapping,
+        ) as worker,
+    ):
+        result = coordinator_chat(original_task)
+
+    assert "может размножить" in result.answer
+    assert worker.call_count == 1
+    assert [name for name, _ in model.messages].count(
+        "submit_worker_plan"
+    ) == 1
+    assert [name for name, _ in model.messages].count(
+        "submit_upstream_answer"
+    ) == 1
+
+
+def test_cardinality_factual_uniqueness_does_not_bypass_reroute(monkeypatch):
+    from agents.coordinator import coordinator_chat
+    from agents.tools.context import (
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    )
+    from agents.tools.saved_results import get_active_saved_result_store
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["cardinality"],
+                    },
+                    "operation-cardinality",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {"task": "Прочитать mapping src_np → tgt_np."}
+                        ]
+                    },
+                    "plan-cardinality-1",
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Повторно прочитать полный exact S2T "
+                                    "mapping src_np → tgt_np."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-cardinality-2",
+                ),
+            ],
+            "submit_upstream_data_decision": [
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {
+                        "decision": "reroute",
+                        "problem": "Нужно проверить фактическую уникальность.",
+                    },
+                    "decision-cardinality-reroute",
+                ),
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {"decision": "pass"},
+                    "decision-cardinality-pass",
+                ),
+            ],
+            "submit_upstream_answer": [
+                _tool_message(
+                    "submit_upstream_answer",
+                    {
+                        "answer": "Фактическая уникальность проверена.",
+                        "used_evidence_ids": ["evidence-cycle-2"],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-cardinality",
+                )
+            ],
+        }
+    )
+    call_number = 0
+
+    def worker_with_complete_mapping(_request):
+        nonlocal call_number
+        call_number += 1
+        store = get_active_saved_result_store()
+        assert store is not None
+        descriptor = store.save_payload(
+            source_tool="read_s2t_source_to_target",
+            source_tool_call_id=f"call-cardinality-{call_number}",
+            payload={
+                "rows": [
+                    {
+                        "source_table": "src_np",
+                        "target_table": "tgt_np",
+                        "transformation_rule": (
+                            "SELECT s.id FROM src_np s JOIN aux_np d "
+                            "ON d.id=s.id"
+                        ),
+                    }
+                ],
+                "total_matches": 1,
+                "truncated": False,
+            },
+        )
+        assert descriptor is not None
+        evidence_id = f"evidence-cycle-{call_number}"
+        return _outcome(
+            "Mapping прочитан.",
+            evidence=[
+                _artifact(
+                    None,
+                    "read_s2t_source_to_target",
+                    "mapping",
+                    evidence_id=evidence_id,
+                    compact_args={
+                        "source_table": "src_np",
+                        "target_table": "tgt_np",
+                    },
+                    dataset_ref=descriptor.result_ref,
+                )
+            ],
+            datasets=[descriptor],
+        )
+
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=worker_with_complete_mapping,
+        ) as worker,
+    ):
+        result = coordinator_chat(
+            "Оцени риск дубликатов для src_np → tgt_np и проверь "
+            "фактическую уникальность aux_np.id."
+        )
+
+    assert result.answer == "Фактическая уникальность проверена."
+    assert worker.call_count == 2
+    assert [name for name, _ in model.messages].count(
+        "submit_worker_plan"
+    ) == 2
 
 
 def test_upstream_has_no_separate_semantic_review():
@@ -2552,6 +3488,398 @@ def test_coordinator_repairs_plan_that_exceeds_worker_limit():
     assert "rejected" in plan_messages[1][-2].content
     assert "от 1 до 8 элементов" in plan_messages[1][-1].content
     assert "непустую `task`" in plan_messages[1][-1].content
+
+
+def test_coordinator_repairs_plan_with_invented_scope_and_rewritten_pair():
+    from agents.coordinator import coordinator_chat
+
+    original_task = (
+        "Для файла synthetic.xlsx оцени точную загрузку src_np → tgt_np."
+    )
+    model = _CoordinatorModel(
+        {
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Перечислить все таблицы source_np и "
+                                    "target_np для file_id=1."
+                                ),
+                                "scope": {"file_id": 1},
+                                "coverage": "all_matches",
+                            }
+                        ]
+                    },
+                    "plan-invalid-origin",
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Разрешить точный файл synthetic.xlsx."
+                                ),
+                                "scope": {"filename": "synthetic.xlsx"},
+                            },
+                            {
+                                "task": (
+                                    "Прочитать точный mapping src_np → tgt_np."
+                                ),
+                                "dependencies": [1],
+                            },
+                        ]
+                    },
+                    "plan-repaired-origin",
+                ),
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Точная пара прочитана.",
+                        "used_evidence_ids": [],
+                        "display_evidence_ids": [],
+                    },
+                    "upstream-origin",
+                )
+            ],
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=[
+                _outcome("Файл разрешён."),
+                _outcome("Точная пара прочитана."),
+            ],
+        ) as worker,
+    ):
+        result = coordinator_chat(original_task)
+
+    assert result.answer == "Точная пара прочитана."
+    assert worker.call_count == 2
+    plan_messages = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_worker_plan"
+    ]
+    assert len(plan_messages) == 2
+    repair_prompt = plan_messages[1][-1].content
+    assert "file_id=1" in repair_prompt
+    assert "src_np" in repair_prompt
+    assert "tgt_np" in repair_prompt
+
+
+def test_constraint_rejection_repairs_origin_and_split_metadata_together():
+    from agents.coordinator import coordinator_chat
+
+    original_task = (
+        "Для файла synthetic.xlsx оцени constraint rejection "
+        "src_np.id → tgt_np.id."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["constraint_rejection"],
+                    },
+                    "operation-constraint",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": "Прочитать metadata src_np.id для file_id=1.",
+                                "scope": {"file_id": 1},
+                            },
+                            {
+                                "task": "Прочитать metadata tgt_np.id для file_id=1.",
+                                "scope": {"file_id": 1},
+                            },
+                        ]
+                    },
+                    "plan-invalid-constraint",
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {"task": "Разрешить точный файл synthetic.xlsx."},
+                            {
+                                "task": (
+                                    "Прочитать exact directed S2T mapping и "
+                                    "column metadata точной пары "
+                                    "src_np.id → tgt_np.id в разрешённом "
+                                    "file scope."
+                                ),
+                                "dependencies": [1],
+                            },
+                        ]
+                    },
+                    "plan-repaired-constraint",
+                ),
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Ограничения сопоставлены.",
+                        "used_evidence_ids": [],
+                        "display_evidence_ids": [],
+                    },
+                    "upstream-constraint",
+                )
+            ],
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=[
+                _outcome("Файл разрешён."),
+                _outcome("Mapping и metadata обеих ролей прочитаны."),
+            ],
+        ) as worker,
+    ):
+        result = coordinator_chat(original_task)
+
+    assert result.answer == "Ограничения сопоставлены."
+    assert worker.call_count == 2
+    plan_messages = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_worker_plan"
+    ]
+    assert len(plan_messages) == 2
+    repair_prompt = plan_messages[1][-1].content
+    assert "file_id=1" in repair_prompt
+    assert "одну самодостаточную worker task" in repair_prompt
+
+
+def test_coordinator_repairs_sql_risk_reroute_that_loses_mapping():
+    from agents.coordinator import coordinator_chat
+
+    # This explicitly asks for a factual uniqueness check, so catalog metadata
+    # is a real requirement.  Pure conditional-cardinality requests are
+    # intentionally kept to one exact mapping step by the initial plan guard.
+    original_task = (
+        "Проверь фактическую уникальность ключей и оцени риск дубликатов "
+        "для src_orders → tgt_orders."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["cardinality"],
+                    },
+                    "operation-risk",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Прочитать полный S2T mapping "
+                                    "src_orders → tgt_orders."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-cycle-1",
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Прочитать metadata src_orders и "
+                                    "tgt_orders для проверки ключей."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-cycle-2-invalid",
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Повторно прочитать полный directed S2T "
+                                    "mapping src_orders → tgt_orders."
+                                )
+                            },
+                            {
+                                "task": (
+                                    "Прочитать metadata src_orders и "
+                                    "tgt_orders для проверки ключей."
+                                )
+                            },
+                        ]
+                    },
+                    "plan-cycle-2-repaired",
+                ),
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "action": "request_more_data",
+                        "problem": "Нужны metadata ключей обеих таблиц.",
+                    },
+                    "reroute-risk",
+                ),
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Риск размножения строк условный.",
+                        "used_evidence_ids": [],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-risk",
+                ),
+            ],
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=[
+                _outcome("Mapping прочитан."),
+                _outcome("Mapping повторно прочитан."),
+                _outcome("Metadata прочитаны."),
+            ],
+        ) as worker,
+    ):
+        result = coordinator_chat(original_task)
+
+    assert result.answer == "Риск размножения строк условный."
+    assert worker.call_count == 3
+    assert "S2T mapping src_orders → tgt_orders" in worker.call_args_list[
+        1
+    ].args[0]
+    plan_messages = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_worker_plan"
+    ]
+    assert len(plan_messages) == 3
+    assert "чистый reroute потерял обязательное" in (
+        plan_messages[2][-1].content
+    )
+
+
+def test_coordinator_rejects_repaired_sql_risk_reroute_without_mapping():
+    from agents.coordinator import CoordinatorResponseError, coordinator_chat
+
+    original_task = "Оцени риск дубликатов для src_orders → tgt_orders."
+    metadata_only = {
+        "steps": [
+            {
+                "task": (
+                    "Прочитать metadata src_orders и tgt_orders для "
+                    "проверки ключей."
+                )
+            }
+        ]
+    }
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["cardinality"],
+                    },
+                    "operation-risk",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Прочитать S2T mapping "
+                                    "src_orders → tgt_orders."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-cycle-1",
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    metadata_only,
+                    "plan-cycle-2-invalid",
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    metadata_only,
+                    "plan-cycle-2-still-invalid",
+                ),
+            ],
+            "submit_upstream_output": [
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "action": "request_more_data",
+                        "problem": "Нужны metadata ключей обеих таблиц.",
+                    },
+                    "reroute-risk",
+                )
+            ],
+        }
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            return_value=_outcome("Mapping прочитан."),
+        ) as worker,
+        pytest.raises(CoordinatorResponseError, match="plan contract"),
+    ):
+        coordinator_chat(original_task)
+
+    assert worker.call_count == 1
 
 
 def test_coordinator_uses_generated_task_without_semantic_checks():

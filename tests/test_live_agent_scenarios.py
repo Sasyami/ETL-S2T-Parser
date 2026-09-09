@@ -22,14 +22,20 @@ from difflib import SequenceMatcher
 from io import StringIO
 from pathlib import Path
 from time import perf_counter
-from typing import Iterator
+from typing import Any, Iterator, Mapping
 from uuid import uuid4
 
 import pytest
 import sqlglot
+from langchain_core.callbacks import BaseCallbackHandler
 
 import storage.database as db_storage
-from agents.run_metrics import AgentRunMetrics, consume_agent_run_metrics
+from agents.run_metrics import (
+    AgentRunMetrics,
+    consume_agent_run_metrics,
+    count_agent_reroutes,
+)
+from scripts.live_agent_config import read_live_agent_http_timeout
 from services.sql_dialects import GREENPLUM_DIALECT  # noqa: F401
 
 
@@ -58,6 +64,7 @@ LIVE_AGENT_ENABLED = os.getenv("RUN_LIVE_AGENT_SCENARIOS", "").strip().lower() i
 LIVE_AGENT_LLM_JUDGE = os.getenv(
     "LIVE_AGENT_LLM_JUDGE", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
+LIVE_AGENT_HTTP_TIMEOUT = read_live_agent_http_timeout()
 STRICT_RETRIEVAL_ENABLED = os.getenv(
     "S2T_NARROW_TOOLS_EXPERIMENT", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -121,6 +128,18 @@ def _payload_contains_value(payload, expected) -> bool:
     return payload == expected or str(payload) == str(expected)
 
 
+def _assert_named_answer_value(answer: str, name: str, expected: object) -> None:
+    """Require one explicit ``name=value`` scalar in a live answer."""
+    pattern = (
+        rf"(?i)(?<![\w.]){re.escape(name)}\s*[:=]\s*`?"
+        rf"{re.escape(str(expected))}`?(?![\w.])"
+    )
+    assert re.search(pattern, answer), {
+        "missing": f"{name}={expected}",
+        "answer": answer,
+    }
+
+
 def _payload_table_paths(payload: dict) -> list[list[str]]:
     paths: list[list[str]] = []
     for collection_name in ("paths", "chains", "rows"):
@@ -142,6 +161,132 @@ class _LiveExchange:
     result: object
     metrics: AgentRunMetrics
     http_elapsed_seconds: float
+
+
+def _judge_usage_values(response: Any) -> tuple[int, int, int, int]:
+    """Extract provider-reported usage from one completed judge attempt."""
+    usage: Mapping[str, Any] = {}
+    llm_output = getattr(response, "llm_output", None)
+    if isinstance(llm_output, Mapping):
+        candidate = llm_output.get("token_usage") or llm_output.get("usage")
+        if isinstance(candidate, Mapping):
+            usage = candidate
+    if not usage:
+        for generation_group in getattr(response, "generations", None) or []:
+            generations = (
+                generation_group
+                if isinstance(generation_group, list)
+                else [generation_group]
+            )
+            for generation in generations:
+                candidate = getattr(
+                    getattr(generation, "message", None),
+                    "usage_metadata",
+                    None,
+                )
+                if isinstance(candidate, Mapping):
+                    usage = candidate
+                    break
+            if usage:
+                break
+    input_tokens = int(
+        usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    )
+    output_tokens = int(
+        usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    )
+    total_tokens = int(usage.get("total_tokens") or 0)
+    if not total_tokens:
+        total_tokens = input_tokens + output_tokens
+    cache_read_tokens = int(usage.get("precached_prompt_tokens") or 0)
+    details = usage.get("input_token_details")
+    if isinstance(details, Mapping):
+        cache_read_tokens = int(details.get("cache_read") or cache_read_tokens)
+    return input_tokens, output_tokens, total_tokens, cache_read_tokens
+
+
+class _JudgeTelemetryCallback(BaseCallbackHandler):
+    """Count actual judge attempts, including LangChain retry attempts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self._run_ids: set[str] = set()
+        self._completed = 0
+        self._errors = 0
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._total_tokens = 0
+        self._cache_read_tokens = 0
+
+    def _start(self, run_id: Any) -> None:
+        with self._lock:
+            self._run_ids.add(str(run_id))
+
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[Any]],
+        *,
+        run_id: Any,
+        **kwargs: Any,
+    ) -> None:
+        del serialized, messages, kwargs
+        self._start(run_id)
+
+    def on_llm_start(
+        self,
+        serialized: dict[str, Any],
+        prompts: list[str],
+        *,
+        run_id: Any,
+        **kwargs: Any,
+    ) -> None:
+        del serialized, prompts, kwargs
+        self._start(run_id)
+
+    def on_llm_end(self, response: Any, *, run_id: Any, **kwargs: Any) -> None:
+        del kwargs
+        usage = _judge_usage_values(response)
+        with self._lock:
+            self._run_ids.add(str(run_id))
+            self._completed += 1
+            self._input_tokens += usage[0]
+            self._output_tokens += usage[1]
+            self._total_tokens += usage[2]
+            self._cache_read_tokens += usage[3]
+
+    def on_llm_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: Any,
+        **kwargs: Any,
+    ) -> None:
+        del error, kwargs
+        with self._lock:
+            self._run_ids.add(str(run_id))
+            self._errors += 1
+
+    def snapshot(self, *, model: str) -> dict[str, Any]:
+        with self._lock:
+            completed = self._completed
+            errors = self._errors
+            attempts = max(len(self._run_ids), completed + errors)
+            input_tokens = self._input_tokens
+            output_tokens = self._output_tokens
+            total_tokens = self._total_tokens
+            cache_read_tokens = self._cache_read_tokens
+        return {
+            "model": str(model or "not_configured"),
+            "attempts": attempts,
+            "completed": completed,
+            "errors": errors,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cache_read_tokens": cache_read_tokens,
+        }
 
 
 def _chat(
@@ -212,14 +357,34 @@ def _record_live_exchange(
         "Не выполнялась; ответ сохранён для ручного разбора и будущего "
         "LLM-as-judge."
     )
+    judge_telemetry: dict[str, Any] = {
+        "model": "not_configured",
+        "attempts": 0,
+        "completed": 0,
+        "errors": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cache_read_tokens": 0,
+    }
     if LIVE_AGENT_LLM_JUDGE:
+        from agents.llm_factory import (
+            create_judge_chat_model,
+            get_judge_model_name,
+        )
+
+        judge_model_name = get_judge_model_name()
+        judge_telemetry["model"] = judge_model_name
         if status_code != 200:
             semantic_status = "failed"
             semantic_reason = f"Технический HTTP {status_code} не решил задачу."
         else:
+            telemetry_callback = _JudgeTelemetryCallback()
             try:
                 from agents.semantic_judge import judge_agent_response
 
+                judge_model = create_judge_chat_model(timeout=180)
+                judge_model.callbacks = [telemetry_callback]
                 verdict = judge_agent_response(
                     query=query,
                     answer=answer,
@@ -229,6 +394,7 @@ def _record_live_exchange(
                         if isinstance(payload, dict)
                         else []
                     ),
+                    model=judge_model,
                 )
                 semantic_status = verdict.status
                 semantic_reason = verdict.reason
@@ -237,6 +403,10 @@ def _record_live_exchange(
                 semantic_reason = (
                     "LLM-as-judge завершился технической ошибкой: "
                     f"{type(exc).__name__}."
+                )
+            finally:
+                judge_telemetry = telemetry_callback.snapshot(
+                    model=judge_model_name,
                 )
         if status_code == 200:
             _LIVE_SEMANTIC_RESULTS.append(
@@ -256,22 +426,7 @@ def _record_live_exchange(
     trace_block = "Трасса недоступна"
     if metrics is not None:
         tool_errors = sum(item.has_error for item in metrics.tool_calls)
-        worker_reroutes = sum(
-            item.routing_attempt > 1 for item in metrics.worker_routes
-        )
-        observed_cycles = [
-            int(item.cycle)
-            for item in metrics.observations
-            if int(item.cycle) > 0
-        ]
-        for step in metrics.coordinator_plan:
-            try:
-                cycle = int(step.get("cycle") or 0)
-            except (TypeError, ValueError):
-                cycle = 0
-            if cycle > 0:
-                observed_cycles.append(cycle)
-        upstream_reroutes = max(0, max(observed_cycles, default=1) - 1)
+        reroutes = count_agent_reroutes(metrics)
         pipelines = list(
             dict.fromkeys(
                 str(step.get("pipeline") or "").strip()
@@ -300,7 +455,7 @@ def _record_live_exchange(
             f"llm_calls: {len(metrics.llm_calls)}\n"
             f"reader_calls: {len(metrics.tool_calls)}\n"
             f"tool_errors: {tool_errors}\n"
-            f"reroutes: {worker_reroutes + upstream_reroutes}\n"
+            f"reroutes: {reroutes}\n"
             f"pipelines: {', '.join(pipelines) or 'Нет'}\n"
             f"tokens: input={metrics.input_tokens}, "
             f"output={metrics.output_tokens}, total={metrics.total_tokens}, "
@@ -348,6 +503,7 @@ def _record_live_exchange(
                 ],
                 "worker_outcomes": metrics.worker_outcomes,
                 "entity_resolution": metrics.entity_resolution,
+                "sql_risk_facts": metrics.sql_risk_facts,
                 "validation_protocol": metrics.validation_protocol,
                 "upstream_output": metrics.upstream_output,
             },
@@ -377,6 +533,17 @@ def _record_live_exchange(
             f"{metrics_block}\n\n"
             "### Agent trace\n\n"
             f"{trace_block}\n\n"
+            "### Judge metrics\n\n"
+            f"judge_model: {judge_telemetry['model']}\n"
+            "judge_calls: "
+            f"attempts={judge_telemetry['attempts']}, "
+            f"completed={judge_telemetry['completed']}, "
+            f"errors={judge_telemetry['errors']}\n"
+            "judge_tokens: "
+            f"input={judge_telemetry['input_tokens']}, "
+            f"output={judge_telemetry['output_tokens']}, "
+            f"total={judge_telemetry['total_tokens']}, "
+            f"cache_read={judge_telemetry['cache_read_tokens']}\n\n"
             "### Semantic evaluation\n\n"
             f"{semantic_reason}\n\n"
             "<!-- LIVE_SEMANTIC "
@@ -630,7 +797,10 @@ class _LiveHttpClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=300) as response:
+            with urllib.request.urlopen(
+                request,
+                timeout=LIVE_AGENT_HTTP_TIMEOUT,
+            ) as response:
                 return _LiveHttpResponse(
                     response.status,
                     response.read(),
@@ -755,6 +925,8 @@ def _protocol_live_case(
     min_mapped_fields: int = 1,
     require_target_catalog: bool = False,
     require_primary_key: bool = False,
+    require_direct_selected_field: bool = False,
+    require_expression_on_other_field: bool = False,
 ) -> _ProtocolLiveCase:
     expression_filter = ""
     if expression:
@@ -874,6 +1046,39 @@ def _protocol_live_case(
                 ensure_ascii=False,
             ).casefold()
             for token in ("coalesce", "case", "cast")
+        ):
+            continue
+        selected_expression = normalized.projections.get(str(candidate[5]))
+        if selected_expression is None:
+            selected_expression = next(
+                (
+                    value
+                    for name, value in normalized.projections.items()
+                    if name.casefold() == str(candidate[5]).casefold()
+                ),
+                None,
+            )
+        if require_direct_selected_field:
+            try:
+                parsed_expression = sqlglot.parse_one(
+                    str(selected_expression or ""),
+                    read=GREENPLUM_DIALECT,
+                )
+            except (TypeError, ValueError, sqlglot.errors.SqlglotError):
+                continue
+            if not (
+                isinstance(parsed_expression, sqlglot.exp.Column)
+                and parsed_expression.name.casefold()
+                == str(candidate[4]).casefold()
+            ):
+                continue
+        if require_expression_on_other_field and not any(
+            name.casefold() != str(candidate[5]).casefold()
+            and any(
+                token in expression_sql.casefold()
+                for token in ("coalesce", "case", "cast")
+            )
+            for name, expression_sql in normalized.projections.items()
         ):
             continue
         row = candidate
@@ -1550,6 +1755,113 @@ def _assert_sql_risk_aspect(
     ), routed_steps
 
 
+def _typed_sql_risk_enabled() -> bool:
+    configured = os.getenv("OPERATION_SQL_RISK_ASPECTS_EXPERIMENT")
+    return configured is None or configured.strip().casefold() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _assert_agentic_answer_uses_complete_evidence(
+    exchange: _LiveExchange,
+) -> None:
+    _assert_agentic_pipeline(exchange)
+    upstream = exchange.metrics.upstream_output
+    assert upstream is not None, exchange.metrics
+    assert str(upstream.get("answer") or "").strip(), upstream
+    assert list(upstream.get("used_evidence_ids") or []), upstream
+    assert exchange.metrics.worker_outcomes, exchange.metrics
+    assert all(
+        str(outcome.get("status") or "") == "complete"
+        for outcome in exchange.metrics.worker_outcomes
+    ), exchange.metrics.worker_outcomes
+
+
+def _assert_exact_s2t_pair_was_read(
+    exchange: _LiveExchange,
+    *,
+    source_table: str,
+    target_table: str,
+) -> list:
+    calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "read_s2t_source_to_target"
+        and str(item.arguments.get("source_table") or "").casefold()
+        == source_table.casefold()
+        and str(item.arguments.get("target_table") or "").casefold()
+        == target_table.casefold()
+    ]
+    assert calls, exchange.metrics.tool_calls
+    assert not [item for item in calls if item.has_error], calls
+    return calls
+
+
+def _assert_exact_column_pair_was_read(
+    exchange: _LiveExchange,
+    *,
+    file_id: int,
+    source_table: str,
+    source_field: str,
+    target_table: str,
+    target_field: str,
+) -> None:
+    pair_calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "get_source_target_column_pair"
+        and item.arguments
+        == {
+            "file_id": file_id,
+            "source_table": source_table,
+            "source_column": source_field,
+            "target_table": target_table,
+            "target_column": target_field,
+        }
+    ]
+    if pair_calls:
+        assert not [item for item in pair_calls if item.has_error], pair_calls
+        return
+
+    batch_calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "list_column_metadata"
+        and str(item.arguments.get("file_scope") or "") == str(file_id)
+        and {
+            value.casefold()
+            for value in item.arguments.get("table_names") or []
+        }
+        >= {source_table.casefold(), target_table.casefold()}
+    ]
+    source_calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "list_source_column_catalog"
+        and item.arguments.get("file_id") == file_id
+        and str(item.arguments.get("table_name") or "").casefold()
+        == source_table.casefold()
+        and str(item.arguments.get("column_name") or "").casefold()
+        == source_field.casefold()
+    ]
+    target_calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "list_target_column_catalog"
+        and item.arguments.get("file_id") == file_id
+        and str(item.arguments.get("table_name") or "").casefold()
+        == target_table.casefold()
+        and str(item.arguments.get("column_name") or "").casefold()
+        == target_field.casefold()
+    ]
+    assert batch_calls or (source_calls and target_calls), (
+        exchange.metrics.tool_calls
+    )
+
+
 def _assert_no_sql_risk_route(exchange: _LiveExchange) -> None:
     if LIVE_AGENT_MODE != "multiagent":
         return
@@ -1785,21 +2097,41 @@ def _assert_exact_reader_uses_canonical(
     exchange: _LiveExchange,
     *,
     canonical: str,
+    role: str,
     rejected_mention: str | None = None,
 ) -> None:
+    assert role in {"source", "target"}
+    argument_name = f"{role}_table"
+    role_readers = {
+        "source": {
+            "read_s2t_source_to_target",
+            "read_s2t_by_source_table",
+            "list_s2t_source_table",
+            "list_s2t_table_mapping",
+        },
+        "target": {
+            "read_s2t_source_to_target",
+            "read_s2t_by_target_table",
+            "list_s2t_target_table",
+            "list_s2t_table_mapping",
+        },
+    }[role]
     exact_calls = [
         item
         for item in exchange.metrics.tool_calls
-        if item.name in _EXACT_S2T_READERS
+        if item.name in role_readers
+        and str(item.arguments.get(argument_name) or "").casefold()
+        == canonical.casefold()
     ]
     assert exact_calls, exchange.metrics.tool_calls
-    serialized = json.dumps(
-        [item.arguments for item in exact_calls],
-        ensure_ascii=False,
-    ).casefold()
-    assert canonical.casefold() in serialized, exact_calls
     if rejected_mention is not None:
-        assert rejected_mention.casefold() not in serialized, exact_calls
+        assert not [
+            item
+            for item in exchange.metrics.tool_calls
+            if item.name in role_readers
+            and str(item.arguments.get(argument_name) or "").casefold()
+            == rejected_mention.casefold()
+        ], exchange.metrics.tool_calls
 
 
 @pytest.mark.live_smoke
@@ -1827,6 +2159,9 @@ def test_live_agent_answers_simple_conversation_without_display_results(
 
 @pytest.mark.live_smoke
 def test_live_agent_returns_exact_global_sqlite_count(live_chat_client):
+    expected_count = int(
+        _fetch_one("SELECT COUNT(*) FROM s2t_transformations")[0]
+    )
     exchange = _chat(
         live_chat_client,
         "Через SQLite посчитай точное число строк в s2t_transformations. "
@@ -1835,19 +2170,50 @@ def test_live_agent_returns_exact_global_sqlite_count(live_chat_client):
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    assert re.findall(r"(?<!\w)\d+(?!\w)", result.answer) == [
+        str(expected_count)
+    ], result.answer
     _warn_unless(
         len(result.answer) <= 220,
         "presentation",
         f"count-only answer is too verbose: {len(result.answer)} chars",
     )
-    _warn_unless(
-        result.display_items == [],
-        "presentation",
-        "count-only response returned unexpected display items",
+    assert result.display_items == [], result.display_items
+    assert exchange.metrics.display_tools == [], exchange.metrics.display_tools
+    run_sql_calls = [
+        item for item in exchange.metrics.tool_calls if item.name == "run_sql"
+    ]
+    assert len(run_sql_calls) == 1, exchange.metrics.tool_calls
+    assert not run_sql_calls[0].has_error, run_sql_calls[0]
+    assert len(exchange.metrics.tool_calls) == 1, exchange.metrics.tool_calls
+    assert set(run_sql_calls[0].arguments) == {"query"}, run_sql_calls[0]
+    statement = sqlglot.parse_one(
+        str(run_sql_calls[0].arguments["query"]),
+        read="sqlite",
     )
+    assert isinstance(statement, sqlglot.exp.Select), statement
+    assert [
+        table.name.casefold()
+        for table in statement.find_all(sqlglot.exp.Table)
+    ] == ["s2t_transformations"], statement
+    counts = list(statement.find_all(sqlglot.exp.Count))
+    assert len(counts) == 1 and isinstance(counts[0].this, sqlglot.exp.Star), statement
+    assert statement.args.get("where") is None, statement
+    assert statement.args.get("group") is None, statement
+    assert statement.args.get("limit") is None, statement
+    assert not [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name
+        in {
+            "run_cypher",
+            "trace_neo4j_table_path",
+            "trace_transformation_path",
+        }
+    ], exchange.metrics.tool_calls
     _assert_execution(
         exchange,
-        expected_tools=[{"run_sql", "list_s2t_transformations"}],
+        expected_tools=["run_sql"],
         expected_displays=[],
         max_seconds=90,
         max_llm_calls=12,
@@ -2076,10 +2442,9 @@ def test_live_agent_selects_full_sql_result_for_scrollable_ui(
         "presentation",
         f"SQL summary is too verbose: {len(result.answer)} chars",
     )
-    _warn_unless(
-        bool(result.display_items),
-        "presentation",
-        "full SQL result was not selected for display",
+    assert result.display_items, "full SQL result was not selected for display"
+    assert exchange.metrics.display_tools == ["run_sql"], (
+        exchange.metrics.display_tools
     )
     matching_payloads = [
         payload
@@ -2087,27 +2452,49 @@ def test_live_agent_selects_full_sql_result_for_scrollable_ui(
         if payload.get("preview_rows") == expected_rows
         or payload.get("rows") == expected_rows
     ]
-    _warn_unless(
-        bool(matching_payloads),
-        "presentation",
-        "display payload does not contain the complete SQL rows",
-    )
-    payload = matching_payloads[0] if matching_payloads else None
-    if payload and payload.get("csv_url"):
+    assert len(matching_payloads) == 1, matching_payloads
+    payload = matching_payloads[0]
+    assert payload.get("returned_rows") == len(expected_rows), payload
+    assert payload.get("truncated") is False, payload
+    if payload.get("csv_url"):
+        assert payload.get("preview_rows") == expected_rows, payload
         downloaded_rows = _download_sql_export(
             live_chat_client,
             payload,
             generated_sql_exports,
         )
-        _warn_unless(
-            downloaded_rows
-            == [
-                {key: str(value) for key, value in row.items()}
-                for row in expected_rows
-            ],
-            "presentation",
-            "downloaded display export differs from the complete SQL rows",
-        )
+        assert downloaded_rows == [
+            {key: str(value) for key, value in row.items()}
+            for row in expected_rows
+        ], downloaded_rows
+    else:
+        assert payload.get("rows") == expected_rows, payload
+    run_sql_calls = [
+        item for item in exchange.metrics.tool_calls if item.name == "run_sql"
+    ]
+    assert len(run_sql_calls) == 1, exchange.metrics.tool_calls
+    assert not run_sql_calls[0].has_error, run_sql_calls[0]
+    assert len(exchange.metrics.tool_calls) == 1, exchange.metrics.tool_calls
+    assert set(run_sql_calls[0].arguments) == {"query"}, run_sql_calls[0]
+    actual_statement = sqlglot.parse_one(
+        str(run_sql_calls[0].arguments["query"]),
+        read="sqlite",
+    )
+    expected_statement = sqlglot.parse_one(
+        "SELECT file_id, filename FROM files ORDER BY file_id",
+        read="sqlite",
+    )
+    assert actual_statement == expected_statement, actual_statement
+    assert not [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name
+        in {
+            "run_cypher",
+            "trace_neo4j_table_path",
+            "trace_transformation_path",
+        }
+    ], exchange.metrics.tool_calls
     _assert_execution(
         exchange,
         expected_tools=["run_sql"],
@@ -2144,27 +2531,65 @@ def test_live_agent_runs_dependent_workers_sequentially(
             (target_table,),
         )[0]
     )
+    target_row_count = int(
+        _fetch_one(
+            """
+            SELECT COUNT(*)
+            FROM s2t_transformations
+            WHERE target_table = ?
+            """,
+            (target_table,),
+        )[0]
+    )
 
     exchange = _chat(
         live_chat_client,
         "Через SQLite сначала найди target_table с максимальным числом строк "
         "в s2t_transformations. Затем отдельным зависимым шагом для найденной "
         "target_table посчитай точное число различных непустых source_table. "
-        "Верни имя target_table, число её строк и число source_table. "
+        "Верни одной строкой строго target_table=<имя>, "
+        "row_count=<число>, source_count=<число>. "
         "Полный результат второго шага покажи отдельно.",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    _assert_named_answer_value(result.answer, "target_table", target_table)
+    _assert_named_answer_value(result.answer, "row_count", target_row_count)
+    _assert_named_answer_value(result.answer, "source_count", source_count)
     payloads = _display_payloads(result)
-    _warn_unless(
+    assert any(
+        _payload_contains_value(payload, target_table)
+        and _payload_contains_value(payload, source_count)
+        for payload in payloads
+    ), {
+        "expected_target_table": target_table,
+        "expected_source_count": source_count,
+        "display_payloads": payloads,
+    }
+    run_sql_calls = [
+        item for item in exchange.metrics.tool_calls if item.name == "run_sql"
+    ]
+    assert len(run_sql_calls) == 2, exchange.metrics.tool_calls
+    assert not [item for item in run_sql_calls if item.has_error], run_sql_calls
+    recorded_plan = [
+        step
+        for step in exchange.metrics.coordinator_plan
+        if str(step.get("pipeline") or "") == "agentic"
+    ]
+    assert len(recorded_plan) == 2, recorded_plan
+    assert recorded_plan[1].get("dependencies") == [1], recorded_plan
+    assert len(exchange.metrics.worker_tasks) == 2, exchange.metrics.worker_tasks
+    assert all(
+        str(outcome.get("status") or "") == "complete"
+        for outcome in exchange.metrics.worker_outcomes
+    ), exchange.metrics.worker_outcomes
+    assert (
         any(
             _payload_contains_value(payload, source_count)
             for payload in payloads
-        ),
-        "presentation",
-        "dependent-step display does not contain the source_table count",
-    )
+        )
+    ), payloads
     _assert_execution(
         exchange,
         expected_tools=["run_sql", "run_sql"],
@@ -2377,46 +2802,73 @@ def test_live_agent_preserves_exact_s2t_pairs_in_answer_and_full_result(
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    answer_without_quotes = re.sub(r"[`\"']", "", result.answer).casefold()
+    qualified_name = r"(?:[a-z_][a-z0-9_$]*\.)+[a-z_][a-z0-9_$]*"
+    actual_pairs = re.findall(
+        rf"({qualified_name})\s*(?:→|->|=>)\s*({qualified_name})",
+        answer_without_quotes,
+    )
+    expected_pairs = [
+        (
+            f"{row['source_table']}.{row['source_field']}".casefold(),
+            f"{row['target_table']}.{row['target_field']}".casefold(),
+        )
+        for row in expected_rows
+    ]
+    assert sorted(actual_pairs) == sorted(expected_pairs), {
+        "expected": expected_pairs,
+        "actual": actual_pairs,
+        "answer": result.answer,
+    }
+    assert exchange.metrics.display_tools == ["run_sql"], (
+        exchange.metrics.display_tools
+    )
     matching_payloads = [
         payload
         for payload in _display_payloads(result)
         if payload.get("preview_rows") == expected_rows
         or payload.get("rows") == expected_rows
     ]
-    _warn_unless(
-        bool(matching_payloads),
-        "presentation",
-        "display payload does not preserve all four S2T pairs",
-    )
-    payload = matching_payloads[0] if matching_payloads else None
-    if payload and payload.get("csv_url"):
-        _warn_unless(
-            payload.get("preview_rows") == expected_rows,
-            "presentation",
-            "CSV display preview differs from the requested S2T pairs",
-        )
+    assert len(matching_payloads) == 1, matching_payloads
+    payload = matching_payloads[0]
+    assert payload.get("returned_rows") == len(expected_rows), payload
+    assert payload.get("truncated") is False, payload
+    if payload.get("csv_url"):
+        assert payload.get("preview_rows") == expected_rows, payload
         downloaded_rows = _download_sql_export(
             live_chat_client,
             payload,
             generated_sql_exports,
         )
-        _warn_unless(
-            downloaded_rows
-            == [
-                {key: str(value) for key, value in row.items()}
-                for row in expected_rows
-            ],
-            "presentation",
-            "downloaded CSV differs from the requested S2T pairs",
-        )
-    elif payload:
-        _warn_unless(
-            payload.get("rows") == expected_rows
-            and payload.get("returned_rows") == len(expected_rows)
-            and payload.get("truncated") is False,
-            "presentation",
-            "inline display is incomplete or differs from the requested S2T pairs",
-        )
+        assert downloaded_rows == [
+            {key: str(value) for key, value in row.items()}
+            for row in expected_rows
+        ], downloaded_rows
+    else:
+        assert payload.get("rows") == expected_rows, payload
+    run_sql_calls = [
+        item for item in exchange.metrics.tool_calls if item.name == "run_sql"
+    ]
+    assert len(run_sql_calls) == 1, exchange.metrics.tool_calls
+    assert not run_sql_calls[0].has_error, run_sql_calls[0]
+    assert len(exchange.metrics.tool_calls) == 1, exchange.metrics.tool_calls
+    assert set(run_sql_calls[0].arguments) == {"query"}, run_sql_calls[0]
+    actual_statement = sqlglot.parse_one(
+        str(run_sql_calls[0].arguments["query"]),
+        read="sqlite",
+    )
+    expected_statement = sqlglot.parse_one(query, read="sqlite")
+    assert actual_statement == expected_statement, actual_statement
+    assert not [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name
+        in {
+            "run_cypher",
+            "trace_neo4j_table_path",
+            "trace_transformation_path",
+        }
+    ], exchange.metrics.tool_calls
     _assert_execution(
         exchange,
         expected_tools=["run_sql"],
@@ -2431,16 +2883,28 @@ def test_live_agent_preserves_exact_s2t_pairs_in_answer_and_full_result(
 def test_live_agent_returns_compound_sqlite_summary(
     live_chat_client,
 ):
-    target_table = _fetch_one(
+    target_table, target_row_count = _fetch_one(
         """
-        SELECT target_table
+        SELECT target_table, COUNT(*) AS row_count
         FROM s2t_transformations
         WHERE target_table IS NOT NULL AND TRIM(target_table) <> ''
         GROUP BY target_table
         ORDER BY COUNT(*) DESC, target_table
         LIMIT 1
         """
-    )[0]
+    )
+    source_count = int(
+        _fetch_one(
+            """
+            SELECT COUNT(DISTINCT source_table)
+            FROM s2t_transformations
+            WHERE target_table = ?
+              AND source_table IS NOT NULL
+              AND TRIM(source_table) <> ''
+            """,
+            (target_table,),
+        )[0]
+    )
     top_source, top_source_count = _fetch_one(
         """
         SELECT source_table, COUNT(*) AS row_count
@@ -2461,21 +2925,81 @@ def test_live_agent_returns_compound_sqlite_summary(
         "в s2t_transformations: имя и число строк target_table, число различных "
         "непустых source_table, а также самый частый source_table и число его "
         "строк. При равенстве выбери лексикографически первый source_table. "
-        "Полную сводку покажи отдельно.",
+        "Верни одной строкой строго target_table=<имя>, row_count=<число>, "
+        "source_count=<число>, top_source=<имя>, "
+        "top_source_count=<число>. Полную сводку с этими же пятью колонками "
+        "покажи отдельно.",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
-    payloads = _display_payloads(result)
-    _warn_unless(
-        any(
-            _payload_contains_value(payload, top_source)
-            and _payload_contains_value(payload, int(top_source_count))
-            for payload in payloads
-        ),
-        "presentation",
-        "compound summary display does not contain the leading source",
+    expected_summary = {
+        "target_table": target_table,
+        "row_count": int(target_row_count),
+        "source_count": source_count,
+        "top_source": top_source,
+        "top_source_count": int(top_source_count),
+    }
+    for name, value in expected_summary.items():
+        _assert_named_answer_value(result.answer, name, value)
+    assert exchange.metrics.display_tools == ["run_sql"], (
+        exchange.metrics.display_tools
     )
+    matching_payloads = []
+    for payload in _display_payloads(result):
+        rows = payload.get("preview_rows") or payload.get("rows") or []
+        if rows == [expected_summary]:
+            matching_payloads.append(payload)
+    assert len(matching_payloads) == 1, _display_payloads(result)
+    payload = matching_payloads[0]
+    assert payload.get("returned_rows") == 1, payload
+    assert payload.get("truncated") is False, payload
+
+    run_sql_calls = [
+        item for item in exchange.metrics.tool_calls if item.name == "run_sql"
+    ]
+    assert len(run_sql_calls) == 1, exchange.metrics.tool_calls
+    assert not run_sql_calls[0].has_error, run_sql_calls[0]
+    assert len(exchange.metrics.tool_calls) == 1, exchange.metrics.tool_calls
+    assert set(run_sql_calls[0].arguments) == {"query"}, run_sql_calls[0]
+    statement = sqlglot.parse_one(
+        str(run_sql_calls[0].arguments["query"]),
+        read="sqlite",
+    )
+    cte_names = {
+        cte.alias_or_name.casefold()
+        for cte in statement.find_all(sqlglot.exp.CTE)
+        if cte.alias_or_name
+    }
+    physical_tables = {
+        table.name.casefold()
+        for table in statement.find_all(sqlglot.exp.Table)
+        if table.name.casefold() not in cte_names
+    }
+    assert physical_tables == {"s2t_transformations"}, statement
+    assert len(list(statement.find_all(sqlglot.exp.Count))) >= 3, statement
+    normalized_sql = statement.sql(dialect="sqlite").casefold()
+    assert re.search(
+        r"count\s*\(\s*distinct\s+[^)]*source_table",
+        normalized_sql,
+    ), normalized_sql
+    order_sql = "\n".join(
+        order.sql(dialect="sqlite").casefold()
+        for order in statement.find_all(sqlglot.exp.Order)
+    )
+    assert "target_table" in order_sql and "source_table" in order_sql, order_sql
+    assert order_sql.count("desc") >= 2, order_sql
+    assert len(list(statement.find_all(sqlglot.exp.Limit))) >= 2, statement
+    assert not [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name
+        in {
+            "run_cypher",
+            "trace_neo4j_table_path",
+            "trace_transformation_path",
+        }
+    ], exchange.metrics.tool_calls
     _assert_execution(
         exchange,
         expected_tools=["run_sql"],
@@ -2527,15 +3051,37 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
-    filename = str(
+    source_not_null = int(
         _fetch_one(
-            "SELECT filename FROM files WHERE file_id = ?",
-            (file_id,),
+            """
+            SELECT not_null
+            FROM source_columns
+            WHERE file_id = ?
+              AND table_name = ? COLLATE NOCASE
+              AND column_name = ? COLLATE NOCASE
+            ORDER BY id
+            LIMIT 1
+            """,
+            (file_id, source_table, source_field),
+        )[0]
+    )
+    target_not_null = int(
+        _fetch_one(
+            """
+            SELECT not_null
+            FROM target_columns
+            WHERE file_id = ?
+              AND table_name = ? COLLATE NOCASE
+              AND column_name = ? COLLATE NOCASE
+            ORDER BY id
+            LIMIT 1
+            """,
+            (file_id, target_table, target_field),
         )[0]
     )
     exchange = _chat(
         live_chat_client,
-        f"Для файла {filename!r} оцени только SQL-риск constraint "
+        f"Для file_id={file_id} оцени только SQL-риск constraint "
         "rejection из-за nullable-ограничений "
         f"{source_table}.{source_field} → {target_table}.{target_field}. Верни "
         "source_not_null=<0|1>, target_not_null=<0|1> и вывод.",
@@ -2543,13 +3089,50 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    _assert_named_answer_value(
+        result.answer,
+        "source_not_null",
+        source_not_null,
+    )
+    _assert_named_answer_value(
+        result.answer,
+        "target_not_null",
+        target_not_null,
+    )
+    assert any(
+        marker in result.answer.casefold()
+        for marker in ("риск", "rejection", "отклон", "огранич")
+    ), result.answer
+    _assert_agentic_answer_uses_complete_evidence(exchange)
+    mapping_calls = _assert_exact_s2t_pair_was_read(
+        exchange,
+        source_table=source_table,
+        target_table=target_table,
+    )
+    _assert_exact_column_pair_was_read(
+        exchange,
+        file_id=file_id,
+        source_table=source_table,
+        source_field=source_field,
+        target_table=target_table,
+        target_field=target_field,
+    )
+    if _typed_sql_risk_enabled():
+        assert len(mapping_calls) == 1, mapping_calls
+        pair_calls = [
+            item
+            for item in exchange.metrics.tool_calls
+            if item.name == "get_source_target_column_pair"
+        ]
+        assert len(pair_calls) == 1, exchange.metrics.tool_calls
+        assert not {
+            "list_column_metadata",
+            "list_source_column_catalog",
+            "list_target_column_catalog",
+        } & set(_tool_names(exchange)), exchange.metrics.tool_calls
     _assert_s2t_work_case_execution(
         exchange,
-        required_tools={
-            "get_source_target_column_pair"
-            if STRICT_RETRIEVAL_ENABLED
-            else "list_column_catalog"
-        },
+        required_tools={"read_s2t_source_to_target"},
         require_analysis=True,
     )
     _assert_sql_risk_aspect(exchange, "constraint_rejection")
@@ -2560,6 +3143,28 @@ def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
+    source_data_type, target_data_type = _fetch_one(
+        """
+        SELECT source_catalog.data_type, target_catalog.data_type
+        FROM source_columns AS source_catalog
+        JOIN target_columns AS target_catalog
+          ON target_catalog.file_id = source_catalog.file_id
+        WHERE source_catalog.file_id = ?
+          AND source_catalog.table_name = ? COLLATE NOCASE
+          AND source_catalog.column_name = ? COLLATE NOCASE
+          AND target_catalog.table_name = ? COLLATE NOCASE
+          AND target_catalog.column_name = ? COLLATE NOCASE
+        ORDER BY source_catalog.id, target_catalog.id
+        LIMIT 1
+        """,
+        (
+            file_id,
+            source_table,
+            source_field,
+            target_table,
+            target_field,
+        ),
+    )
     exchange = _chat(
         live_chat_client,
         f"Для file_id={file_id} оцени совместимость типов "
@@ -2569,35 +3174,116 @@ def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    _assert_named_answer_value(
+        result.answer,
+        "source_data_type",
+        source_data_type,
+    )
+    _assert_named_answer_value(
+        result.answer,
+        "target_data_type",
+        target_data_type,
+    )
+    folded_answer = result.answer.casefold()
+    assert "несовместим" not in folded_answer, result.answer
+    assert "не совместим" not in folded_answer, result.answer
+    assert (
+        "совместим" in folded_answer
+        or (
+            "безопас" in folded_answer
+            and "расшир" in folded_answer
+        )
+    ), result.answer
+    _assert_agentic_answer_uses_complete_evidence(exchange)
+
+    exact_arguments = {
+        "file_id": file_id,
+        "source_table": source_table,
+        "source_column": source_field,
+        "target_table": target_table,
+        "target_column": target_field,
+    }
+    pair_calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "get_source_target_column_pair"
+        and item.arguments == exact_arguments
+        and not item.has_error
+    ]
+    metadata_calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "list_column_metadata"
+        and str(item.arguments.get("file_scope") or "") == str(file_id)
+        and {
+            str(value).casefold()
+            for value in item.arguments.get("table_names") or []
+        }
+        == {source_table.casefold(), target_table.casefold()}
+        and not item.has_error
+    ]
+    assert (len(pair_calls), len(metadata_calls)) in {(1, 0), (0, 1)}, (
+        exchange.metrics.tool_calls
+    )
+    assert len(exchange.metrics.tool_calls) == 1, exchange.metrics.tool_calls
+    required_tool = (
+        "get_source_target_column_pair" if pair_calls else "list_column_metadata"
+    )
     _assert_s2t_work_case_execution(
         exchange,
-        required_tools={
-            "get_source_target_column_pair"
-            if STRICT_RETRIEVAL_ENABLED
-            else "list_column_catalog"
-        },
+        required_tools={required_tool},
         require_analysis=True,
     )
 
 
 @pytest.mark.live_validation
 def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
-    _, target_table, source_table, _, _ = _s2t_work_case_fixture()
+    case = _protocol_live_case()
     exchange = _chat(
         live_chat_client,
         f"Оцени риск появления дубликатов при сохранённой S2T-трансформации "
-        f"{source_table} → {target_table}.",
+        f"{case.source_table} → {case.target_table}. Назови фактический JOIN "
+        "и явно отдели подтверждённый механизм от условия по уникальности.",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    _assert_agentic_answer_uses_complete_evidence(exchange)
+    exact_calls = _assert_exact_s2t_pair_was_read(
+        exchange,
+        source_table=case.source_table,
+        target_table=case.target_table,
+    )
+    folded_answer = result.answer.casefold()
+    assert case.source_table.casefold() in folded_answer, result.answer
+    assert case.target_table.casefold() in folded_answer, result.answer
+    from agents.transformation_ast import normalize_transformation
+
+    normalized = normalize_transformation(case.transformation_rule)
+    assert normalized.parse_status == "ok" and normalized.joins, normalized
+    join_columns = {
+        column.name.casefold()
+        for join in normalized.joins
+        for column in sqlglot.parse_one(
+            join.condition,
+            read=GREENPLUM_DIALECT,
+        ).find_all(sqlglot.exp.Column)
+    }
+    assert join_columns and join_columns <= set(
+        re.findall(r"[a-z_][a-z0-9_$]*", folded_answer)
+    ), {"join_columns": sorted(join_columns), "answer": result.answer}
+    assert any(
+        marker in folded_answer
+        for marker in ("если", "может", "возмож", "завис", "услов")
+    ), result.answer
+    if _typed_sql_risk_enabled():
+        assert len(exact_calls) == 1, exact_calls
+        assert _tool_names(exchange) == ["read_s2t_source_to_target"], (
+            exchange.metrics.tool_calls
+        )
     _assert_s2t_work_case_execution(
         exchange,
-        required_tools=(
-            {"read_s2t_source_to_target"}
-            if STRICT_RETRIEVAL_ENABLED
-            else None
-        ),
+        required_tools={"read_s2t_source_to_target"},
         require_analysis=True,
     )
     _assert_sql_risk_aspect(exchange, "cardinality")
@@ -2636,22 +3322,52 @@ def test_live_agent_checks_unmapped_required_target_fields(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_agent_checks_row_loss_risk(live_chat_client):
-    _, target_table, source_table, _, _ = _s2t_work_case_fixture()
+    case = _protocol_live_case()
     exchange = _chat(
         live_chat_client,
         f"Оцени риск потери строк в сохранённой S2T-трансформации "
-        f"{source_table} → {target_table}.",
+        f"{case.source_table} → {case.target_table}. Назови точный "
+        "WHERE/HAVING/QUALIFY или JOIN predicate, который может отсеять строки.",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    _assert_agentic_answer_uses_complete_evidence(exchange)
+    exact_calls = _assert_exact_s2t_pair_was_read(
+        exchange,
+        source_table=case.source_table,
+        target_table=case.target_table,
+    )
+    folded_answer = result.answer.casefold()
+    assert case.source_table.casefold() in folded_answer, result.answer
+    assert case.target_table.casefold() in folded_answer, result.answer
+    from agents.transformation_ast import normalize_transformation
+
+    normalized = normalize_transformation(case.transformation_rule)
+    assert normalized.parse_status == "ok" and normalized.filters, normalized
+    filter_columns = {
+        column.name.casefold()
+        for predicate in normalized.filters
+        for column in sqlglot.parse_one(
+            predicate,
+            read=GREENPLUM_DIALECT,
+        ).find_all(sqlglot.exp.Column)
+    }
+    assert filter_columns and filter_columns <= set(
+        re.findall(r"[a-z_][a-z0-9_$]*", folded_answer)
+    ), {"filter_columns": sorted(filter_columns), "answer": result.answer}
+    assert any(
+        marker in folded_answer
+        for marker in ("потер", "отсеч", "исключ", "фильтр", "риск")
+    ), result.answer
+    if _typed_sql_risk_enabled():
+        assert len(exact_calls) == 1, exact_calls
+        assert _tool_names(exchange) == ["read_s2t_source_to_target"], (
+            exchange.metrics.tool_calls
+        )
     _assert_s2t_work_case_execution(
         exchange,
-        required_tools=(
-            {"read_s2t_source_to_target"}
-            if STRICT_RETRIEVAL_ENABLED
-            else None
-        ),
+        required_tools={"read_s2t_source_to_target"},
         require_analysis=True,
     )
     _assert_sql_risk_aspect(exchange, "row_filtering")
@@ -2659,18 +3375,27 @@ def test_live_agent_checks_row_loss_risk(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_agent_checks_value_change_risk(live_chat_client):
-    _, target_table, source_table, target_field, source_field = (
-        _s2t_work_case_fixture()
+    case = _protocol_live_case(
+        expression=True,
+        min_mapped_fields=2,
+        require_direct_selected_field=True,
+        require_expression_on_other_field=True,
     )
     exchange = _chat(
         live_chat_client,
         "Оцени только SQL-аспект value changes: может ли "
-        f"сохранённая S2T-трансформация {source_table}.{source_field} "
-        f"→ {target_table}.{target_field} изменить значение? Остальные "
+        f"сохранённая S2T-трансформация {case.source_table}.{case.source_field} "
+        f"→ {case.target_table}.{case.target_field} изменить значение? Остальные "
         "SQL-риски не анализируй.",
     )
 
     _assert_public_answer(exchange.result.answer)
+    lowered_answer = exchange.result.answer.casefold()
+    assert f"{case.source_table}.{case.source_field}".casefold() in lowered_answer
+    assert f"{case.target_table}.{case.target_field}".casefold() in lowered_answer
+    assert not re.match(r"\s*(да\b|может\b)", lowered_answer), (
+        exchange.result.answer
+    )
     _assert_s2t_work_case_execution(
         exchange,
         required_tools=(
@@ -2681,6 +3406,44 @@ def test_live_agent_checks_value_change_risk(live_chat_client):
         require_analysis=True,
     )
     _assert_sql_risk_aspect(exchange, "value_changes")
+    exact_reads = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "read_s2t_source_to_target"
+    ]
+    assert len(exact_reads) == 1, exchange.metrics.tool_calls
+    assert len(exchange.metrics.tool_calls) == 1, exchange.metrics.tool_calls
+    assert exact_reads[0].arguments == {
+        "source_table": case.source_table,
+        "target_table": case.target_table,
+    }
+    latest_fact_cycle = max(
+        (
+            int(fact.get("cycle") or 0)
+            for fact in exchange.metrics.sql_risk_facts
+        ),
+        default=0,
+    )
+    matching_facts = [
+        fact
+        for fact in exchange.metrics.sql_risk_facts
+        if int(fact.get("cycle") or 0) == latest_fact_cycle
+        if str(fact.get("source_table") or "").casefold()
+        == case.source_table.casefold()
+        and str(fact.get("source_field") or "").casefold()
+        == case.source_field.casefold()
+        and str(fact.get("target_table") or "").casefold()
+        == case.target_table.casefold()
+        and str(fact.get("target_field") or "").casefold()
+        == case.target_field.casefold()
+    ]
+    assert len(matching_facts) == 1, exchange.metrics.sql_risk_facts
+    assert matching_facts[0]["conclusion"] == "not_detected"
+    assert matching_facts[0]["mechanism"] == "direct_column"
+    assert exchange.metrics.upstream_output is not None
+    assert exchange.metrics.upstream_output.get("answer_source") == (
+        "deterministic_value_changes"
+    )
 
 
 @pytest.mark.live_validation
@@ -2695,6 +3458,9 @@ def test_live_agent_checks_write_semantics_risk(live_chat_client):
     )
 
     _assert_public_answer(exchange.result.answer)
+    assert "не оцен" in exchange.result.answer.casefold(), (
+        exchange.result.answer
+    )
     _assert_s2t_work_case_execution(
         exchange,
         required_tools=(
@@ -2705,6 +3471,37 @@ def test_live_agent_checks_write_semantics_risk(live_chat_client):
         require_analysis=True,
     )
     _assert_sql_risk_aspect(exchange, "write_semantics")
+    exact_reads = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "read_s2t_source_to_target"
+    ]
+    assert len(exact_reads) == 1, exchange.metrics.tool_calls
+    assert len(exchange.metrics.tool_calls) == 1, exchange.metrics.tool_calls
+    assert exact_reads[0].arguments == {
+        "source_table": source_table,
+        "target_table": target_table,
+    }
+    assert {
+        int(step.get("cycle") or 0)
+        for step in exchange.metrics.coordinator_plan
+    } == {1}, exchange.metrics.coordinator_plan
+    write_facts = [
+        fact
+        for fact in exchange.metrics.sql_risk_facts
+        if int(fact.get("cycle") or 0) == 1
+        and str(fact.get("source_table") or "").casefold()
+        == source_table.casefold()
+        and str(fact.get("target_table") or "").casefold()
+        == target_table.casefold()
+    ]
+    assert len(write_facts) == 1, exchange.metrics.sql_risk_facts
+    assert write_facts[0]["conclusion"] == "not_assessed"
+    assert write_facts[0]["mechanism"] == "write_statement_absent"
+    assert exchange.metrics.upstream_output is not None
+    assert exchange.metrics.upstream_output.get("answer_source") == (
+        "deterministic_write_semantics"
+    )
 
 
 @pytest.mark.live_validation
@@ -2712,21 +3509,101 @@ def test_live_agent_explains_table_transformation(live_chat_client):
     _, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
+    transformation_rule = str(
+        _fetch_one(
+            """
+            SELECT transformation_rule
+            FROM s2t_transformations
+            WHERE source_table = ? COLLATE NOCASE
+              AND source_field = ? COLLATE NOCASE
+              AND target_table = ? COLLATE NOCASE
+              AND target_field = ? COLLATE NOCASE
+              AND NULLIF(TRIM(transformation_rule), '') IS NOT NULL
+            ORDER BY id
+            LIMIT 1
+            """,
+            (source_table, source_field, target_table, target_field),
+        )[0]
+    )
+    from agents.transformation_ast import normalize_transformation
+
+    normalized = normalize_transformation(transformation_rule)
+    assert normalized.parse_status == "ok", normalized
+    selected_expression = next(
+        (
+            expression
+            for name, expression in normalized.projections.items()
+            if name.casefold() == target_field.casefold()
+        ),
+        None,
+    )
+    assert selected_expression, normalized
+    assert normalized.joins and normalized.filters, normalized
     exchange = _chat(
         live_chat_client,
         f"Объясни сохранённую S2T-трансформацию "
-        f"{source_table}.{source_field} → {target_table}.{target_field}.",
+        f"{source_table}.{source_field} → {target_table}.{target_field}. "
+        "Дословно укажи три значения из сохранённого SQL: "
+        "selected_projection=<выражение AS target_field>, "
+        "join_predicate=<условие JOIN>, filter_predicate=<условие WHERE>. "
+        "Не приписывай выбранному полю выражения других target-полей.",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    folded_answer = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[`\"']", "", result.answer),
+    ).casefold()
+    assert f"{source_table}.{source_field}".casefold() in folded_answer, result.answer
+    assert f"{target_table}.{target_field}".casefold() in folded_answer, result.answer
+
+    expected_values = {
+        "selected_projection": f"{selected_expression} AS {target_field}",
+        "join_predicate": normalized.joins[0].condition,
+        "filter_predicate": normalized.filters[0],
+    }
+    for name, expected in expected_values.items():
+        compact_expected = re.sub(r"\s+", " ", expected).casefold()
+        assert re.search(
+            rf"(?<!\w){name}\s*[:=]\s*{re.escape(compact_expected)}(?!\w)",
+            folded_answer,
+        ), {
+            "missing": f"{name}={expected}",
+            "answer": result.answer,
+        }
+    if "coalesce" in folded_answer and "coalesce" not in str(
+        selected_expression
+    ).casefold():
+        coalesce_at = folded_answer.index("coalesce")
+        assert "value" in folded_answer[
+            max(0, coalesce_at - 120) : coalesce_at + 240
+        ], result.answer
+
+    _assert_agentic_answer_uses_complete_evidence(exchange)
+    exact_calls = _assert_exact_s2t_pair_was_read(
+        exchange,
+        source_table=source_table,
+        target_table=target_table,
+    )
+    assert len(exact_calls) == 1, exact_calls
+    assert exact_calls[0].arguments == {
+        "source_table": source_table,
+        "target_table": target_table,
+    }, exact_calls[0]
+    assert len(exchange.metrics.tool_calls) == 1, exchange.metrics.tool_calls
+    assert not [item for item in exchange.metrics.tool_calls if item.has_error], (
+        exchange.metrics.tool_calls
+    )
+    assert not {
+        "run_cypher",
+        "trace_neo4j_table_path",
+        "trace_transformation_path",
+    } & set(_tool_names(exchange)), exchange.metrics.tool_calls
     _assert_s2t_work_case_execution(
         exchange,
-        required_tools=(
-            {"read_s2t_source_to_target"}
-            if STRICT_RETRIEVAL_ENABLED
-            else None
-        ),
+        required_tools={"read_s2t_source_to_target"},
         require_analysis=True,
     )
     _assert_no_sql_risk_route(exchange)
@@ -3099,13 +3976,52 @@ def test_live_agent_catalog_12_compares_two_field_origins(live_chat_client):
 
 @pytest.mark.live_catalog
 def test_live_agent_catalog_13_finds_join_condition(live_chat_client):
+    source_table = "l_000025_t_loansagreement_stg"
+    target_table = "l_000025_t_loanscontract_stg"
+    object_name, object_sql = _fetch_one(
+        """
+        SELECT name, sql
+        FROM additional_objects
+        WHERE LOWER(sql) LIKE '%' || LOWER(?) || '%'
+          AND LOWER(sql) LIKE '%' || LOWER(?) || '%'
+        ORDER BY id
+        LIMIT 1
+        """,
+        (source_table, target_table),
+    )
+    statement = sqlglot.parse_one(str(object_sql), read=GREENPLUM_DIALECT)
+    join = next(statement.find_all(sqlglot.exp.Join), None)
+    assert join is not None and join.args.get("on") is not None, object_sql
+    join_condition = join.args["on"]
+    expected_join_tokens = {
+        value.casefold()
+        for column in join_condition.find_all(sqlglot.exp.Column)
+        for value in (column.table, column.name)
+        if value
+    }
+    assert expected_join_tokens, join_condition.sql()
     exchange = _chat(
         live_chat_client,
-        "По каким полям соединяются l_000025_t_loansagreement_stg и "
-        "l_000025_t_loanscontract_stg в сохранённых Additional objects? "
-        "Покажи JOIN condition и роли алиасов.",
+        f"По каким полям соединяются {source_table} и {target_table} "
+        "в сохранённых Additional objects? "
+        "Покажи имя найденного объекта, JOIN condition и роли алиасов.",
     )
     _assert_s2t_catalog_scenario(exchange)
+    answer = exchange.result.answer.casefold()
+    assert str(object_name).casefold() in answer, exchange.result.answer
+    assert all(token in answer for token in expected_join_tokens), {
+        "expected_join_tokens": sorted(expected_join_tokens),
+        "answer": exchange.result.answer,
+    }
+    object_calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name in {"list_additional_objects", "search_additional_objects"}
+    ]
+    assert object_calls, exchange.metrics.tool_calls
+    assert not [item for item in object_calls if item.has_error], object_calls
+    assert exchange.metrics.worker_tasks, exchange.metrics
+    assert exchange.metrics.upstream_output is not None, exchange.metrics
 
 
 @pytest.mark.live_catalog
@@ -3296,13 +4212,26 @@ def test_live_validation_protocol_exhaustive_mode(live_chat_client):
 
     trace = _assert_validation_pipeline(exchange)
     _assert_protocol_mode(trace, "exhaustive")
-    assert _ALL_PROTOCOL_CHECKS <= {
-        kind
-        for kind in _ALL_PROTOCOL_CHECKS
-        if _protocol_check_records(trace, kind)
-    }, trace
+    _assert_protocol_status(trace, "ready")
+    for kind in _ALL_PROTOCOL_CHECKS:
+        _assert_protocol_check(trace, kind, statuses={"ready"})
     _assert_protocol_phases(trace, {0, 1, 2, 3})
-    _assert_protocol_sql_parseable(exchange, minimum_blocks=4)
+    phase_summaries = [
+        phase
+        for phase in trace.get("phases") or []
+        if isinstance(phase, dict)
+    ]
+    assert phase_summaries, trace
+    assert all(
+        int(phase.get("partial_count") or 0) == 0
+        and int(phase.get("unavailable_count") or 0) == 0
+        and int(phase.get("failed_count") or 0) == 0
+        for phase in phase_summaries
+    ), phase_summaries
+    _assert_protocol_sql_parseable(
+        exchange,
+        minimum_blocks=len(_ALL_PROTOCOL_CHECKS),
+    )
 
 
 @pytest.mark.live_validation
@@ -3337,20 +4266,62 @@ def test_live_validation_protocol_key_reconciliation(live_chat_client):
 )
 def test_live_validation_protocol_field_level_reconciliation(live_chat_client):
     case = _protocol_live_case(min_mapped_fields=2)
+    conn = db_storage.get_db_connection()
+    try:
+        mapped_fields = conn.execute(
+            """
+            SELECT TRIM(source_field), TRIM(target_field)
+            FROM s2t_transformations
+            WHERE file_id = ?
+              AND TRIM(source_table) = ? COLLATE NOCASE
+              AND TRIM(target_table) = ? COLLATE NOCASE
+              AND TRIM(transformation_rule) = ?
+              AND NULLIF(TRIM(source_field), '') IS NOT NULL
+              AND NULLIF(TRIM(target_field), '') IS NOT NULL
+            ORDER BY id
+            """,
+            (
+                case.file_id,
+                case.source_table,
+                case.target_table,
+                case.transformation_rule,
+            ),
+        ).fetchall()
+    finally:
+        conn.close()
+    unique_target_fields = list(
+        dict.fromkeys(str(row[1]) for row in mapped_fields)
+    )
+    assert len(unique_target_fields) >= 2, mapped_fields
+    comparison_key = unique_target_fields[0]
+    compared_field = unique_target_fields[1]
     exchange = _chat(
         live_chat_client,
         f"Составь explicit тест-протокол {case.source_table} → "
         f"{case.target_table} только для check=field_mismatch. Сравни поле "
-        f"{case.target_field} по сохранённой transformation; comparison key "
-        f"явно задаю {case.target_field}. SQL не выполняй.",
+        f"{compared_field} по сохранённой transformation; comparison key "
+        f"явно задаю {comparison_key}. SQL не выполняй.",
     )
 
     trace = _assert_validation_pipeline(exchange)
     _assert_protocol_check(trace, "field_mismatch", statuses={"ready"})
+    target = _trace_target(trace, case.target_table)
+    assert [
+        str(value).casefold() for value in target.get("comparison_key") or []
+    ] == [comparison_key.casefold()], target
     sql_blocks = _assert_protocol_sql_parseable(exchange)
     combined = "\n".join(sql_blocks).casefold()
-    assert case.target_field.casefold() in combined
+    assert compared_field.casefold() in combined
     assert "expected" in combined and "actual" in combined
+    mismatch_pattern = re.compile(
+        r"where\s+row\([^)]*\b"
+        + re.escape(compared_field.casefold())
+        + r"\b[^)]*\)\s+is\s+distinct\s+from\s+row\([^)]*\b"
+        + re.escape(compared_field.casefold())
+        + r"\b[^)]*\)",
+        re.DOTALL,
+    )
+    assert mismatch_pattern.search(combined), combined
 
 
 @pytest.mark.live_validation
@@ -3518,6 +4489,7 @@ def test_live_validation_protocol_table_typo_resolution(live_chat_client):
     _assert_exact_reader_uses_canonical(
         exchange,
         canonical=canonical_target,
+        role="target",
         rejected_mention=target_mention,
     )
     _assert_protocol_check(trace, "row_count", statuses={"ready"})
@@ -3716,6 +4688,7 @@ def test_live_agent_resolves_table_typo_before_exact_reader(live_chat_client):
     _assert_exact_reader_uses_canonical(
         exchange,
         canonical=canonical,
+        role="target",
         rejected_mention=mention,
     )
     _assert_no_worker_reroute(exchange)
@@ -3741,7 +4714,11 @@ def test_live_agent_skips_resolution_for_exact_table(live_chat_client):
         for event in _resolution_events(exchange)
         if str(event.get("mention") or "").casefold() == canonical.casefold()
     ], _resolution_events(exchange)
-    _assert_exact_reader_uses_canonical(exchange, canonical=canonical)
+    _assert_exact_reader_uses_canonical(
+        exchange,
+        canonical=canonical,
+        role="target",
+    )
     _assert_no_worker_reroute(exchange)
 
 
@@ -3769,6 +4746,7 @@ def test_live_agent_resolves_partial_table_name(live_chat_client):
     _assert_exact_reader_uses_canonical(
         exchange,
         canonical=canonical,
+        role="source",
         rejected_mention=mention,
     )
     _assert_no_worker_reroute(exchange)
@@ -3801,7 +4779,11 @@ def test_live_agent_resolves_semantic_table_mention(live_chat_client):
     assert event["candidate_set"].get("coverage") in {"complete", "truncated"}, event
     assert event["candidate_set"].get("source") == "semantic_search_descriptions", event
     assert "resolve_entities" in _tool_names(exchange)
-    _assert_exact_reader_uses_canonical(exchange, canonical=canonical)
+    _assert_exact_reader_uses_canonical(
+        exchange,
+        canonical=canonical,
+        role="target",
+    )
     _assert_no_worker_reroute(exchange)
 
 
@@ -3954,8 +4936,16 @@ def test_live_entity_resolution_preserves_source_target_role(live_chat_client):
         candidate.get("role") == "target"
         for candidate in target_event["candidate_set"]["candidates"]
     ), target_event
-    _assert_exact_reader_uses_canonical(exchange, canonical=source)
-    _assert_exact_reader_uses_canonical(exchange, canonical=target)
+    _assert_exact_reader_uses_canonical(
+        exchange,
+        canonical=source,
+        role="source",
+    )
+    _assert_exact_reader_uses_canonical(
+        exchange,
+        canonical=target,
+        role="target",
+    )
     _assert_no_worker_reroute(exchange)
 
 

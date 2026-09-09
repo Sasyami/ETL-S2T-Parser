@@ -22,6 +22,14 @@ _SUPERVISOR_CONTEXT_PREVIEW_CHARS = 4000
 _ENTITY_RESOLUTION_EVENT_LIMIT = 50
 _ENTITY_RESOLUTION_CANDIDATE_LIMIT = 20
 _ENTITY_RESOLUTION_REASON_CHARS = 600
+_SQL_RISK_FACT_LIMIT = 8
+_SQL_RISK_EXPRESSION_LIMIT = 4
+_SQL_RISK_EVIDENCE_LIMIT = 8
+_SQL_RISK_IDENTIFIER_CHARS = 200
+_SQL_RISK_EXPRESSION_CHARS = 300
+_SQL_RISK_EVIDENCE_ID_CHARS = 120
+_SQL_RISK_CYCLE_LIMIT = 100
+_UPSTREAM_ANSWER_SOURCE_CHARS = 120
 _ACTIVE_RUN: ContextVar[Optional["_RunCollector"]] = ContextVar(
     "agent_run_metrics",
     default=None,
@@ -135,6 +143,7 @@ class AgentRunMetrics(BaseModel):
     observations: List[ObservationMetric] = Field(default_factory=list)
     worker_outcomes: List[Dict[str, Any]] = Field(default_factory=list)
     entity_resolution: List[Dict[str, Any]] = Field(default_factory=list)
+    sql_risk_facts: List[Dict[str, Any]] = Field(default_factory=list)
     validation_protocol: Optional[Dict[str, Any]] = None
     upstream_output: Optional[Dict[str, Any]] = None
     display_tools: List[str] = Field(default_factory=list)
@@ -143,6 +152,28 @@ class AgentRunMetrics(BaseModel):
     total_tokens: int = 0
     cache_read_tokens: int = 0
     error: Optional[str] = None
+
+
+def count_agent_reroutes(metrics: AgentRunMetrics) -> int:
+    """Count worker routing retries plus coordinator data-cycle reroutes.
+
+    ``ObservationMetric.cycle`` belongs to one worker's planner/observer loop;
+    it is deliberately excluded from the coordinator cycle count.
+    """
+
+    worker_reroutes = sum(
+        int(item.routing_attempt) > 1 for item in metrics.worker_routes
+    )
+    coordinator_cycles: set[int] = set()
+    for step in metrics.coordinator_plan:
+        try:
+            cycle = int(step.get("cycle") or 0)
+        except (AttributeError, TypeError, ValueError):
+            cycle = 0
+        if cycle > 0:
+            coordinator_cycles.add(cycle)
+    coordinator_reroutes = max(0, len(coordinator_cycles) - 1)
+    return worker_reroutes + coordinator_reroutes
 
 
 def _clip(value: Any, *, max_chars: int = _VALUE_PREVIEW_CHARS) -> str:
@@ -288,6 +319,7 @@ class _RunCollector:
         self.observations: List[ObservationMetric] = []
         self.worker_outcomes: List[Dict[str, Any]] = []
         self.entity_resolution: List[Dict[str, Any]] = []
+        self.sql_risk_facts: List[Dict[str, Any]] = []
         self.validation_protocol: Optional[Dict[str, Any]] = None
         self.upstream_output: Optional[Dict[str, Any]] = None
         self.display_tools: List[str] = []
@@ -415,6 +447,7 @@ class _RunCollector:
                 entity_resolution=[
                     dict(item) for item in self.entity_resolution
                 ],
+                sql_risk_facts=[dict(item) for item in self.sql_risk_facts],
                 validation_protocol=(
                     dict(self.validation_protocol)
                     if self.validation_protocol is not None
@@ -789,6 +822,108 @@ def record_entity_resolution(events: List[Mapping[str, Any]]) -> None:
             collector.entity_resolution.extend(payload[:remaining])
 
 
+def _sql_risk_fact_mapping(value: Any) -> Optional[Mapping[str, Any]]:
+    """Return a mapping for a fact model without importing its domain type."""
+    if isinstance(value, Mapping):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if not callable(model_dump):
+        return None
+    try:
+        dumped = model_dump(mode="json")
+    except TypeError:
+        dumped = model_dump()
+    return dumped if isinstance(dumped, Mapping) else None
+
+
+def _sql_risk_fact_summary(value: Any) -> Optional[Dict[str, Any]]:
+    """Project one deterministic fact without retaining source data rows."""
+    fact = _sql_risk_fact_mapping(value)
+    if fact is None:
+        return None
+
+    summary: Dict[str, Any] = {}
+    for key in (
+        "source_table",
+        "source_field",
+        "target_table",
+        "target_field",
+        "conclusion",
+        "mechanism",
+    ):
+        if key in fact and fact[key] is not None:
+            summary[key] = _clip(
+                fact[key],
+                max_chars=_SQL_RISK_IDENTIFIER_CHARS,
+            )
+
+    if "matching_rows" in fact:
+        try:
+            summary["matching_rows"] = max(0, int(fact["matching_rows"]))
+        except (TypeError, ValueError):
+            summary["matching_rows"] = 0
+
+    expressions = fact.get("target_expressions")
+    if isinstance(expressions, (list, tuple)):
+        summary["target_expressions"] = [
+            _clip(item, max_chars=_SQL_RISK_EXPRESSION_CHARS)
+            for item in list(expressions)[:_SQL_RISK_EXPRESSION_LIMIT]
+        ]
+
+    evidence_ids = fact.get("evidence_ids")
+    if isinstance(evidence_ids, (list, tuple)):
+        summary["evidence_ids"] = [
+            _clip(item, max_chars=_SQL_RISK_EVIDENCE_ID_CHARS)
+            for item in list(evidence_ids)[:_SQL_RISK_EVIDENCE_LIMIT]
+        ]
+    return summary
+
+
+def record_sql_risk_facts(
+    facts_or_payload: Any,
+    *,
+    cycle: int | None = None,
+) -> None:
+    """Append bounded deterministic SQL-risk facts, never underlying rows.
+
+    Accepts either a sequence of fact models/mappings or the structured
+    payload returned by ``field_value_change_payload``.
+    """
+    collector = _ACTIVE_RUN.get()
+    if collector is None:
+        return
+
+    raw_facts: Any = facts_or_payload
+    if isinstance(facts_or_payload, Mapping) and "facts" in facts_or_payload:
+        raw_facts = facts_or_payload.get("facts")
+    elif isinstance(facts_or_payload, Mapping):
+        raw_facts = [facts_or_payload]
+    if not isinstance(raw_facts, (list, tuple)):
+        return
+
+    payload = [
+        summary
+        for item in raw_facts
+        if (summary := _sql_risk_fact_summary(item)) is not None
+    ]
+    if cycle is not None:
+        try:
+            bounded_cycle = min(
+                _SQL_RISK_CYCLE_LIMIT,
+                max(1, int(cycle)),
+            )
+        except (TypeError, ValueError):
+            bounded_cycle = 1
+        for item in payload:
+            item["cycle"] = bounded_cycle
+    with collector.lock:
+        remaining = max(
+            0,
+            _SQL_RISK_FACT_LIMIT - len(collector.sql_risk_facts),
+        )
+        collector.sql_risk_facts.extend(payload[:remaining])
+
+
 def record_validation_protocol(result: Mapping[str, Any]) -> None:
     """Retain bounded contracts/check SQL and readiness, never reader rows."""
     if collector := _ACTIVE_RUN.get():
@@ -810,6 +945,13 @@ def record_upstream_output(result: Mapping[str, Any]) -> None:
                 for item in result.get("display_evidence_ids", [])
             ],
         }
+        if result.get("answer_source") is not None:
+            answer_source = _clip(
+                result.get("answer_source"),
+                max_chars=_UPSTREAM_ANSWER_SOURCE_CHARS,
+            )
+            if answer_source:
+                payload["answer_source"] = answer_source
         with collector.lock:
             collector.upstream_output = payload
 
@@ -842,6 +984,7 @@ __all__ = [
     "record_coordinator_plan",
     "record_display_tools",
     "record_entity_resolution",
+    "record_sql_risk_facts",
     "record_supervisor_decision",
     "record_validation_protocol",
     "record_worker_observation",

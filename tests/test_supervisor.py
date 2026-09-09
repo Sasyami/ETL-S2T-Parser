@@ -86,6 +86,7 @@ def test_supervisor_prompt_keeps_decision_and_handoff_llm_driven():
     assert "не добавляй новых целей" in normalized_prompt.lower()
     assert "не пересказывай, не сокращай" in normalized_prompt
     assert "не превращай его в план" in normalized_prompt
+    assert "если `recent_history` пуст, оба поля" in normalized_prompt
     assert "при единственном однозначном референте" in normalized_prompt
     assert "«в ней» = таблица x" in normalized_prompt
     assert "относится к `resolved_references`, а не к context" in normalized_prompt
@@ -129,6 +130,80 @@ def test_supervisor_answers_directly_when_coordinator_is_not_needed():
     assert "разовые объекты, ID, числа, результаты" in context_description
     assert parameters["additionalProperties"] is False
     assert stages == ["supervisor"]
+
+
+def test_supervisor_retries_empty_decision_without_changing_history_payload():
+    from agents.supervisor import supervisor_chat
+
+    history = [
+        {"role": "user", "content": "Работаем только с подтверждёнными данными."},
+        {"role": "assistant", "content": "Принято."},
+    ]
+    model = _SupervisorModel(
+        [
+            AIMessage(content="   "),
+            _delegate_message(),
+        ]
+    )
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(
+                answer="Тест-протокол сформирован.",
+                display_refs=[],
+            ),
+        ) as coordinator,
+    ):
+        result = supervisor_chat(
+            "Составь стандартный тест-протокол",
+            history=history,
+        )
+
+    assert result.answer == "Тест-протокол сформирован."
+    assert len(model.messages) == 2
+    assert json.loads(model.messages[0][1].content) == {
+        "current_query": "Составь стандартный тест-протокол",
+        "recent_history": history,
+    }
+    assert model.messages[1][1].content == model.messages[0][1].content
+    assert "предыдущий вызов не вернул" in model.messages[1][0].content.lower()
+    coordinator.assert_called_once_with(
+        "Составь стандартный тест-протокол",
+        context="",
+    )
+
+
+def test_supervisor_rejects_repeated_empty_decision_before_direct_route():
+    from agents.supervisor import supervisor_chat
+
+    model = _SupervisorModel(
+        [
+            AIMessage(content=""),
+            AIMessage(content=[]),
+        ]
+    )
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.supervisor.record_supervisor_decision") as record_decision,
+        patch("agents.supervisor.coordinator_chat") as coordinator,
+    ):
+        try:
+            supervisor_chat("Проверь данные")
+        except RuntimeError as exc:
+            assert "повторно вернул пустой ответ" in str(exc)
+        else:
+            raise AssertionError("Repeated empty supervisor response must fail")
+
+    assert len(model.messages) == 2
+    record_decision.assert_not_called()
+    coordinator.assert_not_called()
 
 
 def test_supervisor_keeps_last_six_history_messages_without_mutating_input():
@@ -223,6 +298,48 @@ def test_supervisor_self_contained_delegate_does_not_forward_raw_history():
     assert "HISTORY_USER_SENTINEL" not in delegated_task
     assert "HISTORY_ASSISTANT_SENTINEL" not in delegated_task
     assert delegated_context == ""
+
+
+def test_supervisor_discards_handoff_fields_when_history_is_empty():
+    from agents.supervisor import supervisor_chat
+
+    model = _SupervisorModel(
+        [
+            _delegate_message(
+                "file_id=9102 и comparison key=order_id.",
+                context="Проверить tgt_pk по ключу order_id.",
+            )
+        ]
+    )
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(
+                answer="Тест-протокол сформирован.",
+                display_refs=[],
+            ),
+        ) as coordinator,
+        patch("agents.supervisor.record_supervisor_decision") as record_decision,
+    ):
+        result = supervisor_chat(
+            "Составь протокол для file_id=9102, ключ order_id",
+            history=[],
+        )
+
+    assert result.answer == "Тест-протокол сформирован."
+    coordinator.assert_called_once_with(
+        "Составь протокол для file_id=9102, ключ order_id",
+        context="",
+    )
+    record_decision.assert_called_once_with(
+        route="delegate",
+        resolved_references="",
+        context="",
+    )
 
 
 def test_supervisor_delegates_whole_goal_and_returns_coordinator_result():

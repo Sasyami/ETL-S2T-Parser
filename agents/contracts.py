@@ -51,7 +51,9 @@ SqlRiskAspect = Literal[
     "write_semantics",
 ]
 MAX_PLAN_STEPS = 8
-WORKER_STABLE_CONTEXT_MARKER = "\n\nУстойчивые правила контекста:\n"
+_LEGACY_WORKER_STABLE_CONTEXT_MARKER = (
+    "\n\nУстойчивые правила контекста:\n"
+)
 WORKER_PREVIOUS_RESULTS_MARKER = "\n\nРезультаты прошлых workers."
 WORKER_OPERATION_EXECUTION_MARKER = "\n\nOperation-skill текущей задачи:\n"
 WORKER_OPERATION_COMPLETENESS_MARKER = (
@@ -120,7 +122,6 @@ class WorkerRequestParts:
     """Programmatic envelope around the current worker task."""
 
     current_task: str
-    stable_context: str = ""
     operation_execution_context: str = ""
     operation_completeness_context: str = ""
     previous_results: Optional[List[PreviousResultReference]] = None
@@ -129,7 +130,14 @@ class WorkerRequestParts:
 def parse_worker_request(value: Any) -> WorkerRequestParts:
     """Separate coordinator-owned context from the worker's current task."""
     full_text = str(value or "").strip()
-    task_and_context = full_text
+    # Older direct worker ingress accepted an arbitrary conversation-context
+    # suffix and forwarded it to both router and planner.  Keep recognizing the
+    # old delimiter only as a fail-closed sanitization boundary: neither the
+    # marker nor anything following it is part of a worker request anymore.
+    task_and_context = full_text.split(
+        _LEGACY_WORKER_STABLE_CONTEXT_MARKER,
+        1,
+    )[0]
     previous_results: Optional[List[PreviousResultReference]] = None
 
     if WORKER_PREVIOUS_RESULTS_MARKER in task_and_context:
@@ -155,13 +163,6 @@ def parse_worker_request(value: Any) -> WorkerRequestParts:
                         previous_results = None
 
     current_task = task_and_context
-    stable_context = ""
-    if WORKER_STABLE_CONTEXT_MARKER in current_task:
-        current_task, stable_context = current_task.split(
-            WORKER_STABLE_CONTEXT_MARKER,
-            1,
-        )
-
     operation_completeness_context = ""
     if WORKER_OPERATION_COMPLETENESS_MARKER in current_task:
         current_task, operation_completeness_context = current_task.split(
@@ -178,7 +179,6 @@ def parse_worker_request(value: Any) -> WorkerRequestParts:
 
     return WorkerRequestParts(
         current_task=current_task.strip(),
-        stable_context=stable_context.strip(),
         operation_execution_context=operation_execution_context.strip(),
         operation_completeness_context=operation_completeness_context.strip(),
         previous_results=previous_results,
@@ -747,6 +747,5 @@ __all__ = [
     "WORKER_PREVIOUS_RESULTS_MARKER",
     "WORKER_OPERATION_COMPLETENESS_MARKER",
     "WORKER_OPERATION_EXECUTION_MARKER",
-    "WORKER_STABLE_CONTEXT_MARKER",
     "parse_worker_request",
 ]

@@ -4,12 +4,14 @@ from uuid import uuid4
 
 from agents.run_metrics import (
     capture_agent_run,
+    count_agent_reroutes,
     consume_agent_run_metrics,
     get_run_metrics_callback,
     llm_stage,
     record_coordinator_plan,
     record_display_tools,
     record_entity_resolution,
+    record_sql_risk_facts,
     record_supervisor_decision,
     record_validation_protocol,
     record_worker_observation,
@@ -18,6 +20,24 @@ from agents.run_metrics import (
     record_worker_task,
     record_upstream_output,
 )
+from agents.value_change_analysis import FieldValueChangeFact
+
+
+def test_reroute_count_does_not_treat_worker_observation_cycle_as_data_cycle():
+    metrics = SimpleNamespace(
+        worker_routes=[
+            SimpleNamespace(routing_attempt=1),
+            SimpleNamespace(routing_attempt=2),
+        ],
+        coordinator_plan=[
+            {"cycle": 1, "step": 1},
+            {"cycle": 1, "step": 2},
+            {"cycle": 2, "step": 1},
+        ],
+        observations=[SimpleNamespace(cycle=5)],
+    )
+
+    assert count_agent_reroutes(metrics) == 2
 
 
 def test_run_metrics_capture_real_callback_events(monkeypatch):
@@ -146,6 +166,22 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
                 }
             ]
         )
+        record_sql_risk_facts(
+            [
+                FieldValueChangeFact(
+                    source_table="src",
+                    source_field="id",
+                    target_table="tgt",
+                    target_field="id",
+                    conclusion="not_detected",
+                    mechanism="direct_column",
+                    matching_rows=1,
+                    target_expressions=["src.id"],
+                    evidence_ids=["evidence-sql"],
+                )
+            ],
+            cycle=2,
+        )
         record_validation_protocol(
             {
                 "mode": "explicit",
@@ -261,6 +297,20 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
             "candidates": ["t_target"],
         }
     ]
+    assert metrics.sql_risk_facts == [
+        {
+            "source_table": "src",
+            "source_field": "id",
+            "target_table": "tgt",
+            "target_field": "id",
+            "conclusion": "not_detected",
+            "mechanism": "direct_column",
+            "matching_rows": 1,
+            "target_expressions": ["src.id"],
+            "evidence_ids": ["evidence-sql"],
+            "cycle": 2,
+        }
+    ]
     assert metrics.validation_protocol == {
         "mode": "explicit",
         "status": "partial_protocol",
@@ -371,6 +421,91 @@ def test_entity_resolution_metrics_are_bounded_without_provenance(monkeypatch):
     serialized = json.dumps(metrics.entity_resolution, ensure_ascii=False)
     assert '"provenance"' not in serialized
     assert "SECRET" not in serialized
+
+
+def test_sql_risk_metrics_accept_payload_and_are_bounded_without_rows(
+    monkeypatch,
+):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    session_id = f"metrics-{uuid4()}"
+    facts = [
+        {
+            "source_table": f"src_{index}" + "s" * 300,
+            "source_field": "id",
+            "target_table": f"tgt_{index}",
+            "target_field": "id",
+            "conclusion": "may_change",
+            "mechanism": "value_expression",
+            "matching_rows": index,
+            "target_expressions": ["x" * 500] * 7,
+            "evidence_ids": ["e" * 200] * 12,
+            "raw_rows": [{"transformation_rule": "SECRET" * 1000}],
+            "unexpected": {"full_result": "SECRET" * 1000},
+            "cycle": 777,
+        }
+        for index in range(12)
+    ]
+
+    with capture_agent_run(session_id):
+        record_sql_risk_facts(
+            {
+                "authority": "deterministic_sqlglot_full_saved_result",
+                "facts": facts,
+                "rows": [{"secret": "SECRET" * 1000}],
+            },
+            cycle=999,
+        )
+        record_sql_risk_facts(facts)
+
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    assert len(metrics.sql_risk_facts) == 8
+    first = metrics.sql_risk_facts[0]
+    assert set(first) == {
+        "source_table",
+        "source_field",
+        "target_table",
+        "target_field",
+        "conclusion",
+        "mechanism",
+        "matching_rows",
+        "target_expressions",
+        "evidence_ids",
+        "cycle",
+    }
+    assert len(first["source_table"]) <= 200
+    assert len(first["target_expressions"]) == 4
+    assert len(first["target_expressions"][0]) <= 300
+    assert len(first["evidence_ids"]) == 8
+    assert len(first["evidence_ids"][0]) <= 120
+    assert first["cycle"] == 100
+    serialized = json.dumps(metrics.sql_risk_facts, ensure_ascii=False)
+    assert "raw_rows" not in serialized
+    assert "full_result" not in serialized
+    assert "SECRET" not in serialized
+
+
+def test_upstream_answer_source_is_optional_and_bounded(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    session_id = f"metrics-{uuid4()}"
+
+    with capture_agent_run(session_id):
+        record_upstream_output(
+            {
+                "answer": "Детерминированный ответ.",
+                "used_evidence_ids": ["evidence-sql"],
+                "display_evidence_ids": [],
+                "answer_source": "deterministic_value_changes" + "x" * 200,
+            }
+        )
+
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    assert metrics.upstream_output is not None
+    assert metrics.upstream_output["answer_source"].startswith(
+        "deterministic_value_changes"
+    )
+    assert len(metrics.upstream_output["answer_source"]) <= 120
 
 
 def test_run_metrics_are_disabled_by_default(monkeypatch):

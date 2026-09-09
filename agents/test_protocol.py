@@ -1644,30 +1644,56 @@ def compile_test_protocol(
         if invalid_keys:
             comparison_key = []
             comparison_key_source = None
-        target_sql = _quote_qualified_name(target_table)
+        target_sql: Optional[str]
+        target_relation_limitation: Optional[str] = None
+        try:
+            target_sql = _quote_qualified_name(target_table)
+        except ValueError:
+            target_sql = None
+            target_relation_limitation = (
+                "Каноническая S2T-цель является виртуальным lineage scope, "
+                "а не исполняемой Greenplum relation."
+                if "::" in target_table
+                else (
+                    "Каноническую S2T-цель нельзя безопасно адресовать как "
+                    "Greenplum relation."
+                )
+            )
         schema_rows, schema_missing = _schema_comparisons(
             s2t_rows,
             bundle.source_catalog_rows,
             bundle.target_catalog_rows,
         )
-        ctx = _CompilerContext(
-            target_sql=target_sql,
-            normalized=normalized,
-            projection_plan=projection_plan,
-            target_fields=target_fields,
-            comparison_key=comparison_key,
-            comparison_key_source=comparison_key_source,
-            required_fields=required_fields,
-            target_catalog_available=bundle.target_catalog_available,
-            source_catalog_available=bundle.source_catalog_available,
-            schema_rows=schema_rows,
-            schema_missing=schema_missing,
-        )
         selected_checks = contract.checks_for_load(load)
-        checks = [
-            CHECKS[kind].compiler(kind, CHECKS[kind], ctx)
-            for kind in selected_checks
-        ]
+        if target_relation_limitation is not None:
+            checks = [
+                _unavailable_check(
+                    kind,
+                    CHECKS[kind],
+                    target_relation_limitation,
+                    missing=["target_relation"],
+                )
+                for kind in selected_checks
+            ]
+        else:
+            assert target_sql is not None
+            ctx = _CompilerContext(
+                target_sql=target_sql,
+                normalized=normalized,
+                projection_plan=projection_plan,
+                target_fields=target_fields,
+                comparison_key=comparison_key,
+                comparison_key_source=comparison_key_source,
+                required_fields=required_fields,
+                target_catalog_available=bundle.target_catalog_available,
+                source_catalog_available=bundle.source_catalog_available,
+                schema_rows=schema_rows,
+                schema_missing=schema_missing,
+            )
+            checks = [
+                CHECKS[kind].compiler(kind, CHECKS[kind], ctx)
+                for kind in selected_checks
+            ]
         preflight = _preflight(
             bundle,
             normalized,
@@ -1678,6 +1704,14 @@ def compile_test_protocol(
             ambiguous_projection,
             required_fields,
         )
+        if target_relation_limitation is not None:
+            preflight.append(
+                ProtocolPreflightItem(
+                    kind="target_relation_addressable",
+                    status="unavailable",
+                    conclusion=target_relation_limitation,
+                )
+            )
         limitations: List[str] = []
         if missing_sources:
             limitations.append(
@@ -1693,6 +1727,8 @@ def compile_test_protocol(
                 + ", ".join(invalid_keys)
                 + "."
             )
+        if target_relation_limitation is not None:
+            limitations.append(target_relation_limitation)
         status = _target_status(checks, preflight)
         if status != "ready":
             issues.append(

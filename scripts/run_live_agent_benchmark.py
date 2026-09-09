@@ -86,6 +86,14 @@ class ModeResult:
     total_tokens: int = 0
     cache_read_tokens: int = 0
     stage_usage: dict[str, dict[str, int | float]] = field(default_factory=dict)
+    judge_attempts: int = 0
+    judge_completed: int = 0
+    judge_errors: int = 0
+    judge_input_tokens: int = 0
+    judge_output_tokens: int = 0
+    judge_total_tokens: int = 0
+    judge_cache_read_tokens: int = 0
+    judge_models: dict[str, int] = field(default_factory=dict)
     http_500: int = 0
     presentation_warnings: int = 0
     efficiency_warnings: int = 0
@@ -310,6 +318,30 @@ def _parse_transcript(result: ModeResult) -> None:
     result.output_tokens = sum(int(row[1]) for row in token_rows)
     result.total_tokens = sum(int(row[2]) for row in token_rows)
     result.cache_read_tokens = sum(int(row[3]) for row in token_rows)
+    for model in re.findall(r"^judge_model: (.+)$", text, re.MULTILINE):
+        clean_model = model.strip()
+        if clean_model and clean_model != "not_configured":
+            result.judge_models[clean_model] = (
+                result.judge_models.get(clean_model, 0) + 1
+            )
+    judge_call_rows = re.findall(
+        r"^judge_calls: attempts=(\d+), completed=(\d+), errors=(\d+)$",
+        text,
+        re.MULTILINE,
+    )
+    result.judge_attempts = sum(int(row[0]) for row in judge_call_rows)
+    result.judge_completed = sum(int(row[1]) for row in judge_call_rows)
+    result.judge_errors = sum(int(row[2]) for row in judge_call_rows)
+    judge_token_rows = re.findall(
+        r"^judge_tokens: input=(\d+), output=(\d+), total=(\d+), "
+        r"cache_read=(\d+)$",
+        text,
+        re.MULTILINE,
+    )
+    result.judge_input_tokens = sum(int(row[0]) for row in judge_token_rows)
+    result.judge_output_tokens = sum(int(row[1]) for row in judge_token_rows)
+    result.judge_total_tokens = sum(int(row[2]) for row in judge_token_rows)
+    result.judge_cache_read_tokens = sum(int(row[3]) for row in judge_token_rows)
     stage_rows = re.findall(
         r"^stage_tokens\[([^\]]+)\]: calls=(\d+), errors=(\d+), "
         r"input=(\d+), output=(\d+), total=(\d+), cache_read=(\d+), "
@@ -456,9 +488,10 @@ def _comparison_report(
         "| Режим | Pytest passed | Pytest failures | Semantic failures | "
         "Skipped | HTTP 500 | Presentation warnings | Efficiency warnings | "
         "Accuracy | Reroutes | Tool errors | Reader calls | Pipelines | "
-        "Agent, с | LLM calls | Tool calls | Total tokens |",
+        "Agent, с | Agent LLM calls | Tool calls | Agent tokens | "
+        "Judge attempts | Judge errors | Judge tokens |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-        "---|---:|---:|---:|---:|",
+        "---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for result in results:
         semantic_failures = sum(
@@ -478,8 +511,37 @@ def _comparison_report(
             f"{result.reader_calls} | {pipeline_summary} | "
             f"{result.agent_seconds:.3f} | "
             f"{result.llm_calls} | {result.tool_calls} | "
-            f"{result.total_tokens} |"
+            f"{result.total_tokens} | {result.judge_attempts} | "
+            f"{result.judge_errors} | {result.judge_total_tokens} |"
         )
+
+    if any(result.judge_attempts or result.judge_models for result in results):
+        lines.extend(
+            [
+                "",
+                "## Расход LLM-as-judge",
+                "",
+                "Attempts включают повторные HTTP-попытки structured-вызовов; "
+                "errors — попытки, завершившиеся ошибкой до успешного retry либо "
+                "окончательного judge_error.",
+                "",
+                "| Режим | Judge models | Attempts | Completed | Errors | "
+                "Input | Output | Total | Cache read |",
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for result in results:
+            models = ", ".join(
+                f"{name}×{count}"
+                for name, count in sorted(result.judge_models.items())
+            ) or "—"
+            lines.append(
+                f"| {result.mode} | {models} | {result.judge_attempts} | "
+                f"{result.judge_completed} | {result.judge_errors} | "
+                f"{result.judge_input_tokens} | {result.judge_output_tokens} | "
+                f"{result.judge_total_tokens} | "
+                f"{result.judge_cache_read_tokens} |"
+            )
 
     if any(result.stage_usage for result in results):
         lines.extend(

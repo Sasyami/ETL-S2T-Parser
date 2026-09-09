@@ -345,6 +345,51 @@ def test_worker_operation_contexts_are_isolated_by_role():
     assert planner_rule not in observer_system
 
 
+def test_direct_worker_discards_legacy_stable_context_before_planner():
+    from agents.contracts import parse_worker_request
+
+    leaked_context = "RAW_CONVERSATION_CONTEXT_MUST_NOT_REACH_PLANNER"
+
+    def lookup():
+        return {"value": "confirmed"}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-sanitized",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Готово."),
+        ]
+    )
+    raw_task = (
+        "Прочитай значение."
+        "\n\nУстойчивые правила контекста:\n"
+        + leaked_context
+    )
+
+    parts = parse_worker_request(raw_task)
+    result = run_worker_graph(
+        task=raw_task,
+        system_prompt="Системный контекст",
+        model=model,
+        tools={"lookup": _as_tool(lookup)},
+    )
+
+    assert parts.current_task == "Прочитай значение."
+    assert not hasattr(parts, "stable_context")
+    assert result.status == "complete"
+    assert leaked_context not in str(model.messages)
+    assert leaked_context not in str(model.observer.messages)
+
+
 class _BoundToolChoiceModel:
     def __init__(self, parent, tool_choice=None):
         self.parent = parent
@@ -1493,6 +1538,160 @@ def test_worker_requires_dependent_value_in_current_tool_filter():
     assert queries == [wrong_query, correct_query]
 
 
+def test_worker_repairs_incomplete_semantic_candidate_s2t_batch_before_execution():
+    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
+    from agents.tools.saved_results import (
+        read_previous_result,
+        saved_result_store_scope,
+    )
+
+    executed = []
+
+    def search_s2t_transformations(
+        needle: str | None = None,
+        needles: list[str] | None = None,
+    ):
+        executed.append({"needle": needle, "needles": list(needles or [])})
+        return {
+            "queries": list(needles or []),
+            "rows": [{"matched": value} for value in (needles or [])],
+        }
+
+    semantic_rows = [
+        {
+            "scope": "source_columns",
+            "record_id": 1,
+            "column_name": "customer_id",
+            "name": "customer_id",
+            "score": 0.95,
+        },
+        {
+            "scope": "target_columns",
+            "record_id": 2,
+            "column_name": "order_id",
+            "name": "order_id",
+            "score": 0.91,
+        },
+    ]
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_previous_result",
+                        "args": {},  # populated after the opaque ID is known
+                        "id": "call-read-candidates",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_s2t_transformations",
+                        "args": {"needles": ["customer_id"]},
+                        "id": "call-incomplete-batch",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_s2t_transformations",
+                        "args": {
+                            "needles": ["customer_id", "order_id"]
+                        },
+                        "id": "call-complete-batch",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Все кандидаты проверены."),
+        ],
+        observer_responses=[
+            Observation(
+                status="continue",
+                gap="Нужен один S2T batch для всех кандидатов.",
+                accepted_tool_call_ids=["call-read-candidates"],
+            ),
+            Observation(
+                goal_satisfied=True,
+                accepted_tool_call_ids=[
+                    "call-read-candidates",
+                    "call-complete-batch",
+                ],
+            ),
+        ],
+    )
+
+    with saved_result_store_scope() as store:
+        reference = store.register_previous_result(
+            source_tool="semantic_search_descriptions",
+            source_tool_call_id="call-semantic",
+            content=json.dumps(
+                {
+                    "scope": "columns",
+                    "total_candidates": 2,
+                    "returned_rows": 2,
+                    "truncated": False,
+                    "rows": semantic_rows,
+                },
+                ensure_ascii=False,
+            ),
+            description="Два semantic-кандида колонок.",
+        )
+        model.responses[0].tool_calls[0]["args"] = {
+            "result_id": reference.result_id
+        }
+        task = (
+            "Проверь все semantic-кандидаты одним S2T batch."
+            + WORKER_PREVIOUS_RESULTS_MARKER
+            + "\n"
+            + json.dumps(
+                {
+                    "previous_results": [
+                        reference.model_dump(mode="json", exclude_none=True)
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        result = run_worker_graph(
+            task=task,
+            system_prompt="Системный контекст",
+            model=model,
+            tools=(
+                read_previous_result,
+                _as_tool(search_s2t_transformations),
+            ),
+            max_steps=3,
+        )
+
+    assert executed == [
+        {"needle": None, "needles": ["customer_id", "order_id"]}
+    ]
+    assert result.status == "complete"
+    assert result.accepted_tool_call_ids == [
+        "call-read-candidates",
+        "call-complete-batch",
+    ]
+    assert [
+        call["name"]
+        for cycle in result.cycle_history
+        for call in cycle.tool_calls
+    ] == ["read_previous_result", "search_s2t_transformations"]
+    assert any(
+        "CandidateSet" in str(message.content)
+        for messages in model.messages
+        for message in messages
+    )
+
+
 def test_worker_reroutes_when_description_is_claimed_as_s2t_rule():
     calls = []
 
@@ -2187,7 +2386,7 @@ def test_worker_repairs_plain_text_before_first_data_tool_call():
     assert "Сначала я выполню поиск." not in str(model.messages[1])
 
 
-def test_worker_allows_native_finish_before_first_data_tool_call():
+def test_worker_marks_native_finish_before_first_data_tool_as_no_results():
     def lookup():
         return {"value": "confirmed"}
 
@@ -2206,7 +2405,36 @@ def test_worker_allows_native_finish_before_first_data_tool_call():
     assert result.answer == "Данных для проверки недостаточно."
     assert result.display_items == []
     assert result.status == "complete"
+    assert result.gap == (
+        "Worker завершил task без принятого data-tool результата."
+    )
+    assert result.stop_reason == "no_results"
+    assert result.unmet_requirements == [result.gap]
     assert len(model.messages) == 1
+
+
+def test_public_worker_maps_early_finish_to_failed_no_results():
+    from agents.worker import worker_chat
+
+    gap = "Worker завершил task без принятого data-tool результата."
+    graph_result = WorkerRunResult(
+        answer="Данных для проверки недостаточно.",
+        gap=gap,
+        stop_reason="no_results",
+        unmet_requirements=[gap],
+    )
+    route = ToolRoute(tools=["list_files"], skills=[], schemas=[])
+
+    with (
+        patch("agents.worker.select_chat_route", return_value=route),
+        patch("agents.worker.run_worker_graph", return_value=graph_result),
+    ):
+        outcome = worker_chat("Получи список файлов")
+
+    assert outcome.status == "failed"
+    assert outcome.stop_reason == "no_results"
+    assert outcome.unmet_requirements == [gap]
+    assert outcome.evidence == []
 
 
 def test_worker_does_not_force_one_tool_when_finish_is_also_allowed():

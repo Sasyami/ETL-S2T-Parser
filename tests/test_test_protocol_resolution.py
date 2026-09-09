@@ -146,6 +146,53 @@ def test_exact_filename_reuses_file_resolver_and_materializes_only_file_id():
     assert result.resolutions[0].method == "exact"
 
 
+def test_resolved_file_scopes_approximate_table_resolution_across_uploads():
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO files (file_id, filename, upload_time, description)
+        VALUES (8, 'Other Mapping.xlsx', '2026-01-02', 'Other S2T mapping')
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field, transformation_rule)
+        VALUES (?, ?, 'S2T', ?, ?, 'id', ?, 'id', 'SELECT id FROM source')
+        """,
+        [
+            (10, 7, 10, "stage.scope_orders", "mart.orders"),
+            (11, 8, 11, "stage.scope_order_items", "mart.other_orders"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = resolve_test_protocol_contract(
+        _raw(
+            "stage.scope_order",
+            "mart.orders",
+            file_mention="Mapping.xlsx",
+        )
+    )
+
+    assert result.status == "resolved"
+    assert result.contract is not None
+    assert result.contract.file_id == 7
+    assert result.contract.loads[0].sources == ["stage.scope_orders"]
+    assert result.contract.loads[0].target == "mart.orders"
+    source_resolution = next(
+        item for item in result.resolutions if item.role == "source"
+    )
+    assert source_resolution.method == "partial"
+    assert {
+        row["file_id"]
+        for candidate in source_resolution.candidate_set.candidates
+        for row in candidate.provenance
+    } == {7}
+
+
 def test_raw_origin_validation_happens_before_canonical_resolution():
     raw = _raw("stage.ordres", "mart.orders", file_id=7)
     validate_raw_contract_origin(

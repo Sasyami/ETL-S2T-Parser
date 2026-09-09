@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Literal, Optional, Sequence, TypedDict
 
 from langchain_core.messages import (
@@ -24,7 +25,11 @@ from pydantic import (
 )
 
 from .agent import chat_model
+from .cardinality_sufficiency import (
+    complete_cardinality_mapping_evidence_ids,
+)
 from .contracts import (
+    EvidenceArtifact,
     MAX_PLAN_STEPS,
     PlanStep,
     SqlRiskAspect,
@@ -38,11 +43,20 @@ from .contracts import (
 )
 from .chat_graph import WorkerDisplayItem
 from .observability import get_callback_handler, langfuse_trace_context
+from .operation_intent import is_exclusive_value_change_request
+from .plan_origin import PlanOriginError, validate_worker_plan_origin
+from .plan_requirements import (
+    ReroutePlanRequirementError,
+    SqlRiskPlanRequirementError,
+    validate_sql_risk_plan_requirements,
+    validate_sql_risk_reroute_plan,
+)
 from .run_metrics import (
     get_run_metrics_callback,
     llm_stage,
     record_coordinator_plan,
     record_entity_resolution,
+    record_sql_risk_facts,
     record_upstream_output,
     record_validation_protocol,
     record_worker_outcome,
@@ -60,7 +74,10 @@ from .worker import (
     register_worker_display_items,
     worker_chat,
 )
-from .tools.saved_results import saved_result_store_scope
+from .tools.saved_results import (
+    get_active_saved_result_store,
+    saved_result_store_scope,
+)
 from .test_protocol import (
     MAX_PROTOCOL_OBJECTS,
     PROTOCOL_CHECKS,
@@ -89,8 +106,43 @@ from .validation_protocol import (
     render_s2t_analysis_answer,
     validate_s2t_analysis_output,
 )
+from .value_change_analysis import (
+    FieldValueChangeFact,
+    derive_field_value_change_facts,
+    field_value_change_payload,
+    render_field_value_change_answer,
+)
+from .write_semantics_analysis import (
+    WriteSemanticsFact,
+    derive_write_semantics_facts,
+    is_exclusive_write_semantics_request,
+    render_terminal_write_semantics_negative,
+    write_semantics_payload,
+)
 
 logger = logging.getLogger(__name__)
+
+
+_SERIALIZED_EVIDENCE_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9_])evidence_[0-9a-f]+(?![A-Za-z0-9_])"
+)
+_SERIALIZED_EVIDENCE_KEYS = frozenset(
+    {
+        "used_evidence_ids",
+        "display_evidence_ids",
+        "evidence_id",
+        "displayable",
+    }
+)
+_SERIALIZED_EVIDENCE_KEY_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:used_evidence_ids|display_evidence_ids|"
+    r"evidence_id|displayable)(?![A-Za-z0-9_])"
+)
+_SERIALIZED_JSON_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:true|false|null)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_SERIALIZED_JSON_NOISE_RE = re.compile(r"^[\s\[\]{},:\"'\\]*$")
 
 COORDINATOR_MAX_WORKERS = MAX_PLAN_STEPS
 COORDINATOR_MAX_CYCLES = 2
@@ -383,6 +435,69 @@ _S2T_ANALYSIS_REPAIR_PROMPT = f"""
 
 class CoordinatorResponseError(RuntimeError):
     """Raised when an LLM response violates a structural coordinator contract."""
+
+
+def _recover_serialized_evidence_ids(
+    value: str,
+    available_evidence_ids: set[str],
+) -> Optional[List[str]]:
+    """Recover only known opaque IDs from an obvious JSON/list fragment.
+
+    Some providers occasionally put a serialized evidence-id list (and even
+    adjacent schema keys) into one string item of the otherwise valid native
+    array. Recovery is intentionally narrower than generic JSON repair: every
+    opaque ID must already be available, and after removing known output keys,
+    JSON literals, and IDs, only serialization punctuation may remain.
+    """
+
+    clean_value = str(value or "").strip()
+    if clean_value in available_evidence_ids:
+        return [clean_value]
+
+    recovered_ids = _SERIALIZED_EVIDENCE_ID_RE.findall(clean_value)
+    key_tokens = _SERIALIZED_EVIDENCE_KEY_RE.findall(clean_value)
+    if any(
+        evidence_id not in available_evidence_ids
+        for evidence_id in recovered_ids
+    ):
+        return None
+    if not recovered_ids and not key_tokens:
+        return None
+
+    has_list_or_json_marker = any(
+        marker in clean_value for marker in '[]{}",:'
+    )
+    if not has_list_or_json_marker and (
+        recovered_ids or clean_value not in _SERIALIZED_EVIDENCE_KEYS
+    ):
+        return None
+
+    remainder = _SERIALIZED_EVIDENCE_ID_RE.sub("", clean_value)
+    remainder = _SERIALIZED_EVIDENCE_KEY_RE.sub("", remainder)
+    remainder = _SERIALIZED_JSON_LITERAL_RE.sub("", remainder)
+    if not _SERIALIZED_JSON_NOISE_RE.fullmatch(remainder):
+        return None
+    return list(dict.fromkeys(recovered_ids))
+
+
+def _normalize_upstream_evidence_id_list(
+    values: Sequence[str],
+    available_evidence_ids: set[str],
+) -> List[str]:
+    """Normalize provider serialization noise without accepting new IDs."""
+
+    normalized: List[str] = []
+    for value in values:
+        clean_value = str(value or "").strip()
+        recovered = _recover_serialized_evidence_ids(
+            clean_value,
+            available_evidence_ids,
+        )
+        candidates = [clean_value] if recovered is None else recovered
+        for candidate in candidates:
+            if candidate and candidate not in normalized:
+                normalized.append(candidate)
+    return normalized
 
 
 _DOWNSTREAM_PLAN_PROMPT = f"""
@@ -889,6 +1004,10 @@ def _plan_tool_schema() -> Dict[str, Any]:
                                         "sheet_name": {"type": "string"},
                                         "filters": {
                                             "type": "object",
+                                            # GigaChat validates every object
+                                            # node as a complete JSON Schema
+                                            # object, including open maps.
+                                            "properties": {},
                                             "additionalProperties": True,
                                         },
                                     },
@@ -1769,12 +1888,48 @@ def build_coordinator_graph(
             plan_messages,
             stage="downstream_plan",
         )
+
+        def validate_plan_contract(candidate: WorkerPlan) -> None:
+            contract_errors: List[str] = []
+            try:
+                validate_worker_plan_origin(
+                    candidate,
+                    state["task"],
+                    context=state["context"],
+                )
+            except PlanOriginError as exc:
+                contract_errors.append(str(exc))
+            try:
+                validate_sql_risk_plan_requirements(
+                    candidate,
+                    state["task"],
+                    sql_risk_aspects=operation_sql_risk_aspects,
+                )
+            except SqlRiskPlanRequirementError as exc:
+                contract_errors.append(str(exc))
+            if (
+                state["upstream_problem"] is not None
+                and "Анализ SQL-рисков" in operation_skills
+            ):
+                try:
+                    validate_sql_risk_reroute_plan(
+                        candidate,
+                        state["task"],
+                        sql_risk_aspects=operation_sql_risk_aspects,
+                    )
+                except ReroutePlanRequirementError as exc:
+                    contract_errors.append(str(exc))
+            if contract_errors:
+                raise CoordinatorResponseError("; ".join(contract_errors))
+
         try:
             plan = _native_payload(
                 plan_result,
                 _PLAN_TOOL_NAME,
                 WorkerPlan,
             )
+            assert isinstance(plan, WorkerPlan)
+            validate_plan_contract(plan)
         except CoordinatorResponseError as first_error:
             logger.warning(
                 "Coordinator plan call violated plan schema; requesting one "
@@ -1800,6 +1955,13 @@ def build_coordinator_graph(
             )
             plan_result = repaired_result
             assert isinstance(plan, WorkerPlan)
+            try:
+                validate_plan_contract(plan)
+            except CoordinatorResponseError as second_error:
+                raise CoordinatorResponseError(
+                    "Исправленный worker plan нарушает plan contract: "
+                    + str(second_error)
+                ) from second_error
         assert isinstance(plan, WorkerPlan)
 
         recorded_plan = [
@@ -1946,8 +2108,30 @@ def build_coordinator_graph(
         *,
         available_evidence_ids: set[str],
         available_display_refs: Dict[str, str],
+        require_used_evidence: bool = False,
     ) -> UpstreamOutput:
         output = _native_upstream_answer(message)
+        normalized_used_ids = _normalize_upstream_evidence_id_list(
+            output.used_evidence_ids,
+            available_evidence_ids,
+        )
+        normalized_display_ids = _normalize_upstream_evidence_id_list(
+            output.display_evidence_ids,
+            available_evidence_ids,
+        )
+        try:
+            output = UpstreamOutput.model_validate(
+                {
+                    "answer": output.answer,
+                    "used_evidence_ids": normalized_used_ids,
+                    "display_evidence_ids": normalized_display_ids,
+                }
+            )
+        except ValidationError as exc:
+            raise CoordinatorResponseError(
+                "Upstream coordinator вернул несогласованный выбор "
+                "evidence_id после безопасной нормализации."
+            ) from exc
         unknown_ids = sorted(
             (
                 set(output.used_evidence_ids)
@@ -1962,6 +2146,15 @@ def build_coordinator_graph(
             raise CoordinatorResponseError(
                 "Upstream coordinator выбрал неизвестные evidence_id: "
                 + ", ".join([*unknown_ids, *undisplayable_ids])
+            )
+        if (
+            require_used_evidence
+            and available_evidence_ids
+            and not output.used_evidence_ids
+        ):
+            raise CoordinatorResponseError(
+                "Data-backed SQL-risk answer обязан сослаться хотя бы на "
+                "один доступный used_evidence_id."
             )
         return output
 
@@ -1982,6 +2175,7 @@ def build_coordinator_graph(
         )
         available_evidence_ids: set[str] = set()
         available_display_refs: Dict[str, str] = {}
+        accepted_artifacts: List[EvidenceArtifact] = []
         evidence_payload: List[Dict[str, Any]] = []
         worker_outcomes: List[Dict[str, Any]] = []
         for run in state["worker_runs"]:
@@ -2009,6 +2203,7 @@ def build_coordinator_graph(
                         + artifact.evidence_id
                     )
                 available_evidence_ids.add(artifact.evidence_id)
+                accepted_artifacts.append(artifact)
                 if artifact.display_ref is not None:
                     available_display_refs[
                         artifact.evidence_id
@@ -2018,6 +2213,60 @@ def build_coordinator_graph(
             "worker_outcomes": worker_outcomes,
             "evidence": evidence_payload,
         }
+        cardinality_sufficient_evidence_ids: List[str] = []
+        if (
+            selected_operation_skills == ["Анализ SQL-рисков"]
+            and selected_sql_risk_aspects == ["cardinality"]
+        ):
+            saved_store = get_active_saved_result_store()
+            if saved_store is not None:
+                cardinality_sufficient_evidence_ids = (
+                    complete_cardinality_mapping_evidence_ids(
+                        state["task"],
+                        accepted_artifacts,
+                        saved_store,
+                    )
+                )
+        value_change_facts: List[FieldValueChangeFact] = []
+        if "value_changes" in selected_sql_risk_aspects:
+            saved_store = get_active_saved_result_store()
+            if saved_store is not None:
+                value_change_facts = derive_field_value_change_facts(
+                    state["task"],
+                    accepted_artifacts,
+                    saved_store,
+                )
+            if value_change_facts:
+                deterministic_sql_risk = field_value_change_payload(
+                    value_change_facts
+                )
+                upstream_payload["deterministic_sql_risk"] = (
+                    deterministic_sql_risk
+                )
+                record_sql_risk_facts(
+                    deterministic_sql_risk,
+                    cycle=state["cycle"],
+                )
+        write_semantics_facts: List[WriteSemanticsFact] = []
+        if "write_semantics" in selected_sql_risk_aspects:
+            saved_store = get_active_saved_result_store()
+            if saved_store is not None:
+                write_semantics_facts = derive_write_semantics_facts(
+                    state["task"],
+                    accepted_artifacts,
+                    saved_store,
+                )
+            if write_semantics_facts:
+                deterministic_write_semantics = write_semantics_payload(
+                    write_semantics_facts
+                )
+                upstream_payload["deterministic_write_semantics"] = (
+                    deterministic_write_semantics
+                )
+                record_sql_risk_facts(
+                    deterministic_write_semantics,
+                    cycle=state["cycle"],
+                )
         decision_messages: List[BaseMessage] = [
             SystemMessage(
                 content="\n\n".join(
@@ -2098,6 +2347,10 @@ def build_coordinator_graph(
         def invoke_answer(
             messages: Sequence[BaseMessage],
         ) -> tuple[Any, UpstreamOutput]:
+            require_used_evidence = bool(
+                available_evidence_ids
+                and "Анализ SQL-рисков" in selected_operation_skills
+            )
             result = invoke(
                 upstream_answer_model,
                 messages,
@@ -2108,6 +2361,7 @@ def build_coordinator_graph(
                     result,
                     available_evidence_ids=available_evidence_ids,
                     available_display_refs=available_display_refs,
+                    require_used_evidence=require_used_evidence,
                 )
             except CoordinatorResponseError as first_error:
                 logger.warning(
@@ -2131,6 +2385,7 @@ def build_coordinator_graph(
                     result,
                     available_evidence_ids=available_evidence_ids,
                     available_display_refs=available_display_refs,
+                    require_used_evidence=require_used_evidence,
                 )
             return result, output
 
@@ -2155,12 +2410,117 @@ def build_coordinator_graph(
                 "selected_display_refs": [],
             }
 
+        terminal_write_semantics_answer = ""
+        if (
+            selected_operation_skills == ["Анализ SQL-рисков"]
+            and selected_sql_risk_aspects == ["write_semantics"]
+            and len(write_semantics_facts) == 1
+            and is_exclusive_write_semantics_request(state["task"])
+        ):
+            terminal_write_semantics_answer = (
+                render_terminal_write_semantics_negative(
+                    write_semantics_facts
+                ).strip()
+            )
+
         _, decision = invoke_decision(decision_messages)
-        if decision.decision == "reroute":
+        ignored_cardinality_reroute = bool(
+            decision.decision == "reroute"
+            and cardinality_sufficient_evidence_ids
+        )
+        if decision.decision == "reroute" and not (
+            terminal_write_semantics_answer or ignored_cardinality_reroute
+        ):
             return data_request_update(decision.problem)
 
+        if ignored_cardinality_reroute:
+            logger.info(
+                "Ignoring redundant upstream reroute because a complete "
+                "exact directed mapping is sufficient for the conditional "
+                "cardinality answer: evidence_ids=%s problem=%s",
+                cardinality_sufficient_evidence_ids,
+                decision.problem,
+            )
+
+        if terminal_write_semantics_answer:
+            if decision.decision == "reroute":
+                logger.info(
+                    "Ignoring redundant upstream reroute because exact "
+                    "write-semantics evidence proves terminal negative: %s",
+                    decision.problem,
+                )
+            used_evidence_ids = list(
+                dict.fromkeys(
+                    evidence_id
+                    for fact in write_semantics_facts
+                    for evidence_id in fact.evidence_ids
+                    if evidence_id in available_evidence_ids
+                )
+            )
+            evidence = UpstreamOutput(
+                answer=terminal_write_semantics_answer,
+                used_evidence_ids=used_evidence_ids,
+                display_evidence_ids=[],
+            )
+            upstream_output = evidence.model_dump()
+            record_upstream_output(
+                {
+                    **upstream_output,
+                    "answer_source": "deterministic_write_semantics",
+                }
+            )
+            logger.info(
+                "Deterministic write-semantics result: %s",
+                json.dumps(upstream_output, ensure_ascii=False)[:8000],
+            )
+            return {
+                "upstream_output": upstream_output,
+                "final_answer": evidence.answer,
+                "selected_display_refs": [],
+            }
+
+        if (
+            selected_operation_skills == ["Анализ SQL-рисков"]
+            and selected_sql_risk_aspects == ["value_changes"]
+            and value_change_facts
+            and is_exclusive_value_change_request(state["task"])
+        ):
+            deterministic_answer = render_field_value_change_answer(
+                value_change_facts
+            ).strip()
+            if deterministic_answer:
+                used_evidence_ids = list(
+                    dict.fromkeys(
+                        evidence_id
+                        for fact in value_change_facts
+                        for evidence_id in fact.evidence_ids
+                        if evidence_id in available_evidence_ids
+                    )
+                )
+                evidence = UpstreamOutput(
+                    answer=deterministic_answer,
+                    used_evidence_ids=used_evidence_ids,
+                    display_evidence_ids=[],
+                )
+                upstream_output = evidence.model_dump()
+                record_upstream_output(
+                    {
+                        **upstream_output,
+                        "answer_source": "deterministic_value_changes",
+                    }
+                )
+                logger.info(
+                    "Deterministic field value-change result: %s",
+                    json.dumps(upstream_output, ensure_ascii=False)[:8000],
+                )
+                return {
+                    "upstream_output": upstream_output,
+                    "final_answer": evidence.answer,
+                    "selected_display_refs": [],
+                }
+
         answer_payload = dict(upstream_payload)
-        if decision.problem:
+        if decision.problem and not ignored_cardinality_reroute:
             answer_payload["data_problem"] = decision.problem
         answer_messages: List[BaseMessage] = [
             SystemMessage(
@@ -2185,7 +2545,9 @@ def build_coordinator_graph(
             available_display_refs[evidence_id]
             for evidence_id in evidence.display_evidence_ids
         ]
-        record_upstream_output(upstream_output)
+        record_upstream_output(
+            {**upstream_output, "answer_source": "model"}
+        )
         logger.info(
             "Upstream coordinator result: %s",
             json.dumps(upstream_output, ensure_ascii=False)[:8000],

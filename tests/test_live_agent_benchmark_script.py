@@ -32,6 +32,9 @@ tool_errors: 0
 reroutes: 0
 pipelines: agentic
 tools: run_sql
+judge_model: GigaChat-2-Max
+judge_calls: attempts=3, completed=2, errors=1
+judge_tokens: input=300, output=30, total=330, cache_read=0
 
 ### Ответ — HTTP 500
 agent_seconds: 2.750
@@ -44,6 +47,9 @@ tool_errors: 1
 reroutes: 2
 pipelines: validation_protocol, agentic
 tools: run_sql, run_cypher
+judge_model: GigaChat-2-Max
+judge_calls: attempts=1, completed=1, errors=0
+judge_tokens: input=150, output=15, total=165, cache_read=5
 <!-- LIVE_WARNING {"category":"presentation","scenario":"test_live_agent_path","message":"missing display"} -->
 <!-- LIVE_WARNING {"category":"efficiency","scenario":"test_live_agent_path","message":"llm_calls=14 exceeds budget=12"} -->
 <!-- LIVE_SEMANTIC {"scenario":"test_live_agent_path","status":"not_evaluated"} -->
@@ -71,6 +77,14 @@ tools: run_sql, run_cypher
     assert result.output_tokens == 50
     assert result.total_tokens == 350
     assert result.cache_read_tokens == 25
+    assert result.judge_models == {"GigaChat-2-Max": 2}
+    assert result.judge_attempts == 4
+    assert result.judge_completed == 3
+    assert result.judge_errors == 1
+    assert result.judge_input_tokens == 450
+    assert result.judge_output_tokens == 45
+    assert result.judge_total_tokens == 495
+    assert result.judge_cache_read_tokens == 5
     assert result.stage_usage == {
         "supervisor": {
             "calls": 2,
@@ -165,6 +179,14 @@ def test_benchmark_report_marks_semantics_as_not_evaluated(tmp_path):
                 "elapsed_seconds": 1.25,
             }
         },
+        judge_models={"GigaChat-2-Max": 1},
+        judge_attempts=3,
+        judge_completed=2,
+        judge_errors=1,
+        judge_input_tokens=200,
+        judge_output_tokens=30,
+        judge_total_tokens=230,
+        judge_cache_read_tokens=5,
     )
 
     _comparison_report(
@@ -188,6 +210,12 @@ def test_benchmark_report_marks_semantics_as_not_evaluated(tmp_path):
     assert "Reroutes" in text
     assert "Tool errors" in text
     assert "Reader calls" in text
+    assert "Judge attempts" in text
+    assert "Judge errors" in text
+    assert "Judge tokens" in text
+    assert "## Расход LLM-as-judge" in text
+    assert "GigaChat-2-Max×1" in text
+    assert "| multiagent | GigaChat-2-Max×1 | 3 | 2 | 1 | 200 | 30 | 230 | 5 |" in text
     assert "agentic×1" in text
     assert "100.0%" in text
     assert "| multiagent | upstream | 2 | 0 | 100 | 20 | 120 | 10 | 1.250 |" in text

@@ -422,8 +422,19 @@ def _candidate_universe(
             name_field="filename",
         )
     assert request.role in {"source", "target"}
+    rows = _table_rows(request.role)
+    if request.file_id is not None:
+        # Exact canonical S2T verification intentionally remains global.  A
+        # file scope applies only after exact bypass, when fuzzy/partial and
+        # semantic mentions must not be resolved against another upload.
+        rows = [
+            row
+            for row in rows
+            if row.get("file_id") is not None
+            and int(row["file_id"]) == request.file_id
+        ]
     return _aggregate_candidates(
-        _table_rows(request.role),
+        rows,
         entity_type="table",
         role=request.role,
         method="none",

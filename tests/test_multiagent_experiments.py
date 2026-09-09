@@ -11,6 +11,12 @@ from scripts.run_live_agent_benchmark import ModeResult
 def test_experiment_matrix_covers_e1_to_e5_and_required_signals():
     assert set(experiments.EXPERIMENTS) == {"E1", "E2", "E3", "E4", "E5"}
     assert len(experiments.EXPERIMENTS["E1"].variants) == 3
+    assert set(experiments.EXPERIMENTS["E1"].scenarios) == {
+        "test_live_agent_runs_dependent_workers_sequentially",
+        "test_live_agent_catalog_13_finds_join_condition",
+        "test_live_agent_resolves_table_typo_before_exact_reader",
+        "test_live_agent_batches_all_semantic_candidates_into_s2t_search",
+    }
     assert len(experiments.EXPERIMENTS["E2"].variants) == 2
     assert set(experiments.EXPERIMENTS["E2"].scenarios) == {
         "test_live_agent_checks_row_loss_risk",

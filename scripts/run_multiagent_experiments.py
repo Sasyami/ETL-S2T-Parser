@@ -84,8 +84,8 @@ EXPERIMENTS: dict[str, ExperimentSpec] = {
         scenarios=(
             "test_live_agent_runs_dependent_workers_sequentially",
             "test_live_agent_catalog_13_finds_join_condition",
-            "test_live_agent_catalog_23_performs_impact_analysis",
             "test_live_agent_resolves_table_typo_before_exact_reader",
+            "test_live_agent_batches_all_semantic_candidates_into_s2t_search",
         ),
         variants=(
             ExperimentVariant(

@@ -728,6 +728,27 @@ def test_chat_tool_router_separates_current_task_from_previous_results():
     assert "result_previous" not in payload["current_task"]
 
 
+def test_chat_tool_router_discards_legacy_stable_context_suffix():
+    model = _ToolRouterModel(
+        ToolRoute(tools=["list_files"], skills=[], schemas=[])
+    )
+    leaked_context = "RAW_CONVERSATION_CONTEXT_MUST_NOT_REACH_ROUTER"
+
+    route = _select_chat_route(
+        "Покажи файлы."
+        "\n\nУстойчивые правила контекста:\n"
+        + leaked_context,
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["list_files"]
+    payload = json.loads(model.messages[-1].content)
+    assert payload["current_task"] == "Покажи файлы."
+    assert "stable_context" not in payload
+    assert leaked_context not in json.dumps(payload, ensure_ascii=False)
+
+
 def test_chat_tool_rerouter_repairs_unchanged_palette_by_adding_tool():
     model = _SequenceToolRouterModel(
         [

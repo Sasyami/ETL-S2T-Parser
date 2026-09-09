@@ -265,6 +265,46 @@ def test_compiler_builds_independent_protocol_for_each_target():
     assert 'FROM "second_target"' in answer
 
 
+def test_compiler_marks_virtual_lineage_target_unavailable_without_sql():
+    virtual_target = "mart.result::cte::src"
+    contract = TestProtocolContract(
+        loads=[
+            TestProtocolLoad(
+                sources=["source_entity"],
+                target=virtual_target,
+                checks=["row_count"],
+            )
+        ],
+    )
+
+    protocol = compile_test_protocol(
+        contract,
+        reader_results=_reader_results(target_table=virtual_target),
+    )
+
+    assert protocol.status == "unavailable"
+    target = protocol.targets[0]
+    assert target.status == "unavailable"
+    assert target.target_table == virtual_target
+    assert target.checks[0].status == "unavailable"
+    assert target.checks[0].missing_dependencies == ["target_relation"]
+    assert target.checks[0].sql_template.startswith(
+        "-- SQL-шаблон не сформирован:"
+    )
+    assert "::" not in target.checks[0].sql_template
+    assert any(
+        item.kind == "target_relation_addressable"
+        and item.status == "unavailable"
+        and "виртуальным lineage scope" in item.conclusion
+        for item in target.preflight
+    )
+    assert any(
+        issue.code == "unavailable_check"
+        and issue.check == "row_count"
+        for issue in protocol.issues
+    )
+
+
 def test_compiler_rejects_expression_as_full_query():
     contract = TestProtocolContract(
         file_id=7,

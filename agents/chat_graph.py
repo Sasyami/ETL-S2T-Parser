@@ -49,7 +49,6 @@ from .contracts import (
     WorkerCapability,
     WorkerStopReason,
     WORKER_PREVIOUS_RESULTS_MARKER,
-    WORKER_STABLE_CONTEXT_MARKER,
     parse_worker_request,
 )
 from .observability import get_callback_handler, langfuse_trace_context
@@ -72,7 +71,12 @@ DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS = 6000
 _FINISH_WORKER_TOOL_NAME = "finish_worker"
 _ANALYZE_KNOWN_FACTS_TOOL_NAME = "analyze_known_facts"
 _SELECT_WORKER_TOOL_NAME = "select_worker_tool"
+_READ_PREVIOUS_RESULT_TOOL_NAME = "read_previous_result"
+_SEARCH_S2T_TRANSFORMATIONS_TOOL_NAME = "search_s2t_transformations"
 _OBSERVER_MAX_RETRIES = 5
+_NO_ACCEPTED_DATA_RESULT_GAP = (
+    "Worker завершил task без принятого data-tool результата."
+)
 _PROVIDER_TOOL_ARGUMENT_MARKERS = (
     "!#native",
     "!#/native",
@@ -271,6 +275,17 @@ task либо подтверждённых tool results.
 
 Отброшенные calls:
 {invalid_calls}
+""".strip()
+
+_CANDIDATE_BATCH_REPAIR_PROMPT = """
+Предыдущий native call отброшен до исполнения: semantic
+CandidateSet нельзя проверять по одному кандидату или неполным
+набором. Сначала заверши `read_previous_result`, затем вызови ровно один
+`search_s2t_transformations`: опусти `needle` и передай в `needles`
+все различающиеся технические имена CandidateSet одним batch-вызовом.
+
+Причина отклонения: {validation_error}
+Обязательные технические имена: {candidate_names}
 """.strip()
 
 _OBSERVER_REPAIR_PROMPT = """
@@ -1011,6 +1026,171 @@ def _tool_message_has_error(message: ToolMessage) -> bool:
     return isinstance(payload, dict) and bool(payload.get("error"))
 
 
+def _decoded_tool_payload(content: Any) -> Any:
+    """Decode one retained result without expanding or rewriting its rows."""
+    from .tools.saved_results import _decode_tool_content
+
+    decoded = _decode_tool_content(content)
+    return decoded if decoded is not None else content
+
+
+def _candidate_sets_in_payload(value: Any) -> List[Mapping[str, Any]]:
+    """Find typed CandidateSet envelopes in a single lazy-read payload."""
+    found: List[Mapping[str, Any]] = []
+    if isinstance(value, Mapping):
+        candidate_set = value.get("candidate_set")
+        if isinstance(candidate_set, Mapping) and isinstance(
+            candidate_set.get("candidates"),
+            list,
+        ):
+            found.append(candidate_set)
+        for key, nested in value.items():
+            if key != "candidate_set":
+                found.extend(_candidate_sets_in_payload(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            found.extend(_candidate_sets_in_payload(nested))
+    return found
+
+
+def _technical_candidate_names(value: Any) -> List[str]:
+    """Return all distinct S2T-relevant names from semantic CandidateSets."""
+    names: Dict[str, str] = {}
+    for candidate_set in _candidate_sets_in_payload(value):
+        for candidate in candidate_set.get("candidates", []):
+            if not isinstance(candidate, Mapping):
+                continue
+            scope = str(candidate.get("scope") or "").strip()
+            if scope in {"source_columns", "target_columns"}:
+                raw_name = candidate.get("column_name") or candidate.get("name")
+            elif scope in {"source_tables", "target_tables"}:
+                raw_name = candidate.get("table_name") or candidate.get("name")
+            else:
+                continue
+            name = str(raw_name or "").strip()
+            if name:
+                names.setdefault(name.casefold(), name)
+    return list(names.values())
+
+
+def _pending_semantic_candidate_names(
+    messages: Sequence[ToolMessage],
+) -> List[str]:
+    """Track semantic names read but not yet covered by one prior batch."""
+    pending: Dict[str, str] = {}
+    for message in messages:
+        if _tool_message_has_error(message):
+            continue
+        payload = _decoded_tool_payload(message.content)
+        if str(message.name or "") == _READ_PREVIOUS_RESULT_TOOL_NAME:
+            for name in _technical_candidate_names(payload):
+                pending.setdefault(name.casefold(), name)
+            continue
+        if (
+            str(message.name or "")
+            != _SEARCH_S2T_TRANSFORMATIONS_TOOL_NAME
+            or not pending
+            or not isinstance(payload, Mapping)
+        ):
+            continue
+        raw_queries = payload.get("queries")
+        if isinstance(raw_queries, list):
+            queries = raw_queries
+        elif payload.get("query") is not None:
+            queries = [payload.get("query")]
+        else:
+            queries = []
+        covered = {
+            str(item or "").strip().casefold()
+            for item in queries
+            if str(item or "").strip()
+        }
+        if set(pending) <= covered:
+            pending.clear()
+    return list(pending.values())
+
+
+def _prospective_semantic_candidate_names(
+    tool_calls: Sequence[Mapping[str, Any]],
+) -> List[str]:
+    """Inspect referenced run-scoped results to reject parallel read/search."""
+    read_calls = [
+        call
+        for call in tool_calls
+        if str(call.get("name") or "") == _READ_PREVIOUS_RESULT_TOOL_NAME
+    ]
+    if not read_calls:
+        return []
+    from .tools.saved_results import get_active_saved_result_store
+
+    store = get_active_saved_result_store()
+    if store is None:
+        return []
+    names: Dict[str, str] = {}
+    for call in read_calls:
+        arguments = call.get("args") or {}
+        if not isinstance(arguments, Mapping):
+            continue
+        raw_ids = []
+        if arguments.get("result_id") is not None:
+            raw_ids.append(arguments.get("result_id"))
+        if isinstance(arguments.get("result_ids"), list):
+            raw_ids.extend(arguments["result_ids"])
+        for result_id in dict.fromkeys(
+            str(item or "").strip() for item in raw_ids if str(item or "").strip()
+        ):
+            for name in _technical_candidate_names(
+                store.read_previous_result(result_id)
+            ):
+                names.setdefault(name.casefold(), name)
+    return list(names.values())
+
+
+def _semantic_candidate_batch_error(
+    tool_calls: Sequence[Mapping[str, Any]],
+    pending_names: Sequence[str],
+) -> Optional[str]:
+    """Validate one lossless CandidateSet -> S2T batch transition."""
+    search_calls = [
+        call
+        for call in tool_calls
+        if str(call.get("name") or "")
+        == _SEARCH_S2T_TRANSFORMATIONS_TOOL_NAME
+    ]
+    prospective_names = _prospective_semantic_candidate_names(tool_calls)
+    if prospective_names and search_calls:
+        return (
+            "read_previous_result и зависимый S2T search "
+            "нельзя выполнять параллельно"
+        )
+    required: Dict[str, str] = {}
+    for name in pending_names:
+        clean_name = str(name or "").strip()
+        if clean_name:
+            required.setdefault(clean_name.casefold(), clean_name)
+    if not required or not search_calls:
+        return None
+    if len(search_calls) != 1:
+        return "требуется ровно один batch search call"
+    arguments = search_calls[0].get("args") or {}
+    if not isinstance(arguments, Mapping):
+        return "аргументы search call не являются object"
+    if str(arguments.get("needle") or "").strip():
+        return "одиночный needle не сохраняет CandidateSet"
+    raw_needles = arguments.get("needles")
+    if not isinstance(raw_needles, list):
+        return "отсутствует batch-список needles"
+    actual = {
+        str(item or "").strip().casefold()
+        for item in raw_needles
+        if str(item or "").strip()
+    }
+    missing = [required[key] for key in required if key not in actual]
+    if missing:
+        return "не переданы кандидаты: " + ", ".join(missing)
+    return None
+
+
 def _tool_result_truncated(message: ToolMessage) -> bool:
     content = message.content
     if isinstance(content, dict):
@@ -1427,6 +1607,77 @@ def build_agent_graph(
                 )
             reply = repaired_reply
 
+        pending_candidate_names = _pending_semantic_candidate_names(
+            list(retained_tool_results.values())
+        )
+        candidate_batch_error = _semantic_candidate_batch_error(
+            reply.tool_calls,
+            pending_candidate_names,
+        )
+        if candidate_batch_error:
+            expected_candidate_names = list(
+                dict.fromkeys(
+                    [
+                        *pending_candidate_names,
+                        *_prospective_semantic_candidate_names(
+                            reply.tool_calls
+                        ),
+                    ]
+                )
+            )
+            logger.warning(
+                "Worker planner returned an incomplete semantic candidate "
+                "batch; discarding calls before execution: %s",
+                candidate_batch_error,
+            )
+            repaired_reply = invoke_with_fallback(
+                selected_model,
+                [
+                    *planner_messages,
+                    HumanMessage(
+                        content=_CANDIDATE_BATCH_REPAIR_PROMPT.format(
+                            validation_error=candidate_batch_error,
+                            candidate_names=json.dumps(
+                                expected_candidate_names,
+                                ensure_ascii=False,
+                            )[:6000],
+                        )
+                    ),
+                ],
+                stage=planner_stage,
+                fallback_model=selected_fallback,
+            )
+            if not isinstance(repaired_reply, AIMessage):
+                repaired_reply = AIMessage(
+                    content=_message_content_text(repaired_reply)
+                )
+            repaired_batch_error = _semantic_candidate_batch_error(
+                repaired_reply.tool_calls,
+                pending_candidate_names,
+            )
+            repaired_continue_finish = bool(
+                must_continue
+                and any(
+                    call.get("name") == _FINISH_WORKER_TOOL_NAME
+                    for call in repaired_reply.tool_calls
+                )
+            )
+            if (
+                not repaired_reply.tool_calls
+                or repaired_continue_finish
+                or repaired_batch_error
+                or _tool_calls_with_provider_markup(
+                    repaired_reply.tool_calls
+                )
+            ):
+                repaired_reply = AIMessage(
+                    content=(
+                        "Worker planner после repair снова нарушил "
+                        "CandidateSet batch contract."
+                    )
+                )
+            reply = repaired_reply
+
         if finish_only and worker_finish and reply.tool_calls and not any(
             call.get("name") == _FINISH_WORKER_TOOL_NAME
             for call in reply.tool_calls
@@ -1483,6 +1734,18 @@ def build_agent_graph(
         last_message = state["messages"][-1]
         if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
             raise RuntimeError("ToolNode вызван без AIMessage.tool_calls.")
+
+        candidate_batch_error = _semantic_candidate_batch_error(
+            last_message.tool_calls,
+            _pending_semantic_candidate_names(
+                list(retained_tool_results.values())
+            ),
+        )
+        if candidate_batch_error:
+            raise WorkerResponseError(
+                "CandidateSet batch contract rejected tool execution: "
+                + candidate_batch_error
+            )
 
         logger.info(
             "Executing tool step %s: %s",
@@ -2045,10 +2308,6 @@ def run_worker_graph(
 
     request_parts = parse_worker_request(raw_task)
     clean_task = request_parts.current_task
-    if request_parts.stable_context:
-        clean_task += (
-            WORKER_STABLE_CONTEXT_MARKER + request_parts.stable_context
-        )
     if request_parts.previous_results is not None:
         clean_task += (
             WORKER_PREVIOUS_RESULTS_MARKER
@@ -2244,6 +2503,42 @@ def run_worker_graph(
         else None
     )
     answer = payload.summary
+
+    # ``finish_worker`` remains available before a data call so the model can
+    # terminate honestly when it has no usable input.  That termination must
+    # not, however, cross the public boundary as a successful worker.  The
+    # internal ``analyze_known_facts`` cycle is the one deliberate exception:
+    # it is observed and may complete tasks whose facts are already literal in
+    # the worker task, while a bare finish carries a typed no-results gap.
+    has_observed_known_facts = any(
+        message.name == _ANALYZE_KNOWN_FACTS_TOOL_NAME
+        and not _tool_message_has_error(message)
+        for message in raw_tool_results.values()
+    )
+    has_attempted_data_tool = any(
+        message.name != _ANALYZE_KNOWN_FACTS_TOOL_NAME
+        for message in raw_tool_results.values()
+    )
+    if (
+        not accepted_tool_call_ids
+        and not has_observed_known_facts
+        and not has_attempted_data_tool
+    ):
+        logger.info(
+            "Worker finished without an accepted data-tool result; "
+            "returning typed no_results"
+        )
+        return WorkerRunResult(
+            answer=answer,
+            display_items=display_items,
+            cycle_history=list(final_state.get("cycle_history") or []),
+            status="complete",
+            gap=_NO_ACCEPTED_DATA_RESULT_GAP,
+            stop_reason="no_results",
+            unmet_requirements=[_NO_ACCEPTED_DATA_RESULT_GAP],
+            facts=[],
+            accepted_tool_call_ids=[],
+        )
 
     logger.info(
         "Worker final response (%d chars), display tools=%s",
