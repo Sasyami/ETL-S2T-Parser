@@ -383,46 +383,51 @@ def _record_live_exchange(
 
         judge_model_name = get_judge_model_name()
         judge_telemetry["model"] = judge_model_name
-        if status_code != 200:
-            semantic_status = "failed"
-            semantic_reason = f"Технический HTTP {status_code} не решил задачу."
-        else:
-            telemetry_callback = _JudgeTelemetryCallback()
-            try:
-                from agents.semantic_judge import judge_agent_response
+        telemetry_callback = _JudgeTelemetryCallback()
+        try:
+            from agents.semantic_judge import judge_agent_response
 
-                judge_model = create_judge_chat_model(timeout=180)
-                judge_model.callbacks = [telemetry_callback]
-                verdict = judge_agent_response(
-                    query=query,
-                    answer=answer,
-                    history=history or [],
-                    display_items=(
-                        payload.get("display_items", [])
-                        if isinstance(payload, dict)
-                        else []
-                    ),
-                    model=judge_model,
-                )
-                semantic_status = verdict.status
-                semantic_reason = verdict.reason
-            except Exception as exc:
-                semantic_status = "judge_error"
-                semantic_reason = (
-                    "LLM-as-judge завершился технической ошибкой: "
-                    f"{type(exc).__name__}."
-                )
-            finally:
-                judge_telemetry = telemetry_callback.snapshot(
-                    model=judge_model_name,
-                )
+            judge_model = create_judge_chat_model(timeout=180)
+            judge_model.callbacks = [telemetry_callback]
+            verdict = judge_agent_response(
+                query=query,
+                answer=answer,
+                history=history or [],
+                display_items=(
+                    payload.get("display_items", [])
+                    if isinstance(payload, dict)
+                    else []
+                ),
+                model=judge_model,
+            )
+            semantic_status = verdict.status
+            semantic_reason = verdict.reason
+        except Exception as exc:
+            semantic_status = "judge_error"
+            semantic_reason = (
+                "LLM-as-judge завершился технической ошибкой: "
+                f"{type(exc).__name__}."
+            )
+        finally:
+            judge_telemetry = telemetry_callback.snapshot(
+                model=judge_model_name,
+            )
+
+        if status_code != 200 and semantic_status in {"passed", "failed"}:
+            judge_status = semantic_status
+            judge_reason = semantic_reason
+            semantic_status = "failed"
+            semantic_reason = (
+                f"Технический HTTP {status_code} не решил задачу. "
+                f"LLM-as-judge: {judge_status}: {judge_reason}"
+            )
     if not LIVE_TRANSCRIPT_PATH:
         return (
             {
                 "status": semantic_status,
                 "reason": semantic_reason,
             }
-            if LIVE_AGENT_LLM_JUDGE and status_code == 200
+            if LIVE_AGENT_LLM_JUDGE
             else None
         )
     transcript_path = Path(LIVE_TRANSCRIPT_PATH)
@@ -574,7 +579,7 @@ def _record_live_exchange(
             "status": semantic_status,
             "reason": semantic_reason,
         }
-        if LIVE_AGENT_LLM_JUDGE and status_code == 200
+        if LIVE_AGENT_LLM_JUDGE
         else None
     )
 
