@@ -418,7 +418,7 @@ JUnit и сводный Markdown-отчёт.
 | Эксперимент | Что сравнивается | Управляющие flags/env |
 |---|---|---|
 | E1 | capability-based reroute и разделение selector/arguments | `WORKER_CAPABILITY_REROUTE_EXPERIMENT`, `WORKER_SPLIT_TOOL_CALL_EXPERIMENT` |
-| E2 | typed SQL-risk aspects | `OPERATION_SQL_RISK_ASPECTS_EXPERIMENT` |
+| E2 | выбор SQL-risk аспектов | `OPERATION_SQL_RISK_ASPECTS_EXPERIMENT` |
 | E3 | modes, preflight, 13 checks, expressions, keys и phases | текущий deterministic compiler |
 | E4 | минимальные dependency-based readers | текущий dependency planner |
 | E5 | единый entity resolver для validation и agentic flows | текущий shared resolver |

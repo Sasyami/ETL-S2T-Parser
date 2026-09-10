@@ -101,6 +101,12 @@ def _assert_public_answer(answer: str) -> None:
         )
 
 
+def _require_live_semantic_judge() -> None:
+    """Keep semantic SQL-risk scenarios from passing without their oracle."""
+
+    assert LIVE_AGENT_LLM_JUDGE, "SQL-risk semantic scenarios require --llm-judge"
+
+
 def _display_payloads(result) -> list[dict]:
     payloads: list[dict] = []
     for item in result.display_items:
@@ -925,6 +931,8 @@ def _protocol_live_case(
     *,
     expression: bool = False,
     min_mapped_fields: int = 1,
+    require_join: bool = False,
+    require_filter: bool = False,
     require_target_catalog: bool = False,
     require_primary_key: bool = False,
     require_direct_selected_field: bool = False,
@@ -1015,6 +1023,10 @@ def _protocol_live_case(
     for candidate in rows:
         normalized = normalize_transformation(str(candidate[6]))
         if normalized.parse_status != "ok":
+            continue
+        if require_join and not normalized.joins:
+            continue
+        if require_filter and not normalized.filters:
             continue
         conn = db_storage.get_db_connection()
         try:
@@ -3187,36 +3199,9 @@ def test_live_agent_returns_full_neo4j_path_for_known_endpoints(
 
 @pytest.mark.live_validation
 def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
+    _require_live_semantic_judge()
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
-    )
-    source_not_null = int(
-        _fetch_one(
-            """
-            SELECT not_null
-            FROM source_columns
-            WHERE file_id = ?
-              AND table_name = ? COLLATE NOCASE
-              AND column_name = ? COLLATE NOCASE
-            ORDER BY id
-            LIMIT 1
-            """,
-            (file_id, source_table, source_field),
-        )[0]
-    )
-    target_not_null = int(
-        _fetch_one(
-            """
-            SELECT not_null
-            FROM target_columns
-            WHERE file_id = ?
-              AND table_name = ? COLLATE NOCASE
-              AND column_name = ? COLLATE NOCASE
-            ORDER BY id
-            LIMIT 1
-            """,
-            (file_id, target_table, target_field),
-        )[0]
     )
     exchange = _chat(
         live_chat_client,
@@ -3225,30 +3210,7 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
         f"{source_table}.{source_field} → {target_table}.{target_field}. Верни "
         "source_not_null=<0|1>, target_not_null=<0|1> и вывод.",
     )
-    result = exchange.result
-
-    _assert_public_answer(result.answer)
-    _assert_named_answer_value(
-        result.answer,
-        "source_not_null",
-        source_not_null,
-    )
-    _assert_named_answer_value(
-        result.answer,
-        "target_not_null",
-        target_not_null,
-    )
-    assert any(
-        marker in result.answer.casefold()
-        for marker in ("риск", "rejection", "отклон", "огранич")
-    ), result.answer
-    _assert_agentic_answer_uses_complete_evidence(exchange)
-    mapping_calls = _assert_exact_s2t_pair_was_read(
-        exchange,
-        source_table=source_table,
-        target_table=target_table,
-    )
-    _assert_exact_column_pair_was_read(
+    _assert_nullable_paraphrase(
         exchange,
         file_id=file_id,
         source_table=source_table,
@@ -3256,44 +3218,11 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
         target_table=target_table,
         target_field=target_field,
     )
-    if _typed_sql_risk_enabled():
-        assert len(mapping_calls) == 1, mapping_calls
-        pair_calls = [
-            item
-            for item in exchange.metrics.tool_calls
-            if item.name == "get_source_target_column_pair"
-        ]
-        assert len(pair_calls) == 1, exchange.metrics.tool_calls
-        assert not {
-            "list_column_metadata",
-            "list_source_column_catalog",
-            "list_target_column_catalog",
-        } & set(_tool_names(exchange)), exchange.metrics.tool_calls
-        from agents.sql_risk_scope_contract import (
-            sql_risk_scope_evidence_architecture,
-        )
-
-        if sql_risk_scope_evidence_architecture() == "typed_plan":
-            assert sorted(_tool_names(exchange)) == sorted(
-                [
-                    "read_s2t_source_to_target",
-                    "get_source_target_column_pair",
-                ]
-            ), exchange.metrics.tool_calls
-    _assert_s2t_work_case_execution(
-        exchange,
-        required_tools={"read_s2t_source_to_target"},
-        require_analysis=True,
-    )
-    _assert_sql_risk_aspect(
-        exchange,
-        "constraint_rejection",
-        expected_execution_mode="nullable_constraint",
-    )
 
 
 @pytest.mark.live_validation
 def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client):
+    _require_live_semantic_judge()
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
@@ -3338,16 +3267,6 @@ def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client
         "target_data_type",
         target_data_type,
     )
-    folded_answer = result.answer.casefold()
-    assert "несовместим" not in folded_answer, result.answer
-    assert "не совместим" not in folded_answer, result.answer
-    assert (
-        "совместим" in folded_answer
-        or (
-            "безопас" in folded_answer
-            and "расшир" in folded_answer
-        )
-    ), result.answer
     _assert_agentic_answer_uses_complete_evidence(exchange)
 
     exact_arguments = {
@@ -3388,16 +3307,23 @@ def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client
         required_tools={required_tool},
         require_analysis=True,
     )
-    _assert_sql_risk_aspect(
-        exchange,
-        "constraint_rejection",
-        expected_execution_mode="agentic",
-    )
+    assert exchange.metrics.coordinator_plan, exchange.metrics
+    assert all(
+        str(step.get("sql_risk_execution_mode") or "agentic") == "agentic"
+        and "plan_source" not in step
+        and "operation_sql_risk_scope_contract" not in step
+        for step in exchange.metrics.coordinator_plan
+    ), exchange.metrics.coordinator_plan
+    assert any(
+        item.stage == "downstream_plan"
+        for item in exchange.metrics.llm_calls
+    ), exchange.metrics.llm_calls
 
 
 @pytest.mark.live_validation
 def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
-    case = _protocol_live_case()
+    _require_live_semantic_judge()
+    case = _protocol_live_case(require_join=True)
     exchange = _chat(
         live_chat_client,
         f"Оцени риск появления дубликатов при сохранённой S2T-трансформации "
@@ -3423,6 +3349,7 @@ def _assert_cardinality_paraphrase(
 ) -> None:
     """Check semantics in both arms and typed facts in the candidate."""
 
+    assert LIVE_AGENT_LLM_JUDGE, "SQL-risk semantic scenarios require --llm-judge"
     _assert_agentic_answer_uses_complete_evidence(exchange)
     exact_calls = _assert_exact_s2t_pair_was_read(
         exchange,
@@ -3430,82 +3357,6 @@ def _assert_cardinality_paraphrase(
         target_table=case.target_table,
     )
     assert len(exact_calls) == 1, exact_calls
-
-    def compact(value: object) -> str:
-        return re.sub(r"[\s`\"]+", "", str(value or "").casefold())
-
-    answer = exchange.result.answer
-    folded_answer = answer.casefold()
-    assert re.search(
-        rf"`?{re.escape(case.source_table)}`?\s*(?:→|->|=>)\s*"
-        rf"`?{re.escape(case.target_table)}`?",
-        answer,
-        re.IGNORECASE,
-    ), answer
-    from agents.transformation_ast import normalize_transformation
-
-    normalized = normalize_transformation(case.transformation_rule)
-    assert normalized.parse_status == "ok" and normalized.joins, normalized
-    for join in normalized.joins:
-        assert compact(join.relation) in compact(answer), (join, answer)
-        assert compact(join.condition) in compact(answer), (join, answer)
-    assert re.search(
-        r"(?:уникальн\w*|uniqueness)[^.!?\n]{0,120}"
-        r"(?:неизвест|не подтвержд|не доказ|не установлен|unknown|not (?:established|"
-        r"confirmed|proven))|(?:неизвест|не подтвержд|не доказ|не установлен|unknown|"
-        r"not (?:established|confirmed|proven))[^.!?\n]{0,120}"
-        r"(?:уникальн\w*|uniqueness)",
-        folded_answer,
-    ), answer
-    assert re.search(
-        r"(?:дубликат\w*|duplicates?)[^.!?\n]{0,120}"
-        r"(?:не доказ|не подтвержд|не установлен|not (?:established|confirmed|proven))|"
-        r"(?:не доказ|не подтвержд|не установлен|not (?:established|confirmed|proven))"
-        r"[^.!?\n]{0,120}(?:дубликат\w*|duplicates?)",
-        folded_answer,
-    ), answer
-    answer_clauses = [
-        clause.strip()
-        for clause in re.split(r"\n+|(?<=[.!?])\s+", folded_answer)
-        if clause.strip()
-    ]
-    assert any(
-        "join" in clause
-        and re.search(
-            r"дубликат\w*|duplicates?|размнож\w*|fan[- ]?out|"
-            r"увелич\w*[^.!?\n]{0,24}строк|multiply\w*[^.!?\n]{0,24}rows",
-            clause,
-        )
-        for clause in answer_clauses
-    ), answer
-    for clause in answer_clauses:
-        if not (
-            ("where" in clause or "coalesce" in clause)
-            and re.search(r"уникальн\w*|uniqueness", clause)
-        ):
-            continue
-        assert not re.search(
-            r"услов\w*[^:]{0,32}уникальн\w*\s*:\s*"
-            r"(?:`?where|`?coalesce)",
-            clause,
-        ), clause
-        positive_proof = re.search(
-            r"(?:where|coalesce)[^.!?\n]{0,80}"
-            r"(?:доказы|подтвержд|обеспеч|гарантир)\w*[^.!?\n]{0,48}"
-            r"(?:уникальн\w*|uniqueness)|"
-            r"(?:where|coalesce)[^.!?\n]{0,80}"
-            r"(?:proves?|confirms?|ensures?|guarantees?)[^.!?\n]{0,48}"
-            r"uniqueness",
-            clause,
-        )
-        explicit_negation = re.search(
-            r"(?:не|нельзя)[^.!?\n]{0,24}"
-            r"(?:доказы|подтвержд|обеспеч|гарантир)|"
-            r"(?:does\s+not|cannot)[^.!?\n]{0,24}"
-            r"(?:prove|confirm|ensure|guarantee)",
-            clause,
-        )
-        assert not positive_proof or explicit_negation, clause
 
     from agents.sql_risk_scope_contract import (
         sql_risk_scope_evidence_architecture,
@@ -3545,6 +3396,33 @@ def _assert_cardinality_paraphrase(
         == "full_join_key_uniqueness_unknown"
         for join in joins
     ), joins
+    statement = sqlglot.parse_one(
+        case.transformation_rule,
+        read=GREENPLUM_DIALECT,
+    )
+    assert isinstance(statement, sqlglot.exp.Select), statement
+    parsed_joins = list(statement.args.get("joins") or [])
+    assert parsed_joins, statement
+    expected_joins = {
+        (
+            join.this.sql(dialect=GREENPLUM_DIALECT).casefold(),
+            join.args["on"].sql(dialect=GREENPLUM_DIALECT).casefold(),
+        )
+        for join in parsed_joins
+        if join.args.get("on") is not None
+    }
+    assert len(expected_joins) == len(parsed_joins), parsed_joins
+    actual_joins = {
+        (
+            str(join.get("relation") or "").casefold(),
+            str(join.get("predicate") or "").casefold(),
+        )
+        for join in joins
+    }
+    assert actual_joins == expected_joins, {
+        "expected": sorted(expected_joins),
+        "actual": sorted(actual_joins),
+    }
 
     upstream = exchange.metrics.upstream_output
     assert upstream is not None, exchange.metrics
@@ -3612,6 +3490,7 @@ def _assert_nullable_paraphrase(
     target_table: str,
     target_field: str,
 ) -> None:
+    assert LIVE_AGENT_LLM_JUDGE, "SQL-risk semantic scenarios require --llm-judge"
     source_not_null, target_not_null = _nullable_flags_for_case(
         file_id=file_id,
         source_table=source_table,
@@ -3620,16 +3499,6 @@ def _assert_nullable_paraphrase(
         target_field=target_field,
     )
     _assert_agentic_answer_uses_complete_evidence(exchange)
-    _assert_named_answer_value(
-        exchange.result.answer,
-        "source_not_null",
-        source_not_null,
-    )
-    _assert_named_answer_value(
-        exchange.result.answer,
-        "target_not_null",
-        target_not_null,
-    )
     _assert_exact_s2t_pair_was_read(
         exchange,
         source_table=source_table,
@@ -3644,13 +3513,6 @@ def _assert_nullable_paraphrase(
         target_field=target_field,
     )
 
-    answer = exchange.result.answer
-    assert f"{source_table}.{source_field}".casefold() in answer.casefold(), answer
-    assert f"{target_table}.{target_field}".casefold() in answer.casefold(), answer
-    assert any(
-        marker in answer.casefold()
-        for marker in ("риск", "rejection", "отклон", "огранич")
-    ), answer
     from agents.sql_risk_scope_contract import (
         sql_risk_scope_evidence_architecture,
     )
@@ -3713,7 +3575,8 @@ def _assert_nullable_paraphrase(
 
 @pytest.mark.live_validation
 def test_live_sql_risk_cardinality_paraphrase_scope_first(live_chat_client):
-    case = _protocol_live_case()
+    _require_live_semantic_judge()
+    case = _protocol_live_case(require_join=True)
     exchange = _chat(
         live_chat_client,
         f"По направлению {case.source_table} → {case.target_table} нужен "
@@ -3727,7 +3590,8 @@ def test_live_sql_risk_cardinality_paraphrase_scope_first(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_sql_risk_cardinality_paraphrase_english(live_chat_client):
-    case = _protocol_live_case()
+    _require_live_semantic_judge()
+    case = _protocol_live_case(require_join=True)
     exchange = _chat(
         live_chat_client,
         f"Using the stored S2T for {case.source_table} → "
@@ -3741,7 +3605,8 @@ def test_live_sql_risk_cardinality_paraphrase_english(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_sql_risk_cardinality_paraphrase_reordered(live_chat_client):
-    case = _protocol_live_case()
+    _require_live_semantic_judge()
+    case = _protocol_live_case(require_join=True)
     exchange = _chat(
         live_chat_client,
         "Реальные дубликаты заранее не утверждай. Для "
@@ -3755,6 +3620,7 @@ def test_live_sql_risk_cardinality_paraphrase_reordered(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_sql_risk_nullable_paraphrase_scope_first(live_chat_client):
+    _require_live_semantic_judge()
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
@@ -3779,6 +3645,7 @@ def test_live_sql_risk_nullable_paraphrase_scope_first(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_sql_risk_nullable_paraphrase_english(live_chat_client):
+    _require_live_semantic_judge()
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
@@ -3803,6 +3670,7 @@ def test_live_sql_risk_nullable_paraphrase_english(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_sql_risk_nullable_paraphrase_reordered(live_chat_client):
+    _require_live_semantic_judge()
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
@@ -3857,7 +3725,8 @@ def test_live_agent_checks_unmapped_required_target_fields(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_agent_checks_row_loss_risk(live_chat_client):
-    case = _protocol_live_case()
+    _require_live_semantic_judge()
+    case = _protocol_live_case(require_filter=True)
     exchange = _chat(
         live_chat_client,
         f"Оцени риск потери строк в сохранённой S2T-трансформации "
@@ -3873,32 +3742,10 @@ def test_live_agent_checks_row_loss_risk(live_chat_client):
         source_table=case.source_table,
         target_table=case.target_table,
     )
-    folded_answer = result.answer.casefold()
-    assert re.search(
-        rf"`?{re.escape(case.source_table)}`?\s*(?:→|->|=>)\s*"
-        rf"`?{re.escape(case.target_table)}`?",
-        result.answer,
-        re.IGNORECASE,
-    ), result.answer
     from agents.transformation_ast import normalize_transformation
 
     normalized = normalize_transformation(case.transformation_rule)
     assert normalized.parse_status == "ok" and normalized.filters, normalized
-    filter_columns = {
-        column.name.casefold()
-        for predicate in normalized.filters
-        for column in sqlglot.parse_one(
-            predicate,
-            read=GREENPLUM_DIALECT,
-        ).find_all(sqlglot.exp.Column)
-    }
-    assert filter_columns and filter_columns <= set(
-        re.findall(r"[a-z_][a-z0-9_$]*", folded_answer)
-    ), {"filter_columns": sorted(filter_columns), "answer": result.answer}
-    assert any(
-        marker in folded_answer
-        for marker in ("потер", "отсеч", "исключ", "фильтр", "риск")
-    ), result.answer
     if _typed_sql_risk_enabled():
         assert len(exact_calls) == 1, exact_calls
         assert _tool_names(exchange) == ["read_s2t_source_to_target"], (
@@ -3914,6 +3761,7 @@ def test_live_agent_checks_row_loss_risk(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_agent_checks_value_change_risk(live_chat_client):
+    _require_live_semantic_judge()
     case = _protocol_live_case(
         expression=True,
         min_mapped_fields=2,
@@ -3929,12 +3777,6 @@ def test_live_agent_checks_value_change_risk(live_chat_client):
     )
 
     _assert_public_answer(exchange.result.answer)
-    lowered_answer = exchange.result.answer.casefold()
-    assert f"{case.source_table}.{case.source_field}".casefold() in lowered_answer
-    assert f"{case.target_table}.{case.target_field}".casefold() in lowered_answer
-    assert not re.match(r"\s*(да\b|может\b)", lowered_answer), (
-        exchange.result.answer
-    )
     _assert_s2t_work_case_execution(
         exchange,
         required_tools=(
@@ -3994,6 +3836,7 @@ def test_live_agent_checks_value_change_risk(live_chat_client):
 
 @pytest.mark.live_validation
 def test_live_agent_checks_write_semantics_risk(live_chat_client):
+    _require_live_semantic_judge()
     _, target_table, source_table, _, _ = _s2t_work_case_fixture()
     exchange = _chat(
         live_chat_client,
@@ -4004,9 +3847,6 @@ def test_live_agent_checks_write_semantics_risk(live_chat_client):
     )
 
     _assert_public_answer(exchange.result.answer)
-    assert "не оцен" in exchange.result.answer.casefold(), (
-        exchange.result.answer
-    )
     _assert_s2t_work_case_execution(
         exchange,
         required_tools=(
