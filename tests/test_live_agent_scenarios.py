@@ -3356,7 +3356,6 @@ def _assert_cardinality_paraphrase(
         source_table=case.source_table,
         target_table=case.target_table,
     )
-    assert len(exact_calls) == 1, exact_calls
 
     from agents.sql_risk_scope_contract import (
         sql_risk_scope_evidence_architecture,
@@ -3370,6 +3369,7 @@ def _assert_cardinality_paraphrase(
         )
         return
 
+    assert len(exact_calls) == 1, exact_calls
     assert _tool_names(exchange) == ["read_s2t_source_to_target"], (
         exchange.metrics.tool_calls
     )
