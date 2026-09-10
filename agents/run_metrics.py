@@ -25,9 +25,14 @@ _ENTITY_RESOLUTION_REASON_CHARS = 600
 _SQL_RISK_FACT_LIMIT = 8
 _SQL_RISK_EXPRESSION_LIMIT = 4
 _SQL_RISK_EVIDENCE_LIMIT = 8
+_SQL_RISK_JOIN_LIMIT = 4
+_SQL_RISK_JOIN_KEY_LIMIT = 8
 _SQL_RISK_IDENTIFIER_CHARS = 200
 _SQL_RISK_EXPRESSION_CHARS = 300
 _SQL_RISK_EVIDENCE_ID_CHARS = 120
+_SQL_RISK_RELATION_CHARS = 240
+_SQL_RISK_PREDICATE_CHARS = 600
+_SQL_RISK_JOIN_KEY_CHARS = 240
 _SQL_RISK_CYCLE_LIMIT = 100
 _SQL_RISK_INTEGER_LIMIT = 2_147_483_647
 _UPSTREAM_ANSWER_SOURCE_CHARS = 120
@@ -851,6 +856,7 @@ def _sql_risk_fact_summary(value: Any) -> Optional[Dict[str, Any]]:
         "target_field",
         "conclusion",
         "mechanism",
+        "condition",
     ):
         if key in fact and fact[key] is not None:
             summary[key] = _clip(
@@ -896,6 +902,32 @@ def _sql_risk_fact_summary(value: Any) -> Optional[Dict[str, Any]]:
             _clip(item, max_chars=_SQL_RISK_EXPRESSION_CHARS)
             for item in list(expressions)[:_SQL_RISK_EXPRESSION_LIMIT]
         ]
+
+    joins = fact.get("joins")
+    if isinstance(joins, (list, tuple)):
+        join_summaries: List[Dict[str, Any]] = []
+        for raw_join in list(joins)[:_SQL_RISK_JOIN_LIMIT]:
+            join = _sql_risk_fact_mapping(raw_join)
+            if join is None:
+                continue
+            item: Dict[str, Any] = {}
+            for key, limit in (
+                ("join_type", _SQL_RISK_IDENTIFIER_CHARS),
+                ("relation", _SQL_RISK_RELATION_CHARS),
+                ("predicate", _SQL_RISK_PREDICATE_CHARS),
+                ("uniqueness_condition", _SQL_RISK_IDENTIFIER_CHARS),
+            ):
+                if key in join and join[key] is not None:
+                    item[key] = _clip(join[key], max_chars=limit)
+            equalities = join.get("join_key_equalities")
+            if isinstance(equalities, (list, tuple)):
+                item["join_key_equalities"] = [
+                    _clip(value, max_chars=_SQL_RISK_JOIN_KEY_CHARS)
+                    for value in list(equalities)[:_SQL_RISK_JOIN_KEY_LIMIT]
+                ]
+            if item:
+                join_summaries.append(item)
+        summary["joins"] = join_summaries
 
     evidence_ids = fact.get("evidence_ids")
     if isinstance(evidence_ids, (list, tuple)):

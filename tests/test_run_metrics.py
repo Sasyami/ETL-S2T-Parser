@@ -563,6 +563,71 @@ def test_sql_risk_metrics_preserve_bounded_constraint_fact(monkeypatch):
     ]
 
 
+def test_sql_risk_metrics_preserve_bounded_cardinality_join_fact(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    session_id = f"metrics-{uuid4()}"
+
+    with capture_agent_run(session_id):
+        record_sql_risk_facts(
+            {
+                "facts": [
+                    {
+                        "source_table": "src_alpha",
+                        "target_table": "tgt_beta",
+                        "conclusion": "conditional_duplicate_risk",
+                        "mechanism": "join_fanout",
+                        "condition": "full_join_key_uniqueness_unknown",
+                        "matching_rows": 2,
+                        "joins": [
+                            {
+                                "join_type": "JOIN",
+                                "relation": "aux_table AS d",
+                                "predicate": "d.id = s.id",
+                                "join_key_equalities": ["d.id = s.id"],
+                                "uniqueness_condition": (
+                                    "full_join_key_uniqueness_unknown"
+                                ),
+                                "raw_rows": ["must-not-leak"],
+                            }
+                        ],
+                        "evidence_ids": ["evidence-mapping"],
+                        "raw_rows": [{"secret": "must-not-leak"}],
+                    }
+                ]
+            },
+            cycle=2,
+        )
+
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    assert metrics.sql_risk_facts == [
+        {
+            "source_table": "src_alpha",
+            "target_table": "tgt_beta",
+            "conclusion": "conditional_duplicate_risk",
+            "mechanism": "join_fanout",
+            "condition": "full_join_key_uniqueness_unknown",
+            "matching_rows": 2,
+            "joins": [
+                {
+                    "join_type": "JOIN",
+                    "relation": "aux_table AS d",
+                    "predicate": "d.id = s.id",
+                    "uniqueness_condition": (
+                        "full_join_key_uniqueness_unknown"
+                    ),
+                    "join_key_equalities": ["d.id = s.id"],
+                }
+            ],
+            "evidence_ids": ["evidence-mapping"],
+            "cycle": 2,
+        }
+    ]
+    serialized = json.dumps(metrics.sql_risk_facts, ensure_ascii=False)
+    assert "raw_rows" not in serialized
+    assert "must-not-leak" not in serialized
+
+
 def test_run_metrics_are_disabled_by_default(monkeypatch):
     monkeypatch.delenv("AGENT_RUN_METRICS_ENABLED", raising=False)
     monkeypatch.delenv("RUN_LIVE_AGENT_SCENARIOS", raising=False)

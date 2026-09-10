@@ -3394,6 +3394,73 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
 
     normalized = normalize_transformation(case.transformation_rule)
     assert normalized.parse_status == "ok" and normalized.joins, normalized
+    answer_clauses = [
+        clause.strip().casefold()
+        for clause in re.split(
+            r"\n+|(?<=[.!?])\s+(?=[A-ZА-ЯЁ])",
+            result.answer,
+        )
+        if clause.strip()
+    ]
+    actual_join_clauses = [
+        clause for clause in answer_clauses if "фактический join" in clause
+    ]
+    assert actual_join_clauses, result.answer
+
+    def compact_sql_fragment(value: str) -> str:
+        return re.sub(r"[\s`\"]+", "", value.casefold())
+
+    for join in normalized.joins:
+        relation = compact_sql_fragment(join.relation)
+        predicate = compact_sql_fragment(join.condition)
+        assert any(
+            relation in compact_sql_fragment(clause)
+            and predicate in compact_sql_fragment(clause)
+            for clause in actual_join_clauses
+        ), {
+            "expected_join": join.model_dump(),
+            "actual_join_clauses": actual_join_clauses,
+            "answer": result.answer,
+        }
+    mechanism_clauses = [
+        clause
+        for clause in answer_clauses
+        if re.search(r"подтвержд\w*\s+механизм", clause)
+    ]
+    assert mechanism_clauses, result.answer
+    assert all("join" in clause for clause in mechanism_clauses), (
+        mechanism_clauses
+    )
+    assert all(
+        "where" not in clause and "coalesce" not in clause
+        for clause in mechanism_clauses
+    ), mechanism_clauses
+    uniqueness_clauses = [
+        clause
+        for clause in answer_clauses
+        if re.search(r"услов\w*[^.!?\n]{0,32}уникальн", clause)
+    ]
+    assert uniqueness_clauses, result.answer
+    assert any(
+        re.search(r"(?:неизвест|не подтвержд|не доказ)", clause)
+        for clause in uniqueness_clauses
+    ), uniqueness_clauses
+    assert not any(
+        re.search(
+            r"(?:услов\w*[^:]{0,32}уникальн\w*\s*:\s*"
+            r"(?:`?where|`?coalesce)|"
+            r"(?:where|coalesce)[^.!?\n]{0,64}"
+            r"(?:доказы|подтвержд|обеспеч|гарантир)\w*[^.!?\n]{0,32}"
+            r"уникальн)",
+            clause,
+        )
+        for clause in uniqueness_clauses
+    ), uniqueness_clauses
+    assert re.search(
+        r"дубликат\w*[^.!?\n]{0,100}(?:не доказ|не подтвержд)|"
+        r"(?:не доказ|не подтвержд)[^.!?\n]{0,100}дубликат\w*",
+        folded_answer,
+    ), result.answer
     join_columns = {
         column.name.casefold()
         for join in normalized.joins
@@ -3414,6 +3481,30 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
         assert _tool_names(exchange) == ["read_s2t_source_to_target"], (
             exchange.metrics.tool_calls
         )
+    from agents.sql_risk_scope_contract import (
+        sql_risk_scope_evidence_architecture,
+    )
+
+    if sql_risk_scope_evidence_architecture() == "typed_plan":
+        upstream = exchange.metrics.upstream_output
+        assert upstream is not None, exchange.metrics
+        assert upstream.get("answer_source") == "deterministic_cardinality", (
+            upstream
+        )
+        used_evidence_ids = list(upstream.get("used_evidence_ids") or [])
+        assert len(used_evidence_ids) == 1, upstream
+        assert list(upstream.get("display_evidence_ids") or []) == (
+            used_evidence_ids
+        ), upstream
+        assert exchange.metrics.display_tools == [
+            "read_s2t_source_to_target"
+        ], exchange.metrics.display_tools
+        assert all(
+            item.stage != "upstream"
+            for item in exchange.metrics.llm_calls
+        ), exchange.metrics.llm_calls
+        assert "where" not in folded_answer
+        assert "coalesce" not in folded_answer
     _assert_s2t_work_case_execution(
         exchange,
         required_tools={"read_s2t_source_to_target"},

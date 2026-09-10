@@ -4722,7 +4722,9 @@ def test_scope_evidence_contract_is_attached_only_to_first_matching_step(
     assert "operation_sql_risk_scope_contract" not in recorded_steps[1]
 
 
-def test_typed_scope_plan_synthesizes_one_exact_cardinality_worker(monkeypatch):
+def test_typed_scope_cardinality_renders_saved_join_without_upstream_llm(
+    monkeypatch,
+):
     from agents.coordinator import coordinator_chat
     from agents.sql_risk_scope_contract import (
         OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
@@ -4736,8 +4738,9 @@ def test_typed_scope_plan_synthesizes_one_exact_cardinality_worker(monkeypatch):
         "typed_plan",
     )
     original_task = (
-        "Оцени условный риск cardinality и появления дубликатов для "
-        "src_np → tgt_np по сохранённому S2T mapping."
+        "Оцени риск появления дубликатов при сохранённой S2T-трансформации "
+        "src_np → tgt_np. Назови фактический JOIN и явно отдели "
+        "подтверждённый механизм от условия по уникальности."
     )
     model = _CoordinatorModel(
         {
@@ -4752,28 +4755,9 @@ def test_typed_scope_plan_synthesizes_one_exact_cardinality_worker(monkeypatch):
                     "operation-cardinality",
                 )
             ],
-            "submit_upstream_data_decision": [
-                _tool_message(
-                    "submit_upstream_data_decision",
-                    {"decision": "pass"},
-                    "decision-cardinality",
-                )
-            ],
-            "submit_upstream_answer": [
-                _tool_message(
-                    "submit_upstream_answer",
-                    {
-                        "answer": (
-                            "Для src_np → tgt_np JOIN может размножить строки."
-                        ),
-                        "used_evidence_ids": ["evidence-cardinality"],
-                        "display_evidence_ids": [],
-                    },
-                    "answer-cardinality",
-                )
-            ],
         }
     )
+
     def worker_with_saved_mapping(_request, **_kwargs):
         store = get_active_saved_result_store()
         assert store is not None
@@ -4795,8 +4779,10 @@ def test_typed_scope_plan_synthesizes_one_exact_cardinality_worker(monkeypatch):
                         "target_table": "tgt_np",
                         "target_field": "id",
                         "transformation_rule": (
-                            "SELECT s.id FROM src_np AS s "
-                            "JOIN aux_np AS d ON d.id = s.id"
+                            "SELECT s.id AS id, "
+                            "COALESCE(s.value, d.value) AS value "
+                            "FROM src_np AS s JOIN aux_np AS d "
+                            "ON d.id = s.id WHERE s.ok = TRUE"
                         ),
                     }
                 ],
@@ -4809,7 +4795,7 @@ def test_typed_scope_plan_synthesizes_one_exact_cardinality_worker(monkeypatch):
             "Полный exact mapping прочитан.",
             evidence=[
                 _artifact(
-                    None,
+                    "display-cardinality",
                     "read_s2t_source_to_target",
                     "exact full mapping",
                     evidence_id="evidence-cardinality",
@@ -4832,13 +4818,31 @@ def test_typed_scope_plan_synthesizes_one_exact_cardinality_worker(monkeypatch):
             side_effect=worker_with_saved_mapping,
         ) as worker,
         patch("agents.coordinator.record_coordinator_plan") as record_plan,
+        patch("agents.coordinator.record_upstream_output") as record_output,
     ):
         result = coordinator_chat(original_task)
 
     assert "src_np → tgt_np" in result.answer
-    assert [name for name, _ in model.messages].count(
-        "submit_worker_plan"
-    ) == 0
+    folded_answer = result.answer.casefold()
+    assert "join" in folded_answer
+    assert "aux_np" in folded_answer
+    assert re.search(r"d\.id\s*=\s*s\.id", folded_answer), result.answer
+    assert re.search(
+        r"уникальн\w*[^.!?\n]{0,100}(?:неизвест|не подтвержд)",
+        folded_answer,
+    ), result.answer
+    assert "where" not in folded_answer
+    assert "coalesce" not in folded_answer
+    assert result.display_refs == ["display-cardinality"]
+    assert all(
+        name
+        not in {
+            "submit_worker_plan",
+            "submit_upstream_data_decision",
+            "submit_upstream_answer",
+        }
+        for name, _ in model.messages
+    )
     worker.assert_called_once()
     worker_request = worker.call_args.args[0]
     assert "src_np" in worker_request and "tgt_np" in worker_request
@@ -4866,6 +4870,12 @@ def test_typed_scope_plan_synthesizes_one_exact_cardinality_worker(monkeypatch):
             }
         ],
     }
+    recorded_output = record_output.call_args.args[0]
+    assert recorded_output["answer_source"] == "deterministic_cardinality"
+    assert recorded_output["used_evidence_ids"] == ["evidence-cardinality"]
+    assert recorded_output["display_evidence_ids"] == [
+        "evidence-cardinality"
+    ]
 
 
 def test_typed_scope_constraint_renders_saved_not_null_without_upstream_llm(

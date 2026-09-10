@@ -196,6 +196,15 @@ def test_factual_cardinality_request_stays_on_downstream_path():
     assert build_typed_sql_risk_worker_plan(task, contract) is None
 
 
+def test_cardinality_identifier_over_fact_bound_stays_on_downstream_path():
+    source = "s_" + "x" * 199
+    task = CARDINALITY_TASK.replace("raw_order_events_v2", source)
+    contract = _contract(task, "cardinality")
+
+    assert len(source) == 201
+    assert build_typed_sql_risk_worker_plan(task, contract) is None
+
+
 @pytest.mark.parametrize(
     "secondary_request",
     [

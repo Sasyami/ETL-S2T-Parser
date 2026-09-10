@@ -25,6 +25,12 @@ from pydantic import (
 )
 
 from .agent import chat_model
+from .cardinality_analysis import (
+    CardinalityFact,
+    cardinality_payload,
+    derive_cardinality_facts,
+    render_cardinality_answer,
+)
 from .cardinality_sufficiency import (
     complete_cardinality_mapping_evidence_ids,
 )
@@ -2548,6 +2554,7 @@ def build_coordinator_graph(
                     cycle=state["cycle"],
                 )
         cardinality_sufficient_evidence_ids: List[str] = []
+        cardinality_facts: List[CardinalityFact] = []
         if (
             selected_operation_skills == ["Анализ SQL-рисков"]
             and selected_sql_risk_aspects == ["cardinality"]
@@ -2561,6 +2568,27 @@ def build_coordinator_graph(
                         saved_store,
                     )
                 )
+                if (
+                    scope_evidence_architecture == "typed_plan"
+                    and scope_evidence_contract is not None
+                    and cardinality_sufficient_evidence_ids
+                ):
+                    cardinality_facts = derive_cardinality_facts(
+                        state["task"],
+                        accepted_artifacts,
+                        saved_store,
+                    )
+                    if cardinality_facts:
+                        deterministic_cardinality = cardinality_payload(
+                            cardinality_facts
+                        )
+                        upstream_payload["deterministic_cardinality"] = (
+                            deterministic_cardinality
+                        )
+                        record_sql_risk_facts(
+                            deterministic_cardinality,
+                            cycle=state["cycle"],
+                        )
         if (
             scope_evidence_architecture == "typed_plan"
             and scope_evidence_contract is not None
@@ -2851,6 +2879,55 @@ def build_coordinator_graph(
                     "upstream_output": upstream_output,
                     "final_answer": evidence.answer,
                     "selected_display_refs": [],
+                }
+
+        if (
+            scope_evidence_architecture == "typed_plan"
+            and scope_evidence_contract is not None
+            and selected_operation_skills == ["Анализ SQL-рисков"]
+            and selected_sql_risk_aspects == ["cardinality"]
+            and len(cardinality_facts) == 1
+        ):
+            deterministic_answer = render_cardinality_answer(
+                cardinality_facts
+            ).strip()
+            if deterministic_answer:
+                used_evidence_ids = list(
+                    dict.fromkeys(
+                        evidence_id
+                        for fact in cardinality_facts
+                        for evidence_id in fact.evidence_ids
+                        if evidence_id in available_evidence_ids
+                    )
+                )
+                display_evidence_ids = [
+                    evidence_id
+                    for evidence_id in used_evidence_ids
+                    if evidence_id in available_display_refs
+                ]
+                evidence = UpstreamOutput(
+                    answer=scoped_answer(deterministic_answer),
+                    used_evidence_ids=used_evidence_ids,
+                    display_evidence_ids=display_evidence_ids,
+                )
+                upstream_output = evidence.model_dump()
+                record_upstream_output(
+                    {
+                        **upstream_output,
+                        "answer_source": "deterministic_cardinality",
+                    }
+                )
+                logger.info(
+                    "Deterministic cardinality result: %s",
+                    json.dumps(upstream_output, ensure_ascii=False)[:8000],
+                )
+                return {
+                    "upstream_output": upstream_output,
+                    "final_answer": evidence.answer,
+                    "selected_display_refs": [
+                        available_display_refs[evidence_id]
+                        for evidence_id in display_evidence_ids
+                    ],
                 }
 
         terminal_write_semantics_answer = ""

@@ -28,8 +28,7 @@ from .sql_risk_scope_contract import (
 
 TypedSqlRiskPlanSource = Literal["deterministic_sql_risk_scope_v2"]
 
-_IDENTIFIER_ATOM = r"[A-Za-z_][A-Za-z0-9_$]*"
-_TABLE_ENDPOINT = _IDENTIFIER_ATOM
+_TABLE_ENDPOINT = r"[A-Za-z_][A-Za-z0-9_$]{0,199}"
 _SUPPORTED_CARDINALITY_REQUEST_RE = re.compile(
     rf"^\s*оцени\s+риск\s+появлен\w*\s+дубликат\w*\s+при\s+"
     rf"сохран[её]нн\w*\s+s2t[-‑–— ]?трансформац\w*\s+"
