@@ -527,18 +527,32 @@ opt-in `OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT`. Значение `1`
 более узкую code-owned ветку. Для однозначного conditional-cardinality
 или exact nullable-constraint запроса она сама строит один typed
 worker-plan и evidence slots, не вызывая downstream planner. Cardinality
-требует полную сохранённую exact S2T relation; nullable-constraint
-компилирует ответ из exact mapping и source/target metadata без
-модельного upstream answer. Любой более широкий или неоднозначный
-запрос fail-closed остаётся на default agentic path без scope-аттестации.
-Default выключен. Форматтер `value_changes` отдельно не публикует
-внутренние SQL aliases; полное выражение остаётся в structured metrics.
+требует полную сохранённую exact S2T relation и детерминированно извлекает
+только фактический JOIN внешнего SELECT: `WHERE`/`COALESCE` не могут стать
+механизмом размножения или доказательством уникальности. Nullable-constraint компилирует
+ответ из exact mapping и source/target metadata. Оба terminal verdict
+возвращаются без модельного upstream answer. Любой более широкий или
+неоднозначный запрос fail-closed остаётся на default agentic path без
+scope-аттестации. Default выключен. Форматтер `value_changes` отдельно не
+публикует внутренние SQL aliases; полное выражение остаётся в structured
+metrics.
 
 Max/Max development A/B на пяти раскрытых baseline failures не подтвердил
 scope/evidence toggle: combined осталось 3/5, semantic снизилось с 4/5 до 3/5,
 а HTTP 500 выросли с одного до двух. Toggle остаётся выключенным; общий
 alias-safe formatter `value_changes` прошёл обе руки. Разбор и rollback-аудит —
 [`LIVE_SQL_RISK_SCOPE_EVIDENCE_DEV_REPORT_2026-09-10.md`](LIVE_SQL_RISK_SCOPE_EVIDENCE_DEV_REPORT_2026-09-10.md).
+
+После этого prompt-mediated roundtrip заменён typed plan и deterministic
+nullable/cardinality compilers. На первом пятисценарном development A/B
+candidate дал combined `4/5 → 5/5`, semantic `5/5 → 5/5`, без HTTP 500, и
+снизил agent tokens на 29,2%. Ручной аудит обнаружил, что Max-agent и Max-judge
+одинаково ошибочно называли `WHERE` условием уникальности. После cardinality
+compiler три повторные пары дали hard/combined `0/3 → 3/3`, tokens
+`53 827 → 27 338` и ноль ошибок, но preregistered `strict_semantic_gain` не
+выполнен: Max-judge снова поставил baseline `3/3`. Default не меняется;
+полный разбор —
+[`LIVE_SQL_RISK_TYPED_PLAN_CARDINALITY_DEV_REPORT_2026-09-10.md`](LIVE_SQL_RISK_TYPED_PLAN_CARDINALITY_DEV_REPORT_2026-09-10.md).
 
 ## Структура проекта
 
@@ -553,6 +567,8 @@ services/graph_sync.py         проекция SQLite → Neo4j
 graph_storage/                 lifecycle и настройки Neo4j
 agents/supervisor.py           верхний LangGraph
 agents/coordinator.py          выбор pipeline, downstream/workers/upstream
+agents/cardinality_analysis.py deterministic cardinality facts из exact S2T
+agents/constraint_rejection_analysis.py  deterministic nullable-risk facts
 agents/worker.py               worker runtime и работа с зависимостями
 agents/chat_graph.py           planner/tool/observer loop
 agents/entity_resolution.py    общий exact/partial/fuzzy/semantic resolver
