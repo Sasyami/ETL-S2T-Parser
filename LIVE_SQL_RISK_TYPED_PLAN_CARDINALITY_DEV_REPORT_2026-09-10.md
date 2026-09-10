@@ -304,7 +304,7 @@ transcripts и semantic markers. Runner также не пишет отдель�
 machine-readable gate verdict, поэтому таблица выше пересчитана независимо.
 
 Cardinality compiler намеренно консервативен и не является полным SQL
-optimizer. Он не constant-fold-ит составные условия вроде
+optimizer. Он fail-closed обрабатывает `ON FALSE`,
 `ON key = key AND FALSE` и финальный `WHERE FALSE`; implicit comma join,
 `NATURAL INNER JOIN` и `INSERT … SELECT` пока дают `not_assessed`. Это не
 затрагивает проверенный flat-SELECT regression, но ограничивает область

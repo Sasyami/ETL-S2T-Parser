@@ -556,6 +556,15 @@ compiler три повторные пары дали hard/combined `0/3 → 3/3`
 полный разбор —
 [`LIVE_SQL_RISK_TYPED_PLAN_CARDINALITY_DEV_REPORT_2026-09-10.md`](LIVE_SQL_RISK_TYPED_PLAN_CARDINALITY_DEV_REPORT_2026-09-10.md).
 
+Затем удалены NL keyword/fullmatch-классификаторы и fixture-shaped prompt
+example; live-oracles переведены с проверки русских фраз на mandatory Max
+semantic judge плюс structured facts/tools/evidence. На шести RU/EN/reordered
+переформулировках `typed_plan` прошёл hard+semantic `6/6`, без HTTP/tool/judge
+errors, и использовал 75 665 против 194 217 agent tokens baseline. Это
+раскрытая regression-проверка, не confirmation; default остаётся выключен.
+Полный anti-overfit и rollback-аудит —
+[`LIVE_SQL_RISK_ANTI_OVERFIT_PARAPHRASE_REPORT_2026-09-10.md`](LIVE_SQL_RISK_ANTI_OVERFIT_PARAPHRASE_REPORT_2026-09-10.md).
+
 ## Структура проекта
 
 ```text
