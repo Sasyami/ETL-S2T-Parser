@@ -3,7 +3,8 @@
 The analysis is deliberately narrow.  It identifies JOINs in the outer
 transformation SELECT as a possible row-multiplication mechanism, but never
 turns an unknown join-key uniqueness property into a factual duplicate claim.
-Filters and scalar projections are outside this contract.
+A provably false outer predicate fails closed; other filters and scalar
+projections are outside this contract.
 """
 
 from __future__ import annotations
@@ -18,8 +19,12 @@ from sqlglot.errors import SqlglotError
 
 from services.sql_dialects import GREENPLUM_DIALECT  # noqa: F401
 
-from .cardinality_sufficiency import ExactTablePair, extract_literal_table_pairs
+from .cardinality_sufficiency import (
+    ExactTablePair,
+    cardinality_pair_from_contract,
+)
 from .contracts import EvidenceArtifact
+from .sql_risk_scope_contract import SqlRiskScopeContract
 from .tools.saved_results import SavedResultStore
 from .transformation_ast import quote_dollar_schemas
 
@@ -33,6 +38,7 @@ CardinalityConclusion = Literal[
 CardinalityMechanism = Literal[
     "join_fanout",
     "no_join",
+    "constant_false_predicate",
     "unparseable_rule",
     "set_operation",
     "unsupported_join",
@@ -51,6 +57,7 @@ CardinalityCondition = Literal[
 CardinalityRuleStatus = Literal[
     "join_detected",
     "no_join",
+    "constant_false_predicate",
     "unparseable_rule",
     "set_operation",
     "unsupported_join",
@@ -210,6 +217,35 @@ def _top_level_conjuncts(node: exp.Expression) -> List[exp.Expression]:
     return [node]
 
 
+def _constant_boolean_value(node: exp.Expression | None) -> bool | None:
+    """Evaluate only boolean constants and their boolean AST composition."""
+
+    current = node
+    while isinstance(current, exp.Paren):
+        current = current.this
+    if isinstance(current, exp.Boolean):
+        return bool(current.this)
+    if isinstance(current, exp.Not):
+        value = _constant_boolean_value(current.this)
+        return None if value is None else not value
+    if isinstance(current, exp.And):
+        left = _constant_boolean_value(current.this)
+        right = _constant_boolean_value(current.expression)
+        if left is False or right is False:
+            return False
+        if left is True and right is True:
+            return True
+        return None
+    if isinstance(current, exp.Or):
+        left = _constant_boolean_value(current.this)
+        right = _constant_boolean_value(current.expression)
+        if left is True or right is True:
+            return True
+        if left is False and right is False:
+            return False
+    return None
+
+
 def _column_equality(
     node: exp.Expression,
     *,
@@ -288,7 +324,7 @@ def _join_fact(join: exp.Join) -> CardinalityJoinFact | None:
     equalities: List[str] = []
     on = join.args.get("on")
     if isinstance(on, exp.Expression):
-        if isinstance(on, exp.Boolean) and on.this is False:
+        if _constant_boolean_value(on) is False:
             return None
         predicate_value = _bounded(_sql(on), _MAX_PREDICATE_CHARS)
         if predicate_value is None:
@@ -349,6 +385,10 @@ def analyze_cardinality_rule(rule: str) -> CardinalityRuleAnalysis:
     if _has_unsupported_outer_shape(query, outer):
         return CardinalityRuleAnalysis(status="unsupported_join")
 
+    where = outer.args.get("where")
+    if isinstance(where, exp.Where) and _constant_boolean_value(where.this) is False:
+        return CardinalityRuleAnalysis(status="constant_false_predicate")
+
     raw_joins = list(outer.args.get("joins") or [])
     if len(raw_joins) > _MAX_JOINS:
         return CardinalityRuleAnalysis(status="unsupported_join")
@@ -356,6 +396,9 @@ def analyze_cardinality_rule(rule: str) -> CardinalityRuleAnalysis:
     for raw_join in raw_joins:
         if not isinstance(raw_join, exp.Join):
             return CardinalityRuleAnalysis(status="unsupported_join")
+        on = raw_join.args.get("on")
+        if isinstance(on, exp.Expression) and _constant_boolean_value(on) is False:
+            return CardinalityRuleAnalysis(status="constant_false_predicate")
         join = _join_fact(raw_join)
         if join is None:
             return CardinalityRuleAnalysis(status="unsupported_join")
@@ -594,12 +637,18 @@ def _fact_for_pair(
         analysis.status
         for analysis in analyses
         if analysis.status
-        in {"unparseable_rule", "set_operation", "unsupported_join"}
+        in {
+            "constant_false_predicate",
+            "unparseable_rule",
+            "set_operation",
+            "unsupported_join",
+        }
     }
     if unknown_statuses:
         mechanism: CardinalityMechanism = next(
             item
             for item in (
+                "constant_false_predicate",
                 "set_operation",
                 "unsupported_join",
                 "unparseable_rule",
@@ -654,18 +703,20 @@ def _fact_for_pair(
 
 
 def derive_cardinality_facts(
-    task: str,
+    contract: SqlRiskScopeContract,
     artifacts: Sequence[EvidenceArtifact],
     store: SavedResultStore,
 ) -> List[CardinalityFact]:
     """Derive bounded facts from complete accepted exact mapping relations."""
 
-    return [
-        _fact_for_pair(pair, artifacts, store)
-        for pair in extract_literal_table_pairs(task)[:_MAX_FACTS]
-        if len(pair.source_table) <= _MAX_IDENTIFIER_CHARS
-        and len(pair.target_table) <= _MAX_IDENTIFIER_CHARS
-    ]
+    pair = cardinality_pair_from_contract(contract)
+    if (
+        pair is None
+        or len(pair.source_table) > _MAX_IDENTIFIER_CHARS
+        or len(pair.target_table) > _MAX_IDENTIFIER_CHARS
+    ):
+        return []
+    return [_fact_for_pair(pair, artifacts, store)]
 
 
 def cardinality_payload(
@@ -735,7 +786,7 @@ def _render_join(join: CardinalityJoinFact) -> str:
 
 
 def render_cardinality_answer(facts: Sequence[CardinalityFact]) -> str:
-    """Render exact JOIN evidence and its still-unknown uniqueness condition."""
+    """Render the structured fact without a benchmark-specific template."""
 
     blocks: List[str] = []
     for fact in list(facts)[:_MAX_FACTS]:
@@ -749,46 +800,43 @@ def render_cardinality_answer(facts: Sequence[CardinalityFact]) -> str:
             )
             if fact.condition == "full_join_key_uniqueness_unknown" and keys:
                 condition = (
-                    "уникальность не подтверждена — полный JOIN-ключ ("
+                    "Уникальность полного JOIN-ключа ("
                     + ", ".join(f"`{key}`" for key in keys)
-                    + ") остаётся неизвестной"
+                    + ") не установлена: в прочитанном mapping нет "
+                    "подтверждающих данных"
                 )
             else:
                 condition = (
-                    "уникальность не подтверждена — кратность совпадений JOIN "
-                    "остаётся неизвестной"
+                    "Уникальность и кратность совпадений JOIN не установлены: "
+                    "в прочитанном mapping нет подтверждающих данных"
                 )
             blocks.append(
-                f"Для {scope}. Фактический JOIN: {clauses}. "
-                "Подтверждённый механизм: JOIN может размножить строки, "
+                f"Для {scope} сохранённое правило содержит {clauses}. "
+                "Такой JOIN может размножить строки, "
                 "если одному входному ряду соответствует несколько строк "
-                f"другой стороны. Условие по уникальности: {condition}. "
-                "Поэтому риск появления дубликатов условный; фактические "
-                "дубликаты не доказаны."
+                f"другой стороны. {condition}. Поэтому возможный fan-out "
+                "условен, а наличие фактических дубликатов не установлено."
             )
         elif fact.conclusion == "join_mechanism_not_detected":
             blocks.append(
-                f"Для {scope}. Фактический JOIN: во внешнем SELECT не обнаружен. "
-                "Подтверждённый механизм: размножение строк через JOIN не "
-                "обнаружено. Условие по уникальности: не применимо, поскольку "
-                "JOIN-механизм не обнаружен. Это не доказывает отсутствие "
-                "дубликатов по другим причинам."
+                f"Для {scope} во внешнем SELECT соединение не обнаружено. "
+                "Поэтому JOIN-based fan-out этим mapping не установлен, а "
+                "проверка уникальности здесь не применима. Это не доказывает "
+                "отсутствие дубликатов по другим причинам."
             )
         elif fact.conclusion == "conflicting":
             blocks.append(
-                f"Для {scope}. Фактический JOIN: не определён. "
-                "Подтверждённый механизм: не установлен, потому что полные "
-                "сохранённые S2T-правила противоречат друг другу по "
-                "JOIN-структуре. Условие по уникальности: не оценено. "
-                "Риск кардинальности не оценён."
+                f"Для {scope} нельзя определить один JOIN-механизм: полные "
+                "сохранённые S2T-правила расходятся по структуре соединений. "
+                "Уникальность ключей и риск изменения кардинальности поэтому "
+                "не оценены."
             )
         else:
             blocks.append(
-                f"Для {scope}. Фактический JOIN: не определён. "
-                "Подтверждённый механизм: не установлен. Условие по "
-                f"уникальности: не оценено. Причина: `{fact.mechanism}`. "
-                "Неполное или неподдерживаемое evidence не подтверждает ни "
-                "JOIN-механизм, ни отсутствие дубликатов."
+                f"Для {scope} evidence не позволяет определить JOIN-механизм "
+                f"(`{fact.mechanism}`). Уникальность ключей и риск изменения "
+                "кардинальности не оценены; неполные либо неподдерживаемые "
+                "данные не подтверждают и отсутствие дубликатов."
             )
     return "\n\n".join(blocks)
 

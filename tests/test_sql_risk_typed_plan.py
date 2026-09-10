@@ -8,7 +8,6 @@ import pytest
 
 from agents.contracts import WorkerPlan
 from agents.plan_origin import validate_worker_plan_origin
-from agents.plan_requirements import validate_sql_risk_plan_requirements
 from agents.sql_risk_scope_contract import (
     GetSourceTargetColumnPairRequirement,
     ReadS2TSourceToTargetRequirement,
@@ -18,7 +17,6 @@ from agents.sql_risk_scope_contract import (
 from agents.sql_risk_typed_plan import (
     TypedSqlRiskWorkerPlan,
     build_typed_sql_risk_worker_plan,
-    is_exclusive_constraint_rejection_request,
 )
 
 
@@ -36,19 +34,35 @@ CONSTRAINT_TASK = (
 
 
 def _contract(task: str, aspect: str) -> SqlRiskScopeContract:
+    execution_mode = {
+        "cardinality": "conditional_cardinality",
+        "constraint_rejection": "nullable_constraint",
+    }.get(aspect, "agentic")
     contract = build_sql_risk_scope_contract(
         task,
         [aspect],
         enabled=True,
+        execution_mode=execution_mode,
     )
     assert contract is not None
     return contract
 
 
+def _typed(
+    task: str,
+    contract: SqlRiskScopeContract,
+) -> TypedSqlRiskWorkerPlan | None:
+    return build_typed_sql_risk_worker_plan(
+        task,
+        contract,
+        sql_risk_execution_mode=contract.execution_mode,
+    )
+
+
 def test_builds_one_closed_cardinality_mapping_step():
     contract = _contract(CARDINALITY_TASK, "cardinality")
 
-    typed = build_typed_sql_risk_worker_plan(CARDINALITY_TASK, contract)
+    typed = _typed(CARDINALITY_TASK, contract)
 
     assert typed is not None
     assert typed.plan_source == "deterministic_sql_risk_scope_v2"
@@ -69,17 +83,12 @@ def test_builds_one_closed_cardinality_mapping_step():
         ),
     )
     validate_worker_plan_origin(typed.plan, CARDINALITY_TASK)
-    validate_sql_risk_plan_requirements(
-        typed.plan,
-        CARDINALITY_TASK,
-        sql_risk_aspects=["cardinality"],
-    )
 
 
 def test_builds_one_joint_constraint_mapping_and_metadata_step():
     contract = _contract(CONSTRAINT_TASK, "constraint_rejection")
 
-    typed = build_typed_sql_risk_worker_plan(CONSTRAINT_TASK, contract)
+    typed = _typed(CONSTRAINT_TASK, contract)
 
     assert typed is not None
     assert typed.aspect == "constraint_rejection"
@@ -108,92 +117,31 @@ def test_builds_one_joint_constraint_mapping_and_metadata_step():
         ),
     )
     validate_worker_plan_origin(typed.plan, CONSTRAINT_TASK)
-    validate_sql_risk_plan_requirements(
-        typed.plan,
-        CONSTRAINT_TASK,
-        sql_risk_aspects=["constraint_rejection"],
-    )
 
 
-@pytest.mark.parametrize(
-    "task",
-    [
-        CONSTRAINT_TASK,
-        (
-            "For file_id=417 assess only constraint rejection from nullable "
-            "constraints for raw_order_events_v2.customer_key → "
-            "mart_order_daily_v3.customer_key. Return "
-            "source_not_null=<0|1>, target_not_null=<0|1>, and a conclusion."
-        ),
-    ],
-)
-def test_recognizes_explicitly_exclusive_constraint_intent(task):
-    assert is_exclusive_constraint_rejection_request(task) is True
-
-
-@pytest.mark.parametrize(
-    "task",
-    [
-        (
-            "Для file_id=417 оцени constraint rejection для "
-            "raw_order_events_v2.customer_key → "
-            "mart_order_daily_v3.customer_key."
-        ),
-        (
-            "Оцени только row filtering. Потом constraint rejection для "
-            "raw_order_events_v2.customer_key → "
-            "mart_order_daily_v3.customer_key."
-        ),
-        (
-            "Constraint rejection из-за nullable для "
-            "raw_order_events_v2.customer_key → "
-            "mart_order_daily_v3.customer_key: оцени только этот риск."
-        ),
-        (
-            "Для file_id=417 оцени только constraint rejection для "
-            "raw_order_events_v2.customer_key → "
-            "mart_order_daily_v3.customer_key и также покажи весь каталог "
-            "колонок."
-        ),
-        (
-            "For file_id=417 assess only constraint rejection caused by "
-            "incompatible data types for source field "
-            "raw_order_events_v2.customer_key → "
-            "mart_order_daily_v3.customer_key."
-        ),
-        "Только оцени SQL-риск без указанного аспекта.",
-    ],
-)
-def test_constraint_exclusivity_fails_closed(task):
-    assert is_exclusive_constraint_rejection_request(task) is False
-
-
-def test_nonexclusive_constraint_request_stays_on_downstream_path():
-    task = CONSTRAINT_TASK.replace("только SQL-риск ", "SQL-риск ")
-    contract = _contract(task, "constraint_rejection")
-
-    assert build_typed_sql_risk_worker_plan(task, contract) is None
-
-
-def test_constraint_request_for_full_sql_stays_on_downstream_path():
+def test_plan_builder_does_not_reclassify_natural_language():
     task = (
-        "Для file_id=417 оцени только nullable constraint rejection для "
-        "raw_order_events_v2.customer_key → "
-        "mart_order_daily_v3.customer_key и верни весь SQL."
-    )
-    contract = _contract(task, "constraint_rejection")
-
-    assert build_typed_sql_risk_worker_plan(task, contract) is None
-
-
-def test_factual_cardinality_request_stays_on_downstream_path():
-    task = (
-        "Посчитай фактическое количество дубликатов для "
-        "raw_order_events_v2 → mart_order_daily_v3."
+        "Иначе сформулированная задача для raw_order_events_v2 → "
+        "mart_order_daily_v3."
     )
     contract = _contract(task, "cardinality")
 
-    assert build_typed_sql_risk_worker_plan(task, contract) is None
+    assert _typed(task, contract) is not None
+
+
+def test_agentic_mode_never_creates_typed_scope_or_plan():
+    assert build_sql_risk_scope_contract(
+        CARDINALITY_TASK,
+        ["cardinality"],
+        enabled=True,
+        execution_mode="agentic",
+    ) is None
+    contract = _contract(CARDINALITY_TASK, "cardinality")
+    assert build_typed_sql_risk_worker_plan(
+        CARDINALITY_TASK,
+        contract,
+        sql_risk_execution_mode="agentic",
+    ) is None
 
 
 def test_cardinality_identifier_over_fact_bound_stays_on_downstream_path():
@@ -202,26 +150,7 @@ def test_cardinality_identifier_over_fact_bound_stays_on_downstream_path():
     contract = _contract(task, "cardinality")
 
     assert len(source) == 201
-    assert build_typed_sql_risk_worker_plan(task, contract) is None
-
-
-@pytest.mark.parametrize(
-    "secondary_request",
-    [
-        "Сравни типы колонок.",
-        "Составь DDL исправления.",
-        "Дай тестовый SQL проверки.",
-        "Дай рекомендации по исправлению.",
-        "Оцени качество данных.",
-    ],
-)
-def test_cardinality_with_secondary_request_stays_on_downstream_path(
-    secondary_request,
-):
-    task = f"{CARDINALITY_TASK} {secondary_request}"
-    contract = _contract(task, "cardinality")
-
-    assert build_typed_sql_risk_worker_plan(task, contract) is None
+    assert _typed(task, contract) is None
 
 
 @pytest.mark.parametrize(
@@ -246,9 +175,12 @@ def test_cardinality_with_secondary_request_stays_on_downstream_path(
     ],
 )
 def test_other_aspects_remain_on_downstream_path(aspect, task):
-    contract = _contract(task, aspect)
-
-    assert build_typed_sql_risk_worker_plan(task, contract) is None
+    assert build_sql_risk_scope_contract(
+        task,
+        [aspect],
+        enabled=True,
+        execution_mode="agentic",
+    ) is None
 
 
 def test_multiple_aspects_remain_on_downstream_path():
@@ -259,7 +191,7 @@ def test_multiple_aspects_remain_on_downstream_path():
     )
 
     assert (
-        build_typed_sql_risk_worker_plan(CONSTRAINT_TASK, multi_aspect)
+        _typed(CONSTRAINT_TASK, multi_aspect)
         is None
     )
 
@@ -282,7 +214,7 @@ def test_stale_or_forged_contract_is_not_materialized_into_a_plan():
         ),
     )
 
-    assert build_typed_sql_risk_worker_plan(CARDINALITY_TASK, forged) is None
+    assert _typed(CARDINALITY_TASK, forged) is None
 
 
 def test_constraint_plan_requires_both_typed_evidence_requirements():
@@ -293,7 +225,7 @@ def test_constraint_plan_requires_both_typed_evidence_requirements():
     )
 
     assert (
-        build_typed_sql_risk_worker_plan(CONSTRAINT_TASK, missing_metadata)
+        _typed(CONSTRAINT_TASK, missing_metadata)
         is None
     )
 
@@ -311,10 +243,7 @@ def test_typed_plan_rejects_requirement_arguments_not_owned_by_scope():
     )
 
     assert (
-        build_typed_sql_risk_worker_plan(
-            CARDINALITY_TASK,
-            mismatched_requirement,
-        )
+        _typed(CARDINALITY_TASK, mismatched_requirement)
         is None
     )
 

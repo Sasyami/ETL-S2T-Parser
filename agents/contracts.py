@@ -50,6 +50,11 @@ SqlRiskAspect = Literal[
     "value_changes",
     "write_semantics",
 ]
+SqlRiskExecutionMode = Literal[
+    "agentic",
+    "conditional_cardinality",
+    "nullable_constraint",
+]
 MAX_PLAN_STEPS = 8
 _LEGACY_WORKER_STABLE_CONTEXT_MARKER = (
     "\n\nУстойчивые правила контекста:\n"
@@ -734,6 +739,7 @@ __all__ = [
     "SavedResultColumn",
     "SavedResultDescriptor",
     "SqlRiskAspect",
+    "SqlRiskExecutionMode",
     "UpstreamOutput",
     "UpstreamAction",
     "UpstreamDecision",

@@ -89,34 +89,6 @@ _TABLE_PAIR_RE = re.compile(
     re.IGNORECASE,
 )
 
-_WRITE_SEMANTICS_PHRASE = (
-    r"(?:write[ _-]*semantics|"
-    r"семантик\w*\s+(?:запис|загруз)\w*|"
-    r"режим\w*\s+(?:запис|загруз)\w*)"
-)
-_SAME_CLAUSE_GAP = r"[^.!?\r\n]{0,96}"
-_EXCLUSIVE_WRITE_SEMANTICS_RE = re.compile(
-    rf"(?:\b(?:только|only)\b{_SAME_CLAUSE_GAP}{_WRITE_SEMANTICS_PHRASE}"
-    rf"|{_WRITE_SEMANTICS_PHRASE}{_SAME_CLAUSE_GAP}\b(?:только|only)\b)",
-    re.IGNORECASE,
-)
-_ADDITIONAL_OR_PRESENTATION_INTENT_RE = re.compile(
-    r"\b(?:также|покажи|выведи|список|объясни|сравни|"
-    r"построй|"
-    r"also|show|list|display|explain|compare)\b"
-    r"|\bа\s+ещ[её]\b"
-    r"|\bполн\w*\s+результат\w*\b",
-    re.IGNORECASE,
-)
-_OTHER_SQL_RISK_ASPECT_RE = re.compile(
-    r"\b(?:row[ _-]*filtering|cardinality|constraint[ _-]*rejection|"
-    r"value[ _-]*changes?)\b"
-    r"|изменен\w*\s+значен\w*"
-    r"|кардинал\w*"
-    r"|фильтр\w*\s+строк\w*",
-    re.IGNORECASE,
-)
-
 
 class ExactTablePair(BaseModel):
     """One literal directed table pair found in the original task."""
@@ -198,26 +170,6 @@ def extract_exact_table_pairs(task: str) -> List[ExactTablePair]:
         if len(pairs) >= _MAX_TABLE_PAIRS:
             break
     return pairs
-
-
-def is_exclusive_write_semantics_request(task: str) -> bool:
-    """Return whether code may answer only the requested write-semantics facet.
-
-    The predicate deliberately requires a literal directed table pair and an
-    explicit ``только``/``only`` qualifier close to the aspect name.  A
-    presentation request or another SQL-risk facet disables this narrow path.
-    """
-
-    if not isinstance(task, str) or not task.strip():
-        return False
-    if _ADDITIONAL_OR_PRESENTATION_INTENT_RE.search(task):
-        return False
-    if _OTHER_SQL_RISK_ASPECT_RE.search(task):
-        return False
-    return bool(
-        extract_exact_table_pairs(task)
-        and _EXCLUSIVE_WRITE_SEMANTICS_RE.search(task)
-    )
 
 
 def _node_write_mechanism(
@@ -731,7 +683,6 @@ __all__ = [
     "classify_write_semantics_rule",
     "derive_write_semantics_facts",
     "extract_exact_table_pairs",
-    "is_exclusive_write_semantics_request",
     "render_terminal_write_semantics_negative",
     "render_write_semantics_answer",
     "write_semantics_payload",

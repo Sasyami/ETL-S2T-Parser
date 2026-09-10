@@ -1000,30 +1000,6 @@ def _write_pair_report(
         "Agent tokens | Judge calls | Judge tokens | Reader calls | Reroutes | Seconds |",
         "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    limitations: list[str] = []
-    if case.aspect in {"value_changes", "write_semantics"}:
-        limitations.append(
-            "- Stage limitation: deterministic code renders the final answer; "
-            "this cell covers plan/planner/observer and only partial decision behavior"
-        )
-    if case.aspect == "write_semantics":
-        limitations.append(
-            "- Additional limitation: deterministic logic may suppress a redundant reroute"
-        )
-    if limitations:
-        lines[13:13] = limitations
-    limitations: list[str] = []
-    if case.aspect in {"value_changes", "write_semantics"}:
-        limitations.append(
-            "- Stage limitation: deterministic code renders the final answer; "
-            "this cell covers plan/planner/observer and only partial decision behavior"
-        )
-    if case.aspect == "write_semantics":
-        limitations.append(
-            "- Additional limitation: deterministic logic may suppress a redundant reroute"
-        )
-    if limitations:
-        lines[13:13] = limitations
     for arm in ("baseline", "candidate"):
         result = results.get(arm)
         if result is None:
@@ -1088,8 +1064,8 @@ def _write_preregistration(
         "- Overall exploratory status is improved when at least one family passes every fixed gate; other families remain separately reported",
         "- No candidate is promoted automatically",
         "- Every experiment is rolled back by deleting its fresh no-hardlinks clone and disposable DB copies",
-        "- Stage limitation: `value_changes` and `write_semantics` use a deterministic code-rendered final answer, so their eight cells exercise plan/planner/observer and only partial decision behavior, not the full five-stage model protocol",
-        "- Additional limitation: `write_semantics` may deterministically suppress a redundant reroute; scenarios and bypass behavior are unchanged",
+        "- All 20 cells exercise the full model-owned upstream decision and answer path",
+        "- Deterministic SQL-risk facts only supplement evidence; they do not render the final answer or suppress reroute",
         "",
         "## Fixed 20-experiment matrix",
         "",
@@ -1136,7 +1112,7 @@ def _write_aggregate_report(
         f"- Completed and rolled back: `{len(completed)}/20`",
         f"- Infrastructure status: `{'aborted' if abort_reason else 'complete'}`",
         f"- Exploratory quality status: `{quality_status}`",
-        "- Stage limitation: the eight `value_changes`/`write_semantics` cells do not exercise a model-generated final upstream answer; `write_semantics` can also suppress redundant reroute deterministically",
+        "- All five aspects exercise a model-generated upstream decision and final answer; deterministic facts only supplement evidence",
         "- Automatic promotion: `disabled`",
         "",
         "| # | Aspect | Family | Order | Baseline | Candidate | Verdict | Rollback |",

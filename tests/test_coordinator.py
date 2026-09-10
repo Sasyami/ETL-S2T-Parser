@@ -459,8 +459,10 @@ def test_sql_risk_router_propagates_only_requested_aspect(monkeypatch):
     assert operation_schema["properties"]["sql_risk_aspects"][
         "maxItems"
     ] == 5
-    assert "sql_risk_aspects=[\"cardinality\"]" in _OPERATION_SKILL_PROMPT
-    assert _operation_skill_prompt() == _OPERATION_SKILL_PROMPT
+    assert "Может ли этот JOIN" not in _OPERATION_SKILL_PROMPT
+    assert "sql_risk_execution_mode" not in _operation_skill_prompt()
+    assert "sql_risk_execution_mode" not in operation_schema["properties"]
+    assert "sql_risk_execution_mode" not in operation_schema["required"]
     for forbidden_aspect in (
         "row_filtering",
         "constraint_rejection",
@@ -499,6 +501,59 @@ def test_sql_risk_router_propagates_only_requested_aspect(monkeypatch):
         )
 
 
+def test_typed_plan_router_requires_consistent_structured_execution_mode(
+    monkeypatch,
+):
+    from agents.coordinator import (
+        OperationSkillSelection,
+        _operation_skill_prompt,
+        _operation_skill_tool_schema,
+    )
+    from agents.sql_risk_scope_contract import (
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+    )
+    from agents.tools.context import OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    monkeypatch.setenv(
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+        "typed_plan",
+    )
+
+    parameters = _operation_skill_tool_schema()["function"]["parameters"]
+    assert parameters["properties"]["sql_risk_execution_mode"]["enum"] == [
+        "agentic",
+        "conditional_cardinality",
+        "nullable_constraint",
+    ]
+    assert "sql_risk_execution_mode" in parameters["required"]
+    prompt = _operation_skill_prompt()
+    assert "conditional_cardinality" in prompt
+    assert "nullable_constraint" in prompt
+    assert "Может ли этот JOIN" not in prompt
+
+    with pytest.raises(ValueError, match="requires an explicit"):
+        OperationSkillSelection(
+            pipeline="agentic",
+            skills=["Анализ SQL-рисков"],
+            sql_risk_aspects=["cardinality"],
+        )
+
+    selection = OperationSkillSelection(
+        pipeline="agentic",
+        skills=["Анализ SQL-рисков"],
+        sql_risk_aspects=["cardinality"],
+        sql_risk_execution_mode="conditional_cardinality",
+    )
+    assert selection.sql_risk_execution_mode == "conditional_cardinality"
+
+    with pytest.raises(ValueError, match="requires pipeline=agentic"):
+        OperationSkillSelection(
+            pipeline="agentic",
+            skills=["Анализ SQL-рисков"],
+            sql_risk_aspects=["cardinality", "row_filtering"],
+            sql_risk_execution_mode="conditional_cardinality",
+        )
 @pytest.mark.parametrize("raw_setting", [None, "", "default", "current"])
 def test_sql_risk_protocol_attestation_marks_current_baseline(
     monkeypatch,
@@ -635,7 +690,7 @@ def test_invalid_protocol_fails_before_plan_attestation_is_recorded(
     assert "submit_worker_plan" not in [name for name, _ in model.messages]
 
 
-def test_value_change_uses_full_saved_result_and_code_rendered_answer(
+def test_value_change_facts_are_passed_to_upstream_without_terminal_bypass(
     monkeypatch,
 ):
     from agents.coordinator import coordinator_chat
@@ -683,6 +738,17 @@ def test_value_change_uses_full_saved_result_and_code_rendered_answer(
                     "submit_upstream_data_decision",
                     {"decision": "pass"},
                     "decision-value-change",
+                )
+            ],
+            "submit_upstream_answer": [
+                _tool_message(
+                    "submit_upstream_answer",
+                    {
+                        "answer": "Для точной пары изменение не обнаружено.",
+                        "used_evidence_ids": ["evidence-exact-id"],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-value-change",
                 )
             ],
         }
@@ -738,13 +804,10 @@ def test_value_change_uses_full_saved_result_and_code_rendered_answer(
     ):
         result = coordinator_chat(original_task)
 
-    assert "src_np.id → tgt_np.id" in result.answer
-    assert "механизм изменения значения не обнаружен" in result.answer
+    assert result.answer == "Для точной пары изменение не обнаружено."
     assert "COALESCE" not in result.answer
     assert result.display_refs == []
-    assert not any(
-        name == "submit_upstream_answer" for name, _ in model.messages
-    )
+    assert any(name == "submit_upstream_answer" for name, _ in model.messages)
 
     decision_payload = _payload(model, "submit_upstream_data_decision")
     deterministic = decision_payload["deterministic_sql_risk"]
@@ -767,12 +830,10 @@ def test_value_change_uses_full_saved_result_and_code_rendered_answer(
     recorded_output = record_upstream.call_args.args[0]
     assert recorded_output["used_evidence_ids"] == ["evidence-exact-id"]
     assert recorded_output["display_evidence_ids"] == []
-    assert recorded_output["answer_source"] == (
-        "deterministic_value_changes"
-    )
+    assert recorded_output["answer_source"] == "model"
 
 
-def test_write_semantics_terminal_negative_ignores_redundant_reroute(
+def test_write_semantics_facts_do_not_bypass_upstream_reroute(
     monkeypatch,
 ):
     from agents.coordinator import coordinator_chat
@@ -815,7 +876,21 @@ def test_write_semantics_terminal_negative_ignores_redundant_reroute(
                         ]
                     },
                     "plan-write-semantics",
-                )
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Повторно прочитать полный точный "
+                                    "directed S2T mapping src_np → tgt_np."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-write-semantics-cycle-2",
+                ),
             ],
             "submit_upstream_data_decision": [
                 _tool_message(
@@ -828,6 +903,24 @@ def test_write_semantics_terminal_negative_ignores_redundant_reroute(
                         ),
                     },
                     "decision-write-semantics-reroute",
+                ),
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {"decision": "pass"},
+                    "decision-write-semantics-pass",
+                ),
+            ],
+            "submit_upstream_answer": [
+                _tool_message(
+                    "submit_upstream_answer",
+                    {
+                        "answer": "Write semantics не оценена.",
+                        "used_evidence_ids": [
+                            "evidence-write-select-only"
+                        ],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-write-semantics",
                 )
             ],
         }
@@ -893,23 +986,20 @@ def test_write_semantics_terminal_negative_ignores_redundant_reroute(
     ):
         result = coordinator_chat(original_task)
 
-    assert "src_np → tgt_np" in result.answer
-    assert "не оценено" in result.answer.casefold()
+    assert result.answer == "Write semantics не оценена."
     assert result.display_refs == []
-    assert worker.call_count == 1
+    assert worker.call_count == 2
     assert len(
         [name for name, _ in model.messages if name == "submit_worker_plan"]
-    ) == 1
+    ) == 2
     assert len(
         [
             name
             for name, _ in model.messages
             if name == "submit_upstream_data_decision"
         ]
-    ) == 1
-    assert not any(
-        name == "submit_upstream_answer" for name, _ in model.messages
-    )
+    ) == 2
+    assert any(name == "submit_upstream_answer" for name, _ in model.messages)
 
     decision_payload = _payload(model, "submit_upstream_data_decision")
     assert decision_payload["worker_outcomes"][0]["cycle"] == 1
@@ -934,9 +1024,7 @@ def test_write_semantics_terminal_negative_ignores_redundant_reroute(
         "evidence-write-select-only"
     ]
     assert recorded_output["display_evidence_ids"] == []
-    assert recorded_output["answer_source"] == (
-        "deterministic_write_semantics"
-    )
+    assert recorded_output["answer_source"] == "model"
 
 
 def test_sql_risk_aspect_experiment_can_load_legacy_full_profile(monkeypatch):
@@ -964,16 +1052,19 @@ def test_sql_risk_aspect_experiment_can_load_legacy_full_profile(monkeypatch):
     )
 
     assert selection.sql_risk_aspects == []
+    assert selection.sql_risk_execution_mode == "agentic"
     assert _operation_skill_tool_schema()["function"]["parameters"][
         "properties"
     ]["sql_risk_aspects"]["maxItems"] == 0
+    assert "sql_risk_execution_mode" not in _operation_skill_tool_schema()[
+        "function"
+    ]["parameters"]["properties"]
     assert "всегда верни\n`sql_risk_aspects=[]`" in _operation_skill_prompt()
     assert "всегда верни `sql_risk_aspects=[]`" in (
         _operation_skill_repair_prompt()
     )
-    assert "sql_risk_aspects=[\"cardinality\"]" not in (
-        _operation_skill_prompt()
-    )
+    assert "conditional_cardinality" not in _operation_skill_prompt()
+    assert "sql_risk_execution_mode" not in _operation_skill_repair_prompt()
     assert "JOIN размножает строку" in context
     assert "rejection" in context
     assert "write semantics" in context
@@ -3078,7 +3169,7 @@ def test_sql_risk_upstream_repairs_empty_used_evidence_ids():
     assert "обязан сослаться" in answer_calls[1][-1].content
 
 
-def test_cardinality_complete_exact_mapping_ignores_redundant_reroute(
+def test_agentic_cardinality_does_not_apply_a_hidden_task_intent_bypass(
     monkeypatch,
 ):
     from agents.coordinator import coordinator_chat
@@ -3120,7 +3211,21 @@ def test_cardinality_complete_exact_mapping_ignores_redundant_reroute(
                         ]
                     },
                     "plan-cardinality",
-                )
+                ),
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Повторно прочитать полный exact directed "
+                                    "S2T mapping src_np → tgt_np."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-cardinality-cycle-2",
+                ),
             ],
             "submit_upstream_data_decision": [
                 _tool_message(
@@ -3132,7 +3237,12 @@ def test_cardinality_complete_exact_mapping_ignores_redundant_reroute(
                         ),
                     },
                     "decision-cardinality-reroute",
-                )
+                ),
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {"decision": "pass"},
+                    "decision-cardinality-pass",
+                ),
             ],
             "submit_upstream_answer": [
                 _tool_message(
@@ -3204,10 +3314,10 @@ def test_cardinality_complete_exact_mapping_ignores_redundant_reroute(
         result = coordinator_chat(original_task)
 
     assert "может размножить" in result.answer
-    assert worker.call_count == 1
+    assert worker.call_count == 2
     assert [name for name, _ in model.messages].count(
         "submit_worker_plan"
-    ) == 1
+    ) == 2
     assert [name for name, _ in model.messages].count(
         "submit_upstream_answer"
     ) == 1
@@ -3793,7 +3903,7 @@ def test_coordinator_repairs_plan_with_invented_scope_and_rewritten_pair():
     assert "tgt_np" in repair_prompt
 
 
-def test_constraint_rejection_repairs_origin_and_split_metadata_together():
+def test_constraint_rejection_repairs_only_invalid_plan_origin():
     from agents.coordinator import coordinator_chat
 
     original_task = (
@@ -3887,10 +3997,10 @@ def test_constraint_rejection_repairs_origin_and_split_metadata_together():
     assert len(plan_messages) == 2
     repair_prompt = plan_messages[1][-1].content
     assert "file_id=1" in repair_prompt
-    assert "одну самодостаточную worker task" in repair_prompt
+    assert "чистый reroute потерял обязательное" not in repair_prompt
 
 
-def test_coordinator_repairs_sql_risk_reroute_that_loses_mapping():
+def test_coordinator_does_not_semantically_reparse_agentic_reroute_plan():
     from agents.coordinator import coordinator_chat
 
     # This explicitly asks for a factual uniqueness check, so catalog metadata
@@ -3942,26 +4052,6 @@ def test_coordinator_repairs_sql_risk_reroute_that_loses_mapping():
                     },
                     "plan-cycle-2-invalid",
                 ),
-                _tool_message(
-                    "submit_worker_plan",
-                    {
-                        "steps": [
-                            {
-                                "task": (
-                                    "Повторно прочитать полный directed S2T "
-                                    "mapping src_orders → tgt_orders."
-                                )
-                            },
-                            {
-                                "task": (
-                                    "Прочитать metadata src_orders и "
-                                    "tgt_orders для проверки ключей."
-                                )
-                            },
-                        ]
-                    },
-                    "plan-cycle-2-repaired",
-                ),
             ],
             "submit_upstream_output": [
                 _tool_message(
@@ -3993,7 +4083,6 @@ def test_coordinator_repairs_sql_risk_reroute_that_loses_mapping():
             "agents.coordinator.worker_chat",
             side_effect=[
                 _outcome("Mapping прочитан."),
-                _outcome("Mapping повторно прочитан."),
                 _outcome("Metadata прочитаны."),
             ],
         ) as worker,
@@ -4001,23 +4090,18 @@ def test_coordinator_repairs_sql_risk_reroute_that_loses_mapping():
         result = coordinator_chat(original_task)
 
     assert result.answer == "Риск размножения строк условный."
-    assert worker.call_count == 3
-    assert "S2T mapping src_orders → tgt_orders" in worker.call_args_list[
-        1
-    ].args[0]
+    assert worker.call_count == 2
+    assert "metadata src_orders и tgt_orders" in worker.call_args_list[1].args[0]
     plan_messages = [
         messages
         for name, messages in model.messages
         if name == "submit_worker_plan"
     ]
-    assert len(plan_messages) == 3
-    assert "чистый reroute потерял обязательное" in (
-        plan_messages[2][-1].content
-    )
+    assert len(plan_messages) == 2
 
 
-def test_coordinator_rejects_repaired_sql_risk_reroute_without_mapping():
-    from agents.coordinator import CoordinatorResponseError, coordinator_chat
+def test_coordinator_accepts_agentic_reroute_plan_without_prose_requirements():
+    from agents.coordinator import coordinator_chat
 
     original_task = "Оцени риск дубликатов для src_orders → tgt_orders."
     metadata_only = {
@@ -4063,11 +4147,6 @@ def test_coordinator_rejects_repaired_sql_risk_reroute_without_mapping():
                     metadata_only,
                     "plan-cycle-2-invalid",
                 ),
-                _tool_message(
-                    "submit_worker_plan",
-                    metadata_only,
-                    "plan-cycle-2-still-invalid",
-                ),
             ],
             "submit_upstream_output": [
                 _tool_message(
@@ -4077,7 +4156,16 @@ def test_coordinator_rejects_repaired_sql_risk_reroute_without_mapping():
                         "problem": "Нужны metadata ключей обеих таблиц.",
                     },
                     "reroute-risk",
-                )
+                ),
+                _tool_message(
+                    "submit_upstream_output",
+                    {
+                        "answer": "Metadata ключей прочитаны.",
+                        "used_evidence_ids": [],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-risk",
+                ),
             ],
         }
     )
@@ -4088,13 +4176,22 @@ def test_coordinator_rejects_repaired_sql_risk_reroute_without_mapping():
         trace_patch,
         patch(
             "agents.coordinator.worker_chat",
-            return_value=_outcome("Mapping прочитан."),
+            side_effect=[
+                _outcome("Mapping прочитан."),
+                _outcome("Metadata ключей прочитаны."),
+            ],
         ) as worker,
-        pytest.raises(CoordinatorResponseError, match="plan contract"),
     ):
-        coordinator_chat(original_task)
+        result = coordinator_chat(original_task)
 
-    assert worker.call_count == 1
+    assert result.answer == "Metadata ключей прочитаны."
+    assert worker.call_count == 2
+    plan_messages = [
+        messages
+        for name, messages in model.messages
+        if name == "submit_worker_plan"
+    ]
+    assert len(plan_messages) == 2
 
 
 def test_coordinator_uses_generated_task_without_semantic_checks():
@@ -4310,22 +4407,15 @@ def test_unknown_scope_architecture_remains_fail_closed_for_sql_risk(
     worker.assert_not_called()
 
 
-def test_scope_evidence_experiment_passes_requirements_and_scopes_answer(
-    monkeypatch,
-):
+def test_legacy_prompt_scope_architecture_is_rejected(monkeypatch):
     from agents.coordinator import coordinator_chat
     from agents.sql_risk_scope_contract import (
         OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
-        ensure_sql_risk_answer_scope,
     )
     from agents.tools.context import OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV
 
     monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
     monkeypatch.setenv(OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV, "1")
-    original_task = (
-        "Assess nullable constraint rejection for the exact column pair "
-        "src_alpha.code → tgt_beta.code with file_id=17."
-    )
     model = _CoordinatorModel(
         {
             "select_operation_skills": [
@@ -4338,388 +4428,23 @@ def test_scope_evidence_experiment_passes_requirements_and_scopes_answer(
                     },
                     "operation-constraint",
                 )
-            ],
-            "submit_worker_plan": [
-                _tool_message(
-                    "submit_worker_plan",
-                    {
-                        "steps": [
-                            {
-                                "task": (
-                                    "Read exact directed S2T mapping and column "
-                                    "metadata for src_alpha.code → "
-                                    "tgt_beta.code with file_id=17."
-                                )
-                            }
-                        ]
-                    },
-                    "plan-constraint",
-                )
-            ],
-            "submit_upstream_data_decision": [
-                _tool_message(
-                    "submit_upstream_data_decision",
-                    {"decision": "pass"},
-                    "decision-pass",
-                )
-            ],
-            "submit_upstream_answer": [
-                _tool_message(
-                    "submit_upstream_answer",
-                    {
-                        "answer": "The required target can reject null input.",
-                        "used_evidence_ids": [
-                            "evidence-mapping",
-                            "evidence-metadata",
-                        ],
-                        "display_evidence_ids": [],
-                    },
-                    "answer-constraint",
-                )
-            ],
+            ]
         }
-    )
-    worker_result = _outcome(
-        "Both exact reads complete.",
-        evidence=[
-            _artifact(
-                None,
-                "read_s2t_source_to_target",
-                '{"rows":[{"transformation_rule":"source.code"}]}',
-                evidence_id="evidence-mapping",
-                compact_args={
-                    "source_table": "src_alpha",
-                    "target_table": "tgt_beta",
-                },
-            ),
-            _artifact(
-                None,
-                "get_source_target_column_pair",
-                '{"source":{"not_null":false},"target":{"not_null":true}}',
-                evidence_id="evidence-metadata",
-                compact_args={
-                    "file_id": 17,
-                    "source_table": "src_alpha",
-                    "source_column": "code",
-                    "target_table": "tgt_beta",
-                    "target_column": "code",
-                },
-            ),
-        ],
     )
     model_patch, callback_patch, trace_patch = _patches(model)
     with (
         model_patch,
         callback_patch,
         trace_patch,
-        patch(
-            "agents.coordinator.worker_chat",
-            return_value=worker_result,
-        ) as worker,
-        patch("agents.coordinator.record_coordinator_plan") as record_plan,
+        patch("agents.coordinator.worker_chat") as worker,
+        pytest.raises(
+            ValueError,
+            match="Unknown OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT",
+        ),
     ):
-        result = coordinator_chat(original_task)
+        coordinator_chat("Check src_alpha.code → tgt_beta.code in file_id=17.")
 
-    assert result.answer == (
-        "Scope: src_alpha.code → tgt_beta.code\n\n"
-        "The required target can reject null input."
-    )
-    assert result.answer.count("Scope:") == 1
-    assert ensure_sql_risk_answer_scope(
-        result.answer,
-        original_task,
-        ["constraint_rejection"],
-        enabled=True,
-    ) == result.answer
-    assert worker.call_count == 1
-    assert [name for name, _ in model.messages].count(
-        "submit_worker_plan"
-    ) == 1
-    recorded_steps = record_plan.call_args.args[0]
-    assert len(recorded_steps) == 1
-    assert "plan_source" not in recorded_steps[0]
-    assert "operation_sql_risk_scope_contract" in recorded_steps[0]
-    requirements = worker.call_args.kwargs["required_evidence"]
-    assert [requirement.tool_name for requirement in requirements] == [
-        "read_s2t_source_to_target",
-        "get_source_target_column_pair",
-    ]
-    assert [dict(requirement.arguments) for requirement in requirements] == [
-        {"source_table": "src_alpha", "target_table": "tgt_beta"},
-        {
-            "file_id": 17,
-            "source_table": "src_alpha",
-            "source_column": "code",
-            "target_table": "tgt_beta",
-            "target_column": "code",
-        },
-    ]
-
-
-def test_scope_evidence_final_cycle_returns_deterministic_not_assessed(
-    monkeypatch,
-):
-    from agents.coordinator import coordinator_chat
-    from agents.sql_risk_scope_contract import (
-        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
-    )
-    from agents.tools.context import OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV
-
-    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
-    monkeypatch.setenv(OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV, "1")
-    original_task = "Assess row loss for src_alpha → tgt_beta."
-    plan = {
-        "steps": [
-            {
-                "task": (
-                    "Read the exact directed S2T mapping "
-                    "src_alpha → tgt_beta."
-                )
-            }
-        ]
-    }
-    model = _CoordinatorModel(
-        {
-            "select_operation_skills": [
-                _tool_message(
-                    "select_operation_skills",
-                    {
-                        "pipeline": "agentic",
-                        "skills": ["Анализ SQL-рисков"],
-                        "sql_risk_aspects": ["row_filtering"],
-                    },
-                    "operation-row-filtering",
-                )
-            ],
-            "submit_worker_plan": [
-                _tool_message("submit_worker_plan", plan, "plan-cycle-1"),
-                _tool_message("submit_worker_plan", plan, "plan-cycle-2"),
-            ],
-        }
-    )
-    failed_outcome = _outcome(
-        "Exact mapping unavailable.",
-        status="failed",
-        stop_reason="no_results",
-        unmet_requirements=("No exact rows.",),
-    )
-    model_patch, callback_patch, trace_patch = _patches(model)
-    with (
-        model_patch,
-        callback_patch,
-        trace_patch,
-        patch(
-            "agents.coordinator.worker_chat",
-            side_effect=[failed_outcome, failed_outcome],
-        ) as worker,
-        patch("agents.coordinator.record_upstream_output") as record_output,
-    ):
-        result = coordinator_chat(original_task)
-
-    assert worker.call_count == 2
-    assert "src_alpha → tgt_beta" in result.answer
-    assert "not assessed" in result.answer
-    assert "read_s2t_source_to_target" in result.answer
-    assert all(
-        name not in {"submit_upstream_data_decision", "submit_upstream_answer"}
-        for name, _ in model.messages
-    )
-    assert record_output.call_args.args[0]["answer_source"] == (
-        "deterministic_scope_evidence_unavailable"
-    )
-
-
-def test_prompt_scope_guard_survives_plan_with_endpoints_split_across_steps(
-    monkeypatch,
-):
-    from agents.coordinator import coordinator_chat
-    from agents.sql_risk_scope_contract import (
-        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
-    )
-    from agents.tools.context import OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV
-
-    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
-    monkeypatch.setenv(OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV, "1")
-    original_task = "Assess row loss for src_alpha → tgt_beta."
-    split_plan = {
-        "steps": [
-            {"task": "Read S2T source facts for src_alpha."},
-            {"task": "Read S2T target facts for tgt_beta."},
-        ]
-    }
-    repaired_plan = {
-        "steps": [
-            {
-                "task": (
-                    "Read the full exact directed S2T mapping "
-                    "src_alpha → tgt_beta."
-                )
-            }
-        ]
-    }
-    model = _CoordinatorModel(
-        {
-            "select_operation_skills": [
-                _tool_message(
-                    "select_operation_skills",
-                    {
-                        "pipeline": "agentic",
-                        "skills": ["Анализ SQL-рисков"],
-                        "sql_risk_aspects": ["row_filtering"],
-                    },
-                    "operation-row-filtering",
-                )
-            ],
-            "submit_worker_plan": [
-                _tool_message("submit_worker_plan", split_plan, "plan-split-1"),
-                _tool_message("submit_worker_plan", split_plan, "plan-split-2"),
-                _tool_message(
-                    "submit_worker_plan",
-                    repaired_plan,
-                    "plan-repaired-2",
-                ),
-            ],
-        }
-    )
-    failed_outcome = _outcome(
-        "No exact directed mapping was accepted.",
-        status="failed",
-        stop_reason="no_results",
-        unmet_requirements=("Exact mapping missing.",),
-    )
-    model_patch, callback_patch, trace_patch = _patches(model)
-    with (
-        model_patch,
-        callback_patch,
-        trace_patch,
-        patch(
-            "agents.coordinator.worker_chat",
-            side_effect=[failed_outcome, failed_outcome, failed_outcome],
-        ) as worker,
-        patch("agents.coordinator.record_coordinator_plan") as record_plan,
-    ):
-        result = coordinator_chat(original_task)
-
-    assert worker.call_count == 3
-    assert record_plan.call_count == 2
-    assert "src_alpha → tgt_beta" in result.answer
-    assert "not assessed" in result.answer
-    assert all(
-        name not in {"submit_upstream_data_decision", "submit_upstream_answer"}
-        for name, _ in model.messages
-    )
-    first_cycle_steps = record_plan.call_args_list[0].args[0]
-    assert all(
-        "operation_sql_risk_scope_contract" not in step
-        for step in first_cycle_steps
-    )
-    second_cycle_steps = record_plan.call_args_list[1].args[0]
-    assert "operation_sql_risk_scope_contract" in second_cycle_steps[0]
-
-
-def test_scope_evidence_contract_is_attached_only_to_first_matching_step(
-    monkeypatch,
-):
-    from agents.coordinator import coordinator_chat
-    from agents.sql_risk_scope_contract import (
-        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
-    )
-    from agents.tools.context import OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV
-
-    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
-    monkeypatch.setenv(OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV, "1")
-    original_task = "Assess row loss for src_alpha → tgt_beta."
-    model = _CoordinatorModel(
-        {
-            "select_operation_skills": [
-                _tool_message(
-                    "select_operation_skills",
-                    {
-                        "pipeline": "agentic",
-                        "skills": ["Анализ SQL-рисков"],
-                        "sql_risk_aspects": ["row_filtering"],
-                    },
-                    "operation-row-filtering",
-                )
-            ],
-            "submit_worker_plan": [
-                _tool_message(
-                    "submit_worker_plan",
-                    {
-                        "steps": [
-                            {
-                                "task": (
-                                    "Read exact S2T mapping "
-                                    "src_alpha → tgt_beta."
-                                )
-                            },
-                            {
-                                "task": (
-                                    "Read supplementary mapping facts for "
-                                    "src_alpha → tgt_beta."
-                                )
-                            },
-                        ]
-                    },
-                    "plan-two-matching-steps",
-                )
-            ],
-            "submit_upstream_data_decision": [
-                _tool_message(
-                    "submit_upstream_data_decision",
-                    {"decision": "pass"},
-                    "decision-pass",
-                )
-            ],
-            "submit_upstream_answer": [
-                _tool_message(
-                    "submit_upstream_answer",
-                    {
-                        "answer": "A filter can remove rows.",
-                        "used_evidence_ids": ["evidence-mapping"],
-                        "display_evidence_ids": [],
-                    },
-                    "answer-row-filtering",
-                )
-            ],
-        }
-    )
-    mapping_outcome = _outcome(
-        "Mapping read.",
-        evidence=[
-            _artifact(
-                None,
-                "read_s2t_source_to_target",
-                '{"rows":[{"transformation_rule":"WHERE active"}]}',
-                evidence_id="evidence-mapping",
-                compact_args={
-                    "source_table": "src_alpha",
-                    "target_table": "tgt_beta",
-                },
-            )
-        ],
-    )
-    supplementary_outcome = _outcome("Supplementary facts read.")
-    model_patch, callback_patch, trace_patch = _patches(model)
-    with (
-        model_patch,
-        callback_patch,
-        trace_patch,
-        patch(
-            "agents.coordinator.worker_chat",
-            side_effect=[mapping_outcome, supplementary_outcome],
-        ) as worker,
-        patch("agents.coordinator.record_coordinator_plan") as record_plan,
-    ):
-        result = coordinator_chat(original_task)
-
-    assert result.answer.startswith("Scope: src_alpha → tgt_beta")
-    assert worker.call_count == 2
-    assert worker.call_args_list[0].kwargs["required_evidence"]
-    assert worker.call_args_list[1].kwargs == {}
-    recorded_steps = record_plan.call_args.args[0]
-    assert "operation_sql_risk_scope_contract" in recorded_steps[0]
-    assert "operation_sql_risk_scope_contract" not in recorded_steps[1]
+    worker.assert_not_called()
 
 
 def test_typed_scope_cardinality_renders_saved_join_without_upstream_llm(
@@ -4751,6 +4476,9 @@ def test_typed_scope_cardinality_renders_saved_join_without_upstream_llm(
                         "pipeline": "agentic",
                         "skills": ["Анализ SQL-рисков"],
                         "sql_risk_aspects": ["cardinality"],
+                        "sql_risk_execution_mode": (
+                            "conditional_cardinality"
+                        ),
                     },
                     "operation-cardinality",
                 )
@@ -4828,7 +4556,7 @@ def test_typed_scope_cardinality_renders_saved_join_without_upstream_llm(
     assert "aux_np" in folded_answer
     assert re.search(r"d\.id\s*=\s*s\.id", folded_answer), result.answer
     assert re.search(
-        r"уникальн\w*[^.!?\n]{0,100}(?:неизвест|не подтвержд)",
+        r"уникальн.{0,150}(?:неизвест|не подтвержд|не установ)",
         folded_answer,
     ), result.answer
     assert "where" not in folded_answer
@@ -4907,6 +4635,7 @@ def test_typed_scope_constraint_renders_saved_not_null_without_upstream_llm(
                         "pipeline": "agentic",
                         "skills": ["Анализ SQL-рисков"],
                         "sql_risk_aspects": ["constraint_rejection"],
+                        "sql_risk_execution_mode": "nullable_constraint",
                     },
                     "operation-constraint",
                 )
@@ -5077,6 +4806,7 @@ def test_typed_scope_ineligible_request_is_byte_equivalent_baseline(monkeypatch)
                         "pipeline": "agentic",
                         "skills": ["Анализ SQL-рисков"],
                         "sql_risk_aspects": ["row_filtering"],
+                        "sql_risk_execution_mode": "agentic",
                     },
                     "operation-row-filtering",
                 )
@@ -5189,6 +4919,9 @@ def test_typed_scope_missing_evidence_reuses_plan_then_returns_not_assessed(
                         "pipeline": "agentic",
                         "skills": ["Анализ SQL-рисков"],
                         "sql_risk_aspects": ["cardinality"],
+                        "sql_risk_execution_mode": (
+                            "conditional_cardinality"
+                        ),
                     },
                     "operation-cardinality",
                 )

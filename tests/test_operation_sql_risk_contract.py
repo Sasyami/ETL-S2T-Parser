@@ -1,5 +1,7 @@
 """Focused contracts for field-scoped and negative-evidence SQL risks."""
 
+import re
+
 from agents.tools.context import (
     OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
     load_operation_skills,
@@ -25,6 +27,19 @@ def test_value_changes_is_scoped_to_exact_target_projection():
     assert "проекции точного target field" in decision
     assert "другом output alias не доказывают" in answer
     assert "прямая проекция" in answer
+
+
+def test_value_change_guidance_states_invariants_without_fixture_sql(monkeypatch):
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "0")
+    answer = _typed_context("value_changes", "upstream")
+
+    assert "выражение output alias целевого поля" in answer
+    assert "Выражения соседних output aliases" in answer
+    assert not re.search(
+        r"\b[a-z]\w*\.[a-z_]\w*\s+AS\s+[a-z_]\w*",
+        answer,
+        flags=re.IGNORECASE,
+    )
 
 
 def test_write_semantics_accepts_complete_mapping_as_terminal_evidence():
@@ -57,4 +72,4 @@ def test_legacy_profile_has_the_same_terminal_and_field_scope_rules(monkeypatch)
     assert "terminal negative evidence, а не gap" in observer
     assert "достаточен для `pass`" in decision
     assert "SQL-проекцию именно target.field" in answer
-    assert "другом output alias не доказывают" in answer
+    assert "соседних output aliases" in answer

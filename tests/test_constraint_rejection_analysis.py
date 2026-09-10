@@ -9,18 +9,18 @@ from agents.constraint_rejection_analysis import (
     ConstraintRejectionFact,
     constraint_rejection_payload,
     derive_constraint_rejection_facts,
-    is_exclusive_constraint_rejection_request,
     render_constraint_rejection_answer,
 )
 from agents.contracts import EvidenceArtifact
+from agents.sql_risk_scope_contract import (
+    GetSourceTargetColumnPairRequirement,
+    LiteralSqlRiskScope,
+    ReadS2TSourceToTargetRequirement,
+    SqlRiskScopeContract,
+)
 from agents.tools.saved_results import SavedResultStore
 
 
-TASK = (
-    "Для file_id=9101 оцени только SQL-риск constraint rejection из-за "
-    "nullable-ограничений src_np.id → tgt_np.id. Верни "
-    "source_not_null=<0|1>, target_not_null=<0|1> и вывод."
-)
 MAPPING_ARGS = {"source_table": "src_np", "target_table": "tgt_np"}
 METADATA_ARGS = {
     "file_id": 9101,
@@ -29,6 +29,23 @@ METADATA_ARGS = {
     "target_table": "tgt_np",
     "target_column": "id",
 }
+CONTRACT = SqlRiskScopeContract(
+    scope=LiteralSqlRiskScope(
+        source="src_np.id",
+        target="tgt_np.id",
+        source_table="src_np",
+        target_table="tgt_np",
+        source_field="id",
+        target_field="id",
+        file_id=9101,
+    ),
+    aspects=("constraint_rejection",),
+    requirements=(
+        ReadS2TSourceToTargetRequirement(**MAPPING_ARGS),
+        GetSourceTargetColumnPairRequirement(**METADATA_ARGS),
+    ),
+    execution_mode="nullable_constraint",
+)
 
 
 def _mapping_row(
@@ -155,7 +172,7 @@ def _derive(
     store = SavedResultStore()
     try:
         return derive_constraint_rejection_facts(
-            TASK,
+            CONTRACT,
             _complete_artifacts(
                 store,
                 source_not_null=source_not_null,
@@ -166,114 +183,6 @@ def _derive(
         )[0]
     finally:
         store.close()
-
-
-def test_live_wording_is_an_exclusive_constraint_rejection_request():
-    assert is_exclusive_constraint_rejection_request(TASK) is True
-
-
-@pytest.mark.parametrize(
-    "task",
-    [
-        "Оцени constraint rejection src_np.id → tgt_np.id.",
-        (
-            "Для file_id=9101 оцени constraint rejection "
-            "src_np.id → tgt_np.id и row filtering."
-        ),
-        (
-            "Для file_id=9101 оцени только constraint rejection "
-            "src_np.id → tgt_np.id и покажи все строки mapping."
-        ),
-        (
-            "Для file_id=9101 оцени только nullable constraint rejection "
-            "src_np.id → tgt_np.id и верни весь SQL."
-        ),
-        (
-            "Для file_id=9101 оцени только constraint rejection из-за "
-            "nullable и уникальности src_np.id → tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только constraint rejection из-за "
-            "nullable и CHECK constraint src_np.id → tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только constraint rejection из-за "
-            "nullable и DEFAULT constraint src_np.id → tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только constraint rejection из-за "
-            "nullable и ссылочной целостности src_np.id → tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только constraint rejection из-за "
-            "nullable и изменения данных src_np.id → tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только constraint rejection из-за "
-            "nullable и фактических NULL в данных src_np.id → tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только nullable constraint rejection "
-            "src_np.id → tgt_np.id и покажи весь каталог колонок."
-        ),
-        (
-            "Для file_id=9101 оцени только nullable constraint rejection "
-            "src_np.id → tgt_np.id и укажи типы данных обеих колонок."
-        ),
-        (
-            "Для file_id=9101 оцени только nullable constraint rejection "
-            "src_np.id → tgt_np.id и описание target-колонки."
-        ),
-        (
-            "Для file_id=9101 оцени только nullable constraint rejection "
-            "src_np.id → tgt_np.id и покажи mapping."
-        ),
-        (
-            "Для file_id=9101 оцени только nullable constraint rejection "
-            "src_np.id → tgt_np.id и укажи transformation_rule."
-        ),
-        (
-            "Для file_id=9101 оцени только nullable constraint rejection "
-            "с внешней ссылкой src_np.id → tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только nullable constraint rejection и "
-            "риск переполнения длины src_np.id → tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только SQL-риск constraint rejection "
-            "из-за nullable-ограничений src_np.id → tgt_np.id. Дай "
-            "рекомендации по исправлению. Верни source_not_null=<0|1>, "
-            "target_not_null=<0|1> и вывод."
-        ),
-        (
-            "Для file_id=9101 оцени только SQL-риск constraint rejection "
-            "из-за nullable-ограничений src_np.id → tgt_np.id. Составь DDL. "
-            "Верни source_not_null=<0|1>, target_not_null=<0|1> и вывод."
-        ),
-        (
-            "Для file_id=9101 оцени только SQL-риск constraint rejection "
-            "из-за nullable-ограничений src_np.id → tgt_np.id. Сравни с "
-            "другой загрузкой. Верни source_not_null=<0|1>, "
-            "target_not_null=<0|1> и вывод."
-        ),
-        (
-            "For file_id=9101 assess only constraint rejection caused by "
-            "incompatible data types for source field "
-            "src_np.id → tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только constraint rejection "
-            "src_np.id -> tgt_np.id."
-        ),
-        (
-            "Для file_id=9101 оцени только constraint rejection "
-            "src_np.id → tgt_np.id и a.id → b.id."
-        ),
-    ],
-)
-def test_exclusive_predicate_fails_closed_for_broader_or_ambiguous_task(task):
-    assert is_exclusive_constraint_rejection_request(task) is False
 
 
 def test_derives_conditional_risk_and_renders_exact_requested_values():
@@ -458,7 +367,7 @@ def test_missing_exact_field_mapping_is_not_assessed():
         )
         metadata = _complete_artifacts(store)[1]
         fact = derive_constraint_rejection_facts(
-            TASK,
+            CONTRACT,
             [mapping, metadata],
             store,
         )[0]
@@ -485,7 +394,7 @@ def test_wrong_mapping_scope_is_rejected_instead_of_cherry_picked():
         )
         metadata = _complete_artifacts(store)[1]
         fact = derive_constraint_rejection_facts(
-            TASK,
+            CONTRACT,
             [mapping, metadata],
             store,
         )[0]
@@ -556,7 +465,7 @@ def test_incomplete_mapping_dataset_is_not_assessed(kind):
             )
         metadata = _complete_artifacts(store)[1]
         fact = derive_constraint_rejection_facts(
-            TASK,
+            CONTRACT,
             [mapping, metadata],
             store,
         )[0]
@@ -580,7 +489,7 @@ def test_source_total_mismatch_is_incomplete_catalog_evidence():
             total_matches=3,
         )
         fact = derive_constraint_rejection_facts(
-            TASK,
+            CONTRACT,
             [mapping, metadata],
             store,
         )[0]
@@ -611,7 +520,7 @@ def test_preview_clipping_does_not_override_complete_saved_relations():
             artifact_truncated=True,
         )
         fact = derive_constraint_rejection_facts(
-            TASK,
+            CONTRACT,
             [mapping, metadata],
             store,
         )[0]
@@ -633,7 +542,7 @@ def test_wrong_exact_arguments_do_not_satisfy_provenance():
                 }
             }
         )
-        fact = derive_constraint_rejection_facts(TASK, artifacts, store)[0]
+        fact = derive_constraint_rejection_facts(CONTRACT, artifacts, store)[0]
     finally:
         store.close()
 
@@ -641,14 +550,44 @@ def test_wrong_exact_arguments_do_not_satisfy_provenance():
     assert fact.evidence_ids == []
 
 
-def test_task_without_safe_exact_contract_produces_no_fact():
+def test_wrong_execution_mode_contract_produces_no_fact():
     store = SavedResultStore()
     try:
+        contract = SqlRiskScopeContract(
+            scope=CONTRACT.scope,
+            aspects=CONTRACT.aspects,
+            requirements=CONTRACT.requirements,
+            execution_mode="agentic",
+        )
         facts = derive_constraint_rejection_facts(
-            "Оцени nullable src_np.id → tgt_np.id без file scope.",
+            contract,
             [],
             store,
         )
+    finally:
+        store.close()
+
+    assert facts == []
+
+
+def test_internally_inconsistent_scope_contract_produces_no_fact():
+    store = SavedResultStore()
+    try:
+        contract = SqlRiskScopeContract(
+            scope=LiteralSqlRiskScope(
+                source="different.id",
+                target=CONTRACT.scope.target,
+                source_table=CONTRACT.scope.source_table,
+                target_table=CONTRACT.scope.target_table,
+                source_field=CONTRACT.scope.source_field,
+                target_field=CONTRACT.scope.target_field,
+                file_id=CONTRACT.scope.file_id,
+            ),
+            aspects=CONTRACT.aspects,
+            requirements=CONTRACT.requirements,
+            execution_mode="nullable_constraint",
+        )
+        facts = derive_constraint_rejection_facts(contract, [], store)
     finally:
         store.close()
 

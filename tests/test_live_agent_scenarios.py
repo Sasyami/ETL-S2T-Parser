@@ -1727,6 +1727,8 @@ def _assert_agentic_pipeline(exchange: _LiveExchange) -> None:
 def _assert_sql_risk_aspect(
     exchange: _LiveExchange,
     expected_aspect: str,
+    *,
+    expected_execution_mode: str = "agentic",
 ) -> None:
     """Hard-check the E2 route without making baseline runs incomparable."""
     if LIVE_AGENT_MODE != "multiagent":
@@ -1738,6 +1740,11 @@ def _assert_sql_risk_aspect(
         "no",
         "off",
     }
+    from agents.sql_risk_scope_contract import (
+        sql_risk_scope_evidence_architecture,
+    )
+
+    architecture = sql_risk_scope_evidence_architecture()
     expected = [expected_aspect] if typed_enabled else []
     routed_steps = [
         step
@@ -1749,6 +1756,20 @@ def _assert_sql_risk_aspect(
     assert actual == [expected] * len(routed_steps), {
         "expected": expected,
         "actual": actual,
+        "plan": routed_steps,
+    }
+    expected_modes = (
+        [expected_execution_mode] * len(routed_steps)
+        if typed_enabled and architecture == "typed_plan"
+        else ["agentic"] * len(routed_steps)
+    )
+    actual_modes = [
+        str(step.get("sql_risk_execution_mode") or "agentic")
+        for step in routed_steps
+    ]
+    assert actual_modes == expected_modes, {
+        "expected": expected_modes,
+        "actual": actual_modes,
         "plan": routed_steps,
     }
     assert all(
@@ -1783,11 +1804,9 @@ def _assert_sql_risk_aspect(
 
     from agents.sql_risk_scope_contract import (
         build_sql_risk_scope_contract,
-        sql_risk_scope_evidence_architecture,
         sql_risk_scope_evidence_enabled,
     )
 
-    architecture = sql_risk_scope_evidence_architecture()
     if not sql_risk_scope_evidence_enabled():
         assert all(
             "operation_sql_risk_scope_contract" not in step
@@ -1799,6 +1818,7 @@ def _assert_sql_risk_aspect(
         exchange.query,
         [expected_aspect],
         enabled=True,
+        execution_mode=expected_execution_mode,
     )
     typed_plan = None
     if architecture == "typed_plan":
@@ -1809,6 +1829,7 @@ def _assert_sql_risk_aspect(
         typed_plan = build_typed_sql_risk_worker_plan(
             exchange.query,
             contract,
+            sql_risk_execution_mode=expected_execution_mode,
         )
     attested_steps = [
         step
@@ -3264,7 +3285,11 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
         required_tools={"read_s2t_source_to_target"},
         require_analysis=True,
     )
-    _assert_sql_risk_aspect(exchange, "constraint_rejection")
+    _assert_sql_risk_aspect(
+        exchange,
+        "constraint_rejection",
+        expected_execution_mode="nullable_constraint",
+    )
 
 
 @pytest.mark.live_validation
@@ -3363,6 +3388,11 @@ def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client
         required_tools={required_tool},
         require_analysis=True,
     )
+    _assert_sql_risk_aspect(
+        exchange,
+        "constraint_rejection",
+        expected_execution_mode="agentic",
+    )
 
 
 @pytest.mark.live_validation
@@ -3374,143 +3404,424 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
         f"{case.source_table} → {case.target_table}. Назови фактический JOIN "
         "и явно отдели подтверждённый механизм от условия по уникальности.",
     )
-    result = exchange.result
 
-    _assert_public_answer(result.answer)
+    _assert_cardinality_paraphrase(exchange, case)
+
+
+def _assert_no_typed_plan_or_upstream_llm(exchange: _LiveExchange) -> None:
+    forbidden_stages = {"downstream_plan", "upstream"}
+    assert not [
+        item
+        for item in exchange.metrics.llm_calls
+        if item.stage in forbidden_stages
+    ], exchange.metrics.llm_calls
+
+
+def _assert_cardinality_paraphrase(
+    exchange: _LiveExchange,
+    case: _ProtocolLiveCase,
+) -> None:
+    """Check semantics in both arms and typed facts in the candidate."""
+
     _assert_agentic_answer_uses_complete_evidence(exchange)
     exact_calls = _assert_exact_s2t_pair_was_read(
         exchange,
         source_table=case.source_table,
         target_table=case.target_table,
     )
-    folded_answer = result.answer.casefold()
+    assert len(exact_calls) == 1, exact_calls
+
+    def compact(value: object) -> str:
+        return re.sub(r"[\s`\"]+", "", str(value or "").casefold())
+
+    answer = exchange.result.answer
+    folded_answer = answer.casefold()
     assert re.search(
         rf"`?{re.escape(case.source_table)}`?\s*(?:→|->|=>)\s*"
         rf"`?{re.escape(case.target_table)}`?",
-        result.answer,
+        answer,
         re.IGNORECASE,
-    ), result.answer
+    ), answer
     from agents.transformation_ast import normalize_transformation
 
     normalized = normalize_transformation(case.transformation_rule)
     assert normalized.parse_status == "ok" and normalized.joins, normalized
+    for join in normalized.joins:
+        assert compact(join.relation) in compact(answer), (join, answer)
+        assert compact(join.condition) in compact(answer), (join, answer)
+    assert re.search(
+        r"(?:уникальн\w*|uniqueness)[^.!?\n]{0,120}"
+        r"(?:неизвест|не подтвержд|не доказ|не установлен|unknown|not (?:established|"
+        r"confirmed|proven))|(?:неизвест|не подтвержд|не доказ|не установлен|unknown|"
+        r"not (?:established|confirmed|proven))[^.!?\n]{0,120}"
+        r"(?:уникальн\w*|uniqueness)",
+        folded_answer,
+    ), answer
+    assert re.search(
+        r"(?:дубликат\w*|duplicates?)[^.!?\n]{0,120}"
+        r"(?:не доказ|не подтвержд|не установлен|not (?:established|confirmed|proven))|"
+        r"(?:не доказ|не подтвержд|не установлен|not (?:established|confirmed|proven))"
+        r"[^.!?\n]{0,120}(?:дубликат\w*|duplicates?)",
+        folded_answer,
+    ), answer
     answer_clauses = [
-        clause.strip().casefold()
-        for clause in re.split(
-            r"\n+|(?<=[.!?])\s+(?=[A-ZА-ЯЁ])",
-            result.answer,
-        )
+        clause.strip()
+        for clause in re.split(r"\n+|(?<=[.!?])\s+", folded_answer)
         if clause.strip()
     ]
-    actual_join_clauses = [
-        clause for clause in answer_clauses if "фактический join" in clause
-    ]
-    assert actual_join_clauses, result.answer
-
-    def compact_sql_fragment(value: str) -> str:
-        return re.sub(r"[\s`\"]+", "", value.casefold())
-
-    for join in normalized.joins:
-        relation = compact_sql_fragment(join.relation)
-        predicate = compact_sql_fragment(join.condition)
-        assert any(
-            relation in compact_sql_fragment(clause)
-            and predicate in compact_sql_fragment(clause)
-            for clause in actual_join_clauses
-        ), {
-            "expected_join": join.model_dump(),
-            "actual_join_clauses": actual_join_clauses,
-            "answer": result.answer,
-        }
-    mechanism_clauses = [
-        clause
-        for clause in answer_clauses
-        if re.search(r"подтвержд\w*\s+механизм", clause)
-    ]
-    assert mechanism_clauses, result.answer
-    assert all("join" in clause for clause in mechanism_clauses), (
-        mechanism_clauses
-    )
-    assert all(
-        "where" not in clause and "coalesce" not in clause
-        for clause in mechanism_clauses
-    ), mechanism_clauses
-    uniqueness_clauses = [
-        clause
-        for clause in answer_clauses
-        if re.search(r"услов\w*[^.!?\n]{0,32}уникальн", clause)
-    ]
-    assert uniqueness_clauses, result.answer
     assert any(
-        re.search(r"(?:неизвест|не подтвержд|не доказ)", clause)
-        for clause in uniqueness_clauses
-    ), uniqueness_clauses
-    assert not any(
-        re.search(
-            r"(?:услов\w*[^:]{0,32}уникальн\w*\s*:\s*"
-            r"(?:`?where|`?coalesce)|"
-            r"(?:where|coalesce)[^.!?\n]{0,64}"
-            r"(?:доказы|подтвержд|обеспеч|гарантир)\w*[^.!?\n]{0,32}"
-            r"уникальн)",
+        "join" in clause
+        and re.search(
+            r"дубликат\w*|duplicates?|размнож\w*|fan[- ]?out|"
+            r"увелич\w*[^.!?\n]{0,24}строк|multiply\w*[^.!?\n]{0,24}rows",
             clause,
         )
-        for clause in uniqueness_clauses
-    ), uniqueness_clauses
-    assert re.search(
-        r"дубликат\w*[^.!?\n]{0,100}(?:не доказ|не подтвержд)|"
-        r"(?:не доказ|не подтвержд)[^.!?\n]{0,100}дубликат\w*",
-        folded_answer,
-    ), result.answer
-    join_columns = {
-        column.name.casefold()
-        for join in normalized.joins
-        for column in sqlglot.parse_one(
-            join.condition,
-            read=GREENPLUM_DIALECT,
-        ).find_all(sqlglot.exp.Column)
-    }
-    assert join_columns and join_columns <= set(
-        re.findall(r"[a-z_][a-z0-9_$]*", folded_answer)
-    ), {"join_columns": sorted(join_columns), "answer": result.answer}
-    assert any(
-        marker in folded_answer
-        for marker in ("если", "может", "возмож", "завис", "услов")
-    ), result.answer
-    if _typed_sql_risk_enabled():
-        assert len(exact_calls) == 1, exact_calls
-        assert _tool_names(exchange) == ["read_s2t_source_to_target"], (
-            exchange.metrics.tool_calls
+        for clause in answer_clauses
+    ), answer
+    for clause in answer_clauses:
+        if not (
+            ("where" in clause or "coalesce" in clause)
+            and re.search(r"уникальн\w*|uniqueness", clause)
+        ):
+            continue
+        assert not re.search(
+            r"услов\w*[^:]{0,32}уникальн\w*\s*:\s*"
+            r"(?:`?where|`?coalesce)",
+            clause,
+        ), clause
+        positive_proof = re.search(
+            r"(?:where|coalesce)[^.!?\n]{0,80}"
+            r"(?:доказы|подтвержд|обеспеч|гарантир)\w*[^.!?\n]{0,48}"
+            r"(?:уникальн\w*|uniqueness)|"
+            r"(?:where|coalesce)[^.!?\n]{0,80}"
+            r"(?:proves?|confirms?|ensures?|guarantees?)[^.!?\n]{0,48}"
+            r"uniqueness",
+            clause,
         )
+        explicit_negation = re.search(
+            r"(?:не|нельзя)[^.!?\n]{0,24}"
+            r"(?:доказы|подтвержд|обеспеч|гарантир)|"
+            r"(?:does\s+not|cannot)[^.!?\n]{0,24}"
+            r"(?:prove|confirm|ensure|guarantee)",
+            clause,
+        )
+        assert not positive_proof or explicit_negation, clause
+
     from agents.sql_risk_scope_contract import (
         sql_risk_scope_evidence_architecture,
     )
 
-    if sql_risk_scope_evidence_architecture() == "typed_plan":
-        upstream = exchange.metrics.upstream_output
-        assert upstream is not None, exchange.metrics
-        assert upstream.get("answer_source") == "deterministic_cardinality", (
-            upstream
+    if sql_risk_scope_evidence_architecture() != "typed_plan":
+        _assert_sql_risk_aspect(
+            exchange,
+            "cardinality",
+            expected_execution_mode="conditional_cardinality",
         )
-        used_evidence_ids = list(upstream.get("used_evidence_ids") or [])
-        assert len(used_evidence_ids) == 1, upstream
-        assert list(upstream.get("display_evidence_ids") or []) == (
-            used_evidence_ids
-        ), upstream
-        assert exchange.metrics.display_tools == [
-            "read_s2t_source_to_target"
-        ], exchange.metrics.display_tools
-        assert all(
-            item.stage != "upstream"
-            for item in exchange.metrics.llm_calls
-        ), exchange.metrics.llm_calls
-        assert "where" not in folded_answer
-        assert "coalesce" not in folded_answer
-    _assert_s2t_work_case_execution(
-        exchange,
-        required_tools={"read_s2t_source_to_target"},
-        require_analysis=True,
+        return
+
+    assert _tool_names(exchange) == ["read_s2t_source_to_target"], (
+        exchange.metrics.tool_calls
     )
-    _assert_sql_risk_aspect(exchange, "cardinality")
+    matching_facts = [
+        fact
+        for fact in exchange.metrics.sql_risk_facts
+        if str(fact.get("source_table") or "").casefold()
+        == case.source_table.casefold()
+        and str(fact.get("target_table") or "").casefold()
+        == case.target_table.casefold()
+    ]
+    assert len(matching_facts) == 1, exchange.metrics.sql_risk_facts
+    fact = matching_facts[0]
+    assert fact.get("conclusion") == "conditional_duplicate_risk", fact
+    assert fact.get("mechanism") == "join_fanout", fact
+    assert fact.get("condition") == "full_join_key_uniqueness_unknown", fact
+    assert int(fact.get("matching_rows") or 0) > 0, fact
+    joins = list(fact.get("joins") or [])
+    assert joins, fact
+    assert all(
+        join.get("relation")
+        and join.get("predicate")
+        and join.get("uniqueness_condition")
+        == "full_join_key_uniqueness_unknown"
+        for join in joins
+    ), joins
+
+    upstream = exchange.metrics.upstream_output
+    assert upstream is not None, exchange.metrics
+    assert upstream.get("answer_source") == "deterministic_cardinality", upstream
+    used_ids = list(upstream.get("used_evidence_ids") or [])
+    assert len(used_ids) == 1, upstream
+    assert list(upstream.get("display_evidence_ids") or []) == used_ids, upstream
+    assert exchange.metrics.display_tools == [
+        "read_s2t_source_to_target"
+    ], exchange.metrics.display_tools
+    assert set(fact.get("evidence_ids") or []) == set(used_ids), fact
+    _assert_no_typed_plan_or_upstream_llm(exchange)
+    _assert_sql_risk_aspect(
+        exchange,
+        "cardinality",
+        expected_execution_mode="conditional_cardinality",
+    )
+
+
+def _nullable_flags_for_case(
+    *,
+    file_id: int,
+    source_table: str,
+    source_field: str,
+    target_table: str,
+    target_field: str,
+) -> tuple[int, int]:
+    source_not_null = int(
+        _fetch_one(
+            """
+            SELECT not_null
+            FROM source_columns
+            WHERE file_id = ?
+              AND table_name = ? COLLATE NOCASE
+              AND column_name = ? COLLATE NOCASE
+            ORDER BY id
+            LIMIT 1
+            """,
+            (file_id, source_table, source_field),
+        )[0]
+    )
+    target_not_null = int(
+        _fetch_one(
+            """
+            SELECT not_null
+            FROM target_columns
+            WHERE file_id = ?
+              AND table_name = ? COLLATE NOCASE
+              AND column_name = ? COLLATE NOCASE
+            ORDER BY id
+            LIMIT 1
+            """,
+            (file_id, target_table, target_field),
+        )[0]
+    )
+    return source_not_null, target_not_null
+
+
+def _assert_nullable_paraphrase(
+    exchange: _LiveExchange,
+    *,
+    file_id: int,
+    source_table: str,
+    source_field: str,
+    target_table: str,
+    target_field: str,
+) -> None:
+    source_not_null, target_not_null = _nullable_flags_for_case(
+        file_id=file_id,
+        source_table=source_table,
+        source_field=source_field,
+        target_table=target_table,
+        target_field=target_field,
+    )
+    _assert_agentic_answer_uses_complete_evidence(exchange)
+    _assert_named_answer_value(
+        exchange.result.answer,
+        "source_not_null",
+        source_not_null,
+    )
+    _assert_named_answer_value(
+        exchange.result.answer,
+        "target_not_null",
+        target_not_null,
+    )
+    _assert_exact_s2t_pair_was_read(
+        exchange,
+        source_table=source_table,
+        target_table=target_table,
+    )
+    _assert_exact_column_pair_was_read(
+        exchange,
+        file_id=file_id,
+        source_table=source_table,
+        source_field=source_field,
+        target_table=target_table,
+        target_field=target_field,
+    )
+
+    answer = exchange.result.answer
+    assert f"{source_table}.{source_field}".casefold() in answer.casefold(), answer
+    assert f"{target_table}.{target_field}".casefold() in answer.casefold(), answer
+    assert any(
+        marker in answer.casefold()
+        for marker in ("риск", "rejection", "отклон", "огранич")
+    ), answer
+    from agents.sql_risk_scope_contract import (
+        sql_risk_scope_evidence_architecture,
+    )
+
+    if sql_risk_scope_evidence_architecture() != "typed_plan":
+        _assert_sql_risk_aspect(
+            exchange,
+            "constraint_rejection",
+            expected_execution_mode="nullable_constraint",
+        )
+        return
+
+    assert sorted(_tool_names(exchange)) == sorted(
+        ["read_s2t_source_to_target", "get_source_target_column_pair"]
+    ), exchange.metrics.tool_calls
+    matching_facts = [
+        fact
+        for fact in exchange.metrics.sql_risk_facts
+        if int(fact.get("file_id") or 0) == file_id
+        and str(fact.get("source_table") or "").casefold()
+        == source_table.casefold()
+        and str(fact.get("source_field") or "").casefold()
+        == source_field.casefold()
+        and str(fact.get("target_table") or "").casefold()
+        == target_table.casefold()
+        and str(fact.get("target_field") or "").casefold()
+        == target_field.casefold()
+    ]
+    assert len(matching_facts) == 1, exchange.metrics.sql_risk_facts
+    fact = matching_facts[0]
+    assert fact.get("source_not_null") == source_not_null, fact
+    assert fact.get("target_not_null") == target_not_null, fact
+    expected = {
+        (0, 1): (
+            "conditional_rejection_risk",
+            "nullable_source_to_not_null_target",
+        ),
+        (0, 0): ("nullable_mismatch_not_detected", "target_allows_null"),
+        (1, 0): ("nullable_mismatch_not_detected", "target_allows_null"),
+        (1, 1): ("nullable_mismatch_not_detected", "both_not_null"),
+    }[(source_not_null, target_not_null)]
+    assert (fact.get("conclusion"), fact.get("mechanism")) == expected, fact
+    upstream = exchange.metrics.upstream_output
+    assert upstream is not None, exchange.metrics
+    assert upstream.get("answer_source") == (
+        "deterministic_constraint_rejection"
+    ), upstream
+    used_ids = set(upstream.get("used_evidence_ids") or [])
+    assert len(used_ids) == 2, upstream
+    assert set(fact.get("evidence_ids") or []) == used_ids, fact
+    assert list(upstream.get("display_evidence_ids") or []) == [], upstream
+    assert exchange.metrics.display_tools == [], exchange.metrics.display_tools
+    _assert_no_typed_plan_or_upstream_llm(exchange)
+    _assert_sql_risk_aspect(
+        exchange,
+        "constraint_rejection",
+        expected_execution_mode="nullable_constraint",
+    )
+
+
+@pytest.mark.live_validation
+def test_live_sql_risk_cardinality_paraphrase_scope_first(live_chat_client):
+    case = _protocol_live_case()
+    exchange = _chat(
+        live_chat_client,
+        f"По направлению {case.source_table} → {case.target_table} нужен "
+        "только условный анализ размножения строк. Укажи JOIN из "
+        "сохранённого S2T и отдельно поясни, что известно о механизме, "
+        "уникальности ключей и наличии реальных дубликатов.",
+    )
+
+    _assert_cardinality_paraphrase(exchange, case)
+
+
+@pytest.mark.live_validation
+def test_live_sql_risk_cardinality_paraphrase_english(live_chat_client):
+    case = _protocol_live_case()
+    exchange = _chat(
+        live_chat_client,
+        f"Using the stored S2T for {case.source_table} → "
+        f"{case.target_table}, assess only conditional row multiplication. "
+        "State the concrete JOIN, then distinguish the established mechanism "
+        "from unknown join-key uniqueness and unproven actual duplicates.",
+    )
+
+    _assert_cardinality_paraphrase(exchange, case)
+
+
+@pytest.mark.live_validation
+def test_live_sql_risk_cardinality_paraphrase_reordered(live_chat_client):
+    case = _protocol_live_case()
+    exchange = _chat(
+        live_chat_client,
+        "Реальные дубликаты заранее не утверждай. Для "
+        f"{case.source_table} → {case.target_table} оцени по сохранённому "
+        "S2T только условный cardinality risk: сначала состояние "
+        "уникальности ключей, затем подтверждённый JOIN-механизм.",
+    )
+
+    _assert_cardinality_paraphrase(exchange, case)
+
+
+@pytest.mark.live_validation
+def test_live_sql_risk_nullable_paraphrase_scope_first(live_chat_client):
+    file_id, target_table, source_table, target_field, source_field = (
+        _s2t_work_case_fixture()
+    )
+    exchange = _chat(
+        live_chat_client,
+        f"В file_id={file_id} для {source_table}.{source_field} → "
+        f"{target_table}.{target_field} проверь исключительно, может ли "
+        "nullable источника привести к отказу записи по NOT NULL цели. "
+        "Сообщи source_not_null, target_not_null и заключение; другие "
+        "SQL-риски не рассматривай.",
+    )
+
+    _assert_nullable_paraphrase(
+        exchange,
+        file_id=file_id,
+        source_table=source_table,
+        source_field=source_field,
+        target_table=target_table,
+        target_field=target_field,
+    )
+
+
+@pytest.mark.live_validation
+def test_live_sql_risk_nullable_paraphrase_english(live_chat_client):
+    file_id, target_table, source_table, target_field, source_field = (
+        _s2t_work_case_fixture()
+    )
+    exchange = _chat(
+        live_chat_client,
+        "Ignore every other SQL risk. For "
+        f"{source_table}.{source_field} → {target_table}.{target_field} in "
+        f"file_id={file_id}, determine only whether the source/target "
+        "nullability contract can cause a NOT NULL constraint rejection. "
+        "State source_not_null, target_not_null, and the conclusion.",
+    )
+
+    _assert_nullable_paraphrase(
+        exchange,
+        file_id=file_id,
+        source_table=source_table,
+        source_field=source_field,
+        target_table=target_table,
+        target_field=target_field,
+    )
+
+
+@pytest.mark.live_validation
+def test_live_sql_risk_nullable_paraphrase_reordered(live_chat_client):
+    file_id, target_table, source_table, target_field, source_field = (
+        _s2t_work_case_fixture()
+    )
+    exchange = _chat(
+        live_chat_client,
+        "Нужны source_not_null и target_not_null плюс вывод. Анализ ограничь "
+        "только nullable constraint rejection для пары "
+        f"{source_table}.{source_field} → {target_table}.{target_field}, "
+        f"file_id={file_id}.",
+    )
+
+    _assert_nullable_paraphrase(
+        exchange,
+        file_id=file_id,
+        source_table=source_table,
+        source_field=source_field,
+        target_table=target_table,
+        target_field=target_field,
+    )
 
 
 @pytest.mark.live_validation
@@ -3670,8 +3981,15 @@ def test_live_agent_checks_value_change_risk(live_chat_client):
     assert matching_facts[0]["mechanism"] == "direct_column"
     assert exchange.metrics.upstream_output is not None
     assert exchange.metrics.upstream_output.get("answer_source") == (
-        "deterministic_value_changes"
+        "model"
     )
+    assert len(
+        [
+            item
+            for item in exchange.metrics.llm_calls
+            if item.stage == "upstream"
+        ]
+    ) >= 2, exchange.metrics.llm_calls
 
 
 @pytest.mark.live_validation
@@ -3728,8 +4046,15 @@ def test_live_agent_checks_write_semantics_risk(live_chat_client):
     assert write_facts[0]["mechanism"] == "write_statement_absent"
     assert exchange.metrics.upstream_output is not None
     assert exchange.metrics.upstream_output.get("answer_source") == (
-        "deterministic_write_semantics"
+        "model"
     )
+    assert len(
+        [
+            item
+            for item in exchange.metrics.llm_calls
+            if item.stage == "upstream"
+        ]
+    ) >= 2, exchange.metrics.llm_calls
 
 
 @pytest.mark.live_validation

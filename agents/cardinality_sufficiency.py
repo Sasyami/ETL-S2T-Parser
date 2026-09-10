@@ -1,18 +1,21 @@
-"""Fail-closed sufficiency check for conditional cardinality analysis.
+"""Fail-closed evidence sufficiency for typed cardinality analysis.
 
-The coordinator may ignore an upstream request for redundant metadata only
-when the original task asks for a conditional duplicate/cardinality risk and
-one accepted exact directed reader produced a demonstrably complete saved
-mapping.  This module never claims factual counts or uniqueness.
+Semantic intent is owned by the structured operation contract.  This module
+only verifies that an accepted exact directed reader materialized a complete
+mapping for the contract's literal scope.  It never classifies natural
+language or claims factual counts or uniqueness.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import List, Sequence
 
 from .contracts import EvidenceArtifact
+from .sql_risk_scope_contract import (
+    ReadS2TSourceToTargetRequirement,
+    SqlRiskScopeContract,
+)
 from .tools.saved_results import SavedResultStore
 
 
@@ -23,129 +26,44 @@ _REQUIRED_COLUMNS = frozenset(
     {"source_table", "target_table", "transformation_rule"}
 )
 
-_IDENTIFIER_PART = (
-    r"(?:[A-Za-z_\u0410-\u042f\u0430-\u044f\u0401\u0451$]"
-    r"[A-Za-z0-9_\u0410-\u042f\u0430-\u044f\u0401\u0451$-]*|"
-    r"`[^`\r\n.]+`|\"[^\"\r\n.]+\")"
-)
-# Whitespace around dots is deliberately unsupported.  Apart from being an
-# unusual spelling for a physical name, accepting it makes the full stop in
-# ``tgt_table. Следующее предложение`` look like another identifier segment.
-_ENDPOINT = rf"{_IDENTIFIER_PART}(?:\.{_IDENTIFIER_PART}){{0,3}}"
-_PAIR_RE = re.compile(
-    rf"(?<![\w$`\"])(?P<source>{_ENDPOINT})\s*"
-    rf"(?:→|->|=>)\s*(?P<target>{_ENDPOINT})(?![\w$`\"])",
-    re.IGNORECASE,
-)
-
-_CARDINALITY_INTENT_RE = re.compile(
-    r"(?:\bcardinality\b|\bduplicate(?:s|d)?\b|\bmany[- ]to[- ]many\b|"
-    r"\bone[- ]to[- ]many\b|\brow\w*\s+multipli\w*|"
-    r"\b1\s*:\s*n\b|\bn\s*:\s*m\b|"
-    r"\bкардинальн\w*|дубликат\w*|размнож\w*\s+строк\w*)",
-    re.IGNORECASE,
-)
-_FACTUAL_COUNT_RE = re.compile(
-    r"\b(?:сколько|посчитай|подсчитай|сосчитай|вычисли|count)\b"
-    r"|\bcount\s*\("
-    r"|\b(?:фактическ|реальн|точн)\w*\s+"
-    r"(?:количеств|числ|count)\w*"
-    r"|\b(?:количеств|числ)\w*\s+(?:фактическ|реальн|точн)\w*",
-    re.IGNORECASE,
-)
-_UNIQUENESS_FACT_RE = re.compile(
-    r"\b(?:проверь|проверить|подтверди|подтвердить|определи|определить|"
-    r"узнай|установи|установить|прочитай|получи|найди|верни|покажи|"
-    r"перечисли|check|verify|fetch|read|show|list)\b"
-    r"[^.!?\r\n]{0,96}"
-    r"(?:уникальн\w*|первичн\w*\s+ключ\w*|\bpk\b|"
-    r"primary[ _-]*key|unique[ _-]*(?:key|constraint|index)|метаданн\w*)"
-    r"|\b(?:уникален|уникальна|уникальны|unique)\s+ли\b"
-    r"|\b(?:есть|имеется|существует|has|have)\s+ли\b"
-    r"[^.!?\r\n]{0,64}"
-    r"(?:\bpk\b|первичн\w*\s+ключ\w*|unique[ _-]*(?:key|constraint|index))"
-    r"|\b(?:фактическ|реальн|сохран[её]нн)\w*\s+уникальн\w*",
-    re.IGNORECASE,
-)
-_ADDITIONAL_INTENT_RE = re.compile(
-    r"\b(?:также|дополнительно|also|additionally)\b"
-    r"|\b(?:а|и)\s+ещ[её]\b|\bкроме\s+того\b"
-    r"|\b(?:покажи|выведи|перечисли|верни|show|display|list)\b"
-    r"[^.!?\r\n]{0,64}\b(?:все\s+)?"
-    r"(?:строк\w*|пол\w*|колон\w*|каталог\w*|metadata|ddl)\b",
-    re.IGNORECASE,
-)
-_OTHER_SQL_RISK_RE = re.compile(
-    r"\b(?:row[ _-]*filtering|constraint[ _-]*rejection|"
-    r"value[ _-]*changes?|write[ _-]*semantics)\b"
-    r"|потер\w*\s+строк\w*|отсеч\w*\s+строк\w*"
-    r"|изменен\w*\s+значен\w*|режим\w*\s+(?:запис|загруз)\w*"
-    r"|(?:not[ _-]*null|тип\w*|constraint\w*)\s+"
-    r"(?:ошиб|отклон|риск)\w*",
-    re.IGNORECASE,
-)
-
 
 @dataclass(frozen=True)
 class ExactTablePair:
-    """One conservative literal technical table pair from the task."""
+    """One exact directed table pair from a structured contract."""
 
     source_table: str
     target_table: str
 
 
-def _clean_endpoint(value: str) -> str:
-    clean = str(value or "").strip().strip("`\"")
-    return ".".join(part.strip("`\"") for part in clean.split("."))
+def cardinality_pair_from_contract(
+    contract: SqlRiskScopeContract,
+) -> ExactTablePair | None:
+    """Return the exact table scope of a conditional-cardinality contract."""
 
-
-def _is_technical_identifier(value: str) -> bool:
-    return bool(value) and any(marker in value for marker in ("_", ".", "$"))
-
-
-def extract_literal_table_pairs(task: str) -> List[ExactTablePair]:
-    """Extract unique literal technical source→target pairs, bounded."""
-
-    pairs: List[ExactTablePair] = []
-    seen: set[tuple[str, str]] = set()
-    for match in _PAIR_RE.finditer(str(task or "")):
-        source_table = _clean_endpoint(match.group("source"))
-        target_table = _clean_endpoint(match.group("target"))
-        if not (
-            _is_technical_identifier(source_table)
-            and _is_technical_identifier(target_table)
-        ):
-            continue
-        identity = (source_table.casefold(), target_table.casefold())
-        if identity in seen:
-            continue
-        seen.add(identity)
-        pairs.append(ExactTablePair(source_table, target_table))
-        if len(pairs) >= 8:
-            break
-    return pairs
-
-
-def is_conditional_cardinality_request(task: str) -> bool:
-    """Return whether exact mapping alone can support a conditional answer.
-
-    Factual row counts, factual uniqueness/constraint checks, other SQL-risk
-    aspects and explicit secondary data intents all fail closed.
-    """
-
-    text = str(task or "").strip()
-    if not text or len(extract_literal_table_pairs(text)) != 1:
-        return False
-    if not _CARDINALITY_INTENT_RE.search(text):
-        return False
-    return not any(
-        pattern.search(text)
-        for pattern in (
-            _FACTUAL_COUNT_RE,
-            _UNIQUENESS_FACT_RE,
-            _ADDITIONAL_INTENT_RE,
-            _OTHER_SQL_RISK_RE,
+    if (
+        contract.execution_mode != "conditional_cardinality"
+        or contract.aspects != ("cardinality",)
+        or contract.scope.is_field_pair
+        or contract.scope.source_field is not None
+        or contract.scope.target_field is not None
+        or contract.scope.source != contract.scope.source_table
+        or contract.scope.target != contract.scope.target_table
+        or len(contract.requirements) != 1
+        or not isinstance(
+            contract.requirements[0],
+            ReadS2TSourceToTargetRequirement,
         )
+    ):
+        return None
+    requirement = contract.requirements[0]
+    if (
+        requirement.source_table != contract.scope.source_table
+        or requirement.target_table != contract.scope.target_table
+    ):
+        return None
+    return ExactTablePair(
+        source_table=contract.scope.source_table,
+        target_table=contract.scope.target_table,
     )
 
 
@@ -154,7 +72,7 @@ def _sql_literal(value: str) -> str:
 
 
 def complete_cardinality_mapping_evidence_ids(
-    task: str,
+    contract: SqlRiskScopeContract,
     artifacts: Sequence[EvidenceArtifact],
     store: SavedResultStore,
 ) -> List[str]:
@@ -165,9 +83,9 @@ def complete_cardinality_mapping_evidence_ids(
     row must match the literal directed pair and carry a non-empty rule.
     """
 
-    if not is_conditional_cardinality_request(task):
+    pair = cardinality_pair_from_contract(contract)
+    if pair is None:
         return []
-    pair = extract_literal_table_pairs(task)[0]
     evidence_ids: List[str] = []
     for artifact in artifacts:
         if artifact.tool_name not in _EXACT_DIRECTED_TOOLS:
@@ -229,7 +147,6 @@ def complete_cardinality_mapping_evidence_ids(
 
 __all__ = [
     "ExactTablePair",
+    "cardinality_pair_from_contract",
     "complete_cardinality_mapping_evidence_ids",
-    "extract_literal_table_pairs",
-    "is_conditional_cardinality_request",
 ]

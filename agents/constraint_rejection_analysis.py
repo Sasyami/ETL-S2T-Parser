@@ -10,15 +10,15 @@ transformation preview.
 from __future__ import annotations
 
 import json
-import re
 from typing import Dict, List, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .contracts import EvidenceArtifact
 from .sql_risk_scope_contract import (
+    GetSourceTargetColumnPairRequirement,
+    ReadS2TSourceToTargetRequirement,
     SqlRiskScopeContract,
-    build_sql_risk_scope_contract,
 )
 from .tools.saved_results import SavedResultStore
 
@@ -69,87 +69,6 @@ _METADATA_COLUMNS = frozenset(
 _MAX_EVIDENCE_IDS = 8
 _MAX_IDENTIFIER_CHARS = 200
 MAX_CONSTRAINT_REJECTION_PAYLOAD_CHARS = 8_000
-
-_IDENTIFIER_ATOM = r"[A-Za-z_][A-Za-z0-9_$]*"
-_FIELD_ENDPOINT = rf"{_IDENTIFIER_ATOM}(?:\.{_IDENTIFIER_ATOM}){{1,2}}"
-_OUTPUT_CONTRACT = (
-    r"(?:верни\s+`?source_not_null`?\s*=\s*<\s*0\s*\|\s*1\s*>"
-    r"\s*,?\s*`?target_not_null`?\s*=\s*<\s*0\s*\|\s*1\s*>"
-    r"\s*(?:,?\s*и\s+вывод)?|"
-    r"return\s+`?source_not_null`?\s*=\s*<\s*0\s*\|\s*1\s*>"
-    r"\s*,?\s*`?target_not_null`?\s*=\s*<\s*0\s*\|\s*1\s*>"
-    r"\s*(?:,?\s*and\s+(?:a\s+)?conclusion)?)"
-)
-_SUPPORTED_NULLABLE_REQUEST_RE = re.compile(
-    rf"^\s*(?:"
-    rf"для\s+file_id\s*=\s*[1-9][0-9]*\s+оцени\s+только\s+"
-    rf"(?:sql[-‑–— ]?риск\s+)?constraint[ _-]*rejection\s+из-за\s+"
-    rf"nullable[-‑–— ]?ограничен\w*\s+{_FIELD_ENDPOINT}\s*→\s*"
-    rf"{_FIELD_ENDPOINT}\s*[.!?]?\s*{_OUTPUT_CONTRACT}"
-    rf"|for\s+file_id\s*=\s*[1-9][0-9]*\s+assess\s+only\s+"
-    rf"(?:sql[ _-]*risk\s+)?constraint[ _-]*rejection\s+"
-    rf"(?:caused\s+by|from)\s+nullable\s+constraints?\s+for\s+"
-    rf"{_FIELD_ENDPOINT}\s*→\s*{_FIELD_ENDPOINT}\s*[.!?]?\s*"
-    rf"{_OUTPUT_CONTRACT}"
-    rf")\s*[.!?]?\s*$",
-    re.IGNORECASE,
-)
-
-_CONSTRAINT_ASPECT = (
-    r"(?:constraint[ _-]*rejection|"
-    r"nullable[^.!?\r\n]{0,48}(?:огранич|constraint)|"
-    r"(?:огранич|constraint)[^.!?\r\n]{0,48}nullable)"
-)
-_EXCLUSIVE_CONSTRAINT_RE = re.compile(
-    rf"(?:\b(?:только|only)\b[^.!?\r\n]{{0,96}}{_CONSTRAINT_ASPECT}"
-    rf"|{_CONSTRAINT_ASPECT}[^.!?\r\n]{{0,96}}\b(?:только|only)\b)",
-    re.IGNORECASE,
-)
-_OTHER_SQL_RISK_RE = re.compile(
-    r"\b(?:row[ _-]*filtering|cardinality|value[ _-]*changes?|"
-    r"write[ _-]*semantics)\b"
-    r"|потер\w*\s+строк\w*|дубликат\w*|кардинальн\w*|"
-    r"изменен\w*\s+(?:значен|данн)\w*|"
-    r"режим\w*\s+(?:запис|загруз)\w*",
-    re.IGNORECASE,
-)
-_NULLABLE_INTENT_RE = re.compile(
-    r"\bnullable\b|\bnot[ _-]*null\b|\bnullability\b|"
-    r"(?:допуска\w*|запрещ\w*|огранич\w*)[^.!?\r\n]{0,32}\bnull\b",
-    re.IGNORECASE,
-)
-_NULLABLE_OUTPUT_CONTRACT_RE = re.compile(
-    r"(?:верни|return)\s+`?source_not_null`?\s*=\s*<\s*0\s*\|\s*1\s*>"
-    r"\s*,?\s*`?target_not_null`?\s*=\s*<\s*0\s*\|\s*1\s*>"
-    r"\s*(?:,?\s*(?:и\s+вывод|and\s+(?:a\s+)?conclusion))?\s*[.!?]?\s*$",
-    re.IGNORECASE,
-)
-_OTHER_CONSTRAINT_KIND_RE = re.compile(
-    r"\b(?:data[ _-]*type|primary[ _-]*key|foreign[ _-]*key|"
-    r"unique(?:ness)?|check|default|referential[ _-]*integrity)\b"
-    r"|\b(?:pk|fk)\b|(?:совместим\w*|несовместим\w*)\s+тип\w*|"
-    r"первичн\w*\s+ключ\w*|внешн\w*\s+ключ\w*|уникальн\w*|"
-    r"ссылочн\w*\s+целостн\w*|внешн\w*\s+ссыл\w*|дефолт\w*|"
-    r"переполн\w*[^.!?\r\n]{0,24}(?:длин\w*|length)|"
-    r"(?:length|длин\w*)[^.!?\r\n]{0,24}переполн\w*|"
-    r"фактич\w*[^.!?\r\n]{0,32}\bnull\b|"
-    r"\bnull\b[^.!?\r\n]{0,32}(?:в\s+)?данн\w*",
-    re.IGNORECASE,
-)
-_UNSUPPORTED_DATA_OUTPUT_RE = re.compile(
-    r"\b(?:data[ _-]*types?|description|mapping|transformation[ _-]*rule)\b|"
-    r"\b(?:тип\w*\s+данн\w*|описан\w*|маппинг\w*|"
-    r"правил\w*\s+трансформац\w*)\b",
-    re.IGNORECASE,
-)
-_ADDITIONAL_RESULT_RE = re.compile(
-    r"\b(?:также|дополнительно|also|additionally)\b|"
-    r"\b(?:покажи|выведи|перечисли|верни|show|display|list|return)\b"
-    r"[^.!?\r\n]{0,64}\b(?:все\s+|весь\s+|полный\s+)?"
-    r"(?:строк\w*|маппинг\w*|правил\w*|sql|ddl|metadata|метаданн\w*|"
-    r"каталог\w*|колон\w*)\b",
-    re.IGNORECASE,
-)
 
 
 class ConstraintRejectionFact(BaseModel):
@@ -220,14 +139,14 @@ class ConstraintRejectionFact(BaseModel):
         return f"{self.target_table}.{self.target_field}"
 
 
-def _exact_contract(task: str) -> SqlRiskScopeContract | None:
-    contract = build_sql_risk_scope_contract(
-        task,
-        ["constraint_rejection"],
-        enabled=True,
-    )
+def _validated_contract(
+    contract: SqlRiskScopeContract,
+) -> SqlRiskScopeContract | None:
+    """Validate only typed shape and exact requirement consistency."""
+
     if (
-        contract is None
+        contract.execution_mode != "nullable_constraint"
+        or contract.aspects != ("constraint_rejection",)
         or not contract.scope.is_field_pair
         or contract.scope.file_id is None
         or contract.scope.source_field is None
@@ -241,29 +160,33 @@ def _exact_contract(task: str) -> SqlRiskScopeContract | None:
                 contract.scope.target_field,
             )
         )
-        or tuple(item.tool_name for item in contract.requirements)
-        != (_MAPPING_TOOL, _METADATA_TOOL)
+        or len(contract.requirements) != 2
+        or not isinstance(
+            contract.requirements[0],
+            ReadS2TSourceToTargetRequirement,
+        )
+        or not isinstance(
+            contract.requirements[1],
+            GetSourceTargetColumnPairRequirement,
+        )
+    ):
+        return None
+    scope = contract.scope
+    mapping = contract.requirements[0]
+    metadata = contract.requirements[1]
+    if (
+        scope.source != f"{scope.source_table}.{scope.source_field}"
+        or scope.target != f"{scope.target_table}.{scope.target_field}"
+        or mapping.source_table != scope.source_table
+        or mapping.target_table != scope.target_table
+        or metadata.file_id != scope.file_id
+        or metadata.source_table != scope.source_table
+        or metadata.source_column != scope.source_field
+        or metadata.target_table != scope.target_table
+        or metadata.target_column != scope.target_field
     ):
         return None
     return contract
-
-
-def is_exclusive_constraint_rejection_request(task: str) -> bool:
-    """Return whether a deterministic nullable-only answer is safe."""
-
-    if not isinstance(task, str) or not task.strip():
-        return False
-    return bool(
-        _exact_contract(task) is not None
-        and _SUPPORTED_NULLABLE_REQUEST_RE.fullmatch(task)
-        and _EXCLUSIVE_CONSTRAINT_RE.search(task)
-        and _NULLABLE_INTENT_RE.search(task)
-        and _NULLABLE_OUTPUT_CONTRACT_RE.search(task)
-        and not _OTHER_SQL_RISK_RE.search(task)
-        and not _OTHER_CONSTRAINT_KIND_RE.search(task)
-        and not _UNSUPPORTED_DATA_OUTPUT_RE.search(task)
-        and not _ADDITIONAL_RESULT_RE.search(task)
-    )
 
 
 def _sql_literal(value: str) -> str:
@@ -757,16 +680,16 @@ def _fact_for_contract(
 
 
 def derive_constraint_rejection_facts(
-    task: str,
+    contract: SqlRiskScopeContract,
     artifacts: Sequence[EvidenceArtifact],
     store: SavedResultStore,
 ) -> List[ConstraintRejectionFact]:
     """Derive one fact from full exact mapping and metadata relations."""
 
-    contract = _exact_contract(task)
-    if contract is None:
+    validated_contract = _validated_contract(contract)
+    if validated_contract is None:
         return []
-    return [_fact_for_contract(contract, artifacts, store)]
+    return [_fact_for_contract(validated_contract, artifacts, store)]
 
 
 def constraint_rejection_payload(
@@ -858,6 +781,5 @@ __all__ = [
     "MAX_CONSTRAINT_REJECTION_PAYLOAD_CHARS",
     "constraint_rejection_payload",
     "derive_constraint_rejection_facts",
-    "is_exclusive_constraint_rejection_request",
     "render_constraint_rejection_answer",
 ]

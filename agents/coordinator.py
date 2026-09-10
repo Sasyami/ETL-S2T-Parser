@@ -39,6 +39,7 @@ from .contracts import (
     MAX_PLAN_STEPS,
     PlanStep,
     SqlRiskAspect,
+    SqlRiskExecutionMode,
     UpstreamDecision,
     UpstreamOutput,
     WORKER_OPERATION_COMPLETENESS_MARKER,
@@ -51,24 +52,16 @@ from .constraint_rejection_analysis import (
     ConstraintRejectionFact,
     constraint_rejection_payload,
     derive_constraint_rejection_facts,
-    is_exclusive_constraint_rejection_request,
     render_constraint_rejection_answer,
 )
 from .chat_graph import WorkerDisplayItem
 from .observability import get_callback_handler, langfuse_trace_context
-from .operation_intent import is_exclusive_value_change_request
 from .operation_protocols import (
     OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
     protocol_variant_sha256,
     selected_sql_risk_protocol,
 )
 from .plan_origin import PlanOriginError, validate_worker_plan_origin
-from .plan_requirements import (
-    ReroutePlanRequirementError,
-    SqlRiskPlanRequirementError,
-    validate_sql_risk_plan_requirements,
-    validate_sql_risk_reroute_plan,
-)
 from .run_metrics import (
     get_run_metrics_callback,
     llm_stage,
@@ -138,13 +131,10 @@ from .value_change_analysis import (
     FieldValueChangeFact,
     derive_field_value_change_facts,
     field_value_change_payload,
-    render_field_value_change_answer,
 )
 from .write_semantics_analysis import (
     WriteSemanticsFact,
     derive_write_semantics_facts,
-    is_exclusive_write_semantics_request,
-    render_terminal_write_semantics_negative,
     write_semantics_payload,
 )
 
@@ -195,6 +185,19 @@ def _typed_sql_risk_aspects_enabled() -> bool:
     if value is None:
         return True
     return value.strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def _typed_sql_risk_execution_mode_enabled() -> bool:
+    """Expose the execution-mode field only for the typed-plan candidate."""
+
+    if not _typed_sql_risk_aspects_enabled():
+        return False
+    try:
+        return sql_risk_scope_evidence_architecture() == "typed_plan"
+    except ValueError:
+        # Preserve the existing non-SQL route under an unrelated bad SQL-risk
+        # setting. A selected SQL-risk route validates the setting later.
+        return False
 
 
 def _sql_risk_protocol_attestation(
@@ -267,23 +270,6 @@ def _scope_evidence_calls(
     return calls
 
 
-def _first_scope_step_index(
-    steps: Sequence[Any],
-    contract: Optional[SqlRiskScopeContract],
-) -> Optional[int]:
-    """Return the zero-based first plan step containing both exact endpoints."""
-
-    if contract is None:
-        return None
-    source_token = contract.scope.source.casefold()
-    target_token = contract.scope.target.casefold()
-    for index, raw_step in enumerate(steps):
-        task = PlanStep.model_validate(raw_step).task.casefold()
-        if source_token in task and target_token in task:
-            return index
-    return None
-
-
 class CoordinatorAnswer(BaseModel):
     """Coordinator output consumed by the top-level supervisor."""
 
@@ -304,11 +290,28 @@ class OperationSkillSelection(BaseModel):
     ] = "agentic"
     skills: List[str]
     sql_risk_aspects: List[SqlRiskAspect] = Field(default_factory=list)
+    sql_risk_execution_mode: SqlRiskExecutionMode = "agentic"
 
     @model_validator(mode="after")
     def _aspects_match_selected_skill(self) -> "OperationSkillSelection":
         self.skills = list(dict.fromkeys(self.skills))
         self.sql_risk_aspects = list(dict.fromkeys(self.sql_risk_aspects))
+        typed_execution_enabled = _typed_sql_risk_execution_mode_enabled()
+        if (
+            typed_execution_enabled
+            and "sql_risk_execution_mode" not in self.model_fields_set
+        ):
+            raise ValueError(
+                "typed_plan operation route requires an explicit "
+                "sql_risk_execution_mode"
+            )
+        if (
+            self.sql_risk_execution_mode != "agentic"
+            and not typed_execution_enabled
+        ):
+            raise ValueError(
+                "typed SQL-risk execution requires typed_plan architecture"
+            )
         if not _typed_sql_risk_aspects_enabled():
             # E2 baseline deliberately loads the complete legacy profile.
             self.sql_risk_aspects = []
@@ -327,6 +330,22 @@ class OperationSkillSelection(BaseModel):
             raise ValueError(
                 "Анализ SQL-рисков requires at least one sql_risk_aspect"
             )
+        typed_modes: dict[SqlRiskExecutionMode, SqlRiskAspect] = {
+            "conditional_cardinality": "cardinality",
+            "nullable_constraint": "constraint_rejection",
+        }
+        if self.sql_risk_execution_mode != "agentic":
+            required_aspect = typed_modes[self.sql_risk_execution_mode]
+            if (
+                self.pipeline != "agentic"
+                or self.skills != [_SQL_RISK_OPERATION_SKILL]
+                or self.sql_risk_aspects != [required_aspect]
+            ):
+                raise ValueError(
+                    f"{self.sql_risk_execution_mode} requires "
+                    "pipeline=agentic, exactly one SQL-risk skill and "
+                    f"sql_risk_aspects=[{required_aspect!r}]"
+                )
         return self
 
 
@@ -341,6 +360,7 @@ class CoordinatorGraphState(TypedDict):
     context: str
     operation_skills: Optional[List[str]]
     operation_sql_risk_aspects: Optional[List[SqlRiskAspect]]
+    operation_sql_risk_execution_mode: Optional[SqlRiskExecutionMode]
     operation_pipeline: Optional[
         Literal["agentic", "s2t_analysis", "validation_protocol"]
     ]
@@ -368,25 +388,26 @@ skills и при `skills=[]` верни `sql_risk_aspects=[]`. Не добавл
 автоматически.
 """.strip()
 
-_SQL_RISK_TYPED_ROUTER_EXAMPLES = """
-- «Может ли этот JOIN размножить строки?» → `Анализ SQL-рисков`,
-  `sql_risk_aspects=["cardinality"]`;
-- «Отфильтрует ли WHERE строки?» → `sql_risk_aspects=["row_filtering"]`;
-- «Может ли NOT NULL отклонить загрузку?» →
-  `sql_risk_aspects=["constraint_rejection"]`;
-- «Меняет ли CASE значение?» → `sql_risk_aspects=["value_changes"]`;
-- «Это MERGE или append?» → `sql_risk_aspects=["write_semantics"]`;
+_SQL_RISK_EXECUTION_MODE_ROUTER_GUIDANCE = """
+`sql_risk_execution_mode="agentic"` — безопасное значение по умолчанию и для
+любого составного, неоднозначного либо расширенного результата.
+`conditional_cardinality` допустим только для одного условного вывода о
+возможности размножения строк по полному exact directed S2T mapping одной
+буквально заданной пары таблиц; режим не устанавливает фактические дубликаты,
+числа строк или уникальность ключей.
+`nullable_constraint` допустим только для одного вывода о совместимости
+catalogued nullable/NOT NULL контрактов одной буквально заданной пары полей с
+явным `file_id`; режим не исследует фактические NULL, типы или другие
+constraints. Оба специальных режима требуют `pipeline="agentic"`, ровно skill
+`Анализ SQL-рисков` и ровно соответствующий единственный аспект; они не
+разрешают дополнительные результаты. Если хотя бы одно условие не выполнено,
+верни `agentic`.
 """.strip()
 
 _SQL_RISK_LEGACY_ROUTER_GUIDANCE = """
 Эксперимент выбора аспектов отключён: для любого маршрута всегда верни
 `sql_risk_aspects=[]`. При выборе `Анализ SQL-рисков` код загрузит полный
 legacy-профиль риска; не перечисляй отдельные аспекты.
-""".strip()
-
-_SQL_RISK_LEGACY_ROUTER_EXAMPLES = """
-- «Может ли этот JOIN размножить строки?» → `Анализ SQL-рисков`,
-  `sql_risk_aspects=[]`;
 """.strip()
 
 _OPERATION_SKILL_PROMPT = f"""
@@ -413,16 +434,13 @@ Operation-skill — профиль результата, которого доб
 
 {_SQL_RISK_TYPED_ROUTER_GUIDANCE}
 
+{_SQL_RISK_EXECUTION_MODE_ROUTER_GUIDANCE}
+
 `skills=[]` — нормальный вариант по умолчанию. Оставляй массив пустым для
 простого чтения, списка либо объяснения одной сохранённой трансформации, если
 пользователь не просит сравнение атрибутов, оценку риска строк, разность покрытия
 маппинга или проектирование проверки. Само наличие SQL, S2T, пары source→target,
 колонок либо слова «трансформация» не является основанием выбрать профиль.
-
-Примеры:
-- «Покажи SQL transformation A → B» → `skills=[]`;
-{_SQL_RISK_TYPED_ROUTER_EXAMPLES}
-- «Какие mandatory target fields не замаплены?» → `Покрытие маппинга`.
 
 Доступные operation-skills:
 {_OPERATION_SKILL_CATALOG_CONTEXT}
@@ -439,22 +457,38 @@ _OPERATION_SKILL_REPAIR_PROMPT = f"""
 аспект, иначе верни пустой массив. Используй только дословные имена из каталогов.
 """.strip()
 
+_OPERATION_SKILL_TYPED_EXECUTION_REPAIR_PROMPT = f"""
+Предыдущий native call `{_OPERATION_SKILL_TOOL_NAME}` нарушает схему или содержит
+имя вне каталога. Верни ровно один исправленный call с полями `pipeline`,
+`skills`, `sql_risk_aspects` и `sql_risk_execution_mode`. Pipeline — `agentic`
+либо `validation_protocol`; массив skills может быть пустым. Аспекты допустимы
+только для `Анализ SQL-рисков`; при выборе этого профиля верни хотя бы один
+нужный аспект, иначе верни пустой массив. Специальный execution mode допустим
+только при точном соответствии pipeline/skill/единственному аспекту; иначе
+верни `agentic`. Используй только дословные имена из каталогов.
+""".strip()
+
 
 def _operation_skill_prompt() -> str:
     """Build an E2-consistent router prompt for the active variant."""
-    if _typed_sql_risk_aspects_enabled():
-        return _OPERATION_SKILL_PROMPT
-    return _OPERATION_SKILL_PROMPT.replace(
-        _SQL_RISK_TYPED_ROUTER_GUIDANCE,
-        _SQL_RISK_LEGACY_ROUTER_GUIDANCE,
-    ).replace(
-        _SQL_RISK_TYPED_ROUTER_EXAMPLES,
-        _SQL_RISK_LEGACY_ROUTER_EXAMPLES,
-    )
+    prompt = _OPERATION_SKILL_PROMPT
+    if not _typed_sql_risk_aspects_enabled():
+        prompt = prompt.replace(
+            _SQL_RISK_TYPED_ROUTER_GUIDANCE,
+            _SQL_RISK_LEGACY_ROUTER_GUIDANCE,
+        )
+    if not _typed_sql_risk_execution_mode_enabled():
+        prompt = prompt.replace(
+            _SQL_RISK_EXECUTION_MODE_ROUTER_GUIDANCE,
+            "",
+        )
+    return prompt
 
 
 def _operation_skill_repair_prompt() -> str:
     """Build repair instructions that match the active E2 schema."""
+    if _typed_sql_risk_execution_mode_enabled():
+        return _OPERATION_SKILL_TYPED_EXECUTION_REPAIR_PROMPT
     if _typed_sql_risk_aspects_enabled():
         return _OPERATION_SKILL_REPAIR_PROMPT
     return (
@@ -801,6 +835,48 @@ def _operation_skill_tool_schema() -> Dict[str, Any]:
             )
         ),
     }
+    properties: Dict[str, Any] = {
+        "pipeline": {
+            "type": "string",
+            "enum": [
+                "agentic",
+                "validation_protocol",
+            ],
+            "description": (
+                "Общий агентный поток либо компиляция внешнего "
+                "SQL test protocol."
+            ),
+        },
+        "skills": {
+            "type": "array",
+            "maxItems": len(OPERATION_SKILL_CATALOG),
+            "items": {
+                "type": "string",
+                "enum": list(OPERATION_SKILL_CATALOG),
+            },
+            "description": (
+                "Точные имена применимых профилей; пустой массив "
+                "означает, что специальный профиль не нужен."
+            ),
+        },
+        "sql_risk_aspects": sql_risk_aspects_schema,
+    }
+    required = ["pipeline", "skills", "sql_risk_aspects"]
+    if _typed_sql_risk_execution_mode_enabled():
+        properties["sql_risk_execution_mode"] = {
+            "type": "string",
+            "enum": [
+                "agentic",
+                "conditional_cardinality",
+                "nullable_constraint",
+            ],
+            "description": (
+                "Структурный режим исполнения SQL-risk. Специальные "
+                "режимы допустимы только для одного закрытого результата "
+                "и согласованного аспекта; иначе agentic."
+            ),
+        }
+        required.append("sql_risk_execution_mode")
     return {
         "type": "function",
         "function": {
@@ -810,33 +886,8 @@ def _operation_skill_tool_schema() -> Dict[str, Any]:
             ),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "pipeline": {
-                        "type": "string",
-                        "enum": [
-                            "agentic",
-                            "validation_protocol",
-                        ],
-                        "description": (
-                            "Общий агентный поток либо компиляция внешнего "
-                            "SQL test protocol."
-                        ),
-                    },
-                    "skills": {
-                        "type": "array",
-                        "maxItems": len(OPERATION_SKILL_CATALOG),
-                        "items": {
-                            "type": "string",
-                            "enum": list(OPERATION_SKILL_CATALOG),
-                        },
-                        "description": (
-                            "Точные имена применимых профилей; пустой массив "
-                            "означает, что специальный профиль не нужен."
-                        ),
-                    },
-                    "sql_risk_aspects": sql_risk_aspects_schema,
-                },
-                "required": ["pipeline", "skills", "sql_risk_aspects"],
+                "properties": properties,
+                "required": required,
                 "additionalProperties": False,
             },
         },
@@ -1509,6 +1560,9 @@ def build_coordinator_graph(
         operation_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
+        operation_sql_risk_execution_mode = (
+            state.get("operation_sql_risk_execution_mode") or "agentic"
+        )
         operation_pipeline = state.get("operation_pipeline")
         if operation_skills is None:
             operation_payload = {
@@ -1548,6 +1602,9 @@ def build_coordinator_graph(
             operation_skills = operation_route.skills
             operation_sql_risk_aspects = (
                 operation_route.sql_risk_aspects
+            )
+            operation_sql_risk_execution_mode = (
+                operation_route.sql_risk_execution_mode
             )
             operation_pipeline = operation_route.pipeline
         if operation_pipeline is None:
@@ -1761,6 +1818,9 @@ def build_coordinator_graph(
                     "sql_risk_aspects": list(
                         operation_sql_risk_aspects
                     ),
+                    "sql_risk_execution_mode": (
+                        operation_sql_risk_execution_mode
+                    ),
                     "pipeline": "validation_protocol",
                 }
                 for index, task in enumerate(
@@ -1784,6 +1844,9 @@ def build_coordinator_graph(
                 "operation_skills": list(operation_skills),
                 "operation_sql_risk_aspects": list(
                     operation_sql_risk_aspects
+                ),
+                "operation_sql_risk_execution_mode": (
+                    operation_sql_risk_execution_mode
                 ),
                 "operation_pipeline": "validation_protocol",
                 "plan": [],
@@ -1942,6 +2005,9 @@ def build_coordinator_graph(
                         "sql_risk_aspects": list(
                             operation_sql_risk_aspects
                         ),
+                        "sql_risk_execution_mode": (
+                            operation_sql_risk_execution_mode
+                        ),
                         "pipeline": "s2t_analysis",
                     }
                     for index, task in enumerate(
@@ -1963,6 +2029,9 @@ def build_coordinator_graph(
                     "operation_skills": list(operation_skills),
                     "operation_sql_risk_aspects": list(
                         operation_sql_risk_aspects
+                    ),
+                    "operation_sql_risk_execution_mode": (
+                        operation_sql_risk_execution_mode
                     ),
                     "operation_pipeline": "s2t_analysis",
                     "plan": [],
@@ -1986,14 +2055,21 @@ def build_coordinator_graph(
             build_sql_risk_scope_contract(
                 state["task"],
                 operation_sql_risk_aspects,
+                execution_mode=operation_sql_risk_execution_mode,
             )
-            if "Анализ SQL-рисков" in operation_skills
+            if (
+                scope_evidence_architecture == "typed_plan"
+                and operation_skills == ["Анализ SQL-рисков"]
+            )
             else None
         )
         typed_scope_plan = (
             build_typed_sql_risk_worker_plan(
                 state["task"],
                 candidate_scope_evidence_contract,
+                sql_risk_execution_mode=(
+                    operation_sql_risk_execution_mode
+                ),
             )
             if (
                 scope_evidence_architecture == "typed_plan"
@@ -2003,21 +2079,9 @@ def build_coordinator_graph(
             else None
         )
         scope_evidence_contract = (
-            candidate_scope_evidence_contract
-            if scope_evidence_architecture == "prompt"
-            else (
-                typed_scope_plan.contract
-                if typed_scope_plan is not None
-                else None
-            )
-        )
-        scope_plan_context = (
-            render_sql_risk_scope_contract(
-                scope_evidence_contract,
-                stage="plan",
-            )
-            if scope_evidence_architecture == "prompt"
-            else ""
+            typed_scope_plan.contract
+            if typed_scope_plan is not None
+            else None
         )
         scope_evidence_attestation: Dict[str, Any] = {}
         if scope_evidence_contract is not None:
@@ -2033,12 +2097,6 @@ def build_coordinator_graph(
                     ],
                 }
             }
-        if scope_plan_context:
-            plan_operation_context = "\n\n".join(
-                part
-                for part in (plan_operation_context, scope_plan_context)
-                if part
-            )
         sql_risk_protocol_attestation = _sql_risk_protocol_attestation(
             operation_skills,
             operation_sql_risk_aspects,
@@ -2053,35 +2111,13 @@ def build_coordinator_graph(
                 )
             except PlanOriginError as exc:
                 contract_errors.append(str(exc))
-            try:
-                validate_sql_risk_plan_requirements(
-                    candidate,
-                    state["task"],
-                    sql_risk_aspects=operation_sql_risk_aspects,
-                )
-            except SqlRiskPlanRequirementError as exc:
-                contract_errors.append(str(exc))
-            if (
-                state["upstream_problem"] is not None
-                and "Анализ SQL-рисков" in operation_skills
-            ):
-                try:
-                    validate_sql_risk_reroute_plan(
-                        candidate,
-                        state["task"],
-                        sql_risk_aspects=operation_sql_risk_aspects,
-                    )
-                except ReroutePlanRequirementError as exc:
-                    contract_errors.append(str(exc))
             if contract_errors:
                 raise CoordinatorResponseError("; ".join(contract_errors))
 
         if typed_scope_plan is not None:
             plan = typed_scope_plan.plan
-            # This plan was built from the same literal task and typed
-            # contract, but keep the normal plan invariants as a defensive
-            # internal boundary.  No LLM repair/fallback is allowed here.
-            validate_plan_contract(plan)
+            # Typed construction validates enum/aspect/requirements and exact
+            # literal origin. Do not reclassify its code-owned task prose.
             scope_step_index = typed_scope_plan.evidence_step_index
             plan_source_attestation = {
                 "plan_source": typed_scope_plan.plan_source,
@@ -2156,10 +2192,7 @@ def build_coordinator_graph(
                         + str(second_error)
                     ) from second_error
             assert isinstance(plan, WorkerPlan)
-            scope_step_index = _first_scope_step_index(
-                plan.steps,
-                scope_evidence_contract,
-            )
+            scope_step_index = None
             plan_source_attestation = {}
         recorded_plan = [
             {
@@ -2168,6 +2201,7 @@ def build_coordinator_graph(
                 **step.model_dump(mode="json", exclude_none=True),
                 "operation_skills": list(operation_skills),
                 "sql_risk_aspects": list(operation_sql_risk_aspects),
+                "sql_risk_execution_mode": operation_sql_risk_execution_mode,
                 "pipeline": operation_pipeline,
                 **sql_risk_protocol_attestation,
                 **plan_source_attestation,
@@ -2185,22 +2219,17 @@ def build_coordinator_graph(
             json.dumps(recorded_plan, ensure_ascii=False),
         )
         record_coordinator_plan(recorded_plan)
-        active_scope_step_index = (
-            scope_step_index
-            if scope_step_index is not None
-            else (-1 if scope_evidence_contract is not None else None)
-        )
         return {
             "operation_skills": list(operation_skills),
             "operation_sql_risk_aspects": list(
                 operation_sql_risk_aspects
             ),
+            "operation_sql_risk_execution_mode": (
+                operation_sql_risk_execution_mode
+            ),
             "operation_pipeline": operation_pipeline,
             "plan": [step.model_dump() for step in plan.steps],
-            # Legacy prompt mode may fail to place both endpoints into one
-            # step.  Sentinel -1 keeps its upstream missing-evidence guard
-            # active without attaching requirements to an unrelated worker.
-            "scope_evidence_step_index": active_scope_step_index,
+            "scope_evidence_step_index": scope_step_index,
             "next_step": 0,
         }
 
@@ -2228,11 +2257,15 @@ def build_coordinator_graph(
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
+        selected_sql_risk_execution_mode = (
+            state.get("operation_sql_risk_execution_mode") or "agentic"
+        )
         step_scope_contract: SqlRiskScopeContract | None = None
         if state.get("scope_evidence_step_index") == step_index:
             step_scope_contract = build_sql_risk_scope_contract(
                 state["task"],
                 selected_sql_risk_aspects,
+                execution_mode=selected_sql_risk_execution_mode,
             )
             if step_scope_contract is None:
                 raise CoordinatorResponseError(
@@ -2414,6 +2447,9 @@ def build_coordinator_graph(
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
+        selected_sql_risk_execution_mode = (
+            state.get("operation_sql_risk_execution_mode") or "agentic"
+        )
         scope_evidence_architecture = (
             sql_risk_scope_evidence_architecture()
             if "Анализ SQL-рисков" in selected_operation_skills
@@ -2424,6 +2460,7 @@ def build_coordinator_graph(
             scope_evidence_contract = build_sql_risk_scope_contract(
                 state["task"],
                 selected_sql_risk_aspects,
+                execution_mode=selected_sql_risk_execution_mode,
             )
             if scope_evidence_contract is None:
                 raise CoordinatorResponseError(
@@ -2468,6 +2505,7 @@ def build_coordinator_graph(
                 answer,
                 state["task"],
                 selected_sql_risk_aspects,
+                execution_mode=selected_sql_risk_execution_mode,
             )
         available_evidence_ids: set[str] = set()
         available_display_refs: Dict[str, str] = {}
@@ -2529,13 +2567,14 @@ def build_coordinator_graph(
         if (
             scope_evidence_architecture == "typed_plan"
             and scope_evidence_contract is not None
+            and selected_sql_risk_execution_mode == "nullable_constraint"
             and selected_operation_skills == ["Анализ SQL-рисков"]
             and selected_sql_risk_aspects == ["constraint_rejection"]
             and saved_result_store is not None
         ):
             constraint_rejection_facts = (
                 derive_constraint_rejection_facts(
-                    state["task"],
+                    scope_evidence_contract,
                     accepted_artifacts,
                     saved_result_store,
                 )
@@ -2556,14 +2595,17 @@ def build_coordinator_graph(
         cardinality_sufficient_evidence_ids: List[str] = []
         cardinality_facts: List[CardinalityFact] = []
         if (
-            selected_operation_skills == ["Анализ SQL-рисков"]
+            scope_evidence_contract is not None
+            and selected_sql_risk_execution_mode
+            == "conditional_cardinality"
+            and selected_operation_skills == ["Анализ SQL-рисков"]
             and selected_sql_risk_aspects == ["cardinality"]
         ):
             saved_store = get_active_saved_result_store()
             if saved_store is not None:
                 cardinality_sufficient_evidence_ids = (
                     complete_cardinality_mapping_evidence_ids(
-                        state["task"],
+                        scope_evidence_contract,
                         accepted_artifacts,
                         saved_store,
                     )
@@ -2574,7 +2616,7 @@ def build_coordinator_graph(
                     and cardinality_sufficient_evidence_ids
                 ):
                     cardinality_facts = derive_cardinality_facts(
-                        state["task"],
+                        scope_evidence_contract,
                         accepted_artifacts,
                         saved_store,
                     )
@@ -2592,6 +2634,8 @@ def build_coordinator_graph(
         if (
             scope_evidence_architecture == "typed_plan"
             and scope_evidence_contract is not None
+            and selected_sql_risk_execution_mode
+            == "conditional_cardinality"
             and selected_sql_risk_aspects == ["cardinality"]
             and not cardinality_sufficient_evidence_ids
         ):
@@ -2840,7 +2884,7 @@ def build_coordinator_graph(
 
         if (
             len(constraint_rejection_facts) == 1
-            and is_exclusive_constraint_rejection_request(state["task"])
+            and selected_sql_risk_execution_mode == "nullable_constraint"
         ):
             deterministic_answer = render_constraint_rejection_answer(
                 constraint_rejection_facts
@@ -2884,6 +2928,8 @@ def build_coordinator_graph(
         if (
             scope_evidence_architecture == "typed_plan"
             and scope_evidence_contract is not None
+            and selected_sql_risk_execution_mode
+            == "conditional_cardinality"
             and selected_operation_skills == ["Анализ SQL-рисков"]
             and selected_sql_risk_aspects == ["cardinality"]
             and len(cardinality_facts) == 1
@@ -2930,27 +2976,12 @@ def build_coordinator_graph(
                     ],
                 }
 
-        terminal_write_semantics_answer = ""
-        if (
-            selected_operation_skills == ["Анализ SQL-рисков"]
-            and selected_sql_risk_aspects == ["write_semantics"]
-            and len(write_semantics_facts) == 1
-            and is_exclusive_write_semantics_request(state["task"])
-        ):
-            terminal_write_semantics_answer = (
-                render_terminal_write_semantics_negative(
-                    write_semantics_facts
-                ).strip()
-            )
-
         _, decision = invoke_decision(decision_messages)
         ignored_cardinality_reroute = bool(
             decision.decision == "reroute"
             and cardinality_sufficient_evidence_ids
         )
-        if decision.decision == "reroute" and not (
-            terminal_write_semantics_answer or ignored_cardinality_reroute
-        ):
+        if decision.decision == "reroute" and not ignored_cardinality_reroute:
             return data_request_update(decision.problem)
 
         if ignored_cardinality_reroute:
@@ -2961,83 +2992,6 @@ def build_coordinator_graph(
                 cardinality_sufficient_evidence_ids,
                 decision.problem,
             )
-
-        if terminal_write_semantics_answer:
-            if decision.decision == "reroute":
-                logger.info(
-                    "Ignoring redundant upstream reroute because exact "
-                    "write-semantics evidence proves terminal negative: %s",
-                    decision.problem,
-                )
-            used_evidence_ids = list(
-                dict.fromkeys(
-                    evidence_id
-                    for fact in write_semantics_facts
-                    for evidence_id in fact.evidence_ids
-                    if evidence_id in available_evidence_ids
-                )
-            )
-            evidence = UpstreamOutput(
-                answer=scoped_answer(terminal_write_semantics_answer),
-                used_evidence_ids=used_evidence_ids,
-                display_evidence_ids=[],
-            )
-            upstream_output = evidence.model_dump()
-            record_upstream_output(
-                {
-                    **upstream_output,
-                    "answer_source": "deterministic_write_semantics",
-                }
-            )
-            logger.info(
-                "Deterministic write-semantics result: %s",
-                json.dumps(upstream_output, ensure_ascii=False)[:8000],
-            )
-            return {
-                "upstream_output": upstream_output,
-                "final_answer": evidence.answer,
-                "selected_display_refs": [],
-            }
-
-        if (
-            selected_operation_skills == ["Анализ SQL-рисков"]
-            and selected_sql_risk_aspects == ["value_changes"]
-            and value_change_facts
-            and is_exclusive_value_change_request(state["task"])
-        ):
-            deterministic_answer = scoped_answer(
-                render_field_value_change_answer(value_change_facts).strip()
-            )
-            if deterministic_answer:
-                used_evidence_ids = list(
-                    dict.fromkeys(
-                        evidence_id
-                        for fact in value_change_facts
-                        for evidence_id in fact.evidence_ids
-                        if evidence_id in available_evidence_ids
-                    )
-                )
-                evidence = UpstreamOutput(
-                    answer=deterministic_answer,
-                    used_evidence_ids=used_evidence_ids,
-                    display_evidence_ids=[],
-                )
-                upstream_output = evidence.model_dump()
-                record_upstream_output(
-                    {
-                        **upstream_output,
-                        "answer_source": "deterministic_value_changes",
-                    }
-                )
-                logger.info(
-                    "Deterministic field value-change result: %s",
-                    json.dumps(upstream_output, ensure_ascii=False)[:8000],
-                )
-                return {
-                    "upstream_output": upstream_output,
-                    "final_answer": evidence.answer,
-                    "selected_display_refs": [],
-                }
 
         answer_payload = dict(upstream_payload)
         if decision.problem and not ignored_cardinality_reroute:
@@ -3166,6 +3120,7 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
         "context": clean_context,
         "operation_skills": None,
         "operation_sql_risk_aspects": None,
+        "operation_sql_risk_execution_mode": None,
         "operation_pipeline": None,
         "cycle": 1,
         "plan": [],

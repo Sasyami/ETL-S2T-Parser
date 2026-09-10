@@ -16,13 +16,29 @@ from agents.cardinality_analysis import (
     render_cardinality_answer,
 )
 from agents.contracts import EvidenceArtifact
+from agents.sql_risk_scope_contract import (
+    LiteralSqlRiskScope,
+    ReadS2TSourceToTargetRequirement,
+    SqlRiskScopeContract,
+)
 from agents.tools.saved_results import SavedResultStore
 
 
-TASK = (
-    "Оцени риск появления дубликатов при сохранённой S2T-трансформации "
-    "src_np → tgt_np. Назови фактический JOIN и явно отдели "
-    "подтверждённый механизм от условия по уникальности."
+CONTRACT = SqlRiskScopeContract(
+    scope=LiteralSqlRiskScope(
+        source="src_np",
+        target="tgt_np",
+        source_table="src_np",
+        target_table="tgt_np",
+    ),
+    aspects=("cardinality",),
+    requirements=(
+        ReadS2TSourceToTargetRequirement(
+            source_table="src_np",
+            target_table="tgt_np",
+        ),
+    ),
+    execution_mode="conditional_cardinality",
 )
 JOIN_RULE = (
     "SELECT s.id AS id, COALESCE(s.value, d.value) AS value "
@@ -174,12 +190,40 @@ def test_where_and_coalesce_without_join_are_not_mechanisms():
         ),
         (
             "SELECT * FROM src_np s JOIN aux_np d ON FALSE",
-            "unsupported_join",
+            "constant_false_predicate",
         ),
     ],
 )
 def test_rule_analysis_fails_closed(rule, status):
     assert analyze_cardinality_rule(rule).status == status
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        pytest.param(
+            "SELECT s.id FROM src_np s JOIN aux_np d "
+            "ON d.id = s.id AND FALSE",
+            id="false-join-conjunct",
+        ),
+        pytest.param(
+            "SELECT s.id FROM src_np s JOIN aux_np d "
+            "ON d.id = s.id WHERE FALSE",
+            id="false-final-filter",
+        ),
+    ],
+)
+def test_constant_false_predicate_is_not_assessed(saved_result_store, rule):
+    analysis = analyze_cardinality_rule(rule)
+    artifact = _artifact(saved_result_store, [_row(rule)])
+
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
+
+    assert analysis.status == "constant_false_predicate"
+    assert analysis.joins == []
+    assert fact.conclusion == "not_assessed"
+    assert fact.mechanism == "constant_false_predicate"
+    assert fact.joins == []
 
 
 @pytest.mark.parametrize(
@@ -236,7 +280,7 @@ def test_complete_duplicate_s2t_rows_produce_one_conditional_fact(
         [_row(JOIN_RULE), _row(JOIN_RULE)],
     )
 
-    facts = derive_cardinality_facts(TASK, [artifact], saved_result_store)
+    facts = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)
 
     assert len(facts) == 1
     fact = facts[0]
@@ -258,7 +302,7 @@ def test_fact_preserves_opaque_evidence_id_for_coordinator_provenance(
         evidence_id=evidence_id,
     )
 
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     assert fact.evidence_ids == [evidence_id]
 
@@ -277,7 +321,7 @@ def test_projection_and_filter_differences_do_not_create_false_conflict(
         ],
     )
 
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     assert fact.conclusion == "conditional_duplicate_risk"
     assert fact.mechanism == "join_fanout"
@@ -292,7 +336,7 @@ def test_conflicting_join_structures_fail_closed(saved_result_store):
         ],
     )
 
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     assert fact.conclusion == "conflicting"
     assert fact.mechanism == "conflicting_rules"
@@ -302,7 +346,7 @@ def test_conflicting_join_structures_fail_closed(saved_result_store):
 def test_empty_complete_mapping_is_not_assessed(saved_result_store):
     artifact = _artifact(saved_result_store, [])
 
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     assert fact.conclusion == "not_assessed"
     assert fact.mechanism == "no_exact_mapping"
@@ -315,7 +359,7 @@ def test_wrong_scope_saved_rows_fail_closed(saved_result_store):
         [_row(JOIN_RULE, source="src_other")],
     )
 
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     assert fact.conclusion == "not_assessed"
     assert fact.mechanism == "scope_mismatch"
@@ -325,7 +369,7 @@ def test_wrong_scope_saved_rows_fail_closed(saved_result_store):
 def test_missing_transformation_rule_fails_closed(saved_result_store, rule):
     artifact = _artifact(saved_result_store, [_row(rule)])
 
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     assert fact.conclusion == "not_assessed"
     assert fact.mechanism == "missing_transformation_rule"
@@ -334,7 +378,7 @@ def test_missing_transformation_rule_fails_closed(saved_result_store, rule):
 def test_incomplete_saved_relation_fails_closed(saved_result_store):
     artifact = _artifact(saved_result_store, [_row(JOIN_RULE)], total=2)
 
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     assert fact.conclusion == "not_assessed"
     assert fact.mechanism == "incomplete_evidence"
@@ -357,7 +401,7 @@ def test_invalid_saved_count_fails_closed(saved_result_store, monkeypatch):
         },
     )
 
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     assert fact.conclusion == "not_assessed"
     assert fact.mechanism == "incomplete_evidence"
@@ -367,19 +411,21 @@ def test_renderer_names_join_and_unknown_condition_but_not_filter_or_projection(
     saved_result_store,
 ):
     artifact = _artifact(saved_result_store, [_row(JOIN_RULE)])
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     answer = render_cardinality_answer([fact])
     payload = cardinality_payload([fact])
 
     assert "src_np → tgt_np" in answer
-    assert "Фактический JOIN" in answer
     assert "JOIN aux_np AS d ON d.id = s.id" in answer
-    assert "Подтверждённый механизм" in answer
-    assert "Условие по уникальности" in answer
-    assert "не подтверждена" in answer
-    assert "условный" in answer
-    assert "фактические дубликаты не доказаны" in answer
+    assert "JOIN может размножить строки" in answer
+    assert "Уникальность полного JOIN-ключа" in answer
+    assert "не установлена" in answer
+    assert "условен" in answer
+    assert "фактических дубликатов не установлено" in answer
+    assert "Фактический JOIN" not in answer
+    assert "Подтверждённый механизм" not in answer
+    assert "Условие по уникальности" not in answer
     assert "where" not in answer.casefold()
     assert "coalesce" not in answer.casefold()
     assert payload["authority"] == "deterministic_sqlglot_full_saved_result"
@@ -393,15 +439,13 @@ def test_no_join_renderer_keeps_complete_requested_output_contract(
         saved_result_store,
         [_row("SELECT s.id FROM src_np AS s")],
     )
-    fact = derive_cardinality_facts(TASK, [artifact], saved_result_store)[0]
+    fact = derive_cardinality_facts(CONTRACT, [artifact], saved_result_store)[0]
 
     answer = render_cardinality_answer([fact])
 
-    assert "Фактический JOIN" in answer
-    assert "Подтверждённый механизм" in answer
-    assert "Условие по уникальности" in answer
-    assert "не применимо" in answer
+    assert "не применим" in answer
     assert "не доказывает отсутствие дубликатов" in answer
+    assert "Фактический JOIN" not in answer
 
 
 def test_payload_is_hard_bounded_for_maximal_valid_facts():

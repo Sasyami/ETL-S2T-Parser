@@ -9,15 +9,16 @@ worker, observer and upstream stages.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import ClassVar, Literal
 
-from .cardinality_sufficiency import is_conditional_cardinality_request
-from .constraint_rejection_analysis import (
-    is_exclusive_constraint_rejection_request,
+from .contracts import (
+    PlanScope,
+    PlanStep,
+    SqlRiskAspect,
+    SqlRiskExecutionMode,
+    WorkerPlan,
 )
-from .contracts import PlanScope, PlanStep, SqlRiskAspect, WorkerPlan
 from .sql_risk_scope_contract import (
     GetSourceTargetColumnPairRequirement,
     ReadS2TSourceToTargetRequirement,
@@ -27,24 +28,8 @@ from .sql_risk_scope_contract import (
 
 
 TypedSqlRiskPlanSource = Literal["deterministic_sql_risk_scope_v2"]
+_MAX_IDENTIFIER_CHARS = 200
 
-_TABLE_ENDPOINT = r"[A-Za-z_][A-Za-z0-9_$]{0,199}"
-_SUPPORTED_CARDINALITY_REQUEST_RE = re.compile(
-    rf"^\s*оцени\s+риск\s+появлен\w*\s+дубликат\w*\s+при\s+"
-    rf"сохран[её]нн\w*\s+s2t[-‑–— ]?трансформац\w*\s+"
-    rf"{_TABLE_ENDPOINT}\s*→\s*{_TABLE_ENDPOINT}\s*[.!?]?\s*"
-    rf"назови\s+фактическ\w*\s+join\s+и\s+явно\s+отдели\s+"
-    rf"подтвержд[её]нн\w*\s+механизм\s+от\s+услови\w*\s+по\s+"
-    rf"уникальност\w*\s*[.!?]?\s*$",
-    re.IGNORECASE,
-)
-_SUPPORTED_CARDINALITY_REQUEST_ALT_RE = re.compile(
-    rf"^\s*оцени\s+условн\w*\s+риск\s+cardinality\s+и\s+"
-    rf"появлен\w*\s+дубликат\w*\s+для\s+{_TABLE_ENDPOINT}\s*→\s*"
-    rf"{_TABLE_ENDPOINT}\s+по\s+сохран[её]нн\w*\s+s2t\s+mapping\s*"
-    rf"[.!?]?\s*$",
-    re.IGNORECASE,
-)
 
 @dataclass(frozen=True)
 class TypedSqlRiskWorkerPlan:
@@ -133,14 +118,15 @@ def _has_constraint_requirements(contract: SqlRiskScopeContract) -> bool:
     )
 
 
-def _is_supported_cardinality_request(task: str) -> bool:
-    return bool(
-        isinstance(task, str)
-        and (
-            _SUPPORTED_CARDINALITY_REQUEST_RE.fullmatch(task)
-            or _SUPPORTED_CARDINALITY_REQUEST_ALT_RE.fullmatch(task)
+def _scope_identifiers_are_bounded(contract: SqlRiskScopeContract) -> bool:
+    scope = contract.scope
+    return all(
+        len(value) <= _MAX_IDENTIFIER_CHARS
+        for value in (
+            scope.source_table,
+            scope.target_table,
+            *(value for value in (scope.source_field, scope.target_field) if value),
         )
-        and is_conditional_cardinality_request(task)
     )
 
 
@@ -175,6 +161,8 @@ def _constraint_step(contract: SqlRiskScopeContract) -> PlanStep:
 def build_typed_sql_risk_worker_plan(
     original_task: str,
     contract: SqlRiskScopeContract | None,
+    *,
+    sql_risk_execution_mode: SqlRiskExecutionMode,
 ) -> TypedSqlRiskWorkerPlan | None:
     """Build one safe closed worker plan, otherwise return ``None``.
 
@@ -182,33 +170,39 @@ def build_typed_sql_risk_worker_plan(
     required evidence is known to be complete before planning:
 
     * conditional cardinality from one full directed table mapping;
-    * explicitly exclusive nullable constraint rejection from that mapping
-      plus the exact role-preserving source/target column pair.
+    * nullable constraint compatibility from that mapping plus the exact
+      role-preserving source/target column pair.
 
     Other aspects and broader requests remain on the unchanged downstream
     planner path.  No identifier is resolved, normalized or inferred here.
     """
 
-    if contract is None or len(contract.aspects) != 1:
+    if (
+        contract is None
+        or len(contract.aspects) != 1
+        or contract.execution_mode != sql_risk_execution_mode
+        or not _scope_identifiers_are_bounded(contract)
+    ):
         return None
 
     aspect = contract.aspects[0]
     step: PlanStep
-    if aspect == "cardinality":
+    if sql_risk_execution_mode == "conditional_cardinality":
         if not (
-            _has_mapping_only_requirements(contract)
+            aspect == "cardinality"
+            and _has_mapping_only_requirements(contract)
             and _contract_matches_original_task(
                 original_task,
                 contract,
                 endpoint_kind="table",
             )
-            and _is_supported_cardinality_request(original_task)
         ):
             return None
         step = _cardinality_step(contract)
-    elif aspect == "constraint_rejection":
+    elif sql_risk_execution_mode == "nullable_constraint":
         if not (
-            contract.scope.is_field_pair
+            aspect == "constraint_rejection"
+            and contract.scope.is_field_pair
             and contract.scope.file_id is not None
             and _has_constraint_requirements(contract)
             and _contract_matches_original_task(
@@ -216,7 +210,6 @@ def build_typed_sql_risk_worker_plan(
                 contract,
                 endpoint_kind="field",
             )
-            and is_exclusive_constraint_rejection_request(original_task)
         ):
             return None
         step = _constraint_step(contract)
@@ -233,5 +226,4 @@ __all__ = [
     "TypedSqlRiskPlanSource",
     "TypedSqlRiskWorkerPlan",
     "build_typed_sql_risk_worker_plan",
-    "is_exclusive_constraint_rejection_request",
 ]

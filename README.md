@@ -509,10 +509,10 @@ Runner не переносит победивший вариант в default: E
 development evidence, поэтому потенциальному победителю нужен новый независимый
 holdout.
 
-Для `value_changes` и `write_semantics` итоговый verdict формируется
-детерминированным кодом. Их восемь ячеек проверяют влияние протокола на
-plan/planner/observer и частично upstream decision, но не сравнивают модельный
-upstream answer; это ограничение записывается в preregistration и отчёт.
+Все 20 ячеек, включая `value_changes` и `write_semantics`, проходят
+полный model-owned upstream decision и upstream answer. Детерминированный
+SQLGlot-анализ добавляет только structured facts к evidence payload и не
+формирует финальный ответ и не подавляет reroute.
 
 Confirmatory Max/Max-run `20260910_021405` завершил все 20 пар и откаты, но ни
 одно семейство не прошло preregistered gate. Combined score изменился с 7/20 до
@@ -522,20 +522,22 @@ Confirmatory Max/Max-run `20260910_021405` завершил все 20 пар и 
 [`LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md`](LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md).
 
 Для development-проверки SQL-risk evidence scope доступен отдельный
-opt-in `OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT`. Значение `1`
-сохраняет первый prompt-mediated контракт, а `typed_plan` включает
-более узкую code-owned ветку. Для однозначного conditional-cardinality
-или exact nullable-constraint запроса она сама строит один typed
-worker-plan и evidence slots, не вызывая downstream planner. Cardinality
+opt-in `OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT=typed_plan`.
+В этом режиме operation router возвращает typed execution mode native enum;
+ниже по цепочке нет regex/keyword-классификации пользовательской формулировки.
+Для conditional-cardinality или exact nullable-constraint запроса coordinator
+сам строит один typed worker-plan и evidence slots, не вызывая downstream planner. Cardinality
 требует полную сохранённую exact S2T relation и детерминированно извлекает
-только фактический JOIN внешнего SELECT: `WHERE`/`COALESCE` не могут стать
+только JOIN внешнего SELECT: `WHERE`/`COALESCE` не могут стать
 механизмом размножения или доказательством уникальности. Nullable-constraint компилирует
 ответ из exact mapping и source/target metadata. Оба terminal verdict
 возвращаются без модельного upstream answer. Любой более широкий или
 неоднозначный запрос fail-closed остаётся на default agentic path без
-scope-аттестации. Default выключен. Форматтер `value_changes` отдельно не
-публикует внутренние SQL aliases; полное выражение остаётся в structured
-metrics.
+scope-аттестации. Literal arrow/file_id parsing проверяет только происхождение
+scope и не определяет intent. Default выключен; старый prompt-mediated режим
+удалён, а его truthy-значения теперь отклоняются. Форматтер `value_changes`
+отдельно не публикует внутренние SQL aliases; полное выражение остаётся в
+structured metrics.
 
 Max/Max development A/B на пяти раскрытых baseline failures не подтвердил
 scope/evidence toggle: combined осталось 3/5, semantic снизилось с 4/5 до 3/5,

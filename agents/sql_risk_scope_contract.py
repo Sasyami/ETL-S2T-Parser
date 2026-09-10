@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, ClassVar, Iterable, Literal, Mapping, TypedDict
 
-from .contracts import SqlRiskAspect
+from .contracts import SqlRiskAspect, SqlRiskExecutionMode
 
 
 OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV = (
@@ -26,7 +26,7 @@ SqlRiskToolName = Literal[
     "read_s2t_source_to_target",
     "get_source_target_column_pair",
 ]
-SqlRiskScopeEvidenceArchitecture = Literal["off", "prompt", "typed_plan"]
+SqlRiskScopeEvidenceArchitecture = Literal["off", "typed_plan"]
 SqlRiskScopeStage = Literal[
     "plan",
     "planner",
@@ -43,7 +43,6 @@ _SUPPORTED_ASPECTS: tuple[SqlRiskAspect, ...] = (
     "value_changes",
     "write_semantics",
 )
-_ENABLED_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 _DISABLED_VALUES = frozenset(
     {"", "0", "false", "no", "off", "disabled", "default", "current"}
 )
@@ -63,11 +62,6 @@ _ARROW_PAIR_RE = re.compile(
 )
 _FILE_ID_RE = re.compile(
     r"\bfile_id\s*(?:=|:)\s*(?P<file_id>[1-9][0-9]*)\b",
-    re.IGNORECASE,
-)
-_EXPLICIT_COLUMN_SCOPE_RE = re.compile(
-    r"(?:\b(?:source_not_null|target_not_null|not_null|nullable|column|field)\b"
-    r"|колонк|\bпол(?:е|я|ей|ю|ем)\b)",
     re.IGNORECASE,
 )
 _ENDPOINT_BOUNDARY_CHARS = r"A-Za-z0-9_$\."
@@ -172,6 +166,7 @@ class SqlRiskScopeContract:
     scope: LiteralSqlRiskScope
     aspects: tuple[SqlRiskAspect, ...]
     requirements: tuple[SqlRiskEvidenceRequirement, ...]
+    execution_mode: SqlRiskExecutionMode
 
     @property
     def tool_names(self) -> tuple[SqlRiskToolName, ...]:
@@ -183,10 +178,10 @@ def sql_risk_scope_evidence_architecture(
 ) -> SqlRiskScopeEvidenceArchitecture:
     """Return the explicitly selected scope/evidence architecture.
 
-    Legacy truthy values retain the original prompt-mediated experiment.
     ``typed_plan`` selects deterministic worker-plan synthesis while keeping
-    the worker and upstream agentic.  Disabled values preserve the default
-    path.  Unknown values raise instead of silently selecting another mode.
+    the worker agentic. Disabled values preserve the default path. The
+    rejected prompt-mediated experiment and unknown values raise instead of
+    silently selecting another mode.
 
     An explicit ``value`` is useful for pure callers and tests; otherwise the
     environment is read.
@@ -200,8 +195,6 @@ def sql_risk_scope_evidence_architecture(
     normalized = str(configured or "").strip().casefold()
     if normalized == _TYPED_PLAN_VALUE:
         return "typed_plan"
-    if normalized in _ENABLED_VALUES:
-        return "prompt"
     if normalized in _DISABLED_VALUES:
         return "off"
     raise ValueError(
@@ -214,13 +207,6 @@ def sql_risk_scope_evidence_enabled(value: str | None = None) -> bool:
     """Return whether either isolated scope/evidence architecture is active."""
 
     return sql_risk_scope_evidence_architecture(value) != "off"
-
-
-def _is_technical_endpoint(value: str) -> bool:
-    # A bare natural-language word around an arrow is not enough evidence that
-    # it is a physical identifier.  Dotted and conventionally marked names are
-    # accepted without trying to interpret their business meaning.
-    return "." in value or "_" in value or "$" in value
 
 
 def _endpoint_parts(
@@ -262,11 +248,6 @@ def extract_literal_sql_risk_scope(
     for match in _ARROW_PAIR_RE.finditer(str(original_task or "")):
         source = match.group("source")
         target = match.group("target")
-        if not (
-            _is_technical_endpoint(source)
-            and _is_technical_endpoint(target)
-        ):
-            continue
         source_parts = source.split(".")
         target_parts = target.split(".")
         if len(source_parts) != len(target_parts):
@@ -319,17 +300,19 @@ def build_sql_risk_scope_contract(
     sql_risk_aspects: Iterable[SqlRiskAspect],
     *,
     enabled: bool | None = None,
+    execution_mode: SqlRiskExecutionMode = "agentic",
 ) -> SqlRiskScopeContract | None:
     """Build typed reader requirements, or no contract when unsafe/off.
 
-    Every supported aspect needs the full directed S2T mapping.  Constraint
-    rejection additionally needs exact endpoint metadata only when the task
-    itself supplies both fields and one literal ``file_id``.  No resolver or
-    inferred active-file state is consulted.
+    Only a router-selected closed execution mode can create a contract.
+    Conditional cardinality needs the full directed S2T mapping. Nullable
+    constraint compatibility additionally needs exact endpoint metadata and
+    one literal ``file_id``. No resolver, keyword matcher or inferred active
+    file state is consulted.
     """
 
     aspects = _selected_aspects(sql_risk_aspects)
-    if not aspects:
+    if not aspects or execution_mode == "agentic":
         return None
     is_enabled = (
         sql_risk_scope_evidence_enabled()
@@ -338,22 +321,21 @@ def build_sql_risk_scope_contract(
     )
     if not is_enabled:
         return None
-    table_level_aspects = {
-        "row_filtering",
-        "cardinality",
-        "write_semantics",
+    typed_mode_spec: dict[
+        SqlRiskExecutionMode,
+        tuple[tuple[SqlRiskAspect, ...], SqlRiskEndpointKind] | None,
+    ] = {
+        "agentic": None,
+        "conditional_cardinality": (("cardinality",), "table"),
+        "nullable_constraint": (("constraint_rejection",), "field"),
     }
-    field_level_aspects = {"constraint_rejection", "value_changes"}
-    requested = set(aspects)
-    if requested & table_level_aspects and requested & field_level_aspects:
-        # A dotted endpoint cannot simultaneously be interpreted as a table
-        # scope and a field scope without guessing.  Multi-scope requests stay
-        # on the unchanged baseline path.
+    typed_spec = typed_mode_spec[execution_mode]
+    # The operation router owns semantic classification. This boundary checks
+    # only enum/aspect consistency and literal origin; it never reclassifies
+    # natural language with keywords, examples or sentence templates.
+    if typed_spec is None or aspects != typed_spec[0]:
         return None
-    else:
-        endpoint_kind = (
-            "field" if requested & field_level_aspects else "table"
-        )
+    endpoint_kind = typed_spec[1]
     scope = extract_literal_sql_risk_scope(
         original_task,
         endpoint_kind=endpoint_kind,
@@ -362,22 +344,17 @@ def build_sql_risk_scope_contract(
         return None
     source_depth = scope.source.count(".") + 1
     target_depth = scope.target.count(".") + 1
-    if endpoint_kind == "table" and (
-        source_depth != 1 or target_depth != 1
-    ):
-        # ``schema.table`` and ``table.field`` have the same textual shape.
-        # Without an exact lookup the runtime contract must not choose one.
-        return None
     if endpoint_kind == "field":
         if source_depth == 1 or target_depth == 1:
             return None
-        if source_depth == 2:
-            if not (
-                aspects == ("constraint_rejection",)
-                and scope.file_id is not None
-                and _EXPLICIT_COLUMN_SCOPE_RE.search(original_task)
-            ):
-                return None
+        # Field semantics come from the structured router enum. Only the exact
+        # endpoints and file_id are extracted from text.
+        if scope.file_id is None:
+            return None
+    if execution_mode == "nullable_constraint" and (
+        not scope.is_field_pair or scope.file_id is None
+    ):
+        return None
 
     requirements: list[SqlRiskEvidenceRequirement] = [
         ReadS2TSourceToTargetRequirement(
@@ -408,6 +385,7 @@ def build_sql_risk_scope_contract(
         scope=scope,
         aspects=aspects,
         requirements=tuple(requirements),
+        execution_mode=execution_mode,
     )
 
 
@@ -416,6 +394,7 @@ def required_sql_risk_tools(
     sql_risk_aspects: Iterable[SqlRiskAspect],
     *,
     enabled: bool | None = None,
+    execution_mode: SqlRiskExecutionMode = "agentic",
 ) -> tuple[SqlRiskToolName, ...]:
     """Return the ordered typed tool names required by the exact contract."""
 
@@ -423,6 +402,7 @@ def required_sql_risk_tools(
         original_task,
         sql_risk_aspects,
         enabled=enabled,
+        execution_mode=execution_mode,
     )
     return contract.tool_names if contract is not None else ()
 
@@ -573,6 +553,7 @@ def ensure_sql_risk_answer_scope(
     sql_risk_aspects: Iterable[SqlRiskAspect],
     *,
     enabled: bool | None = None,
+    execution_mode: SqlRiskExecutionMode = "agentic",
 ) -> str:
     """Prepend the exact compact scope unless its directed pair is present.
 
@@ -587,6 +568,7 @@ def ensure_sql_risk_answer_scope(
         original_task,
         sql_risk_aspects,
         enabled=enabled,
+        execution_mode=execution_mode,
     )
     if contract is None:
         return answer

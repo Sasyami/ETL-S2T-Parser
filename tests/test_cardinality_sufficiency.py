@@ -8,13 +8,29 @@ from agents.cardinality_sufficiency import (
     complete_cardinality_mapping_evidence_ids,
 )
 from agents.contracts import EvidenceArtifact
+from agents.sql_risk_scope_contract import (
+    LiteralSqlRiskScope,
+    ReadS2TSourceToTargetRequirement,
+    SqlRiskScopeContract,
+)
 from agents.tools.saved_results import SavedResultStore
 
 
-CARDINALITY_TASK = (
-    "Оцени риск появления дубликатов при сохранённой "
-    "S2T-трансформации src_alpha → tgt_beta. Назови фактический JOIN "
-    "и явно отдели подтверждённый механизм от условия по уникальности."
+CARDINALITY_CONTRACT = SqlRiskScopeContract(
+    scope=LiteralSqlRiskScope(
+        source="src_alpha",
+        target="tgt_beta",
+        source_table="src_alpha",
+        target_table="tgt_beta",
+    ),
+    aspects=("cardinality",),
+    requirements=(
+        ReadS2TSourceToTargetRequirement(
+            source_table="src_alpha",
+            target_table="tgt_beta",
+        ),
+    ),
+    execution_mode="conditional_cardinality",
 )
 
 
@@ -76,7 +92,7 @@ def test_complete_exact_saved_mapping_is_sufficient(saved_result_store):
     )
 
     assert complete_cardinality_mapping_evidence_ids(
-        CARDINALITY_TASK,
+        CARDINALITY_CONTRACT,
         [artifact],
         saved_result_store,
     ) == ["evidence-complete"]
@@ -99,7 +115,7 @@ def test_wrong_scope_saved_rows_are_not_sufficient(saved_result_store):
     )
 
     assert complete_cardinality_mapping_evidence_ids(
-        CARDINALITY_TASK,
+        CARDINALITY_CONTRACT,
         [artifact],
         saved_result_store,
     ) == []
@@ -123,7 +139,46 @@ def test_blank_or_dash_transformation_rule_is_not_sufficient(
     )
 
     assert complete_cardinality_mapping_evidence_ids(
-        CARDINALITY_TASK,
+        CARDINALITY_CONTRACT,
         [artifact],
+        saved_result_store,
+    ) == []
+
+
+def test_non_cardinality_execution_mode_cannot_claim_sufficiency(
+    saved_result_store,
+):
+    contract = SqlRiskScopeContract(
+        scope=CARDINALITY_CONTRACT.scope,
+        aspects=CARDINALITY_CONTRACT.aspects,
+        requirements=CARDINALITY_CONTRACT.requirements,
+        execution_mode="agentic",
+    )
+
+    assert complete_cardinality_mapping_evidence_ids(
+        contract,
+        [],
+        saved_result_store,
+    ) == []
+
+
+def test_internally_inconsistent_scope_cannot_claim_sufficiency(
+    saved_result_store,
+):
+    contract = SqlRiskScopeContract(
+        scope=LiteralSqlRiskScope(
+            source="different_source",
+            target="tgt_beta",
+            source_table="src_alpha",
+            target_table="tgt_beta",
+        ),
+        aspects=CARDINALITY_CONTRACT.aspects,
+        requirements=CARDINALITY_CONTRACT.requirements,
+        execution_mode="conditional_cardinality",
+    )
+
+    assert complete_cardinality_mapping_evidence_ids(
+        contract,
+        [],
         saved_result_store,
     ) == []

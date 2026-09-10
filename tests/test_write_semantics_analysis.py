@@ -11,7 +11,6 @@ from agents.write_semantics_analysis import (
     classify_write_semantics_rule,
     derive_write_semantics_facts,
     extract_exact_table_pairs,
-    is_exclusive_write_semantics_request,
     render_terminal_write_semantics_negative,
     render_write_semantics_answer,
     write_semantics_payload,
@@ -77,37 +76,6 @@ def test_extracts_quoted_schema_pairs_and_deduplicates_casefolded_values():
         {"source_table": "raw.sales", "target_table": "mart.sales"},
         {"source_table": "$$raw.events", "target_table": "$$mart.events"},
     ]
-
-
-def test_current_live_wording_is_an_exclusive_write_semantics_request():
-    task = (
-        "Оцени только SQL-аспект write semantics для сохранённой "
-        f"S2T-загрузки {SOURCE_TABLE} → {TARGET_TABLE}: append, overwrite, "
-        "MERGE/UPSERT или conflict handling. Если write statement не "
-        "сохранён, честно отметь «не оценено» и не выводи режим из PK."
-    )
-
-    assert is_exclusive_write_semantics_request(task) is True
-
-
-@pytest.mark.parametrize(
-    "task",
-    [
-        f"Оцени write semantics для {SOURCE_TABLE} → {TARGET_TABLE}.",
-        (
-            f"Оцени только write semantics для {SOURCE_TABLE} → "
-            f"{TARGET_TABLE} и покажи полный результат."
-        ),
-        (
-            f"Оцени только write semantics и value changes для "
-            f"{SOURCE_TABLE} → {TARGET_TABLE}."
-        ),
-        "Оцени только write semantics без точной пары.",
-        "",
-    ],
-)
-def test_exclusive_predicate_rejects_broad_or_display_requests(task):
-    assert is_exclusive_write_semantics_request(task) is False
 
 
 @pytest.mark.parametrize(

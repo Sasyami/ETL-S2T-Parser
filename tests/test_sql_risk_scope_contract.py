@@ -63,14 +63,11 @@ def test_experiment_is_off_by_default_and_preserves_answer_byte_for_byte(
         ("0", "off"),
         ("false", "off"),
         ("default", "off"),
-        ("1", "prompt"),
-        ("TRUE", "prompt"),
-        (" enabled ", "prompt"),
         ("typed_plan", "typed_plan"),
         (" TYPED_PLAN ", "typed_plan"),
     ],
 )
-def test_scope_evidence_architecture_preserves_legacy_values(
+def test_scope_evidence_architecture_accepts_only_off_or_typed_plan(
     value,
     expected,
 ):
@@ -88,6 +85,7 @@ def test_typed_plan_mode_enables_the_same_exact_scope_contract(monkeypatch):
     contract = build_sql_risk_scope_contract(
         TABLE_TASK,
         ["cardinality"],
+        execution_mode="conditional_cardinality",
     )
 
     assert contract is not None
@@ -97,8 +95,12 @@ def test_typed_plan_mode_enables_the_same_exact_scope_contract(monkeypatch):
 
 
 @pytest.mark.parametrize("value", ["1", "TRUE", " yes ", "on", "enabled"])
-def test_explicit_enabled_values(value):
-    assert sql_risk_scope_evidence_enabled(value) is True
+def test_removed_prompt_architecture_values_fail_visibly(value):
+    with pytest.raises(
+        ValueError,
+        match="Unknown OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT",
+    ):
+        sql_risk_scope_evidence_enabled(value)
 
 
 @pytest.mark.parametrize("value", [None, "", "0", "false", "default"])
@@ -168,66 +170,49 @@ def test_repeated_identical_pair_is_not_ambiguous():
     "task",
     [
         "Сравни raw_a → mart_b и raw_c → mart_d.",
-        "Сравни source → target.",
         "Сравни raw_a.id → mart_b.",
         "Сравни schema.raw_a.id → mart_b.id.",
         "Оцени риск без указанной пары.",
         "Проверь SQL-выражение payload_json -> customer_key.",
     ],
 )
-def test_ambiguous_or_nontechnical_scope_never_creates_requirements(task):
+def test_ambiguous_or_invalid_scope_never_creates_requirements(task):
     assert extract_literal_sql_risk_scope(task) is None
     assert build_sql_risk_scope_contract(
         task,
         ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     ) is None
     assert required_sql_risk_tools(
         task,
         ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     ) == ()
 
 
-@pytest.mark.parametrize(
-    "aspect",
-    [
-        "row_filtering",
-        "cardinality",
-        "value_changes",
-        "write_semantics",
-    ],
-)
-def test_mapping_aspects_require_only_exact_directed_s2t_reader(aspect):
-    task = QUALIFIED_FIELD_TASK if aspect == "value_changes" else TABLE_TASK
-    source_table = (
-        "stg.raw_customer_events_v2"
-        if aspect == "value_changes"
-        else "raw_customer_events_v2"
-    )
-    target_table = (
-        "dwh.mart_customer_daily_v3"
-        if aspect == "value_changes"
-        else "mart_customer_daily_v3"
-    )
+def test_cardinality_mode_requires_only_exact_directed_s2t_reader():
     contract = build_sql_risk_scope_contract(
-        task,
-        [aspect],
+        TABLE_TASK,
+        ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     )
 
     assert contract is not None
-    assert contract.aspects == (aspect,)
+    assert contract.aspects == ("cardinality",)
+    assert contract.execution_mode == "conditional_cardinality"
     assert contract.tool_names == ("read_s2t_source_to_target",)
     assert contract.requirements == (
         ReadS2TSourceToTargetRequirement(
-            source_table=source_table,
-            target_table=target_table,
+            source_table="raw_customer_events_v2",
+            target_table="mart_customer_daily_v3",
         ),
     )
     assert contract.requirements[0].arguments == {
-        "source_table": source_table,
-        "target_table": target_table,
+        "source_table": "raw_customer_events_v2",
+        "target_table": "mart_customer_daily_v3",
     }
 
 
@@ -236,6 +221,7 @@ def test_constraint_field_pair_with_literal_file_requires_both_exact_readers():
         FIELD_TASK,
         ["constraint_rejection"],
         enabled=True,
+        execution_mode="nullable_constraint",
     )
 
     assert contract is not None
@@ -265,12 +251,16 @@ def test_constraint_field_pair_with_literal_file_requires_both_exact_readers():
     }
 
 
-def test_table_aspect_does_not_guess_schema_qualified_table_shape():
-    assert build_sql_risk_scope_contract(
+def test_structured_table_mode_accepts_schema_qualified_tables():
+    contract = build_sql_risk_scope_contract(
         "Оцени cardinality для stg.orders → dwh.orders.",
         ["cardinality"],
         enabled=True,
-    ) is None
+        execution_mode="conditional_cardinality",
+    )
+    assert contract is not None
+    assert contract.scope.source_table == "stg.orders"
+    assert contract.scope.target_table == "dwh.orders"
 
 
 def test_field_aspect_splits_schema_qualified_fields_from_the_right():
@@ -278,6 +268,7 @@ def test_field_aspect_splits_schema_qualified_fields_from_the_right():
         "Для file_id=17 проверь stg.orders.id → dwh.orders.order_id.",
         ["constraint_rejection"],
         enabled=True,
+        execution_mode="nullable_constraint",
     )
 
     assert contract is not None
@@ -307,16 +298,21 @@ def test_two_part_value_scope_is_left_to_existing_exact_analysis():
     ) is None
 
 
-def test_two_part_constraint_requires_strong_column_grammar_and_file():
-    assert build_sql_risk_scope_contract(
+def test_two_part_constraint_uses_structured_mode_and_explicit_file_only():
+    contract = build_sql_risk_scope_contract(
         "Для file_id=17 проверь src_alpha.id → tgt_beta.id.",
         ["constraint_rejection"],
         enabled=True,
-    ) is None
+        execution_mode="nullable_constraint",
+    )
+    assert contract is not None
+    assert contract.scope.source_field == "id"
+    assert contract.scope.target_field == "id"
     assert build_sql_risk_scope_contract(
         "Проверь nullable колонок src_alpha.id → tgt_beta.id.",
         ["constraint_rejection"],
         enabled=True,
+        execution_mode="nullable_constraint",
     ) is None
 
 
@@ -333,25 +329,17 @@ def test_ambiguous_constraint_scope_stays_on_baseline_path(task):
         task,
         ["constraint_rejection"],
         enabled=True,
+        execution_mode="nullable_constraint",
     ) == ()
 
 
-def test_multiple_aspects_deduplicate_tools_in_stable_order():
-    contract = build_sql_risk_scope_contract(
+def test_multiple_aspects_cannot_enter_one_closed_execution_mode():
+    assert build_sql_risk_scope_contract(
         QUALIFIED_FIELD_TASK,
         ["value_changes", "constraint_rejection"],
         enabled=True,
-    )
-
-    assert contract is not None
-    assert contract.aspects == (
-        "constraint_rejection",
-        "value_changes",
-    )
-    assert contract.tool_names == (
-        "read_s2t_source_to_target",
-        "get_source_target_column_pair",
-    )
+        execution_mode="nullable_constraint",
+    ) is None
 
 
 def test_answer_with_exact_directed_scope_is_unchanged():
@@ -363,8 +351,9 @@ def test_answer_with_exact_directed_scope_is_unchanged():
     assert ensure_sql_risk_answer_scope(
         answer,
         QUALIFIED_FIELD_TASK,
-        ["value_changes"],
+        ["constraint_rejection"],
         enabled=True,
+        execution_mode="nullable_constraint",
     ) == answer
 
 
@@ -387,6 +376,7 @@ def test_reversed_or_unordered_endpoints_get_correct_scope(answer):
         TABLE_TASK,
         ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     )
 
     assert rendered == (
@@ -403,6 +393,7 @@ def test_missing_endpoint_gets_compact_exact_scope_line_idempotently():
         TABLE_TASK,
         ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     )
 
     assert rendered == (
@@ -414,6 +405,7 @@ def test_missing_endpoint_gets_compact_exact_scope_line_idempotently():
         TABLE_TASK,
         ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     ) == rendered
 
 
@@ -425,8 +417,9 @@ def test_larger_identifier_substring_does_not_count_as_exact_endpoint():
     rendered = ensure_sql_risk_answer_scope(
         answer,
         TABLE_TASK,
-        ["row_filtering"],
+        ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     )
 
     assert rendered.startswith(
@@ -441,8 +434,9 @@ def test_ambiguous_scope_leaves_answer_unchanged_even_when_enabled():
     assert ensure_sql_risk_answer_scope(
         answer,
         task,
-        ["row_filtering"],
+        ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     ) == answer
 
 
@@ -451,6 +445,7 @@ def test_requirement_matcher_checks_exact_name_args_and_truncation():
         FIELD_TASK,
         ["constraint_rejection"],
         enabled=True,
+        execution_mode="nullable_constraint",
     )
     assert contract is not None
     calls = [
@@ -496,8 +491,9 @@ def test_requirement_matcher_accepts_evidence_artifact_shape():
 
     contract = build_sql_risk_scope_contract(
         TABLE_TASK,
-        ["row_filtering"],
+        ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     )
 
     assert missing_sql_risk_requirements(contract, [EvidenceLike()]) == ()
@@ -513,6 +509,7 @@ def test_short_stage_renderer_uses_only_literal_generic_scope(stage):
         FIELD_TASK,
         ["constraint_rejection"],
         enabled=True,
+        execution_mode="nullable_constraint",
     )
 
     rendered = render_sql_risk_scope_contract(contract, stage=stage)
@@ -530,6 +527,7 @@ def test_stage_renderer_is_empty_without_safe_contract_and_rejects_bad_stage():
         TABLE_TASK,
         ["cardinality"],
         enabled=True,
+        execution_mode="conditional_cardinality",
     )
     assert contract is not None
     with pytest.raises(ValueError, match="Unknown SQL-risk scope stage"):
