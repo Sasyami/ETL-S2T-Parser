@@ -26,6 +26,7 @@ SqlRiskToolName = Literal[
     "read_s2t_source_to_target",
     "get_source_target_column_pair",
 ]
+SqlRiskScopeEvidenceArchitecture = Literal["off", "prompt", "typed_plan"]
 SqlRiskScopeStage = Literal[
     "plan",
     "planner",
@@ -46,6 +47,7 @@ _ENABLED_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 _DISABLED_VALUES = frozenset(
     {"", "0", "false", "no", "off", "disabled", "default", "current"}
 )
+_TYPED_PLAN_VALUE = "typed_plan"
 
 _IDENTIFIER_ATOM = r"[A-Za-z_][A-Za-z0-9_$]*"
 _TECHNICAL_ENDPOINT = rf"{_IDENTIFIER_ATOM}(?:\.{_IDENTIFIER_ATOM}){{0,2}}"
@@ -176,12 +178,18 @@ class SqlRiskScopeContract:
         return tuple(requirement.tool_name for requirement in self.requirements)
 
 
-def sql_risk_scope_evidence_enabled(value: str | None = None) -> bool:
-    """Return whether the isolated scope/evidence experiment is enabled.
+def sql_risk_scope_evidence_architecture(
+    value: str | None = None,
+) -> SqlRiskScopeEvidenceArchitecture:
+    """Return the explicitly selected scope/evidence architecture.
 
-    Unknown values raise instead of silently running the baseline under a
-    misspelled experiment setting.  An explicit ``value`` is useful for pure
-    callers and tests; otherwise the environment is read.
+    Legacy truthy values retain the original prompt-mediated experiment.
+    ``typed_plan`` selects deterministic worker-plan synthesis while keeping
+    the worker and upstream agentic.  Disabled values preserve the default
+    path.  Unknown values raise instead of silently selecting another mode.
+
+    An explicit ``value`` is useful for pure callers and tests; otherwise the
+    environment is read.
     """
 
     configured = (
@@ -190,14 +198,22 @@ def sql_risk_scope_evidence_enabled(value: str | None = None) -> bool:
         else value
     )
     normalized = str(configured or "").strip().casefold()
+    if normalized == _TYPED_PLAN_VALUE:
+        return "typed_plan"
     if normalized in _ENABLED_VALUES:
-        return True
+        return "prompt"
     if normalized in _DISABLED_VALUES:
-        return False
+        return "off"
     raise ValueError(
         "Unknown OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT value: "
         + repr(configured)
     )
+
+
+def sql_risk_scope_evidence_enabled(value: str | None = None) -> bool:
+    """Return whether either isolated scope/evidence architecture is active."""
+
+    return sql_risk_scope_evidence_architecture(value) != "off"
 
 
 def _is_technical_endpoint(value: str) -> bool:
@@ -533,13 +549,20 @@ def render_sql_risk_scope_contract(
         raise ValueError(f"Unknown SQL-risk scope stage: {stage!r}") from exc
 
 
-def _contains_exact_endpoint(answer: str, endpoint: str) -> bool:
+def _contains_exact_directed_scope(
+    answer: str,
+    source: str,
+    target: str,
+) -> bool:
     return bool(
         re.search(
             rf"(?<![{_ENDPOINT_BOUNDARY_CHARS}])"
-            rf"{re.escape(endpoint)}"
+            rf"`?{re.escape(source)}`?"
+            rf"\s*(?:→|->|=>)\s*"
+            rf"`?{re.escape(target)}`?"
             rf"(?![{_ENDPOINT_BOUNDARY_CHARS}])",
             answer,
+            re.IGNORECASE,
         )
     )
 
@@ -551,12 +574,13 @@ def ensure_sql_risk_answer_scope(
     *,
     enabled: bool | None = None,
 ) -> str:
-    """Prepend an exact compact scope line only when an endpoint is absent.
+    """Prepend the exact compact scope unless its directed pair is present.
 
     The line is derived solely from the original literal pair.  If both exact
-    endpoint strings already occur in the model answer, or if the experiment
-    cannot form a safe contract, the answer is returned byte-for-byte.
-    Applying the helper twice is idempotent.
+    endpoints already occur in the correct source-to-target direction, or if
+    the experiment cannot form a safe contract, the answer is returned
+    byte-for-byte.  Merely mentioning both endpoints, including in the reverse
+    direction, is not sufficient.  Applying the helper twice is idempotent.
     """
 
     contract = build_sql_risk_scope_contract(
@@ -567,10 +591,7 @@ def ensure_sql_risk_answer_scope(
     if contract is None:
         return answer
     scope = contract.scope
-    if _contains_exact_endpoint(answer, scope.source) and _contains_exact_endpoint(
-        answer,
-        scope.target,
-    ):
+    if _contains_exact_directed_scope(answer, scope.source, scope.target):
         return answer
 
     scope_line = f"Scope: {scope.label}"
@@ -585,6 +606,7 @@ __all__ = [
     "ReadS2TSourceToTargetArguments",
     "ReadS2TSourceToTargetRequirement",
     "SqlRiskEvidenceRequirement",
+    "SqlRiskScopeEvidenceArchitecture",
     "SqlRiskScopeContract",
     "SqlRiskScopeStage",
     "SqlRiskToolName",
@@ -595,5 +617,6 @@ __all__ = [
     "missing_sql_risk_requirements",
     "render_sql_risk_scope_contract",
     "required_sql_risk_tools",
+    "sql_risk_scope_evidence_architecture",
     "sql_risk_scope_evidence_enabled",
 ]

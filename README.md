@@ -521,14 +521,18 @@ Confirmatory Max/Max-run `20260910_021405` завершил все 20 пар и 
 Продвигать варианты нельзя; подробности —
 [`LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md`](LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md).
 
-Для development-проверки ошибок baseline доступен отдельный opt-in
-`OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT=1`. Он не меняет default: для
-однозначной literal source→target-пары добавляет компактный typed contract,
-принудительно включает обязательные exact readers, не разрешает observer
-завершиться без принятого evidence и стабилизирует scope публичного ответа.
-Неоднозначные dotted endpoints остаются на исходном пути. Форматтер
-`value_changes` отдельно не публикует внутренние SQL aliases; полное выражение
-остаётся в structured metrics.
+Для development-проверки SQL-risk evidence scope доступен отдельный
+opt-in `OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT`. Значение `1`
+сохраняет первый prompt-mediated контракт, а `typed_plan` включает
+более узкую code-owned ветку. Для однозначного conditional-cardinality
+или exact nullable-constraint запроса она сама строит один typed
+worker-plan и evidence slots, не вызывая downstream planner. Cardinality
+требует полную сохранённую exact S2T relation; nullable-constraint
+компилирует ответ из exact mapping и source/target metadata без
+модельного upstream answer. Любой более широкий или неоднозначный
+запрос fail-closed остаётся на default agentic path без scope-аттестации.
+Default выключен. Форматтер `value_changes` отдельно не публикует
+внутренние SQL aliases; полное выражение остаётся в structured metrics.
 
 Max/Max development A/B на пяти раскрытых baseline failures не подтвердил
 scope/evidence toggle: combined осталось 3/5, semantic снизилось с 4/5 до 3/5,

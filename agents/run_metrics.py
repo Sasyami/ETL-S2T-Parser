@@ -29,6 +29,7 @@ _SQL_RISK_IDENTIFIER_CHARS = 200
 _SQL_RISK_EXPRESSION_CHARS = 300
 _SQL_RISK_EVIDENCE_ID_CHARS = 120
 _SQL_RISK_CYCLE_LIMIT = 100
+_SQL_RISK_INTEGER_LIMIT = 2_147_483_647
 _UPSTREAM_ANSWER_SOURCE_CHARS = 120
 _ACTIVE_RUN: ContextVar[Optional["_RunCollector"]] = ContextVar(
     "agent_run_metrics",
@@ -859,9 +860,35 @@ def _sql_risk_fact_summary(value: Any) -> Optional[Dict[str, Any]]:
 
     if "matching_rows" in fact:
         try:
-            summary["matching_rows"] = max(0, int(fact["matching_rows"]))
+            summary["matching_rows"] = min(
+                _SQL_RISK_INTEGER_LIMIT,
+                max(0, int(fact["matching_rows"])),
+            )
         except (TypeError, ValueError):
             summary["matching_rows"] = 0
+
+    for key in (
+        "file_id",
+        "source_not_null",
+        "target_not_null",
+        "mapping_rows",
+        "exact_field_rows",
+        "source_metadata_rows",
+        "target_metadata_rows",
+    ):
+        if key not in fact:
+            continue
+        value = fact[key]
+        if value is None and key in {"source_not_null", "target_not_null"}:
+            summary[key] = None
+            continue
+        try:
+            summary[key] = min(
+                _SQL_RISK_INTEGER_LIMIT,
+                max(0, int(value)),
+            )
+        except (TypeError, ValueError):
+            summary[key] = 0
 
     expressions = fact.get("target_expressions")
     if isinstance(expressions, (list, tuple)):

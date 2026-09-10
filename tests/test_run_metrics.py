@@ -508,6 +508,61 @@ def test_upstream_answer_source_is_optional_and_bounded(monkeypatch):
     assert len(metrics.upstream_output["answer_source"]) <= 120
 
 
+def test_sql_risk_metrics_preserve_bounded_constraint_fact(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    session_id = f"metrics-{uuid4()}"
+
+    with capture_agent_run(session_id):
+        record_sql_risk_facts(
+            {
+                "facts": [
+                    {
+                        "file_id": 17,
+                        "source_table": "src_alpha",
+                        "source_field": "code",
+                        "target_table": "tgt_beta",
+                        "target_field": "code",
+                        "source_not_null": 0,
+                        "target_not_null": 1,
+                        "conclusion": "conditional_rejection_risk",
+                        "mechanism": (
+                            "nullable_source_to_not_null_target"
+                        ),
+                        "mapping_rows": 2,
+                        "exact_field_rows": 1,
+                        "source_metadata_rows": 1,
+                        "target_metadata_rows": 1,
+                        "evidence_ids": ["evidence-m", "evidence-c"],
+                        "rows": [{"secret": "must-not-leak"}],
+                    }
+                ]
+            },
+            cycle=1,
+        )
+
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    assert metrics.sql_risk_facts == [
+        {
+            "source_table": "src_alpha",
+            "source_field": "code",
+            "target_table": "tgt_beta",
+            "target_field": "code",
+            "conclusion": "conditional_rejection_risk",
+            "mechanism": "nullable_source_to_not_null_target",
+            "file_id": 17,
+            "source_not_null": 0,
+            "target_not_null": 1,
+            "mapping_rows": 2,
+            "exact_field_rows": 1,
+            "source_metadata_rows": 1,
+            "target_metadata_rows": 1,
+            "evidence_ids": ["evidence-m", "evidence-c"],
+            "cycle": 1,
+        }
+    ]
+
+
 def test_run_metrics_are_disabled_by_default(monkeypatch):
     monkeypatch.delenv("AGENT_RUN_METRICS_ENABLED", raising=False)
     monkeypatch.delenv("RUN_LIVE_AGENT_SCENARIOS", raising=False)

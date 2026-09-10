@@ -1783,9 +1783,11 @@ def _assert_sql_risk_aspect(
 
     from agents.sql_risk_scope_contract import (
         build_sql_risk_scope_contract,
+        sql_risk_scope_evidence_architecture,
         sql_risk_scope_evidence_enabled,
     )
 
+    architecture = sql_risk_scope_evidence_architecture()
     if not sql_risk_scope_evidence_enabled():
         assert all(
             "operation_sql_risk_scope_contract" not in step
@@ -1798,14 +1800,51 @@ def _assert_sql_risk_aspect(
         [expected_aspect],
         enabled=True,
     )
+    typed_plan = None
+    if architecture == "typed_plan":
+        from agents.sql_risk_typed_plan import (
+            build_typed_sql_risk_worker_plan,
+        )
+
+        typed_plan = build_typed_sql_risk_worker_plan(
+            exchange.query,
+            contract,
+        )
     attested_steps = [
         step
         for step in routed_steps
         if "operation_sql_risk_scope_contract" in step
     ]
+    if architecture == "typed_plan" and typed_plan is None:
+        assert not attested_steps, routed_steps
+        assert all("plan_source" not in step for step in routed_steps), (
+            routed_steps
+        )
+        assert any(
+            item.stage == "downstream_plan"
+            for item in exchange.metrics.llm_calls
+        ), exchange.metrics.llm_calls
+        return
     if contract is None:
         assert not attested_steps, routed_steps
         return
+
+    if typed_plan is not None:
+        assert all(
+            step.get("plan_source") == typed_plan.plan_source
+            for step in routed_steps
+        ), routed_steps
+        assert all(
+            item.stage != "downstream_plan"
+            for item in exchange.metrics.llm_calls
+        ), exchange.metrics.llm_calls
+        if expected_aspect == "constraint_rejection":
+            assert exchange.metrics.upstream_output is not None, (
+                exchange.metrics
+            )
+            assert exchange.metrics.upstream_output.get("answer_source") == (
+                "deterministic_constraint_rejection"
+            ), exchange.metrics.upstream_output
 
     expected_contract = {
         "scope": contract.scope.label,
@@ -3209,6 +3248,17 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
             "list_source_column_catalog",
             "list_target_column_catalog",
         } & set(_tool_names(exchange)), exchange.metrics.tool_calls
+        from agents.sql_risk_scope_contract import (
+            sql_risk_scope_evidence_architecture,
+        )
+
+        if sql_risk_scope_evidence_architecture() == "typed_plan":
+            assert sorted(_tool_names(exchange)) == sorted(
+                [
+                    "read_s2t_source_to_target",
+                    "get_source_target_column_pair",
+                ]
+            ), exchange.metrics.tool_calls
     _assert_s2t_work_case_execution(
         exchange,
         required_tools={"read_s2t_source_to_target"},
@@ -3334,8 +3384,12 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
         target_table=case.target_table,
     )
     folded_answer = result.answer.casefold()
-    assert case.source_table.casefold() in folded_answer, result.answer
-    assert case.target_table.casefold() in folded_answer, result.answer
+    assert re.search(
+        rf"`?{re.escape(case.source_table)}`?\s*(?:→|->|=>)\s*"
+        rf"`?{re.escape(case.target_table)}`?",
+        result.answer,
+        re.IGNORECASE,
+    ), result.answer
     from agents.transformation_ast import normalize_transformation
 
     normalized = normalize_transformation(case.transformation_rule)
@@ -3418,8 +3472,12 @@ def test_live_agent_checks_row_loss_risk(live_chat_client):
         target_table=case.target_table,
     )
     folded_answer = result.answer.casefold()
-    assert case.source_table.casefold() in folded_answer, result.answer
-    assert case.target_table.casefold() in folded_answer, result.answer
+    assert re.search(
+        rf"`?{re.escape(case.source_table)}`?\s*(?:→|->|=>)\s*"
+        rf"`?{re.escape(case.target_table)}`?",
+        result.answer,
+        re.IGNORECASE,
+    ), result.answer
     from agents.transformation_ast import normalize_transformation
 
     normalized = normalize_transformation(case.transformation_rule)

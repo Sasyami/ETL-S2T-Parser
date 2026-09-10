@@ -15,6 +15,7 @@ from agents.sql_risk_scope_contract import (
     missing_sql_risk_requirements,
     render_sql_risk_scope_contract,
     required_sql_risk_tools,
+    sql_risk_scope_evidence_architecture,
     sql_risk_scope_evidence_enabled,
 )
 
@@ -53,6 +54,46 @@ def test_experiment_is_off_by_default_and_preserves_answer_byte_for_byte(
         TABLE_TASK,
         ["row_filtering"],
     ) == answer
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", "off"),
+        ("0", "off"),
+        ("false", "off"),
+        ("default", "off"),
+        ("1", "prompt"),
+        ("TRUE", "prompt"),
+        (" enabled ", "prompt"),
+        ("typed_plan", "typed_plan"),
+        (" TYPED_PLAN ", "typed_plan"),
+    ],
+)
+def test_scope_evidence_architecture_preserves_legacy_values(
+    value,
+    expected,
+):
+    assert sql_risk_scope_evidence_architecture(value) == expected
+
+
+def test_typed_plan_mode_enables_the_same_exact_scope_contract(monkeypatch):
+    monkeypatch.setenv(
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+        "typed_plan",
+    )
+
+    assert sql_risk_scope_evidence_architecture() == "typed_plan"
+    assert sql_risk_scope_evidence_enabled() is True
+    contract = build_sql_risk_scope_contract(
+        TABLE_TASK,
+        ["cardinality"],
+    )
+
+    assert contract is not None
+    assert contract.scope.label == (
+        "raw_customer_events_v2 → mart_customer_daily_v3"
+    )
 
 
 @pytest.mark.parametrize("value", ["1", "TRUE", " yes ", "on", "enabled"])
@@ -313,10 +354,10 @@ def test_multiple_aspects_deduplicate_tools_in_stable_order():
     )
 
 
-def test_answer_with_both_exact_endpoints_is_unchanged():
+def test_answer_with_exact_directed_scope_is_unchanged():
     answer = (
-        "Для stg.raw_customer_events_v2.customer_key преобразование в "
-        "dwh.mart_customer_daily_v3.customer_key не меняет значение."
+        "Для `stg.raw_customer_events_v2.customer_key` → "
+        "`dwh.mart_customer_daily_v3.customer_key` значение не меняется."
     )
 
     assert ensure_sql_risk_answer_scope(
@@ -325,6 +366,33 @@ def test_answer_with_both_exact_endpoints_is_unchanged():
         ["value_changes"],
         enabled=True,
     ) == answer
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (
+            "Для mart_customer_daily_v3 → raw_customer_events_v2 "
+            "JOIN может размножить строки."
+        ),
+        (
+            "raw_customer_events_v2 и mart_customer_daily_v3 упомянуты, "
+            "но направление не зафиксировано."
+        ),
+    ],
+)
+def test_reversed_or_unordered_endpoints_get_correct_scope(answer):
+    rendered = ensure_sql_risk_answer_scope(
+        answer,
+        TABLE_TASK,
+        ["cardinality"],
+        enabled=True,
+    )
+
+    assert rendered == (
+        "Scope: raw_customer_events_v2 → mart_customer_daily_v3\n\n"
+        + answer
+    )
 
 
 def test_missing_endpoint_gets_compact_exact_scope_line_idempotently():

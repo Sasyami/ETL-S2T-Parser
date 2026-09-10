@@ -41,6 +41,13 @@ from .contracts import (
     WorkerOutcome,
     WorkerPlan,
 )
+from .constraint_rejection_analysis import (
+    ConstraintRejectionFact,
+    constraint_rejection_payload,
+    derive_constraint_rejection_facts,
+    is_exclusive_constraint_rejection_request,
+    render_constraint_rejection_answer,
+)
 from .chat_graph import WorkerDisplayItem
 from .observability import get_callback_handler, langfuse_trace_context
 from .operation_intent import is_exclusive_value_change_request
@@ -72,7 +79,9 @@ from .sql_risk_scope_contract import (
     ensure_sql_risk_answer_scope,
     missing_sql_risk_requirements,
     render_sql_risk_scope_contract,
+    sql_risk_scope_evidence_architecture,
 )
+from .sql_risk_typed_plan import build_typed_sql_risk_worker_plan
 from .tools.context import (
     OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
     OPERATION_SKILL_CATALOG,
@@ -331,6 +340,7 @@ class CoordinatorGraphState(TypedDict):
     ]
     cycle: int
     plan: List[Dict[str, Any]]
+    scope_evidence_step_index: Optional[int]
     next_step: int
     worker_runs: List[CoordinatorWorkerRun]
     upstream_problem: Optional[str]
@@ -1961,13 +1971,47 @@ def build_coordinator_graph(
             stage="plan",
             sql_risk_aspects=operation_sql_risk_aspects,
         )
-        scope_evidence_contract = build_sql_risk_scope_contract(
-            state["task"],
-            operation_sql_risk_aspects,
+        scope_evidence_architecture = (
+            sql_risk_scope_evidence_architecture()
+            if "Анализ SQL-рисков" in operation_skills
+            else "off"
         )
-        scope_plan_context = render_sql_risk_scope_contract(
-            scope_evidence_contract,
-            stage="plan",
+        candidate_scope_evidence_contract = (
+            build_sql_risk_scope_contract(
+                state["task"],
+                operation_sql_risk_aspects,
+            )
+            if "Анализ SQL-рисков" in operation_skills
+            else None
+        )
+        typed_scope_plan = (
+            build_typed_sql_risk_worker_plan(
+                state["task"],
+                candidate_scope_evidence_contract,
+            )
+            if (
+                scope_evidence_architecture == "typed_plan"
+                and operation_pipeline == "agentic"
+                and operation_skills == ["Анализ SQL-рисков"]
+            )
+            else None
+        )
+        scope_evidence_contract = (
+            candidate_scope_evidence_contract
+            if scope_evidence_architecture == "prompt"
+            else (
+                typed_scope_plan.contract
+                if typed_scope_plan is not None
+                else None
+            )
+        )
+        scope_plan_context = (
+            render_sql_risk_scope_contract(
+                scope_evidence_contract,
+                stage="plan",
+            )
+            if scope_evidence_architecture == "prompt"
+            else ""
         )
         scope_evidence_attestation: Dict[str, Any] = {}
         if scope_evidence_contract is not None:
@@ -1993,36 +2037,6 @@ def build_coordinator_graph(
             operation_skills,
             operation_sql_risk_aspects,
         )
-        plan_payload: Dict[str, Any] = {
-            "original_task": state["task"],
-            "context": state["context"],
-        }
-        if state["upstream_problem"] is not None:
-            plan_payload["problem"] = state["upstream_problem"]
-        plan_messages: List[BaseMessage] = [
-            SystemMessage(
-                content="\n\n".join(
-                    part
-                    for part in (
-                        _DOWNSTREAM_PLAN_PROMPT,
-                        plan_operation_context,
-                    )
-                    if part
-                )
-            ),
-            HumanMessage(
-                content=json.dumps(
-                    plan_payload,
-                    ensure_ascii=False,
-                )
-            ),
-        ]
-        plan_result = invoke(
-            plan_model,
-            plan_messages,
-            stage="downstream_plan",
-        )
-
         def validate_plan_contract(candidate: WorkerPlan) -> None:
             contract_errors: List[str] = []
             try:
@@ -2056,52 +2070,91 @@ def build_coordinator_graph(
             if contract_errors:
                 raise CoordinatorResponseError("; ".join(contract_errors))
 
-        try:
-            plan = _native_payload(
-                plan_result,
-                _PLAN_TOOL_NAME,
-                WorkerPlan,
-            )
-            assert isinstance(plan, WorkerPlan)
+        if typed_scope_plan is not None:
+            plan = typed_scope_plan.plan
+            # This plan was built from the same literal task and typed
+            # contract, but keep the normal plan invariants as a defensive
+            # internal boundary.  No LLM repair/fallback is allowed here.
             validate_plan_contract(plan)
-        except CoordinatorResponseError as first_error:
-            logger.warning(
-                "Coordinator plan call violated plan schema; requesting one "
-                "LLM repair: %s",
-                first_error,
-            )
-            repaired_result = invoke(
-                plan_model,
-                _repair_messages(
-                    plan_messages,
-                    plan_result,
-                    _DOWNSTREAM_PLAN_REPAIR_PROMPT.replace(
-                        "{validation_error}",
-                        str(first_error),
-                    ),
+            scope_step_index = typed_scope_plan.evidence_step_index
+            plan_source_attestation = {
+                "plan_source": typed_scope_plan.plan_source,
+            }
+        else:
+            plan_payload: Dict[str, Any] = {
+                "original_task": state["task"],
+                "context": state["context"],
+            }
+            if state["upstream_problem"] is not None:
+                plan_payload["problem"] = state["upstream_problem"]
+            plan_messages: List[BaseMessage] = [
+                SystemMessage(
+                    content="\n\n".join(
+                        part
+                        for part in (
+                            _DOWNSTREAM_PLAN_PROMPT,
+                            plan_operation_context,
+                        )
+                        if part
+                    )
                 ),
+                HumanMessage(
+                    content=json.dumps(
+                        plan_payload,
+                        ensure_ascii=False,
+                    )
+                ),
+            ]
+            plan_result = invoke(
+                plan_model,
+                plan_messages,
                 stage="downstream_plan",
             )
-            plan = _native_payload(
-                repaired_result,
-                _PLAN_TOOL_NAME,
-                WorkerPlan,
-            )
-            plan_result = repaired_result
-            assert isinstance(plan, WorkerPlan)
             try:
+                plan = _native_payload(
+                    plan_result,
+                    _PLAN_TOOL_NAME,
+                    WorkerPlan,
+                )
+                assert isinstance(plan, WorkerPlan)
                 validate_plan_contract(plan)
-            except CoordinatorResponseError as second_error:
-                raise CoordinatorResponseError(
-                    "Исправленный worker plan нарушает plan contract: "
-                    + str(second_error)
-                ) from second_error
-        assert isinstance(plan, WorkerPlan)
-
-        scope_step_index = _first_scope_step_index(
-            plan.steps,
-            scope_evidence_contract,
-        )
+            except CoordinatorResponseError as first_error:
+                logger.warning(
+                    "Coordinator plan call violated plan schema; requesting "
+                    "one LLM repair: %s",
+                    first_error,
+                )
+                repaired_result = invoke(
+                    plan_model,
+                    _repair_messages(
+                        plan_messages,
+                        plan_result,
+                        _DOWNSTREAM_PLAN_REPAIR_PROMPT.replace(
+                            "{validation_error}",
+                            str(first_error),
+                        ),
+                    ),
+                    stage="downstream_plan",
+                )
+                plan = _native_payload(
+                    repaired_result,
+                    _PLAN_TOOL_NAME,
+                    WorkerPlan,
+                )
+                assert isinstance(plan, WorkerPlan)
+                try:
+                    validate_plan_contract(plan)
+                except CoordinatorResponseError as second_error:
+                    raise CoordinatorResponseError(
+                        "Исправленный worker plan нарушает plan contract: "
+                        + str(second_error)
+                    ) from second_error
+            assert isinstance(plan, WorkerPlan)
+            scope_step_index = _first_scope_step_index(
+                plan.steps,
+                scope_evidence_contract,
+            )
+            plan_source_attestation = {}
         recorded_plan = [
             {
                 "cycle": state["cycle"],
@@ -2111,6 +2164,7 @@ def build_coordinator_graph(
                 "sql_risk_aspects": list(operation_sql_risk_aspects),
                 "pipeline": operation_pipeline,
                 **sql_risk_protocol_attestation,
+                **plan_source_attestation,
                 **(
                     scope_evidence_attestation
                     if index - 1 == scope_step_index
@@ -2125,6 +2179,11 @@ def build_coordinator_graph(
             json.dumps(recorded_plan, ensure_ascii=False),
         )
         record_coordinator_plan(recorded_plan)
+        active_scope_step_index = (
+            scope_step_index
+            if scope_step_index is not None
+            else (-1 if scope_evidence_contract is not None else None)
+        )
         return {
             "operation_skills": list(operation_skills),
             "operation_sql_risk_aspects": list(
@@ -2132,6 +2191,10 @@ def build_coordinator_graph(
             ),
             "operation_pipeline": operation_pipeline,
             "plan": [step.model_dump() for step in plan.steps],
+            # Legacy prompt mode may fail to place both endpoints into one
+            # step.  Sentinel -1 keeps its upstream missing-evidence guard
+            # active without attaching requirements to an unrelated worker.
+            "scope_evidence_step_index": active_scope_step_index,
             "next_step": 0,
         }
 
@@ -2159,17 +2222,17 @@ def build_coordinator_graph(
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
-        scope_evidence_contract = build_sql_risk_scope_contract(
-            state["task"],
-            selected_sql_risk_aspects,
-        )
         step_scope_contract: SqlRiskScopeContract | None = None
-        if scope_evidence_contract is not None:
-            if step_index == _first_scope_step_index(
-                state["plan"],
-                scope_evidence_contract,
-            ):
-                step_scope_contract = scope_evidence_contract
+        if state.get("scope_evidence_step_index") == step_index:
+            step_scope_contract = build_sql_risk_scope_contract(
+                state["task"],
+                selected_sql_risk_aspects,
+            )
+            if step_scope_contract is None:
+                raise CoordinatorResponseError(
+                    "Active SQL-risk scope/evidence contract disappeared "
+                    "before worker execution."
+                )
         planner_context = load_operation_skills(
             selected_operation_skills,
             stage="planner",
@@ -2345,10 +2408,22 @@ def build_coordinator_graph(
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
-        scope_evidence_contract = build_sql_risk_scope_contract(
-            state["task"],
-            selected_sql_risk_aspects,
+        scope_evidence_architecture = (
+            sql_risk_scope_evidence_architecture()
+            if "Анализ SQL-рисков" in selected_operation_skills
+            else "off"
         )
+        scope_evidence_contract: SqlRiskScopeContract | None = None
+        if state.get("scope_evidence_step_index") is not None:
+            scope_evidence_contract = build_sql_risk_scope_contract(
+                state["task"],
+                selected_sql_risk_aspects,
+            )
+            if scope_evidence_contract is None:
+                raise CoordinatorResponseError(
+                    "Active SQL-risk scope/evidence contract disappeared "
+                    "before upstream verification."
+                )
         decision_context = load_operation_skills(
             selected_operation_skills,
             stage="upstream_decision",
@@ -2381,6 +2456,8 @@ def build_coordinator_graph(
             )
 
         def scoped_answer(answer: str) -> str:
+            if scope_evidence_contract is None:
+                return answer
             return ensure_sql_risk_answer_scope(
                 answer,
                 state["task"],
@@ -2442,6 +2519,34 @@ def build_coordinator_graph(
                 }
                 for requirement in missing_scope_requirements
             ]
+        constraint_rejection_facts: List[ConstraintRejectionFact] = []
+        if (
+            scope_evidence_architecture == "typed_plan"
+            and scope_evidence_contract is not None
+            and selected_operation_skills == ["Анализ SQL-рисков"]
+            and selected_sql_risk_aspects == ["constraint_rejection"]
+            and saved_result_store is not None
+        ):
+            constraint_rejection_facts = (
+                derive_constraint_rejection_facts(
+                    state["task"],
+                    accepted_artifacts,
+                    saved_result_store,
+                )
+            )
+            if constraint_rejection_facts:
+                deterministic_constraint_rejection = (
+                    constraint_rejection_payload(
+                        constraint_rejection_facts
+                    )
+                )
+                upstream_payload["deterministic_constraint_rejection"] = (
+                    deterministic_constraint_rejection
+                )
+                record_sql_risk_facts(
+                    deterministic_constraint_rejection,
+                    cycle=state["cycle"],
+                )
         cardinality_sufficient_evidence_ids: List[str] = []
         if (
             selected_operation_skills == ["Анализ SQL-рисков"]
@@ -2456,6 +2561,27 @@ def build_coordinator_graph(
                         saved_store,
                     )
                 )
+        if (
+            scope_evidence_architecture == "typed_plan"
+            and scope_evidence_contract is not None
+            and selected_sql_risk_aspects == ["cardinality"]
+            and not cardinality_sufficient_evidence_ids
+        ):
+            # In the code-owned lane a successful call is not by itself
+            # sufficient evidence: require a complete, non-empty exact saved
+            # mapping whose rows stay in scope and contain transformation
+            # rules.  Otherwise repeat the same deterministic plan once and
+            # then return structured not-assessed.
+            missing_scope_requirements = (
+                scope_evidence_contract.requirements
+            )
+            upstream_payload["missing_scope_evidence"] = [
+                {
+                    "tool_name": requirement.tool_name,
+                    "arguments": dict(requirement.arguments),
+                }
+                for requirement in missing_scope_requirements
+            ]
         value_change_facts: List[FieldValueChangeFact] = []
         if "value_changes" in selected_sql_risk_aspects:
             saved_store = get_active_saved_result_store()
@@ -2631,6 +2757,7 @@ def build_coordinator_graph(
             return {
                 "cycle": state["cycle"] + 1,
                 "plan": [],
+                "scope_evidence_step_index": None,
                 "next_step": 0,
                 "worker_runs": [],
                 "upstream_problem": problem,
@@ -2682,6 +2809,49 @@ def build_coordinator_graph(
                 "final_answer": evidence.answer,
                 "selected_display_refs": [],
             }
+
+        if (
+            len(constraint_rejection_facts) == 1
+            and is_exclusive_constraint_rejection_request(state["task"])
+        ):
+            deterministic_answer = render_constraint_rejection_answer(
+                constraint_rejection_facts
+            ).strip()
+            if deterministic_answer:
+                used_evidence_ids = list(
+                    dict.fromkeys(
+                        evidence_id
+                        for fact in constraint_rejection_facts
+                        for evidence_id in fact.evidence_ids
+                        if evidence_id in available_evidence_ids
+                    )
+                )
+                evidence = UpstreamOutput(
+                    answer=scoped_answer(deterministic_answer),
+                    used_evidence_ids=used_evidence_ids,
+                    display_evidence_ids=[],
+                )
+                upstream_output = evidence.model_dump()
+                record_upstream_output(
+                    {
+                        **upstream_output,
+                        "answer_source": (
+                            "deterministic_constraint_rejection"
+                        ),
+                    }
+                )
+                logger.info(
+                    "Deterministic constraint-rejection result: %s",
+                    json.dumps(
+                        upstream_output,
+                        ensure_ascii=False,
+                    )[:8000],
+                )
+                return {
+                    "upstream_output": upstream_output,
+                    "final_answer": evidence.answer,
+                    "selected_display_refs": [],
+                }
 
         terminal_write_semantics_answer = ""
         if (
@@ -2922,6 +3092,7 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
         "operation_pipeline": None,
         "cycle": 1,
         "plan": [],
+        "scope_evidence_step_index": None,
         "next_step": 0,
         "worker_runs": [],
         "upstream_problem": None,
