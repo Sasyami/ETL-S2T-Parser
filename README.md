@@ -530,6 +530,12 @@ Confirmatory Max/Max-run `20260910_021405` завершил все 20 пар и 
 `value_changes` отдельно не публикует внутренние SQL aliases; полное выражение
 остаётся в structured metrics.
 
+Max/Max development A/B на пяти раскрытых baseline failures не подтвердил
+scope/evidence toggle: combined осталось 3/5, semantic снизилось с 4/5 до 3/5,
+а HTTP 500 выросли с одного до двух. Toggle остаётся выключенным; общий
+alias-safe formatter `value_changes` прошёл обе руки. Разбор и rollback-аудит —
+[`LIVE_SQL_RISK_SCOPE_EVIDENCE_DEV_REPORT_2026-09-10.md`](LIVE_SQL_RISK_SCOPE_EVIDENCE_DEV_REPORT_2026-09-10.md).
+
 ## Структура проекта
 
 ```text
