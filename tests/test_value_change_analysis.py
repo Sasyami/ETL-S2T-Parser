@@ -211,9 +211,42 @@ def test_derives_authoritative_fact_from_full_accepted_saved_result():
     assert payload["authority"] == "deterministic_sqlglot_full_saved_result"
     assert "neighbouring output aliases are excluded" in payload["scope_rule"]
     answer = render_field_value_change_answer(facts)
+    assert "`src_np.id → tgt_np.id`" in answer
     assert "механизм изменения значения не обнаружен" in answer
     assert "соседних output aliases" in answer
+    assert "s.id" not in answer
     assert "COALESCE" not in answer
+
+
+def test_may_change_answer_keeps_pair_but_not_raw_sql_expression():
+    expression = "COALESCE(s.id, 0)"
+    store = SavedResultStore()
+    try:
+        artifact = _saved_artifact(
+            store,
+            [_mapping_row(f"SELECT {expression} AS id FROM src_np AS s")],
+        )
+        fact = derive_field_value_change_facts(
+            "src_np.id → tgt_np.id",
+            [artifact],
+            store,
+        )[0]
+    finally:
+        store.close()
+
+    assert fact.conclusion == "may_change"
+    assert fact.mechanism == "value_expression"
+    assert fact.target_expressions == [expression]
+    assert field_value_change_payload([fact])["facts"][0][
+        "target_expressions"
+    ] == [expression]
+
+    answer = render_field_value_change_answer([fact])
+    assert "`src_np.id → tgt_np.id`" in answer
+    assert "значение может измениться" in answer
+    assert "`value_expression`" in answer
+    assert expression not in answer
+    assert "s.id" not in answer
 
 
 @pytest.mark.parametrize("rule", [None, "", "   ", "-"])

@@ -1,0 +1,599 @@
+"""Opt-in exact-scope contracts for typed SQL-risk operations.
+
+The helpers stay pure while coordinator and worker opt into them through one
+environment flag.  Only a single literal technical ``source → target`` pair
+from the original task becomes a typed reader requirement.  Missing or
+ambiguous literals produce no requirements: this experiment must never resolve
+or invent an identifier on the model's behalf.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, ClassVar, Iterable, Literal, Mapping, TypedDict
+
+from .contracts import SqlRiskAspect
+
+
+OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV = (
+    "OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT"
+)
+
+SqlRiskToolName = Literal[
+    "read_s2t_source_to_target",
+    "get_source_target_column_pair",
+]
+SqlRiskScopeStage = Literal[
+    "plan",
+    "planner",
+    "observer",
+    "upstream_decision",
+    "upstream",
+]
+SqlRiskEndpointKind = Literal["table", "field"]
+
+_SUPPORTED_ASPECTS: tuple[SqlRiskAspect, ...] = (
+    "row_filtering",
+    "cardinality",
+    "constraint_rejection",
+    "value_changes",
+    "write_semantics",
+)
+_ENABLED_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
+_DISABLED_VALUES = frozenset(
+    {"", "0", "false", "no", "off", "disabled", "default", "current"}
+)
+
+_IDENTIFIER_ATOM = r"[A-Za-z_][A-Za-z0-9_$]*"
+_TECHNICAL_ENDPOINT = rf"{_IDENTIFIER_ATOM}(?:\.{_IDENTIFIER_ATOM}){{0,2}}"
+_ARROW_PAIR_RE = re.compile(
+    rf"(?<![A-Za-z0-9_$.])"
+    rf"`?(?P<source>{_TECHNICAL_ENDPOINT})`?"
+    # The opt-in runtime contract accepts only the unambiguous relation
+    # glyph.  ASCII ``->`` is also a SQL/JSON operator and must not silently
+    # turn an expression into a physical S2T scope.
+    rf"\s*→\s*"
+    rf"`?(?P<target>{_TECHNICAL_ENDPOINT})`?"
+    rf"(?![A-Za-z0-9_$]|\.[A-Za-z_])"
+)
+_FILE_ID_RE = re.compile(
+    r"\bfile_id\s*(?:=|:)\s*(?P<file_id>[1-9][0-9]*)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_COLUMN_SCOPE_RE = re.compile(
+    r"(?:\b(?:source_not_null|target_not_null|not_null|nullable|column|field)\b"
+    r"|колонк|\bпол(?:е|я|ей|ю|ем)\b)",
+    re.IGNORECASE,
+)
+_ENDPOINT_BOUNDARY_CHARS = r"A-Za-z0-9_$\."
+
+
+class ReadS2TSourceToTargetArguments(TypedDict):
+    """Exact arguments of ``read_s2t_source_to_target``."""
+
+    source_table: str
+    target_table: str
+
+
+class GetSourceTargetColumnPairArguments(TypedDict):
+    """Exact arguments of ``get_source_target_column_pair``."""
+
+    file_id: int
+    source_table: str
+    source_column: str
+    target_table: str
+    target_column: str
+
+
+@dataclass(frozen=True)
+class LiteralSqlRiskScope:
+    """One unambiguous literal pair copied from the original task."""
+
+    source: str
+    target: str
+    source_table: str
+    target_table: str
+    source_field: str | None = None
+    target_field: str | None = None
+    file_id: int | None = None
+
+    @property
+    def is_field_pair(self) -> bool:
+        """Return whether both endpoints are explicit ``table.field`` names."""
+
+        return self.source_field is not None and self.target_field is not None
+
+    @property
+    def label(self) -> str:
+        """Return the exact compact label suitable for a public answer."""
+
+        return f"{self.source} → {self.target}"
+
+
+@dataclass(frozen=True)
+class ReadS2TSourceToTargetRequirement:
+    """Required full directed S2T read for the literal table pair."""
+
+    source_table: str
+    target_table: str
+
+    tool_name: ClassVar[Literal["read_s2t_source_to_target"]] = (
+        "read_s2t_source_to_target"
+    )
+
+    @property
+    def arguments(self) -> ReadS2TSourceToTargetArguments:
+        return {
+            "source_table": self.source_table,
+            "target_table": self.target_table,
+        }
+
+
+@dataclass(frozen=True)
+class GetSourceTargetColumnPairRequirement:
+    """Required exact role-preserving endpoint metadata read."""
+
+    file_id: int
+    source_table: str
+    source_column: str
+    target_table: str
+    target_column: str
+
+    tool_name: ClassVar[Literal["get_source_target_column_pair"]] = (
+        "get_source_target_column_pair"
+    )
+
+    @property
+    def arguments(self) -> GetSourceTargetColumnPairArguments:
+        return {
+            "file_id": self.file_id,
+            "source_table": self.source_table,
+            "source_column": self.source_column,
+            "target_table": self.target_table,
+            "target_column": self.target_column,
+        }
+
+
+SqlRiskEvidenceRequirement = (
+    ReadS2TSourceToTargetRequirement
+    | GetSourceTargetColumnPairRequirement
+)
+
+
+@dataclass(frozen=True)
+class SqlRiskScopeContract:
+    """Typed, immutable runtime requirements for one literal scope."""
+
+    scope: LiteralSqlRiskScope
+    aspects: tuple[SqlRiskAspect, ...]
+    requirements: tuple[SqlRiskEvidenceRequirement, ...]
+
+    @property
+    def tool_names(self) -> tuple[SqlRiskToolName, ...]:
+        return tuple(requirement.tool_name for requirement in self.requirements)
+
+
+def sql_risk_scope_evidence_enabled(value: str | None = None) -> bool:
+    """Return whether the isolated scope/evidence experiment is enabled.
+
+    Unknown values raise instead of silently running the baseline under a
+    misspelled experiment setting.  An explicit ``value`` is useful for pure
+    callers and tests; otherwise the environment is read.
+    """
+
+    configured = (
+        os.getenv(OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV)
+        if value is None
+        else value
+    )
+    normalized = str(configured or "").strip().casefold()
+    if normalized in _ENABLED_VALUES:
+        return True
+    if normalized in _DISABLED_VALUES:
+        return False
+    raise ValueError(
+        "Unknown OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT value: "
+        + repr(configured)
+    )
+
+
+def _is_technical_endpoint(value: str) -> bool:
+    # A bare natural-language word around an arrow is not enough evidence that
+    # it is a physical identifier.  Dotted and conventionally marked names are
+    # accepted without trying to interpret their business meaning.
+    return "." in value or "_" in value or "$" in value
+
+
+def _endpoint_parts(
+    value: str,
+    *,
+    endpoint_kind: SqlRiskEndpointKind,
+) -> tuple[str, str | None]:
+    if endpoint_kind == "table" or "." not in value:
+        return value, None
+    table, field = value.rsplit(".", 1)
+    return table, field
+
+
+def extract_literal_file_id(original_task: str) -> int | None:
+    """Extract one unambiguous, explicitly labelled positive ``file_id``."""
+
+    values = {
+        int(match.group("file_id"))
+        for match in _FILE_ID_RE.finditer(str(original_task or ""))
+    }
+    if len(values) != 1:
+        return None
+    return next(iter(values))
+
+
+def extract_literal_sql_risk_scope(
+    original_task: str,
+    *,
+    endpoint_kind: SqlRiskEndpointKind | None = None,
+) -> LiteralSqlRiskScope | None:
+    """Extract exactly one distinct literal technical directed pair.
+
+    Both endpoints must use the same supported shape: either ``table`` or
+    ``table.field``.  Repeating the same literal pair is harmless, while two
+    different pairs are ambiguous and therefore return ``None``.
+    """
+
+    matches: dict[tuple[str, str], tuple[str, str]] = {}
+    for match in _ARROW_PAIR_RE.finditer(str(original_task or "")):
+        source = match.group("source")
+        target = match.group("target")
+        if not (
+            _is_technical_endpoint(source)
+            and _is_technical_endpoint(target)
+        ):
+            continue
+        source_parts = source.split(".")
+        target_parts = target.split(".")
+        if len(source_parts) != len(target_parts):
+            continue
+        resolved_kind = endpoint_kind
+        if resolved_kind is None:
+            resolved_kind = "field" if len(source_parts) > 1 else "table"
+        if resolved_kind == "table" and len(source_parts) > 2:
+            continue
+        if resolved_kind == "field" and len(source_parts) not in {1, 2, 3}:
+            continue
+        key = (source.casefold(), target.casefold())
+        matches.setdefault(key, (source, target))
+
+    if len(matches) != 1:
+        return None
+
+    source, target = next(iter(matches.values()))
+    resolved_kind = endpoint_kind
+    if resolved_kind is None:
+        resolved_kind = "field" if "." in source else "table"
+    source_table, source_field = _endpoint_parts(
+        source,
+        endpoint_kind=resolved_kind,
+    )
+    target_table, target_field = _endpoint_parts(
+        target,
+        endpoint_kind=resolved_kind,
+    )
+    return LiteralSqlRiskScope(
+        source=source,
+        target=target,
+        source_table=source_table,
+        target_table=target_table,
+        source_field=source_field,
+        target_field=target_field,
+        file_id=extract_literal_file_id(original_task),
+    )
+
+
+def _selected_aspects(
+    sql_risk_aspects: Iterable[SqlRiskAspect],
+) -> tuple[SqlRiskAspect, ...]:
+    requested = set(sql_risk_aspects)
+    return tuple(aspect for aspect in _SUPPORTED_ASPECTS if aspect in requested)
+
+
+def build_sql_risk_scope_contract(
+    original_task: str,
+    sql_risk_aspects: Iterable[SqlRiskAspect],
+    *,
+    enabled: bool | None = None,
+) -> SqlRiskScopeContract | None:
+    """Build typed reader requirements, or no contract when unsafe/off.
+
+    Every supported aspect needs the full directed S2T mapping.  Constraint
+    rejection additionally needs exact endpoint metadata only when the task
+    itself supplies both fields and one literal ``file_id``.  No resolver or
+    inferred active-file state is consulted.
+    """
+
+    aspects = _selected_aspects(sql_risk_aspects)
+    if not aspects:
+        return None
+    is_enabled = (
+        sql_risk_scope_evidence_enabled()
+        if enabled is None
+        else bool(enabled)
+    )
+    if not is_enabled:
+        return None
+    table_level_aspects = {
+        "row_filtering",
+        "cardinality",
+        "write_semantics",
+    }
+    field_level_aspects = {"constraint_rejection", "value_changes"}
+    requested = set(aspects)
+    if requested & table_level_aspects and requested & field_level_aspects:
+        # A dotted endpoint cannot simultaneously be interpreted as a table
+        # scope and a field scope without guessing.  Multi-scope requests stay
+        # on the unchanged baseline path.
+        return None
+    else:
+        endpoint_kind = (
+            "field" if requested & field_level_aspects else "table"
+        )
+    scope = extract_literal_sql_risk_scope(
+        original_task,
+        endpoint_kind=endpoint_kind,
+    )
+    if scope is None:
+        return None
+    source_depth = scope.source.count(".") + 1
+    target_depth = scope.target.count(".") + 1
+    if endpoint_kind == "table" and (
+        source_depth != 1 or target_depth != 1
+    ):
+        # ``schema.table`` and ``table.field`` have the same textual shape.
+        # Without an exact lookup the runtime contract must not choose one.
+        return None
+    if endpoint_kind == "field":
+        if source_depth == 1 or target_depth == 1:
+            return None
+        if source_depth == 2:
+            if not (
+                aspects == ("constraint_rejection",)
+                and scope.file_id is not None
+                and _EXPLICIT_COLUMN_SCOPE_RE.search(original_task)
+            ):
+                return None
+
+    requirements: list[SqlRiskEvidenceRequirement] = [
+        ReadS2TSourceToTargetRequirement(
+            source_table=scope.source_table,
+            target_table=scope.target_table,
+        )
+    ]
+    if (
+        "constraint_rejection" in aspects
+        and scope.is_field_pair
+        and scope.file_id is not None
+    ):
+        # ``is_field_pair`` makes the fields non-optional, but retaining this
+        # assertion keeps the constructor statically and dynamically honest.
+        assert scope.source_field is not None
+        assert scope.target_field is not None
+        requirements.append(
+            GetSourceTargetColumnPairRequirement(
+                file_id=scope.file_id,
+                source_table=scope.source_table,
+                source_column=scope.source_field,
+                target_table=scope.target_table,
+                target_column=scope.target_field,
+            )
+        )
+
+    return SqlRiskScopeContract(
+        scope=scope,
+        aspects=aspects,
+        requirements=tuple(requirements),
+    )
+
+
+def required_sql_risk_tools(
+    original_task: str,
+    sql_risk_aspects: Iterable[SqlRiskAspect],
+    *,
+    enabled: bool | None = None,
+) -> tuple[SqlRiskToolName, ...]:
+    """Return the ordered typed tool names required by the exact contract."""
+
+    contract = build_sql_risk_scope_contract(
+        original_task,
+        sql_risk_aspects,
+        enabled=enabled,
+    )
+    return contract.tool_names if contract is not None else ()
+
+
+def _requirement_sequence(
+    contract_or_requirements: (
+        SqlRiskScopeContract
+        | Iterable[SqlRiskEvidenceRequirement]
+        | None
+    ),
+) -> tuple[SqlRiskEvidenceRequirement, ...]:
+    if contract_or_requirements is None:
+        return ()
+    if isinstance(contract_or_requirements, SqlRiskScopeContract):
+        return contract_or_requirements.requirements
+    return tuple(contract_or_requirements)
+
+
+def _call_name_and_arguments(
+    call: Mapping[str, Any] | object,
+) -> tuple[str | None, Mapping[str, Any] | None, bool]:
+    """Read accepted-evidence and tool-call shapes without coupling to them."""
+
+    if isinstance(call, Mapping):
+        name = call.get("tool_name", call.get("name"))
+        arguments = call.get(
+            "args",
+            call.get("compact_args", call.get("arguments")),
+        )
+        truncated = bool(call.get("truncated", False))
+    else:
+        name = getattr(call, "tool_name", getattr(call, "name", None))
+        arguments = getattr(
+            call,
+            "compact_args",
+            getattr(call, "args", getattr(call, "arguments", None)),
+        )
+        truncated = bool(getattr(call, "truncated", False))
+    return (
+        str(name) if name is not None else None,
+        arguments if isinstance(arguments, Mapping) else None,
+        truncated,
+    )
+
+
+def missing_sql_risk_requirements(
+    contract_or_requirements: (
+        SqlRiskScopeContract
+        | Iterable[SqlRiskEvidenceRequirement]
+        | None
+    ),
+    calls: Iterable[Mapping[str, Any] | object],
+) -> tuple[SqlRiskEvidenceRequirement, ...]:
+    """Return exact requirements not satisfied by accepted tool evidence.
+
+    A requirement matches only the same tool name and byte/value-equivalent
+    argument mapping.  Truncated evidence never satisfies the contract.  The
+    function understands both upstream payload mappings (``args``) and
+    ``EvidenceArtifact``-like objects (``compact_args``), while remaining
+    independent from runtime model classes.
+    """
+
+    requirements = _requirement_sequence(contract_or_requirements)
+    observed = tuple(_call_name_and_arguments(call) for call in calls)
+    return tuple(
+        requirement
+        for requirement in requirements
+        if not any(
+            name == requirement.tool_name
+            and not truncated
+            and dict(arguments or {}) == dict(requirement.arguments)
+            for name, arguments, truncated in observed
+        )
+    )
+
+
+def render_sql_risk_scope_contract(
+    contract: SqlRiskScopeContract | None,
+    *,
+    stage: SqlRiskScopeStage,
+) -> str:
+    """Render a short stage-specific instruction for an already safe scope."""
+
+    if contract is None:
+        return ""
+    rendered_requirements = "; ".join(
+        f"`{requirement.tool_name}`(" 
+        + json.dumps(
+            requirement.arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + ")"
+        for requirement in contract.requirements
+    )
+    scope = contract.scope.label
+    by_stage: Mapping[SqlRiskScopeStage, str] = {
+        "plan": (
+            f"Exact scope `{scope}`: запланируй одну самодостаточную task "
+            f"для обязательных чтений {rendered_requirements}; не добавляй "
+            "analysis task."
+        ),
+        "planner": (
+            f"Для exact scope `{scope}` выполни обязательные чтения "
+            f"{rendered_requirements} с точными args без narrowing."
+        ),
+        "observer": (
+            f"Для exact scope `{scope}` верни `complete` только когда "
+            f"приняты все чтения name+args: {rendered_requirements}."
+        ),
+        "upstream_decision": (
+            f"Для exact scope `{scope}` считай evidence полным только при "
+            f"наличии всех name+args: {rendered_requirements}."
+        ),
+        "upstream": (
+            f"Ответ относится строго к `{scope}`; обе точные endpoint-строки "
+            "должны присутствовать в публичном ответе."
+        ),
+    }
+    try:
+        return by_stage[stage]
+    except KeyError as exc:
+        raise ValueError(f"Unknown SQL-risk scope stage: {stage!r}") from exc
+
+
+def _contains_exact_endpoint(answer: str, endpoint: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?<![{_ENDPOINT_BOUNDARY_CHARS}])"
+            rf"{re.escape(endpoint)}"
+            rf"(?![{_ENDPOINT_BOUNDARY_CHARS}])",
+            answer,
+        )
+    )
+
+
+def ensure_sql_risk_answer_scope(
+    answer: str,
+    original_task: str,
+    sql_risk_aspects: Iterable[SqlRiskAspect],
+    *,
+    enabled: bool | None = None,
+) -> str:
+    """Prepend an exact compact scope line only when an endpoint is absent.
+
+    The line is derived solely from the original literal pair.  If both exact
+    endpoint strings already occur in the model answer, or if the experiment
+    cannot form a safe contract, the answer is returned byte-for-byte.
+    Applying the helper twice is idempotent.
+    """
+
+    contract = build_sql_risk_scope_contract(
+        original_task,
+        sql_risk_aspects,
+        enabled=enabled,
+    )
+    if contract is None:
+        return answer
+    scope = contract.scope
+    if _contains_exact_endpoint(answer, scope.source) and _contains_exact_endpoint(
+        answer,
+        scope.target,
+    ):
+        return answer
+
+    scope_line = f"Scope: {scope.label}"
+    return scope_line if not answer else f"{scope_line}\n\n{answer}"
+
+
+__all__ = [
+    "GetSourceTargetColumnPairArguments",
+    "GetSourceTargetColumnPairRequirement",
+    "LiteralSqlRiskScope",
+    "OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV",
+    "ReadS2TSourceToTargetArguments",
+    "ReadS2TSourceToTargetRequirement",
+    "SqlRiskEvidenceRequirement",
+    "SqlRiskScopeContract",
+    "SqlRiskScopeStage",
+    "SqlRiskToolName",
+    "build_sql_risk_scope_contract",
+    "ensure_sql_risk_answer_scope",
+    "extract_literal_file_id",
+    "extract_literal_sql_risk_scope",
+    "missing_sql_risk_requirements",
+    "render_sql_risk_scope_contract",
+    "required_sql_risk_tools",
+    "sql_risk_scope_evidence_enabled",
+]

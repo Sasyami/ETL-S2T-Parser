@@ -1781,6 +1781,58 @@ def _assert_sql_risk_aspect(
         "plan": routed_steps,
     }
 
+    from agents.sql_risk_scope_contract import (
+        build_sql_risk_scope_contract,
+        sql_risk_scope_evidence_enabled,
+    )
+
+    if not sql_risk_scope_evidence_enabled():
+        assert all(
+            "operation_sql_risk_scope_contract" not in step
+            for step in routed_steps
+        ), routed_steps
+        return
+
+    contract = build_sql_risk_scope_contract(
+        exchange.query,
+        [expected_aspect],
+        enabled=True,
+    )
+    attested_steps = [
+        step
+        for step in routed_steps
+        if "operation_sql_risk_scope_contract" in step
+    ]
+    if contract is None:
+        assert not attested_steps, routed_steps
+        return
+
+    expected_contract = {
+        "scope": contract.scope.label,
+        "required_evidence": [
+            {
+                "tool_name": requirement.tool_name,
+                "arguments": dict(requirement.arguments),
+            }
+            for requirement in contract.requirements
+        ],
+    }
+    cycles = {
+        int(step.get("cycle") or 0)
+        for step in routed_steps
+    }
+    for cycle in cycles:
+        cycle_attestations = [
+            step["operation_sql_risk_scope_contract"]
+            for step in attested_steps
+            if int(step.get("cycle") or 0) == cycle
+        ]
+        assert cycle_attestations == [expected_contract], {
+            "cycle": cycle,
+            "expected": expected_contract,
+            "plan": routed_steps,
+        }
+
 
 def _typed_sql_risk_enabled() -> bool:
     configured = os.getenv("OPERATION_SQL_RISK_ASPECTS_EXPERIMENT")

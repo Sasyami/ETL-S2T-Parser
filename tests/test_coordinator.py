@@ -15,7 +15,11 @@ from agents.contracts import (
     parse_worker_request,
 )
 from agents.coordinator import CoordinatorAnswer
-from agents.tools.saved_results import SavedResultColumn, SavedResultDescriptor
+from agents.tools.saved_results import (
+    SavedResultColumn,
+    SavedResultDescriptor,
+    SavedResultStore,
+)
 
 
 def _tool_message(name, args, call_id):
@@ -95,6 +99,80 @@ def _outcome(
         datasets=list(datasets),
         previous_results=list(previous_results),
     )
+
+
+def test_scope_evidence_uses_saved_source_completeness_not_preview_length():
+    from agents.coordinator import _scope_evidence_calls
+
+    store = SavedResultStore()
+    try:
+        complete = store.save_payload(
+            source_tool="read_s2t_source_to_target",
+            payload={
+                "columns": ["source_table", "target_table"],
+                "total_matches": 1,
+                "truncated": False,
+                "rows": [
+                    {
+                        "source_table": "src_alpha",
+                        "target_table": "tgt_beta",
+                    }
+                ],
+            },
+        )
+        incomplete = store.save_payload(
+            source_tool="read_s2t_source_to_target",
+            payload={
+                "columns": ["source_table", "target_table"],
+                "total_matches": 2,
+                "truncated": False,
+                "rows": [
+                    {
+                        "source_table": "src_alpha",
+                        "target_table": "tgt_beta",
+                    }
+                ],
+            },
+        )
+        assert complete is not None and incomplete is not None
+
+        calls = _scope_evidence_calls(
+            [
+                _artifact(
+                    None,
+                    "read_s2t_source_to_target",
+                    "preview clipped",
+                    compact_args={
+                        "source_table": "src_alpha",
+                        "target_table": "tgt_beta",
+                    },
+                    truncated=True,
+                    dataset_ref=complete.result_ref,
+                ),
+                _artifact(
+                    None,
+                    "read_s2t_source_to_target",
+                    "short preview",
+                    compact_args={
+                        "source_table": "src_alpha",
+                        "target_table": "tgt_beta",
+                    },
+                    truncated=False,
+                    dataset_ref=incomplete.result_ref,
+                ),
+                _artifact(
+                    None,
+                    "read_s2t_source_to_target",
+                    "preview clipped without dataset",
+                    truncated=True,
+                ),
+            ],
+            store,
+        )
+    finally:
+        store.close()
+
+    assert [call["truncated"] for call in calls] == [False, True, True]
 
 
 class _BoundModel:
@@ -4056,3 +4134,412 @@ def test_coordinator_uses_generated_task_without_semantic_checks():
     ]
     assert len(plan_calls) == 1
     assert all(name != "dispatch_worker" for name, _ in model.messages)
+
+
+def test_scope_evidence_experiment_off_preserves_worker_call_and_answer(monkeypatch):
+    from agents.coordinator import coordinator_chat
+    from agents.sql_risk_scope_contract import (
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+    )
+    from agents.tools.context import OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    monkeypatch.setenv(OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV, "0")
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["row_filtering"],
+                    },
+                    "operation-row-filtering",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Read the exact directed S2T mapping "
+                                    "src_alpha → tgt_beta."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-row-filtering",
+                )
+            ],
+            "submit_upstream_data_decision": [
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {"decision": "pass"},
+                    "decision-pass",
+                )
+            ],
+            "submit_upstream_answer": [
+                _tool_message(
+                    "submit_upstream_answer",
+                    {
+                        "answer": "A WHERE predicate can remove rows.",
+                        "used_evidence_ids": ["evidence-mapping"],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-row-filtering",
+                )
+            ],
+        }
+    )
+    worker_result = _outcome(
+        "Mapping read.",
+        evidence=[
+            _artifact(
+                None,
+                "read_s2t_source_to_target",
+                '{"rows":[{"transformation_rule":"WHERE active"}]}',
+                evidence_id="evidence-mapping",
+                compact_args={
+                    "source_table": "src_alpha",
+                    "target_table": "tgt_beta",
+                },
+            )
+        ],
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            return_value=worker_result,
+        ) as worker,
+    ):
+        result = coordinator_chat(
+            "Assess row filtering for src_alpha → tgt_beta."
+        )
+
+    assert result.answer == "A WHERE predicate can remove rows."
+    assert "Scope:" not in result.answer
+    assert worker.call_count == 1
+    assert worker.call_args.kwargs == {}
+
+
+def test_scope_evidence_experiment_passes_requirements_and_scopes_answer(
+    monkeypatch,
+):
+    from agents.coordinator import coordinator_chat
+    from agents.sql_risk_scope_contract import (
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+        ensure_sql_risk_answer_scope,
+    )
+    from agents.tools.context import OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    monkeypatch.setenv(OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV, "1")
+    original_task = (
+        "Assess nullable constraint rejection for the exact column pair "
+        "src_alpha.code → tgt_beta.code with file_id=17."
+    )
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["constraint_rejection"],
+                    },
+                    "operation-constraint",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Read exact directed S2T mapping and column "
+                                    "metadata for src_alpha.code → "
+                                    "tgt_beta.code with file_id=17."
+                                )
+                            }
+                        ]
+                    },
+                    "plan-constraint",
+                )
+            ],
+            "submit_upstream_data_decision": [
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {"decision": "pass"},
+                    "decision-pass",
+                )
+            ],
+            "submit_upstream_answer": [
+                _tool_message(
+                    "submit_upstream_answer",
+                    {
+                        "answer": "The required target can reject null input.",
+                        "used_evidence_ids": [
+                            "evidence-mapping",
+                            "evidence-metadata",
+                        ],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-constraint",
+                )
+            ],
+        }
+    )
+    worker_result = _outcome(
+        "Both exact reads complete.",
+        evidence=[
+            _artifact(
+                None,
+                "read_s2t_source_to_target",
+                '{"rows":[{"transformation_rule":"source.code"}]}',
+                evidence_id="evidence-mapping",
+                compact_args={
+                    "source_table": "src_alpha",
+                    "target_table": "tgt_beta",
+                },
+            ),
+            _artifact(
+                None,
+                "get_source_target_column_pair",
+                '{"source":{"not_null":false},"target":{"not_null":true}}',
+                evidence_id="evidence-metadata",
+                compact_args={
+                    "file_id": 17,
+                    "source_table": "src_alpha",
+                    "source_column": "code",
+                    "target_table": "tgt_beta",
+                    "target_column": "code",
+                },
+            ),
+        ],
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            return_value=worker_result,
+        ) as worker,
+    ):
+        result = coordinator_chat(original_task)
+
+    assert result.answer == (
+        "Scope: src_alpha.code → tgt_beta.code\n\n"
+        "The required target can reject null input."
+    )
+    assert result.answer.count("Scope:") == 1
+    assert ensure_sql_risk_answer_scope(
+        result.answer,
+        original_task,
+        ["constraint_rejection"],
+        enabled=True,
+    ) == result.answer
+    assert worker.call_count == 1
+    requirements = worker.call_args.kwargs["required_evidence"]
+    assert [requirement.tool_name for requirement in requirements] == [
+        "read_s2t_source_to_target",
+        "get_source_target_column_pair",
+    ]
+    assert [dict(requirement.arguments) for requirement in requirements] == [
+        {"source_table": "src_alpha", "target_table": "tgt_beta"},
+        {
+            "file_id": 17,
+            "source_table": "src_alpha",
+            "source_column": "code",
+            "target_table": "tgt_beta",
+            "target_column": "code",
+        },
+    ]
+
+
+def test_scope_evidence_final_cycle_returns_deterministic_not_assessed(
+    monkeypatch,
+):
+    from agents.coordinator import coordinator_chat
+    from agents.sql_risk_scope_contract import (
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+    )
+    from agents.tools.context import OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    monkeypatch.setenv(OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV, "1")
+    original_task = "Assess row loss for src_alpha → tgt_beta."
+    plan = {
+        "steps": [
+            {
+                "task": (
+                    "Read the exact directed S2T mapping "
+                    "src_alpha → tgt_beta."
+                )
+            }
+        ]
+    }
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["row_filtering"],
+                    },
+                    "operation-row-filtering",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message("submit_worker_plan", plan, "plan-cycle-1"),
+                _tool_message("submit_worker_plan", plan, "plan-cycle-2"),
+            ],
+        }
+    )
+    failed_outcome = _outcome(
+        "Exact mapping unavailable.",
+        status="failed",
+        stop_reason="no_results",
+        unmet_requirements=("No exact rows.",),
+    )
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=[failed_outcome, failed_outcome],
+        ) as worker,
+        patch("agents.coordinator.record_upstream_output") as record_output,
+    ):
+        result = coordinator_chat(original_task)
+
+    assert worker.call_count == 2
+    assert "src_alpha → tgt_beta" in result.answer
+    assert "not assessed" in result.answer
+    assert "read_s2t_source_to_target" in result.answer
+    assert all(
+        name not in {"submit_upstream_data_decision", "submit_upstream_answer"}
+        for name, _ in model.messages
+    )
+    assert record_output.call_args.args[0]["answer_source"] == (
+        "deterministic_scope_evidence_unavailable"
+    )
+
+
+def test_scope_evidence_contract_is_attached_only_to_first_matching_step(
+    monkeypatch,
+):
+    from agents.coordinator import coordinator_chat
+    from agents.sql_risk_scope_contract import (
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+    )
+    from agents.tools.context import OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV
+
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    monkeypatch.setenv(OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV, "1")
+    original_task = "Assess row loss for src_alpha → tgt_beta."
+    model = _CoordinatorModel(
+        {
+            "select_operation_skills": [
+                _tool_message(
+                    "select_operation_skills",
+                    {
+                        "pipeline": "agentic",
+                        "skills": ["Анализ SQL-рисков"],
+                        "sql_risk_aspects": ["row_filtering"],
+                    },
+                    "operation-row-filtering",
+                )
+            ],
+            "submit_worker_plan": [
+                _tool_message(
+                    "submit_worker_plan",
+                    {
+                        "steps": [
+                            {
+                                "task": (
+                                    "Read exact S2T mapping "
+                                    "src_alpha → tgt_beta."
+                                )
+                            },
+                            {
+                                "task": (
+                                    "Read supplementary mapping facts for "
+                                    "src_alpha → tgt_beta."
+                                )
+                            },
+                        ]
+                    },
+                    "plan-two-matching-steps",
+                )
+            ],
+            "submit_upstream_data_decision": [
+                _tool_message(
+                    "submit_upstream_data_decision",
+                    {"decision": "pass"},
+                    "decision-pass",
+                )
+            ],
+            "submit_upstream_answer": [
+                _tool_message(
+                    "submit_upstream_answer",
+                    {
+                        "answer": "A filter can remove rows.",
+                        "used_evidence_ids": ["evidence-mapping"],
+                        "display_evidence_ids": [],
+                    },
+                    "answer-row-filtering",
+                )
+            ],
+        }
+    )
+    mapping_outcome = _outcome(
+        "Mapping read.",
+        evidence=[
+            _artifact(
+                None,
+                "read_s2t_source_to_target",
+                '{"rows":[{"transformation_rule":"WHERE active"}]}',
+                evidence_id="evidence-mapping",
+                compact_args={
+                    "source_table": "src_alpha",
+                    "target_table": "tgt_beta",
+                },
+            )
+        ],
+    )
+    supplementary_outcome = _outcome("Supplementary facts read.")
+    model_patch, callback_patch, trace_patch = _patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.coordinator.worker_chat",
+            side_effect=[mapping_outcome, supplementary_outcome],
+        ) as worker,
+        patch("agents.coordinator.record_coordinator_plan") as record_plan,
+    ):
+        result = coordinator_chat(original_task)
+
+    assert result.answer.startswith("Scope: src_alpha → tgt_beta")
+    assert worker.call_count == 2
+    assert worker.call_args_list[0].kwargs["required_evidence"]
+    assert worker.call_args_list[1].kwargs == {}
+    recorded_steps = record_plan.call_args.args[0]
+    assert "operation_sql_risk_scope_contract" in recorded_steps[0]
+    assert "operation_sql_risk_scope_contract" not in recorded_steps[1]

@@ -3778,3 +3778,166 @@ def test_wrong_arguments_retains_previously_expanded_general_tool():
     assert router.call_args_list[2].kwargs["reroute_context"][
         "required_capabilities"
     ] == []
+
+
+def test_required_evidence_expands_router_palette_before_worker_graph():
+    from agents.sql_risk_scope_contract import (
+        GetSourceTargetColumnPairRequirement,
+        ReadS2TSourceToTargetRequirement,
+    )
+    from agents.worker import worker_chat
+
+    requirements = (
+        ReadS2TSourceToTargetRequirement(
+            source_table="src_alpha",
+            target_table="tgt_beta",
+        ),
+        GetSourceTargetColumnPairRequirement(
+            file_id=17,
+            source_table="src_alpha",
+            source_column="code",
+            target_table="tgt_beta",
+            target_column="code",
+        ),
+    )
+    route = ToolRoute(
+        tools=["get_source_target_column_pair"],
+        skills=[],
+        schemas=[],
+    )
+
+    with (
+        patch("agents.worker.select_chat_route", return_value=route),
+        patch(
+            "agents.worker.run_worker_graph",
+            return_value=WorkerRunResult(answer="Evidence complete."),
+        ) as run_graph,
+    ):
+        result = worker_chat(
+            "Read exact evidence for src_alpha.code → tgt_beta.code.",
+            required_evidence=requirements,
+        )
+
+    assert result.status == "complete"
+    assert {tool.name for tool in run_graph.call_args.kwargs["tools"]} == {
+        "read_s2t_source_to_target",
+        "get_source_target_column_pair",
+    }
+    assert run_graph.call_args.kwargs["required_evidence"] == requirements
+
+
+def test_required_evidence_repairs_metadata_only_complete_then_accumulates_mapping():
+    from agents.sql_risk_scope_contract import (
+        GetSourceTargetColumnPairRequirement,
+        ReadS2TSourceToTargetRequirement,
+    )
+
+    calls = []
+
+    def read_s2t_source_to_target(source_table: str, target_table: str):
+        calls.append(("mapping", source_table, target_table))
+        return {"rows": [{"transformation_rule": "source.code"}]}
+
+    def get_source_target_column_pair(
+        file_id: int,
+        source_table: str,
+        source_column: str,
+        target_table: str,
+        target_column: str,
+    ):
+        calls.append(
+            (
+                "metadata",
+                file_id,
+                source_table,
+                source_column,
+                target_table,
+                target_column,
+            )
+        )
+        return {"source": {"not_null": False}, "target": {"not_null": True}}
+
+    mapping_args = {
+        "source_table": "src_alpha",
+        "target_table": "tgt_beta",
+    }
+    metadata_args = {
+        "file_id": 17,
+        "source_table": "src_alpha",
+        "source_column": "code",
+        "target_table": "tgt_beta",
+        "target_column": "code",
+    }
+    requirements = (
+        ReadS2TSourceToTargetRequirement(**mapping_args),
+        GetSourceTargetColumnPairRequirement(**metadata_args),
+    )
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_source_target_column_pair",
+                        "args": metadata_args,
+                        "id": "call-metadata",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_s2t_source_to_target",
+                        "args": mapping_args,
+                        "id": "call-mapping",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Both exact reads accepted."),
+        ],
+        observer_responses=[
+            Observation(
+                status="complete",
+                accepted_tool_call_ids=["call-metadata"],
+                facts=[],
+            ),
+            Observation(
+                status="continue",
+                gap="The directed mapping is still required.",
+                accepted_tool_call_ids=["call-metadata"],
+                facts=[],
+            ),
+            Observation(
+                status="complete",
+                accepted_tool_call_ids=["call-metadata", "call-mapping"],
+                facts=[],
+            ),
+        ],
+    )
+
+    result = run_worker_graph(
+        task="Read exact evidence for src_alpha.code → tgt_beta.code.",
+        system_prompt="System context",
+        model=model,
+        tools=(
+            _as_tool(read_s2t_source_to_target),
+            _as_tool(get_source_target_column_pair),
+        ),
+        max_steps=3,
+        required_evidence=requirements,
+    )
+
+    assert result.status == "complete"
+    assert result.accepted_tool_call_ids == ["call-metadata", "call-mapping"]
+    assert [item.name for item in result.display_items] == [
+        "get_source_target_column_pair",
+        "read_s2t_source_to_target",
+    ]
+    assert [item[0] for item in calls] == ["metadata", "mapping"]
+    assert len(model.observer.messages) == 3
+    repair_prompt = str(model.observer.messages[1][-1].content)
+    assert "evidence contract" in repair_prompt
+    assert "read_s2t_source_to_target" in repair_prompt

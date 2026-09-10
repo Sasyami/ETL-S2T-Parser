@@ -455,21 +455,16 @@ def render_field_value_change_answer(
     lines: List[str] = []
     for fact in facts:
         pair = f"`{fact.source_reference} → {fact.target_reference}`"
-        expression = (
-            f" Проекция target field: `{fact.target_expressions[0]}`."
-            if fact.target_expressions
-            else ""
-        )
         if fact.conclusion == "not_detected":
             lines.append(
                 f"Для {pair} механизм изменения значения не обнаружен: "
-                f"target field получает прямую колонку source field.{expression} "
+                "target field получает прямую колонку source field. "
                 "Выражения соседних output aliases к этой паре не относятся."
             )
         elif fact.conclusion == "may_change":
             lines.append(
                 f"Для {pair} значение может измениться: обнаружен механизм "
-                f"`{fact.mechanism}` в точной target-проекции.{expression}"
+                f"`{fact.mechanism}` в точной target-проекции."
             )
         elif fact.conclusion == "conflicting":
             lines.append(

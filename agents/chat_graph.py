@@ -53,6 +53,10 @@ from .contracts import (
 )
 from .observability import get_callback_handler, langfuse_trace_context
 from .run_metrics import llm_stage
+from .sql_risk_scope_contract import (
+    SqlRiskEvidenceRequirement,
+    missing_sql_risk_requirements,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1264,6 +1268,7 @@ def build_agent_graph(
     tool_message_preview_chars: Optional[int] = None,
     worker_finish: bool = False,
     split_tool_call_planning: bool = False,
+    required_evidence: Sequence[SqlRiskEvidenceRequirement] = (),
 ):
     """Build planner -> tools -> observer -> planner."""
     tool_list = _normalize_tools(tools)
@@ -1271,6 +1276,20 @@ def build_agent_graph(
     retained_tool_results = (
         raw_tool_results if raw_tool_results is not None else {}
     )
+    retained_tool_calls: Dict[str, Dict[str, Any]] = {}
+    required_evidence = tuple(required_evidence)
+    missing_tools = sorted(
+        {
+            requirement.tool_name
+            for requirement in required_evidence
+            if requirement.tool_name not in tool_names
+        }
+    )
+    if missing_tools:
+        raise WorkerResponseError(
+            "SQL-risk scope contract requires unavailable worker tools: "
+            + ", ".join(missing_tools)
+        )
     evidence_ids = (
         evidence_ids_by_tool_call
         if evidence_ids_by_tool_call is not None
@@ -1759,6 +1778,14 @@ def build_agent_graph(
             ],
         )
 
+        for call in last_message.tool_calls:
+            tool_call_id = str(call.get("id") or "").strip()
+            if tool_call_id:
+                retained_tool_calls[tool_call_id] = {
+                    "tool_name": str(call.get("name") or ""),
+                    "args": dict(call.get("args") or {}),
+                }
+
         result = tool_node.invoke(state)
         raw_messages = [
             message.model_copy(update={"status": "error"})
@@ -1780,6 +1807,10 @@ def build_agent_graph(
                 message = persist_sqlite_tool_message(message)
 
             tool_call_id = str(message.tool_call_id or "").strip()
+            if tool_call_id in retained_tool_calls:
+                retained_tool_calls[tool_call_id]["truncated"] = (
+                    _tool_result_truncated(message)
+                )
             if (
                 tool_call_id
                 and not _tool_message_has_error(message)
@@ -1973,6 +2004,33 @@ def build_agent_graph(
                     "status=complete требует хотя бы один принятый "
                     "внешний tool result в accepted_tool_call_ids"
                 )
+            if parsed_observation.status == "complete" and required_evidence:
+                accepted_calls = [
+                    retained_tool_calls[tool_call_id]
+                    for tool_call_id in accepted_ids
+                    if tool_call_id in retained_tool_calls
+                ]
+                missing_requirements = missing_sql_risk_requirements(
+                    required_evidence,
+                    accepted_calls,
+                )
+                if missing_requirements:
+                    missing_text = "; ".join(
+                        requirement.tool_name
+                        + "("
+                        + json.dumps(
+                            requirement.arguments,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        + ")"
+                        for requirement in missing_requirements
+                    )
+                    raise ValueError(
+                        "status=complete не закрывает обязательный SQL-risk "
+                        "evidence contract: "
+                        + missing_text
+                    )
             accepted_evidence_ids = {
                 evidence_ids[tool_call_id]
                 for tool_call_id in accepted_ids
@@ -2300,6 +2358,7 @@ def run_worker_graph(
     tool_message_preview_chars: int = DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS,
     callbacks: Optional[List[Any]] = None,
     split_tool_call_planning: bool = False,
+    required_evidence: Sequence[SqlRiskEvidenceRequirement] = (),
 ) -> WorkerRunResult:
     """Run the internal worker graph and retain its selected UI results locally."""
     raw_task = str(task or "").strip()
@@ -2336,6 +2395,7 @@ def run_worker_graph(
         tool_message_preview_chars=preview_chars,
         worker_finish=True,
         split_tool_call_planning=split_tool_call_planning,
+        required_evidence=required_evidence,
     )
 
     initial_state: AgentGraphState = {

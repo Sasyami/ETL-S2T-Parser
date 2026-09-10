@@ -40,6 +40,7 @@ from .run_metrics import (
     record_worker_route,
     record_worker_task,
 )
+from .sql_risk_scope_contract import SqlRiskEvidenceRequirement
 from .tools import get_worker_tools, load_schemas, load_skills
 from .tools.saved_results import (
     bind_saved_result_schemas,
@@ -281,6 +282,8 @@ def _final_outcome_summary(
 
 def worker_chat(
     task: str,
+    *,
+    required_evidence: Sequence[SqlRiskEvidenceRequirement] = (),
 ) -> WorkerOutcome:
     """Execute one self-contained task in an isolated generic worker."""
     clean_task = str(task or "").strip()
@@ -369,9 +372,10 @@ def worker_chat(
         if reroute_context is not None:
             route_kwargs["reroute_context"] = reroute_context
         route = select_chat_route(worker_request, **route_kwargs)
-        palette = tuple(sorted(dict.fromkeys(route.tools)))
-        attempted_palettes.append(palette)
         selected_names = set(route.tools)
+        selected_names.update(
+            requirement.tool_name for requirement in required_evidence
+        )
         if any(
             item.name == _READ_PREVIOUS_RESULT_TOOL_NAME
             for item in available_tools
@@ -380,6 +384,8 @@ def worker_chat(
         selected_tools = tuple(
             item for item in available_tools if item.name in selected_names
         )
+        palette = tuple(sorted(tool.name for tool in selected_tools))
+        attempted_palettes.append(palette)
         worker_tools = ensure_worker_tools(selected_tools)
         selected_skills = load_skills(tuple(route.skills))
         selected_schemas = load_schemas(tuple(route.schemas))
@@ -436,6 +442,7 @@ def worker_chat(
                 split_tool_call_planning=(
                     _split_tool_call_planning_enabled()
                 ),
+                required_evidence=required_evidence,
             )
         except WorkerResponseError as exc:
             logger.warning("Worker contract failed: %s", exc)

@@ -66,6 +66,13 @@ from .run_metrics import (
     record_validation_protocol,
     record_worker_outcome,
 )
+from .sql_risk_scope_contract import (
+    SqlRiskScopeContract,
+    build_sql_risk_scope_contract,
+    ensure_sql_risk_answer_scope,
+    missing_sql_risk_requirements,
+    render_sql_risk_scope_contract,
+)
 from .tools.context import (
     OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
     OPERATION_SKILL_CATALOG,
@@ -80,6 +87,7 @@ from .worker import (
     worker_chat,
 )
 from .tools.saved_results import (
+    SavedResultStore,
     get_active_saved_result_store,
     saved_result_store_scope,
 )
@@ -204,6 +212,61 @@ def _sql_risk_protocol_attestation(
             protocol_variant_sha256(variant)
         ),
     }
+
+
+def _scope_evidence_calls(
+    artifacts: Sequence[EvidenceArtifact],
+    store: Optional[SavedResultStore],
+) -> List[Dict[str, Any]]:
+    """Project accepted artifacts onto source-completeness call evidence.
+
+    ``EvidenceArtifact.truncated`` combines two different boundaries: source
+    truncation and harmless model-preview clipping.  Required SQLite readers
+    are materialized, so their saved descriptor is authoritative whenever a
+    dataset reference exists.
+    """
+
+    calls: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        source_truncated = artifact.truncated
+        if artifact.dataset_ref is not None:
+            descriptor = (
+                store.descriptor(artifact.dataset_ref)
+                if store is not None
+                else None
+            )
+            source_truncated = not (
+                descriptor is not None
+                and descriptor.source_tool == artifact.tool_name
+                and not descriptor.truncated
+                and descriptor.source_total is not None
+                and descriptor.source_total == descriptor.row_count
+            )
+        calls.append(
+            {
+                "tool_name": artifact.tool_name,
+                "args": artifact.compact_args,
+                "truncated": source_truncated,
+            }
+        )
+    return calls
+
+
+def _first_scope_step_index(
+    steps: Sequence[Any],
+    contract: Optional[SqlRiskScopeContract],
+) -> Optional[int]:
+    """Return the zero-based first plan step containing both exact endpoints."""
+
+    if contract is None:
+        return None
+    source_token = contract.scope.source.casefold()
+    target_token = contract.scope.target.casefold()
+    for index, raw_step in enumerate(steps):
+        task = PlanStep.model_validate(raw_step).task.casefold()
+        if source_token in task and target_token in task:
+            return index
+    return None
 
 
 class CoordinatorAnswer(BaseModel):
@@ -1898,6 +1961,34 @@ def build_coordinator_graph(
             stage="plan",
             sql_risk_aspects=operation_sql_risk_aspects,
         )
+        scope_evidence_contract = build_sql_risk_scope_contract(
+            state["task"],
+            operation_sql_risk_aspects,
+        )
+        scope_plan_context = render_sql_risk_scope_contract(
+            scope_evidence_contract,
+            stage="plan",
+        )
+        scope_evidence_attestation: Dict[str, Any] = {}
+        if scope_evidence_contract is not None:
+            scope_evidence_attestation = {
+                "operation_sql_risk_scope_contract": {
+                    "scope": scope_evidence_contract.scope.label,
+                    "required_evidence": [
+                        {
+                            "tool_name": requirement.tool_name,
+                            "arguments": dict(requirement.arguments),
+                        }
+                        for requirement in scope_evidence_contract.requirements
+                    ],
+                }
+            }
+        if scope_plan_context:
+            plan_operation_context = "\n\n".join(
+                part
+                for part in (plan_operation_context, scope_plan_context)
+                if part
+            )
         sql_risk_protocol_attestation = _sql_risk_protocol_attestation(
             operation_skills,
             operation_sql_risk_aspects,
@@ -2007,6 +2098,10 @@ def build_coordinator_graph(
                 ) from second_error
         assert isinstance(plan, WorkerPlan)
 
+        scope_step_index = _first_scope_step_index(
+            plan.steps,
+            scope_evidence_contract,
+        )
         recorded_plan = [
             {
                 "cycle": state["cycle"],
@@ -2016,6 +2111,11 @@ def build_coordinator_graph(
                 "sql_risk_aspects": list(operation_sql_risk_aspects),
                 "pipeline": operation_pipeline,
                 **sql_risk_protocol_attestation,
+                **(
+                    scope_evidence_attestation
+                    if index - 1 == scope_step_index
+                    else {}
+                ),
             }
             for index, step in enumerate(plan.steps, start=1)
         ]
@@ -2059,6 +2159,17 @@ def build_coordinator_graph(
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
+        scope_evidence_contract = build_sql_risk_scope_contract(
+            state["task"],
+            selected_sql_risk_aspects,
+        )
+        step_scope_contract: SqlRiskScopeContract | None = None
+        if scope_evidence_contract is not None:
+            if step_index == _first_scope_step_index(
+                state["plan"],
+                scope_evidence_contract,
+            ):
+                step_scope_contract = scope_evidence_contract
         planner_context = load_operation_skills(
             selected_operation_skills,
             stage="planner",
@@ -2069,6 +2180,26 @@ def build_coordinator_graph(
             stage="observer",
             sql_risk_aspects=selected_sql_risk_aspects,
         )
+        scope_planner_context = render_sql_risk_scope_contract(
+            step_scope_contract,
+            stage="planner",
+        )
+        scope_observer_context = render_sql_risk_scope_contract(
+            step_scope_contract,
+            stage="observer",
+        )
+        if scope_planner_context:
+            planner_context = "\n\n".join(
+                part
+                for part in (planner_context, scope_planner_context)
+                if part
+            )
+        if scope_observer_context:
+            observer_context = "\n\n".join(
+                part
+                for part in (observer_context, scope_observer_context)
+                if part
+            )
         if planner_context:
             worker_task += (
                 WORKER_OPERATION_EXECUTION_MARKER + planner_context
@@ -2112,7 +2243,14 @@ def build_coordinator_graph(
             step_index + 1,
             worker_task[:1000],
         )
-        outcome = worker_chat(worker_task)
+        outcome = (
+            worker_chat(
+                worker_task,
+                required_evidence=step_scope_contract.requirements,
+            )
+            if step_scope_contract is not None
+            else worker_chat(worker_task)
+        )
         record_worker_outcome(
             cycle=state["cycle"],
             step=step_index + 1,
@@ -2207,6 +2345,10 @@ def build_coordinator_graph(
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
+        scope_evidence_contract = build_sql_risk_scope_contract(
+            state["task"],
+            selected_sql_risk_aspects,
+        )
         decision_context = load_operation_skills(
             selected_operation_skills,
             stage="upstream_decision",
@@ -2217,6 +2359,33 @@ def build_coordinator_graph(
             stage="upstream",
             sql_risk_aspects=selected_sql_risk_aspects,
         )
+        scope_decision_context = render_sql_risk_scope_contract(
+            scope_evidence_contract,
+            stage="upstream_decision",
+        )
+        scope_analysis_context = render_sql_risk_scope_contract(
+            scope_evidence_contract,
+            stage="upstream",
+        )
+        if scope_decision_context:
+            decision_context = "\n\n".join(
+                part
+                for part in (decision_context, scope_decision_context)
+                if part
+            )
+        if scope_analysis_context:
+            analysis_context = "\n\n".join(
+                part
+                for part in (analysis_context, scope_analysis_context)
+                if part
+            )
+
+        def scoped_answer(answer: str) -> str:
+            return ensure_sql_risk_answer_scope(
+                answer,
+                state["task"],
+                selected_sql_risk_aspects,
+            )
         available_evidence_ids: set[str] = set()
         available_display_refs: Dict[str, str] = {}
         accepted_artifacts: List[EvidenceArtifact] = []
@@ -2257,6 +2426,22 @@ def build_coordinator_graph(
             "worker_outcomes": worker_outcomes,
             "evidence": evidence_payload,
         }
+        saved_result_store = get_active_saved_result_store()
+        missing_scope_requirements = missing_sql_risk_requirements(
+            scope_evidence_contract,
+            _scope_evidence_calls(
+                accepted_artifacts,
+                saved_result_store,
+            ),
+        )
+        if missing_scope_requirements:
+            upstream_payload["missing_scope_evidence"] = [
+                {
+                    "tool_name": requirement.tool_name,
+                    "arguments": dict(requirement.arguments),
+                }
+                for requirement in missing_scope_requirements
+            ]
         cardinality_sufficient_evidence_ids: List[str] = []
         if (
             selected_operation_skills == ["Анализ SQL-рисков"]
@@ -2454,6 +2639,50 @@ def build_coordinator_graph(
                 "selected_display_refs": [],
             }
 
+        if missing_scope_requirements:
+            missing_text = "; ".join(
+                requirement.tool_name
+                + "("
+                + json.dumps(
+                    requirement.arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + ")"
+                for requirement in missing_scope_requirements
+            )
+            if state["cycle"] < COORDINATOR_MAX_CYCLES:
+                return data_request_update(
+                    "Opt-in SQL-risk scope/evidence contract не закрыт: "
+                    + missing_text
+                )
+            assert scope_evidence_contract is not None
+            incomplete_answer = (
+                "Не удалось завершить оценку SQL-риска для exact scope "
+                f"`{scope_evidence_contract.scope.label}`: не получены "
+                "обязательные подтверждения "
+                f"{missing_text}. Результат: not assessed."
+            )
+            evidence = UpstreamOutput(
+                answer=incomplete_answer,
+                used_evidence_ids=[],
+                display_evidence_ids=[],
+            )
+            upstream_output = evidence.model_dump()
+            record_upstream_output(
+                {
+                    **upstream_output,
+                    "answer_source": (
+                        "deterministic_scope_evidence_unavailable"
+                    ),
+                }
+            )
+            return {
+                "upstream_output": upstream_output,
+                "final_answer": evidence.answer,
+                "selected_display_refs": [],
+            }
+
         terminal_write_semantics_answer = ""
         if (
             selected_operation_skills == ["Анализ SQL-рисков"]
@@ -2502,7 +2731,7 @@ def build_coordinator_graph(
                 )
             )
             evidence = UpstreamOutput(
-                answer=terminal_write_semantics_answer,
+                answer=scoped_answer(terminal_write_semantics_answer),
                 used_evidence_ids=used_evidence_ids,
                 display_evidence_ids=[],
             )
@@ -2529,9 +2758,9 @@ def build_coordinator_graph(
             and value_change_facts
             and is_exclusive_value_change_request(state["task"])
         ):
-            deterministic_answer = render_field_value_change_answer(
-                value_change_facts
-            ).strip()
+            deterministic_answer = scoped_answer(
+                render_field_value_change_answer(value_change_facts).strip()
+            )
             if deterministic_answer:
                 used_evidence_ids = list(
                     dict.fromkeys(
@@ -2584,6 +2813,11 @@ def build_coordinator_graph(
         ]
         _, evidence = invoke_answer(answer_messages)
 
+        scoped_model_answer = scoped_answer(evidence.answer)
+        if scoped_model_answer != evidence.answer:
+            evidence = evidence.model_copy(
+                update={"answer": scoped_model_answer}
+            )
         upstream_output = evidence.model_dump()
         selected_display_refs = [
             available_display_refs[evidence_id]
