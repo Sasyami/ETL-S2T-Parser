@@ -1,20 +1,20 @@
-# Восстановление original agentic и статус 9 основных Word-требований
+# Добавленные возможности и статус 9 основных Word-требований
 
 Дата: 2026-09-15
-Базовый ориентир: `5757bd993c1076092c8dadb68ada2a648fbe870f`
 
 ## Итог
 
-Текущая ветка offline готова как «рабочий original agentic + общие исправления
-обнаруженных отказов + изолированные opt-in возможности»:
+В версию добавлены и проверены следующие возможности:
 
-- обычный agentic снова использует model-owned `PlanStep(task)` без
-  `plan_origin`, code-owned NL-классификаторов и автоматического fuzzy resolver;
-- upstream получает только исходную задачу и accepted evidence;
-- экспериментальные capability/aspect/scope-маршруты выключены по умолчанию;
-- специализированные `validation_protocol` и `sql_risk_scope` изолированы от
-  обычного agentic и не делают silent fallback;
-- deterministic SQL-risk verdict compilers и literal parser удалены;
+- отдельный opt-in `sql_risk_scope`: LLM извлекает режим и точный scope,
+  exact readers получают данные, SQLGlot формирует нейтральную структуру, а
+  второй LLM-вызов делает вывод о риске и формирует ответ;
+- обязательный LLM-review полноты и ролей для `validation_protocol` с одной
+  ограниченной попыткой исправления контракта;
+- точные field-level S2T readers и `run_sql` доступны worker сразу;
+- role-aware обработка истории, независимые lineage-чтения и более строгая
+  evidence-проверка производных выводов;
+- улучшенная проверка пользовательского display и физических идентификаторов;
 - полный offline suite: **1036 passed, 81 skipped, 3 warnings**.
 
 Все семь основных Word-сценариев прошли доступный итоговый gate: №1–6
@@ -23,22 +23,9 @@ extraction boundary. Повторный post-fix live-вызов №7 выпол
 доступные токены GigaChat закончились (`402 Payment Required`). Поэтому это
 честный результат **7/7 по совокупной проверке**, но не заявление «7/7 live».
 
-## Что восстановлено относительно original
+## Добавленные улучшения по результатам проверок
 
-1. Downstream снова выдаёт только 1–8 самодостаточных `PlanStep(task)`.
-2. В normal agentic нет plan-origin guard, pre-resolution filename guard,
-   deterministic risk verdicts или code-owned entity choice.
-3. Default worker reroute повторяет baseline: первые две попытки используют
-   специализированную палитру, общая read-only палитра открывается затем.
-4. Worker router и observer оценивают только текущую task. Исходная coordinator
-   task доступна planner только как immutable источник точных literals.
-5. Upstream boundary снова равна `{original_task, evidence}`; model-owned
-   worker summaries/outcomes не подмешиваются в факты ответа.
-6. Все экспериментальные флаги в source defaults и `.env.example` равны `0`.
-
-## Общие исправления семи разобранных отказов
-
-- `run_sql` возвращён в начальную model-selected worker palette: точный SQLite
+- `run_sql` добавлен в начальную model-selected worker palette: точный SQLite
   count больше не зависит от предварительного ошибочного reroute.
 - Exact `list_s2t_source_field` и `list_s2t_target_field` доступны сразу:
   запрос одного поля не обязан анализировать широкий preview таблицы.
@@ -127,21 +114,11 @@ gate на той же старой БД.
 - Targeted validation/review/Word-7 release gate: **112 passed**.
 - `git diff --check`: clean.
 - `python -m compileall -q agents scripts tests`: clean.
-- Production scan не нашёл Word fixture identifiers, `plan_origin`,
-  `literal_contract` или deterministic risk verdict imports.
 
-## Commit / push verdict
+## Публикация
 
-Код готов к checkpoint commit/push при обязательном добавлении всех новых `??`
-source/test-файлов; `git commit -am` здесь недостаточен и создаст битый
-checkout. Итог по семи основным Word-сценариям: **7/7 прошли совокупный gate:
+Функциональные изменения и этот отчёт опубликованы в ветке `main`, начиная с
+коммита `fa0f05d`. Итог по семи основным Word-сценариям: **7/7 прошли совокупный gate:
 6/7 live + №7 offline после исправления**. Повторный live №7 остаётся желательной
 проверкой после пополнения токенов, но его отсутствие явно зафиксировано и не
 выдаётся за live-результат. Дополнительно upload-требования №8–9 прошли offline.
-
-Repository default для SQL-risk scope выключен. Локальный ignored `.env` сейчас
-содержит `OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT=1`; перед baseline smoke
-его нужно явно запустить с `0`/unset. В commit это значение не попадёт.
-
-Удалённые GigaChat budget guard/scripts намеренно не восстанавливались согласно
-явному решению пользователя.
