@@ -6,6 +6,23 @@ import logging
 # Add project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# Keep ordinary unit tests independent from developer-local ``.env`` opt-ins.
+# Explicit shell/runner values win because setdefault never overwrites them.
+from agents.env_flags import parse_binary_flag
+from agents.experiment_flags import BINARY_EXPERIMENT_DEFAULTS
+
+_live_agent_tests_enabled = parse_binary_flag(
+    "RUN_LIVE_AGENT_SCENARIOS",
+    os.getenv("RUN_LIVE_AGENT_SCENARIOS"),
+    default=False,
+)
+if not _live_agent_tests_enabled:
+    for _experiment_name, _experiment_default in BINARY_EXPERIMENT_DEFAULTS.items():
+        os.environ.setdefault(
+            _experiment_name,
+            "1" if _experiment_default else "0",
+        )
+
 # Disable Langfuse/OTEL export noise before project modules load dotenv.
 os.environ["LANGFUSE_PUBLIC_KEY"] = ""
 os.environ["LANGFUSE_SECRET_KEY"] = ""
@@ -117,4 +134,3 @@ def sample_excel_bytes():
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Sheet1', index=False)
     return output.getvalue()
-

@@ -27,7 +27,7 @@ from agents.tools.context import (
 
 
 _FROZEN_CURRENT_CONTEXT_SHA256 = (
-    "419f022a8f7785aa0cb17e2a80fb0ef84cacb20173d16cf709b34ffd253e105a"
+    "602712e9bf74279bcc68c8e7f3f8fdbee8a28f3c183dcf37a65dcd835b71723b"
 )
 
 
@@ -90,7 +90,7 @@ def test_current_fallback_contexts_match_frozen_pre_experiment_digest(
     monkeypatch,
 ):
     monkeypatch.delenv(OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV, raising=False)
-    monkeypatch.delenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, raising=False)
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
     aspect_subsets = [
         subset
         for length in range(len(SQL_RISK_ASPECTS) + 1)

@@ -26,12 +26,15 @@ class _StructuredJudge:
 class _JudgeModel:
     def __init__(self, result):
         self.structured = _StructuredJudge(result)
+        self.audit = _StructuredJudge({"findings": []})
         self.schema = None
         self.method = None
 
     def with_structured_output(self, schema, method=None):
         self.schema = schema
         self.method = method
+        if schema is IdentifierEvidenceAudit:
+            return self.audit
         return self.structured
 
 
@@ -43,6 +46,64 @@ class _SchemaAwareJudgeModel:
     def with_structured_output(self, schema, method=None):
         self.calls.append(schema)
         return _StructuredJudge(self.results[schema])
+
+
+def test_identifier_audit_runs_without_natural_language_keyword_gate():
+    model = _SchemaAwareJudgeModel(
+        {
+            IdentifierEvidenceAudit: {"findings": []},
+            SemanticJudgeVerdict: {
+                "status": "passed",
+                "reason": "Ответ подтверждён.",
+            },
+        }
+    )
+
+    verdict = judge_agent_response(
+        query="Покажи соответствующий объект.",
+        answer="Объект не найден.",
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "passed"
+    assert model.calls == [IdentifierEvidenceAudit, SemanticJudgeVerdict]
+
+
+def test_identifier_audit_does_not_reject_generic_technical_terms():
+    model = _SchemaAwareJudgeModel(
+        {
+            IdentifierEvidenceAudit: {
+                "findings": [
+                    {
+                        "surface": "PK/UNIQUE",
+                        "kind": "generic_technical_term",
+                    },
+                    {
+                        "surface": "source_table",
+                        "kind": "generic_technical_term",
+                    },
+                ]
+            },
+            SemanticJudgeVerdict: {
+                "status": "passed",
+                "reason": "Общие технические термины не требуют provenance.",
+            },
+        }
+    )
+
+    verdict = judge_agent_response(
+        query="Оцени условный риск соединения.",
+        answer=(
+            "Без подтверждённого PK/UNIQUE для роли source_table фактическая "
+            "кардинальность неизвестна."
+        ),
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "passed"
+    assert model.calls == [IdentifierEvidenceAudit, SemanticJudgeVerdict]
 
 
 def test_semantic_judge_receives_only_user_visible_result():
@@ -71,6 +132,11 @@ def test_semantic_judge_receives_only_user_visible_result():
         "display_results": [
             {"name": "path", "content": '{"path":["A","B"]}'}
         ],
+        "display_contract": {
+            "each_item_is_separate_ui": True,
+            "each_item_is_scrollable": True,
+            "content_is_user_visible": True,
+        },
     }
     assert "worker" not in model.structured.messages[1].content.lower()
     judge_prompt = model.structured.messages[0].content
@@ -91,11 +157,13 @@ def test_semantic_judge_receives_only_user_visible_result():
     assert "транзитивный обход до terminal targets" in judge_prompt
     assert "Следуй оставшимся проверкам строго по порядку" in judge_prompt
     assert "Evidence-аудит новых физических идентификаторов уже выполнен" in judge_prompt
+    assert "отдельным пользовательским\nscrollable UI-блоком" in judge_prompt
     assert "до полного B" in judge_prompt
     assert "B::subquery" in judge_prompt
 
     audit_prompt = _IDENTIFIER_AUDIT_PROMPT
-    assert "таблиц, колонок, ключей" in audit_prompt
+    assert "физической таблицы, колонки" in audit_prompt
+    assert "generic_technical_term" in audit_prompt
     assert "`display_results[*].content`" in audit_prompt
     assert "Сам answer не подтверждает" in audit_prompt
     assert "`display_results=[]` означает ноль evidence" in audit_prompt
@@ -145,7 +213,16 @@ def test_identifier_audit_does_not_trust_assistant_only_history():
     model = _SchemaAwareJudgeModel(
         {
             IdentifierEvidenceAudit: {
-                "unconfirmed_identifiers": ["user_table", "assistant_table"]
+                "findings": [
+                    {
+                        "surface": "user_table",
+                        "kind": "physical_identifier",
+                    },
+                    {
+                        "surface": "assistant_table",
+                        "kind": "physical_identifier",
+                    },
+                ]
             },
             SemanticJudgeVerdict: {
                 "status": "passed",
@@ -174,10 +251,13 @@ def test_semantic_judge_rejects_llm_reported_unconfirmed_identifier():
     model = _SchemaAwareJudgeModel(
         {
             IdentifierEvidenceAudit: {
-                "unconfirmed_identifiers": [
-                    "known_table",
-                    "placeholder_column",
-                    "made_up_column",
+                "findings": [
+                    {"surface": name, "kind": "physical_identifier"}
+                    for name in (
+                        "known_table",
+                        "placeholder_column",
+                        "made_up_column",
+                    )
                 ]
             },
             SemanticJudgeVerdict: {
@@ -197,3 +277,153 @@ def test_semantic_judge_rejects_llm_reported_unconfirmed_identifier():
     assert verdict.status == "failed"
     assert "made_up_column" in verdict.reason
     assert model.calls == [IdentifierEvidenceAudit]
+
+
+def test_identifier_audit_cannot_reject_identifier_absent_from_answer():
+    model = _SchemaAwareJudgeModel(
+        {
+            IdentifierEvidenceAudit: {
+                "findings": [
+                    {
+                        "surface": "b3050000420005_rate",
+                        "kind": "physical_identifier",
+                    }
+                ]
+            },
+            SemanticJudgeVerdict: {
+                "status": "passed",
+                "reason": "Ответ выполняет запрос.",
+            },
+        }
+    )
+
+    verdict = judge_agent_response(
+        query="Проверь S2T-маппинг для указанной пары.",
+        answer=(
+            "Для `b3050000420005.rate → t_rate.rate` значение может "
+            "измениться."
+        ),
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "passed"
+    assert model.calls == [IdentifierEvidenceAudit, SemanticJudgeVerdict]
+
+
+def test_identifier_audit_matches_quotes_and_whitespace_around_dots():
+    model = _SchemaAwareJudgeModel(
+        {
+            IdentifierEvidenceAudit: {
+                "findings": [
+                    {
+                        "surface": "private_schema.secret_table",
+                        "kind": "physical_identifier",
+                    }
+                ]
+            },
+            SemanticJudgeVerdict: {
+                "status": "passed",
+                "reason": "Не должен вызываться.",
+            },
+        }
+    )
+
+    verdict = judge_agent_response(
+        query="Составь SQL по доступным данным.",
+        answer='SELECT * FROM "private_schema" . "secret_table"',
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "failed"
+    assert "private_schema.secret_table" in verdict.reason
+    assert model.calls == [IdentifierEvidenceAudit]
+
+
+def test_identifier_audit_does_not_normalize_underscore_to_dot():
+    model = _SchemaAwareJudgeModel(
+        {
+            IdentifierEvidenceAudit: {
+                "findings": [
+                    {
+                        "surface": "b3050000420005_rate",
+                        "kind": "physical_identifier",
+                    }
+                ]
+            },
+            SemanticJudgeVerdict: {
+                "status": "passed",
+                "reason": "Ответ выполняет запрос.",
+            },
+        }
+    )
+
+    verdict = judge_agent_response(
+        query="Проверь SQL-маппинг.",
+        answer="Проверена колонка `b3050000420005 . rate`.",
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "passed"
+    assert model.calls == [IdentifierEvidenceAudit, SemanticJudgeVerdict]
+
+
+def test_identifier_audit_does_not_confirm_longer_name_substrings():
+    model = _SchemaAwareJudgeModel(
+        {
+            IdentifierEvidenceAudit: {
+                "findings": [
+                    {
+                        "surface": "customer_orders",
+                        "kind": "physical_identifier",
+                    }
+                ]
+            },
+            SemanticJudgeVerdict: {
+                "status": "passed",
+                "reason": "Не должен вызываться.",
+            },
+        }
+    )
+
+    verdict = judge_agent_response(
+        query="Покажи customer_orders_archive.",
+        answer="Источник: customer_orders.",
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "failed"
+    assert "customer_orders" in verdict.reason
+    assert model.calls == [IdentifierEvidenceAudit]
+
+
+def test_identifier_audit_accepts_qualified_identifier_suffix():
+    model = _SchemaAwareJudgeModel(
+        {
+            IdentifierEvidenceAudit: {
+                "findings": [
+                    {
+                        "surface": "table_name.column_name",
+                        "kind": "physical_identifier",
+                    }
+                ]
+            },
+            SemanticJudgeVerdict: {
+                "status": "passed",
+                "reason": "Идентификатор подтверждён запросом.",
+            },
+        }
+    )
+
+    verdict = judge_agent_response(
+        query="Покажи schema_name.table_name.column_name.",
+        answer="Найдена table_name.column_name.",
+        display_items=[],
+        model=model,
+    )
+
+    assert verdict.status == "passed"
+    assert model.calls == [IdentifierEvidenceAudit, SemanticJudgeVerdict]

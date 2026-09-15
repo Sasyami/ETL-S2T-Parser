@@ -30,12 +30,21 @@ import sqlglot
 from langchain_core.callbacks import BaseCallbackHandler
 
 import storage.database as db_storage
+from agents.experiment_flags import (
+    OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    S2T_NARROW_TOOLS_EXPERIMENT_ENV,
+    experiment_flag_enabled,
+)
 from agents.run_metrics import (
     AgentRunMetrics,
     consume_agent_run_metrics,
     count_agent_reroutes,
 )
-from scripts.live_agent_config import read_live_agent_http_timeout
+from scripts.live_agent_config import (
+    read_live_agent_http_timeout,
+    read_live_agent_llm_judge_enabled,
+    read_live_agent_scenarios_enabled,
+)
 from services.sql_dialects import GREENPLUM_DIALECT  # noqa: F401
 
 
@@ -55,19 +64,12 @@ if LIVE_AGENT_MODE not in {"multiagent", "single_agent"}:
     raise ValueError(
         "LIVE_AGENT_MODE must be 'multiagent' or 'single_agent'"
     )
-LIVE_AGENT_ENABLED = os.getenv("RUN_LIVE_AGENT_SCENARIOS", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-LIVE_AGENT_LLM_JUDGE = os.getenv(
-    "LIVE_AGENT_LLM_JUDGE", ""
-).strip().lower() in {"1", "true", "yes", "on"}
+LIVE_AGENT_ENABLED = read_live_agent_scenarios_enabled()
+LIVE_AGENT_LLM_JUDGE = read_live_agent_llm_judge_enabled()
 LIVE_AGENT_HTTP_TIMEOUT = read_live_agent_http_timeout()
-STRICT_RETRIEVAL_ENABLED = os.getenv(
-    "S2T_NARROW_TOOLS_EXPERIMENT", ""
-).strip().lower() in {"1", "true", "yes", "on"}
+STRICT_RETRIEVAL_ENABLED = experiment_flag_enabled(
+    S2T_NARROW_TOOLS_EXPERIMENT_ENV,
+)
 _LIVE_TRANSCRIPT_LOCK = threading.Lock()
 _LIVE_TRANSCRIPT_INDEX = 0
 
@@ -135,14 +137,37 @@ def _payload_contains_value(payload, expected) -> bool:
 
 def _assert_named_answer_value(answer: str, name: str, expected: object) -> None:
     """Require one explicit ``name=value`` scalar in a live answer."""
+    value_boundary = (
+        r"(?!\w|[.,]\d)"
+        if isinstance(expected, (int, float)) and not isinstance(expected, bool)
+        else r"(?![\w.])"
+    )
     pattern = (
         rf"(?i)(?<![\w.]){re.escape(name)}\s*[:=]\s*`?"
-        rf"{re.escape(str(expected))}`?(?![\w.])"
+        rf"{re.escape(str(expected))}`?{value_boundary}"
     )
     assert re.search(pattern, answer), {
         "missing": f"{name}={expected}",
         "answer": answer,
     }
+
+
+def _assert_named_answer_list(
+    answer: str,
+    name: str,
+    expected: list[str],
+) -> None:
+    """Require one explicit JSON list without relying on the semantic judge."""
+    match = re.search(
+        rf"(?i)(?<![\w.]){re.escape(name)}\s*[:=]\s*`?(\[[^\]\n]*\])`?",
+        answer,
+    )
+    assert match is not None, {"missing": name, "answer": answer}
+    parsed = json.loads(match.group(1))
+    assert isinstance(parsed, list), parsed
+    assert sorted(str(item).casefold() for item in parsed) == sorted(
+        str(item).casefold() for item in expected
+    ), {"expected": expected, "actual": parsed, "answer": answer}
 
 
 def _payload_table_paths(payload: dict) -> list[list[str]]:
@@ -452,6 +477,12 @@ def _record_live_exchange(
                 if str(step.get("pipeline") or "").strip()
             )
         )
+        if metrics.sql_risk_operation is not None:
+            operation_pipeline = str(
+                metrics.sql_risk_operation.get("pipeline") or ""
+            ).strip()
+            if operation_pipeline and operation_pipeline not in pipelines:
+                pipelines.append(operation_pipeline)
         if not pipelines:
             if metrics.worker_tasks:
                 pipelines = ["agentic"]
@@ -522,6 +553,7 @@ def _record_live_exchange(
                 "worker_outcomes": metrics.worker_outcomes,
                 "entity_resolution": metrics.entity_resolution,
                 "sql_risk_facts": metrics.sql_risk_facts,
+                "sql_risk_operation": metrics.sql_risk_operation,
                 "validation_protocol": metrics.validation_protocol,
                 "upstream_output": metrics.upstream_output,
             },
@@ -927,16 +959,143 @@ class _ProtocolLiveCase:
     transformation_rule: str
 
 
+def _effective_predicate_sql(predicate: str) -> str:
+    """Drop only AST conjuncts that SQLGlot proves are constant true."""
+
+    from sqlglot.optimizer.simplify import simplify
+
+    parsed = sqlglot.parse_one(predicate, read=GREENPLUM_DIALECT)
+
+    def conjuncts(
+        node: sqlglot.exp.Expression,
+    ) -> list[sqlglot.exp.Expression]:
+        if isinstance(node, sqlglot.exp.And):
+            return [*conjuncts(node.this), *conjuncts(node.expression)]
+        return [node]
+
+    effective: list[sqlglot.exp.Expression] = []
+    for conjunct in conjuncts(parsed):
+        try:
+            reduced = simplify(conjunct.copy())
+        except (
+            sqlglot.errors.SqlglotError,
+            AttributeError,
+            TypeError,
+            ValueError,
+        ):
+            reduced = None
+        if isinstance(reduced, sqlglot.exp.Boolean) and reduced.this is True:
+            continue
+        effective.append(conjunct)
+    if not effective:
+        return ""
+    combined = effective[0].copy()
+    for conjunct in effective[1:]:
+        combined = sqlglot.exp.and_(combined, conjunct.copy())
+    return combined.sql(dialect=GREENPLUM_DIALECT)
+
+
+def _extract_named_sql_values(
+    answer: str,
+    names: tuple[str, ...],
+) -> dict[str, str]:
+    """Extract one explicitly labelled, single-line SQL value per name."""
+
+    alternatives = "|".join(re.escape(name) for name in names)
+    pattern = re.compile(
+        rf"(?im)^[ \t]*(?:[-*+]\s*)?(?:\d+[.)]\s*)?"
+        rf"(?:\*\*|`)?(?P<name>{alternatives})(?:\*\*|`)?"
+        r"\s*[:=]\s*(?P<value>[^\r\n]+)$"
+    )
+    extracted: dict[str, str] = {}
+    duplicates: list[str] = []
+    for match in pattern.finditer(answer):
+        name = match.group("name").casefold()
+        value = match.group("value").strip()
+        if value.startswith("`") and value.endswith("`"):
+            value = value[1:-1].strip()
+        if name in extracted:
+            duplicates.append(name)
+        extracted[name] = value
+    expected_names = {name.casefold() for name in names}
+    assert not duplicates and set(extracted) == expected_names, {
+        "expected_names": sorted(expected_names),
+        "actual_names": sorted(extracted),
+        "duplicates": duplicates,
+        "answer": answer,
+    }
+    return extracted
+
+
+def _canonical_sql_ast(value: str) -> tuple[object, ...]:
+    """Return a case-normalized semantic AST signature for one expression."""
+
+    from sqlglot.optimizer.simplify import simplify
+
+    parsed = sqlglot.parse_one(value, read=GREENPLUM_DIALECT)
+    simplified = simplify(parsed.copy())
+
+    def flatten_boolean(
+        node: sqlglot.exp.Expression,
+        kind: type[sqlglot.exp.Expression],
+    ) -> list[sqlglot.exp.Expression]:
+        if isinstance(node, kind):
+            return [
+                *flatten_boolean(node.this, kind),
+                *flatten_boolean(node.expression, kind),
+            ]
+        return [node]
+
+    def signature(node: object) -> object:
+        if isinstance(node, sqlglot.exp.Paren):
+            return signature(node.this)
+        if isinstance(node, (sqlglot.exp.And, sqlglot.exp.Or)):
+            operands = flatten_boolean(node, type(node))
+            return (
+                node.key,
+                tuple(sorted((signature(item) for item in operands), key=repr)),
+            )
+        if isinstance(node, (sqlglot.exp.EQ, sqlglot.exp.NEQ)):
+            operands = sorted(
+                (signature(node.this), signature(node.expression)),
+                key=repr,
+            )
+            return node.key, tuple(operands)
+        if isinstance(node, sqlglot.exp.Identifier):
+            return "identifier", str(node.this).casefold()
+        if isinstance(node, sqlglot.exp.Literal):
+            return "literal", node.this, bool(node.is_string)
+        if isinstance(node, sqlglot.exp.Expression):
+            return (
+                node.key,
+                tuple(
+                    (key, signature(argument))
+                    for key, argument in sorted(node.args.items())
+                    if key != "comments"
+                ),
+            )
+        if isinstance(node, list):
+            return tuple(signature(item) for item in node)
+        if isinstance(node, tuple):
+            return tuple(signature(item) for item in node)
+        return node
+
+    result = signature(simplified)
+    assert isinstance(result, tuple), result
+    return result
+
+
 def _protocol_live_case(
     *,
     expression: bool = False,
     min_mapped_fields: int = 1,
     require_join: bool = False,
+    require_effective_join_predicate: bool = False,
     require_filter: bool = False,
     require_target_catalog: bool = False,
     require_primary_key: bool = False,
-    require_direct_selected_field: bool = False,
-    require_expression_on_other_field: bool = False,
+    require_explicit_selected_projection: bool = False,
+    require_non_column_selected_projection: bool = False,
 ) -> _ProtocolLiveCase:
     expression_filter = ""
     if expression:
@@ -1026,8 +1185,17 @@ def _protocol_live_case(
             continue
         if require_join and not normalized.joins:
             continue
-        if require_filter and not normalized.filters:
+        if require_effective_join_predicate and not any(
+            join.condition and _effective_predicate_sql(join.condition)
+            for join in normalized.joins
+        ):
             continue
+        if require_filter:
+            if not any(
+                _effective_predicate_sql(predicate)
+                for predicate in normalized.filters
+            ):
+                continue
         conn = db_storage.get_db_connection()
         try:
             mappings = conn.execute(
@@ -1072,29 +1240,18 @@ def _protocol_live_case(
                 ),
                 None,
             )
-        if require_direct_selected_field:
+        if require_explicit_selected_projection and not selected_expression:
+            continue
+        if require_non_column_selected_projection:
             try:
-                parsed_expression = sqlglot.parse_one(
+                parsed_projection = sqlglot.parse_one(
                     str(selected_expression or ""),
                     read=GREENPLUM_DIALECT,
                 )
             except (TypeError, ValueError, sqlglot.errors.SqlglotError):
                 continue
-            if not (
-                isinstance(parsed_expression, sqlglot.exp.Column)
-                and parsed_expression.name.casefold()
-                == str(candidate[4]).casefold()
-            ):
+            if isinstance(parsed_projection, sqlglot.exp.Column):
                 continue
-        if require_expression_on_other_field and not any(
-            name.casefold() != str(candidate[5]).casefold()
-            and any(
-                token in expression_sql.casefold()
-                for token in ("coalesce", "case", "cast")
-            )
-            for name, expression_sql in normalized.projections.items()
-        ):
-            continue
         row = candidate
         break
     if row is None:
@@ -1565,7 +1722,18 @@ def _assert_s2t_work_case_execution(
             str(step.get("pipeline") or "") == "validation_protocol"
             for step in metrics.coordinator_plan
         )
-        if direct_pipeline:
+        scope_pipeline = bool(
+            metrics.sql_risk_operation is not None
+            and str(metrics.sql_risk_operation.get("pipeline") or "")
+            == "sql_risk_scope"
+        )
+        if scope_pipeline:
+            _warn_unless(
+                not metrics.coordinator_plan and not metrics.worker_tasks,
+                "efficiency",
+                "SQL-risk operation-scope trace contains agentic planning",
+            )
+        elif direct_pipeline:
             _warn_unless(
                 bool(metrics.coordinator_plan) and not metrics.worker_tasks,
                 "efficiency",
@@ -1734,30 +1902,142 @@ def _assert_agentic_pipeline(exchange: _LiveExchange) -> None:
     ), metrics.coordinator_plan
     assert metrics.worker_tasks, metrics.worker_tasks
     assert metrics.validation_protocol is None, metrics.validation_protocol
+    assert "resolve_entities" not in _tool_names(exchange), metrics.tool_calls
+    assert metrics.entity_resolution == [], metrics.entity_resolution
+
+
+_SQL_RISK_SCOPE_MODES = {
+    "row_filtering": "row_filtering",
+    "cardinality": "conditional_cardinality",
+    "constraint_rejection": "nullable_constraint",
+    "value_changes": "value_changes",
+    "write_semantics": "write_semantics",
+}
+
+
+def _sql_risk_operation_scope_enabled() -> bool:
+    if LIVE_AGENT_MODE != "multiagent":
+        return False
+    from agents.sql_risk_scope_contract import sql_risk_scope_evidence_enabled
+
+    return sql_risk_scope_evidence_enabled()
+
+
+def _assert_sql_risk_scope_pipeline(
+    exchange: _LiveExchange,
+    *,
+    expected_execution_mode: str,
+) -> dict:
+    """Require internal model analysis while ordinary agentic stages stay off."""
+
+    metrics = exchange.metrics
+    _assert_public_answer(exchange.result.answer)
+    assert metrics.error is None, metrics.error
+    assert not [item for item in metrics.tool_calls if item.has_error], (
+        metrics.tool_calls
+    )
+    operation = metrics.sql_risk_operation
+    assert operation is not None, metrics
+    assert operation.get("pipeline") == "sql_risk_scope", operation
+    assert operation.get("status") == "complete", operation
+    assert operation.get("execution_mode") == expected_execution_mode, (
+        operation
+    )
+    assert operation.get("answer_source") == "sql_risk_scope_llm", operation
+    assert operation.get("silent_fallback") is False, operation
+    assert list(operation.get("issues") or []) == [], operation
+    assessment = dict(operation.get("assessment") or {})
+    assert assessment.get("status") == "complete", operation
+    assert assessment.get("outcome") in {
+        "risk_present",
+        "risk_absent",
+        "not_assessed",
+    }, operation
+
+    assert metrics.supervisor_decision is not None, metrics
+    assert metrics.supervisor_decision.route == "delegate", (
+        metrics.supervisor_decision
+    )
+    assert metrics.coordinator_plan == [], metrics.coordinator_plan
+    assert metrics.worker_tasks == [], metrics.worker_tasks
+    assert metrics.worker_routes == [], metrics.worker_routes
+    assert metrics.observations == [], metrics.observations
+    assert metrics.worker_outcomes == [], metrics.worker_outcomes
+    assert metrics.validation_protocol is None, metrics.validation_protocol
+    assert {item.stage for item in metrics.llm_calls} == {
+        "supervisor",
+        "operation_router",
+        "sql_risk_scope_contract",
+        "sql_risk_scope_analysis",
+    }, metrics.llm_calls
+    assert {item.stage for item in metrics.llm_stages} == {
+        "supervisor",
+        "operation_router",
+        "sql_risk_scope_contract",
+        "sql_risk_scope_analysis",
+    }, metrics.llm_stages
+
+    upstream = metrics.upstream_output
+    assert upstream is not None, metrics
+    assert upstream.get("answer_source") == "sql_risk_scope_llm", upstream
+    assert str(upstream.get("answer") or "").strip(), upstream
+    used_ids = list(upstream.get("used_evidence_ids") or [])
+    assert used_ids and len(used_ids) == len(set(used_ids)), upstream
+
+    reads = list(operation.get("reads") or [])
+    assert reads and len(reads) == len(metrics.tool_calls), {
+        "reads": reads,
+        "tools": metrics.tool_calls,
+    }
+    assert all(read.get("status") == "complete" for read in reads), reads
+    assert all(read.get("evidence_id") for read in reads), reads
+    assert {
+        str(read.get("evidence_id")) for read in reads
+    } == set(used_ids), {"reads": reads, "upstream": upstream}
+    assert [
+        (read.get("tool_name"), dict(read.get("arguments") or {}))
+        for read in reads
+    ] == [
+        (item.name, dict(item.arguments or {})) for item in metrics.tool_calls
+    ], {"reads": reads, "tools": metrics.tool_calls}
+    display_ids = list(upstream.get("display_evidence_ids") or [])
+    assert set(display_ids).issubset(used_ids), upstream
+    evidence_tool = {
+        str(read.get("evidence_id")): str(read.get("tool_name"))
+        for read in reads
+    }
+    assert metrics.display_tools == [
+        evidence_tool[evidence_id] for evidence_id in display_ids
+    ], {"display_ids": display_ids, "display_tools": metrics.display_tools}
+    assert metrics.sql_risk_facts == [], metrics.sql_risk_facts
+    return dict(operation)
 
 
 def _assert_sql_risk_aspect(
     exchange: _LiveExchange,
     expected_aspect: str,
     *,
-    expected_execution_mode: str = "agentic",
+    expected_execution_mode: str | None = None,
 ) -> None:
-    """Hard-check the E2 route without making baseline runs incomparable."""
+    """Check either the separate scope lane or the ordinary operation skill."""
+
     if LIVE_AGENT_MODE != "multiagent":
         return
-    configured = os.getenv("OPERATION_SQL_RISK_ASPECTS_EXPERIMENT")
-    typed_enabled = configured is None or configured.strip().casefold() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-    from agents.sql_risk_scope_contract import (
-        sql_risk_scope_evidence_architecture,
-    )
+    expected_mode = expected_execution_mode or _SQL_RISK_SCOPE_MODES[
+        expected_aspect
+    ]
+    if _sql_risk_operation_scope_enabled():
+        assert expected_mode == _SQL_RISK_SCOPE_MODES[expected_aspect]
+        _assert_sql_risk_scope_pipeline(
+            exchange,
+            expected_execution_mode=expected_mode,
+        )
+        return
 
-    architecture = sql_risk_scope_evidence_architecture()
-    expected = [expected_aspect] if typed_enabled else []
+    aspects_enabled = experiment_flag_enabled(
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    )
+    expected = [expected_aspect] if aspects_enabled else []
     routed_steps = [
         step
         for step in exchange.metrics.coordinator_plan
@@ -1770,20 +2050,12 @@ def _assert_sql_risk_aspect(
         "actual": actual,
         "plan": routed_steps,
     }
-    expected_modes = (
-        [expected_execution_mode] * len(routed_steps)
-        if typed_enabled and architecture == "typed_plan"
-        else ["agentic"] * len(routed_steps)
-    )
-    actual_modes = [
-        str(step.get("sql_risk_execution_mode") or "agentic")
+    assert all(
+        "sql_risk_execution_mode" not in step
+        and "plan_source" not in step
+        and "operation_sql_risk_scope_contract" not in step
         for step in routed_steps
-    ]
-    assert actual_modes == expected_modes, {
-        "expected": expected_modes,
-        "actual": actual_modes,
-        "plan": routed_steps,
-    }
+    ), routed_steps
     assert all(
         "Анализ SQL-рисков" in (step.get("operation_skills") or [])
         for step in routed_steps
@@ -1813,107 +2085,15 @@ def _assert_sql_risk_aspect(
         "expected_protocol_sha256": expected_protocol_sha256,
         "plan": routed_steps,
     }
-
-    from agents.sql_risk_scope_contract import (
-        build_sql_risk_scope_contract,
-        sql_risk_scope_evidence_enabled,
+    assert exchange.metrics.sql_risk_operation is None, (
+        exchange.metrics.sql_risk_operation
     )
 
-    if not sql_risk_scope_evidence_enabled():
-        assert all(
-            "operation_sql_risk_scope_contract" not in step
-            for step in routed_steps
-        ), routed_steps
-        return
 
-    contract = build_sql_risk_scope_contract(
-        exchange.query,
-        [expected_aspect],
-        enabled=True,
-        execution_mode=expected_execution_mode,
+def _sql_risk_aspects_enabled() -> bool:
+    return experiment_flag_enabled(
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
     )
-    typed_plan = None
-    if architecture == "typed_plan":
-        from agents.sql_risk_typed_plan import (
-            build_typed_sql_risk_worker_plan,
-        )
-
-        typed_plan = build_typed_sql_risk_worker_plan(
-            exchange.query,
-            contract,
-            sql_risk_execution_mode=expected_execution_mode,
-        )
-    attested_steps = [
-        step
-        for step in routed_steps
-        if "operation_sql_risk_scope_contract" in step
-    ]
-    if architecture == "typed_plan" and typed_plan is None:
-        assert not attested_steps, routed_steps
-        assert all("plan_source" not in step for step in routed_steps), (
-            routed_steps
-        )
-        assert any(
-            item.stage == "downstream_plan"
-            for item in exchange.metrics.llm_calls
-        ), exchange.metrics.llm_calls
-        return
-    if contract is None:
-        assert not attested_steps, routed_steps
-        return
-
-    if typed_plan is not None:
-        assert all(
-            step.get("plan_source") == typed_plan.plan_source
-            for step in routed_steps
-        ), routed_steps
-        assert all(
-            item.stage != "downstream_plan"
-            for item in exchange.metrics.llm_calls
-        ), exchange.metrics.llm_calls
-        if expected_aspect == "constraint_rejection":
-            assert exchange.metrics.upstream_output is not None, (
-                exchange.metrics
-            )
-            assert exchange.metrics.upstream_output.get("answer_source") == (
-                "deterministic_constraint_rejection"
-            ), exchange.metrics.upstream_output
-
-    expected_contract = {
-        "scope": contract.scope.label,
-        "required_evidence": [
-            {
-                "tool_name": requirement.tool_name,
-                "arguments": dict(requirement.arguments),
-            }
-            for requirement in contract.requirements
-        ],
-    }
-    cycles = {
-        int(step.get("cycle") or 0)
-        for step in routed_steps
-    }
-    for cycle in cycles:
-        cycle_attestations = [
-            step["operation_sql_risk_scope_contract"]
-            for step in attested_steps
-            if int(step.get("cycle") or 0) == cycle
-        ]
-        assert cycle_attestations == [expected_contract], {
-            "cycle": cycle,
-            "expected": expected_contract,
-            "plan": routed_steps,
-        }
-
-
-def _typed_sql_risk_enabled() -> bool:
-    configured = os.getenv("OPERATION_SQL_RISK_ASPECTS_EXPERIMENT")
-    return configured is None or configured.strip().casefold() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
 
 
 def _assert_agentic_answer_uses_complete_evidence(
@@ -1945,6 +2125,31 @@ def _assert_exact_s2t_pair_was_read(
         == source_table.casefold()
         and str(item.arguments.get("target_table") or "").casefold()
         == target_table.casefold()
+    ]
+    assert calls, exchange.metrics.tool_calls
+    assert not [item for item in calls if item.has_error], calls
+    return calls
+
+
+def _assert_exact_s2t_field_pair_was_read(
+    exchange: _LiveExchange,
+    *,
+    source_table: str,
+    source_field: str,
+    target_table: str,
+    target_field: str,
+) -> list:
+    expected = {
+        "source_table": source_table,
+        "source_field": source_field,
+        "target_table": target_table,
+        "target_field": target_field,
+    }
+    calls = [
+        item
+        for item in exchange.metrics.tool_calls
+        if item.name == "list_s2t_field_mapping"
+        and item.arguments == expected
     ]
     assert calls, exchange.metrics.tool_calls
     assert not [item for item in calls if item.has_error], calls
@@ -2242,6 +2447,17 @@ def _assert_no_worker_reroute(exchange: _LiveExchange) -> None:
         if item.routing_attempt > 1
     ]
     assert reroutes == [], reroutes
+
+
+def _assert_model_owned_table_candidate_retrieval(
+    exchange: _LiveExchange,
+) -> None:
+    candidate_readers = {
+        "list_s2t_table_names",
+        "search_s2t_transformations",
+        "semantic_search_descriptions",
+    }
+    assert candidate_readers & set(_tool_names(exchange)), exchange.metrics.tool_calls
 
 
 def _assert_exact_reader_uses_canonical(
@@ -2729,7 +2945,7 @@ def test_live_agent_runs_dependent_workers_sequentially(
         if str(step.get("pipeline") or "") == "agentic"
     ]
     assert len(recorded_plan) == 2, recorded_plan
-    assert recorded_plan[1].get("dependencies") == [1], recorded_plan
+    assert all("dependencies" not in step for step in recorded_plan), recorded_plan
     assert len(exchange.metrics.worker_tasks) == 2, exchange.metrics.worker_tasks
     assert all(
         str(outcome.get("status") or "") == "complete"
@@ -3203,10 +3419,15 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
     file_id, target_table, source_table, target_field, source_field = (
         _s2t_work_case_fixture()
     )
+    filename = str(
+        _fetch_one(
+            "SELECT filename FROM files WHERE file_id = ?",
+            (file_id,),
+        )[0]
+    )
     exchange = _chat(
         live_chat_client,
-        f"Для file_id={file_id} оцени только SQL-риск constraint "
-        "rejection из-за nullable-ограничений "
+        f"Для файла {filename!r} оцени совместимость nullable-ограничений "
         f"{source_table}.{source_field} → {target_table}.{target_field}. Верни "
         "source_not_null=<0|1>, target_not_null=<0|1> и вывод.",
     )
@@ -3218,6 +3439,12 @@ def test_live_agent_checks_nulls_in_required_target_fields(live_chat_client):
         target_table=target_table,
         target_field=target_field,
     )
+    assert any(
+        item.name == "resolve_file"
+        and item.arguments == {"filename": filename}
+        and not item.has_error
+        for item in exchange.metrics.tool_calls
+    ), exchange.metrics.tool_calls
 
 
 @pytest.mark.live_validation
@@ -3309,7 +3536,7 @@ def test_live_agent_checks_source_and_target_type_compatibility(live_chat_client
     )
     assert exchange.metrics.coordinator_plan, exchange.metrics
     assert all(
-        str(step.get("sql_risk_execution_mode") or "agentic") == "agentic"
+        "sql_risk_execution_mode" not in step
         and "plan_source" not in step
         and "operation_sql_risk_scope_contract" not in step
         for step in exchange.metrics.coordinator_plan
@@ -3334,8 +3561,16 @@ def test_live_agent_checks_duplicate_risk_in_target(live_chat_client):
     _assert_cardinality_paraphrase(exchange, case)
 
 
-def _assert_no_typed_plan_or_upstream_llm(exchange: _LiveExchange) -> None:
-    forbidden_stages = {"downstream_plan", "upstream"}
+def _assert_scope_has_no_agentic_llm_stages(exchange: _LiveExchange) -> None:
+    forbidden_stages = {
+        "downstream_plan",
+        "router",
+        "planner",
+        "worker_planner",
+        "observer",
+        "finish_worker",
+        "upstream",
+    }
     assert not [
         item
         for item in exchange.metrics.llm_calls
@@ -3347,21 +3582,25 @@ def _assert_cardinality_paraphrase(
     exchange: _LiveExchange,
     case: _ProtocolLiveCase,
 ) -> None:
-    """Check semantics in both arms and typed facts in the candidate."""
+    """Check semantics in both arms and direct facts in operation scope."""
 
     assert LIVE_AGENT_LLM_JUDGE, "SQL-risk semantic scenarios require --llm-judge"
-    _assert_agentic_answer_uses_complete_evidence(exchange)
+    _assert_public_answer(exchange.result.answer)
+    scope_pipeline = _sql_risk_operation_scope_enabled()
+    if scope_pipeline:
+        _assert_sql_risk_aspect(
+            exchange,
+            "cardinality",
+            expected_execution_mode="conditional_cardinality",
+        )
+    else:
+        _assert_agentic_answer_uses_complete_evidence(exchange)
     exact_calls = _assert_exact_s2t_pair_was_read(
         exchange,
         source_table=case.source_table,
         target_table=case.target_table,
     )
-
-    from agents.sql_risk_scope_contract import (
-        sql_risk_scope_evidence_architecture,
-    )
-
-    if sql_risk_scope_evidence_architecture() != "typed_plan":
+    if not scope_pipeline:
         _assert_sql_risk_aspect(
             exchange,
             "cardinality",
@@ -3373,72 +3612,17 @@ def _assert_cardinality_paraphrase(
     assert _tool_names(exchange) == ["read_s2t_source_to_target"], (
         exchange.metrics.tool_calls
     )
-    matching_facts = [
-        fact
-        for fact in exchange.metrics.sql_risk_facts
-        if str(fact.get("source_table") or "").casefold()
-        == case.source_table.casefold()
-        and str(fact.get("target_table") or "").casefold()
-        == case.target_table.casefold()
-    ]
-    assert len(matching_facts) == 1, exchange.metrics.sql_risk_facts
-    fact = matching_facts[0]
-    assert fact.get("conclusion") == "conditional_duplicate_risk", fact
-    assert fact.get("mechanism") == "join_fanout", fact
-    assert fact.get("condition") == "full_join_key_uniqueness_unknown", fact
-    assert int(fact.get("matching_rows") or 0) > 0, fact
-    joins = list(fact.get("joins") or [])
-    assert joins, fact
-    assert all(
-        join.get("relation")
-        and join.get("predicate")
-        and join.get("uniqueness_condition")
-        == "full_join_key_uniqueness_unknown"
-        for join in joins
-    ), joins
-    statement = sqlglot.parse_one(
-        case.transformation_rule,
-        read=GREENPLUM_DIALECT,
-    )
-    assert isinstance(statement, sqlglot.exp.Select), statement
-    parsed_joins = list(statement.args.get("joins") or [])
-    assert parsed_joins, statement
-    expected_joins = {
-        (
-            join.this.sql(dialect=GREENPLUM_DIALECT).casefold(),
-            join.args["on"].sql(dialect=GREENPLUM_DIALECT).casefold(),
-        )
-        for join in parsed_joins
-        if join.args.get("on") is not None
-    }
-    assert len(expected_joins) == len(parsed_joins), parsed_joins
-    actual_joins = {
-        (
-            str(join.get("relation") or "").casefold(),
-            str(join.get("predicate") or "").casefold(),
-        )
-        for join in joins
-    }
-    assert actual_joins == expected_joins, {
-        "expected": sorted(expected_joins),
-        "actual": sorted(actual_joins),
-    }
-
     upstream = exchange.metrics.upstream_output
     assert upstream is not None, exchange.metrics
-    assert upstream.get("answer_source") == "deterministic_cardinality", upstream
+    assert upstream.get("answer_source") == "sql_risk_scope_llm", upstream
     used_ids = list(upstream.get("used_evidence_ids") or [])
     assert len(used_ids) == 1, upstream
-    assert list(upstream.get("display_evidence_ids") or []) == used_ids, upstream
-    assert exchange.metrics.display_tools == [
-        "read_s2t_source_to_target"
-    ], exchange.metrics.display_tools
-    assert set(fact.get("evidence_ids") or []) == set(used_ids), fact
-    _assert_no_typed_plan_or_upstream_llm(exchange)
-    _assert_sql_risk_aspect(
+    assert set(upstream.get("display_evidence_ids") or []).issubset(used_ids)
+    _assert_scope_has_no_agentic_llm_stages(exchange)
+    _assert_s2t_work_case_execution(
         exchange,
-        "cardinality",
-        expected_execution_mode="conditional_cardinality",
+        required_tools={"read_s2t_source_to_target"},
+        require_analysis=True,
     )
 
 
@@ -3498,12 +3682,18 @@ def _assert_nullable_paraphrase(
         target_table=target_table,
         target_field=target_field,
     )
-    _assert_agentic_answer_uses_complete_evidence(exchange)
-    _assert_exact_s2t_pair_was_read(
-        exchange,
-        source_table=source_table,
-        target_table=target_table,
+    _assert_public_answer(exchange.result.answer)
+    _assert_named_answer_value(
+        exchange.result.answer,
+        "source_not_null",
+        source_not_null,
     )
+    _assert_named_answer_value(
+        exchange.result.answer,
+        "target_not_null",
+        target_not_null,
+    )
+    _assert_agentic_answer_uses_complete_evidence(exchange)
     _assert_exact_column_pair_was_read(
         exchange,
         file_id=file_id,
@@ -3512,64 +3702,28 @@ def _assert_nullable_paraphrase(
         target_table=target_table,
         target_field=target_field,
     )
-
-    from agents.sql_risk_scope_contract import (
-        sql_risk_scope_evidence_architecture,
+    assert exchange.metrics.sql_risk_operation is None, (
+        exchange.metrics.sql_risk_operation
     )
-
-    if sql_risk_scope_evidence_architecture() != "typed_plan":
-        _assert_sql_risk_aspect(
-            exchange,
-            "constraint_rejection",
-            expected_execution_mode="nullable_constraint",
-        )
-        return
-
-    assert sorted(_tool_names(exchange)) == sorted(
-        ["read_s2t_source_to_target", "get_source_target_column_pair"]
-    ), exchange.metrics.tool_calls
-    matching_facts = [
-        fact
-        for fact in exchange.metrics.sql_risk_facts
-        if int(fact.get("file_id") or 0) == file_id
-        and str(fact.get("source_table") or "").casefold()
-        == source_table.casefold()
-        and str(fact.get("source_field") or "").casefold()
-        == source_field.casefold()
-        and str(fact.get("target_table") or "").casefold()
-        == target_table.casefold()
-        and str(fact.get("target_field") or "").casefold()
-        == target_field.casefold()
+    routed_steps = [
+        step
+        for step in exchange.metrics.coordinator_plan
+        if str(step.get("pipeline") or "") == "agentic"
     ]
-    assert len(matching_facts) == 1, exchange.metrics.sql_risk_facts
-    fact = matching_facts[0]
-    assert fact.get("source_not_null") == source_not_null, fact
-    assert fact.get("target_not_null") == target_not_null, fact
-    expected = {
-        (0, 1): (
-            "conditional_rejection_risk",
-            "nullable_source_to_not_null_target",
-        ),
-        (0, 0): ("nullable_mismatch_not_detected", "target_allows_null"),
-        (1, 0): ("nullable_mismatch_not_detected", "target_allows_null"),
-        (1, 1): ("nullable_mismatch_not_detected", "both_not_null"),
-    }[(source_not_null, target_not_null)]
-    assert (fact.get("conclusion"), fact.get("mechanism")) == expected, fact
-    upstream = exchange.metrics.upstream_output
-    assert upstream is not None, exchange.metrics
-    assert upstream.get("answer_source") == (
-        "deterministic_constraint_rejection"
-    ), upstream
-    used_ids = set(upstream.get("used_evidence_ids") or [])
-    assert len(used_ids) == 2, upstream
-    assert set(fact.get("evidence_ids") or []) == used_ids, fact
-    assert list(upstream.get("display_evidence_ids") or []) == [], upstream
-    assert exchange.metrics.display_tools == [], exchange.metrics.display_tools
-    _assert_no_typed_plan_or_upstream_llm(exchange)
-    _assert_sql_risk_aspect(
+    assert routed_steps, exchange.metrics.coordinator_plan
+    assert all(
+        "Совместимость колонок" in (step.get("operation_skills") or [])
+        and list(step.get("sql_risk_aspects") or []) == []
+        for step in routed_steps
+    ), routed_steps
+    assert any(
+        item.stage == "downstream_plan"
+        for item in exchange.metrics.llm_calls
+    ), exchange.metrics.llm_calls
+    _assert_s2t_work_case_execution(
         exchange,
-        "constraint_rejection",
-        expected_execution_mode="nullable_constraint",
+        required_tools={"get_source_target_column_pair"},
+        require_analysis=True,
     )
 
 
@@ -3701,17 +3855,72 @@ def test_live_agent_checks_unmapped_required_target_fields(live_chat_client):
             (file_id,),
         )[0]
     )
+    conn = db_storage.get_db_connection()
+    try:
+        mandatory_fields = sorted(
+            {
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT column_name
+                    FROM target_columns
+                    WHERE file_id = ?
+                      AND table_name = ? COLLATE NOCASE
+                      AND not_null = 1
+                      AND column_name IS NOT NULL
+                      AND TRIM(column_name) <> ''
+                    """,
+                    (file_id, target_table),
+                ).fetchall()
+            },
+            key=str.casefold,
+        )
+        mapped_fields = {
+            str(row[0]).casefold()
+            for row in conn.execute(
+                """
+                SELECT target_field
+                FROM s2t_transformations
+                WHERE target_table = ? COLLATE NOCASE
+                  AND target_field IS NOT NULL
+                  AND TRIM(target_field) <> ''
+                """,
+                (target_table,),
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    unmapped_required = [
+        field
+        for field in mandatory_fields
+        if field.casefold() not in mapped_fields
+    ]
     exchange = _chat(
         live_chat_client,
         f"Для файла {filename!r} найди обязательные поля {target_table} без "
         "сохранённого S2T-маппинга. Верни "
         "mandatory_fields_count=<число>, "
         "mandatory_fields_without_mapping_count=<число> и имена полей без "
-        "маппинга.",
+        "маппинга как fields_without_mapping=<JSON-массив>.",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
+    _assert_named_answer_value(
+        result.answer,
+        "mandatory_fields_count",
+        len(mandatory_fields),
+    )
+    _assert_named_answer_value(
+        result.answer,
+        "mandatory_fields_without_mapping_count",
+        len(unmapped_required),
+    )
+    _assert_named_answer_list(
+        result.answer,
+        "fields_without_mapping",
+        unmapped_required,
+    )
     _assert_s2t_work_case_execution(
         exchange,
         required_tools=(
@@ -3736,102 +3945,181 @@ def test_live_agent_checks_row_loss_risk(live_chat_client):
     result = exchange.result
 
     _assert_public_answer(result.answer)
-    _assert_agentic_answer_uses_complete_evidence(exchange)
+    scope_pipeline = _sql_risk_operation_scope_enabled()
+    if scope_pipeline:
+        _assert_sql_risk_aspect(
+            exchange,
+            "row_filtering",
+            expected_execution_mode="row_filtering",
+        )
+    else:
+        _assert_agentic_answer_uses_complete_evidence(exchange)
     exact_calls = _assert_exact_s2t_pair_was_read(
         exchange,
         source_table=case.source_table,
         target_table=case.target_table,
     )
-    from agents.transformation_ast import normalize_transformation
+    from agents.transformation_ast import quote_dollar_schemas
 
-    normalized = normalize_transformation(case.transformation_rule)
-    assert normalized.parse_status == "ok" and normalized.filters, normalized
-    if _typed_sql_risk_enabled():
+    statement = sqlglot.parse_one(
+        quote_dollar_schemas(case.transformation_rule),
+        read=GREENPLUM_DIALECT,
+    )
+    expected_filter_predicates = {
+        clause.this.sql(dialect=GREENPLUM_DIALECT).casefold()
+        for clause_type in (
+            sqlglot.exp.Where,
+            sqlglot.exp.Having,
+            sqlglot.exp.Qualify,
+        )
+        for clause in statement.find_all(clause_type)
+    }
+    assert expected_filter_predicates, statement
+    if scope_pipeline or _sql_risk_aspects_enabled():
         assert len(exact_calls) == 1, exact_calls
         assert _tool_names(exchange) == ["read_s2t_source_to_target"], (
             exchange.metrics.tool_calls
         )
+    if scope_pipeline:
+        upstream = exchange.metrics.upstream_output
+        assert upstream is not None
+        assert upstream.get("answer_source") == "sql_risk_scope_llm"
+        assert set(upstream.get("display_evidence_ids") or []).issubset(
+            set(upstream.get("used_evidence_ids") or [])
+        )
+        operation = exchange.metrics.sql_risk_operation or {}
+        assessment = dict(operation.get("assessment") or {})
+        assert assessment.get("outcome") == "risk_present", assessment
+        _assert_scope_has_no_agentic_llm_stages(exchange)
     _assert_s2t_work_case_execution(
         exchange,
         required_tools={"read_s2t_source_to_target"},
         require_analysis=True,
     )
-    _assert_sql_risk_aspect(exchange, "row_filtering")
+    if not scope_pipeline:
+        _assert_sql_risk_aspect(exchange, "row_filtering")
 
 
 @pytest.mark.live_validation
 def test_live_agent_checks_value_change_risk(live_chat_client):
     _require_live_semantic_judge()
     case = _protocol_live_case(
-        expression=True,
-        min_mapped_fields=2,
-        require_direct_selected_field=True,
-        require_expression_on_other_field=True,
+        require_explicit_selected_projection=True,
+        require_non_column_selected_projection=True,
     )
     exchange = _chat(
         live_chat_client,
-        "Оцени только SQL-аспект value changes: может ли "
-        f"сохранённая S2T-трансформация {case.source_table}.{case.source_field} "
-        f"→ {case.target_table}.{case.target_field} изменить значение? Остальные "
-        "SQL-риски не анализируй.",
+        "Проверь только возможность изменения значения в сохранённой "
+        f"S2T-паре {case.source_table}.{case.source_field} → "
+        f"{case.target_table}.{case.target_field}. Может ли вычисление "
+        "целевого поля изменить исходное значение? Остальные SQL-риски "
+        "не анализируй.",
     )
 
     _assert_public_answer(exchange.result.answer)
+    scope_pipeline = _sql_risk_operation_scope_enabled()
+    if scope_pipeline:
+        _assert_sql_risk_aspect(
+            exchange,
+            "value_changes",
+            expected_execution_mode="value_changes",
+        )
+    else:
+        _assert_agentic_answer_uses_complete_evidence(exchange)
     _assert_s2t_work_case_execution(
         exchange,
         required_tools=(
-            {"read_s2t_source_to_target"}
+            {
+                "list_s2t_field_mapping"
+                if scope_pipeline
+                else "read_s2t_source_to_target"
+            }
             if STRICT_RETRIEVAL_ENABLED
             else None
         ),
         require_analysis=True,
     )
-    _assert_sql_risk_aspect(exchange, "value_changes")
+    if not scope_pipeline:
+        _assert_sql_risk_aspect(exchange, "value_changes")
+    exact_reader_name = (
+        "list_s2t_field_mapping"
+        if scope_pipeline
+        else "read_s2t_source_to_target"
+    )
     exact_reads = [
         item
         for item in exchange.metrics.tool_calls
-        if item.name == "read_s2t_source_to_target"
+        if item.name == exact_reader_name
     ]
     assert len(exact_reads) == 1, exchange.metrics.tool_calls
     assert len(exchange.metrics.tool_calls) == 1, exchange.metrics.tool_calls
-    assert exact_reads[0].arguments == {
+    expected_arguments = {
         "source_table": case.source_table,
         "target_table": case.target_table,
     }
-    latest_fact_cycle = max(
+    if scope_pipeline:
+        expected_arguments.update(
+            {
+                "source_field": case.source_field,
+                "target_field": case.target_field,
+            }
+        )
+    assert exact_reads[0].arguments == expected_arguments
+    from agents.transformation_ast import normalize_transformation
+
+    normalized = normalize_transformation(case.transformation_rule)
+    target_expression = next(
         (
-            int(fact.get("cycle") or 0)
-            for fact in exchange.metrics.sql_risk_facts
+            value
+            for name, value in normalized.projections.items()
+            if name.casefold() == case.target_field.casefold()
         ),
-        default=0,
+        None,
     )
-    matching_facts = [
-        fact
-        for fact in exchange.metrics.sql_risk_facts
-        if int(fact.get("cycle") or 0) == latest_fact_cycle
-        if str(fact.get("source_table") or "").casefold()
-        == case.source_table.casefold()
-        and str(fact.get("source_field") or "").casefold()
-        == case.source_field.casefold()
-        and str(fact.get("target_table") or "").casefold()
-        == case.target_table.casefold()
-        and str(fact.get("target_field") or "").casefold()
-        == case.target_field.casefold()
-    ]
-    assert len(matching_facts) == 1, exchange.metrics.sql_risk_facts
-    assert matching_facts[0]["conclusion"] == "not_detected"
-    assert matching_facts[0]["mechanism"] == "direct_column"
+    assert target_expression, normalized
+    parsed_projection = sqlglot.parse_one(
+        target_expression,
+        read=GREENPLUM_DIALECT,
+    )
+    assert not isinstance(
+        parsed_projection,
+        sqlglot.exp.Column,
+    ), parsed_projection
+    folded_answer = exchange.result.answer.casefold()
     assert exchange.metrics.upstream_output is not None
-    assert exchange.metrics.upstream_output.get("answer_source") == (
-        "model"
-    )
-    assert len(
-        [
-            item
-            for item in exchange.metrics.llm_calls
-            if item.stage == "upstream"
-        ]
-    ) >= 2, exchange.metrics.llm_calls
+    if scope_pipeline:
+        assert exchange.metrics.upstream_output.get("answer_source") == (
+            "sql_risk_scope_llm"
+        )
+        assert set(
+            exchange.metrics.upstream_output.get("display_evidence_ids") or []
+        ).issubset(
+            set(
+                exchange.metrics.upstream_output.get("used_evidence_ids")
+                or []
+            )
+        )
+        operation = exchange.metrics.sql_risk_operation or {}
+        assessment = dict(operation.get("assessment") or {})
+        assert assessment.get("outcome") == "risk_present", assessment
+        _assert_scope_has_no_agentic_llm_stages(exchange)
+    else:
+        assert (
+            f"{case.source_table}.{case.source_field}".casefold()
+            in folded_answer
+        ), exchange.result.answer
+        assert (
+            f"{case.target_table}.{case.target_field}".casefold()
+            in folded_answer
+        ), exchange.result.answer
+        assert exchange.metrics.upstream_output.get("answer_source") == "model"
+        assert len(
+            [
+                item
+                for item in exchange.metrics.llm_calls
+                if item.stage == "upstream"
+            ]
+        ) >= 2, exchange.metrics.llm_calls
 
 
 @pytest.mark.live_validation
@@ -3847,6 +4135,15 @@ def test_live_agent_checks_write_semantics_risk(live_chat_client):
     )
 
     _assert_public_answer(exchange.result.answer)
+    scope_pipeline = _sql_risk_operation_scope_enabled()
+    if scope_pipeline:
+        _assert_sql_risk_aspect(
+            exchange,
+            "write_semantics",
+            expected_execution_mode="write_semantics",
+        )
+    else:
+        _assert_agentic_answer_uses_complete_evidence(exchange)
     _assert_s2t_work_case_execution(
         exchange,
         required_tools=(
@@ -3856,7 +4153,8 @@ def test_live_agent_checks_write_semantics_risk(live_chat_client):
         ),
         require_analysis=True,
     )
-    _assert_sql_risk_aspect(exchange, "write_semantics")
+    if not scope_pipeline:
+        _assert_sql_risk_aspect(exchange, "write_semantics")
     exact_reads = [
         item
         for item in exchange.metrics.tool_calls
@@ -3868,56 +4166,52 @@ def test_live_agent_checks_write_semantics_risk(live_chat_client):
         "source_table": source_table,
         "target_table": target_table,
     }
-    assert {
-        int(step.get("cycle") or 0)
-        for step in exchange.metrics.coordinator_plan
-    } == {1}, exchange.metrics.coordinator_plan
-    write_facts = [
-        fact
-        for fact in exchange.metrics.sql_risk_facts
-        if int(fact.get("cycle") or 0) == 1
-        and str(fact.get("source_table") or "").casefold()
-        == source_table.casefold()
-        and str(fact.get("target_table") or "").casefold()
-        == target_table.casefold()
-    ]
-    assert len(write_facts) == 1, exchange.metrics.sql_risk_facts
-    assert write_facts[0]["conclusion"] == "not_assessed"
-    assert write_facts[0]["mechanism"] == "write_statement_absent"
     assert exchange.metrics.upstream_output is not None
-    assert exchange.metrics.upstream_output.get("answer_source") == (
-        "model"
-    )
-    assert len(
-        [
-            item
-            for item in exchange.metrics.llm_calls
-            if item.stage == "upstream"
-        ]
-    ) >= 2, exchange.metrics.llm_calls
+    if scope_pipeline:
+        assert exchange.metrics.upstream_output.get("answer_source") == (
+            "sql_risk_scope_llm"
+        )
+        assert set(
+            exchange.metrics.upstream_output.get("display_evidence_ids") or []
+        ).issubset(
+            set(
+                exchange.metrics.upstream_output.get("used_evidence_ids")
+                or []
+            )
+        )
+        operation = exchange.metrics.sql_risk_operation or {}
+        assessment = dict(operation.get("assessment") or {})
+        assert assessment.get("outcome") == "not_assessed", assessment
+        assert assessment.get("limitations"), assessment
+        _assert_scope_has_no_agentic_llm_stages(exchange)
+    else:
+        assert {
+            int(step.get("cycle") or 0)
+            for step in exchange.metrics.coordinator_plan
+        } == {1}, exchange.metrics.coordinator_plan
+        assert exchange.metrics.upstream_output.get("answer_source") == "model"
+        assert len(
+            [
+                item
+                for item in exchange.metrics.llm_calls
+                if item.stage == "upstream"
+            ]
+        ) >= 2, exchange.metrics.llm_calls
 
 
 @pytest.mark.live_validation
 def test_live_agent_explains_table_transformation(live_chat_client):
-    _, target_table, source_table, target_field, source_field = (
-        _s2t_work_case_fixture()
+    case = _protocol_live_case(
+        require_join=True,
+        require_effective_join_predicate=True,
+        require_filter=True,
+        require_explicit_selected_projection=True,
     )
-    transformation_rule = str(
-        _fetch_one(
-            """
-            SELECT transformation_rule
-            FROM s2t_transformations
-            WHERE source_table = ? COLLATE NOCASE
-              AND source_field = ? COLLATE NOCASE
-              AND target_table = ? COLLATE NOCASE
-              AND target_field = ? COLLATE NOCASE
-              AND NULLIF(TRIM(transformation_rule), '') IS NOT NULL
-            ORDER BY id
-            LIMIT 1
-            """,
-            (source_table, source_field, target_table, target_field),
-        )[0]
-    )
+    target_table = case.target_table
+    source_table = case.source_table
+    target_field = case.target_field
+    source_field = case.source_field
+    transformation_rule = case.transformation_rule
     from agents.transformation_ast import normalize_transformation
 
     normalized = normalize_transformation(transformation_rule)
@@ -3932,48 +4226,57 @@ def test_live_agent_explains_table_transformation(live_chat_client):
     )
     assert selected_expression, normalized
     assert normalized.joins and normalized.filters, normalized
+    effective_join_predicate = next(
+        (
+            effective
+            for join in normalized.joins
+            if join.condition
+            if (effective := _effective_predicate_sql(join.condition))
+        ),
+        None,
+    )
+    effective_filter_predicate = next(
+        (
+            effective
+            for predicate in normalized.filters
+            if (effective := _effective_predicate_sql(predicate))
+        ),
+        None,
+    )
+    assert effective_join_predicate, normalized
+    assert effective_filter_predicate, normalized
     exchange = _chat(
         live_chat_client,
         f"Объясни сохранённую S2T-трансформацию "
         f"{source_table}.{source_field} → {target_table}.{target_field}. "
-        "Дословно укажи три значения из сохранённого SQL: "
-        "selected_projection=<выражение AS target_field>, "
-        "join_predicate=<условие JOIN>, filter_predicate=<условие WHERE>. "
-        "Не приписывай выбранному полю выражения других target-полей.",
+        "Укажи три нормализованных эффективных значения из сохранённого SQL; "
+        "служебные тождества TRUE и 1=1 не включай. Не приписывай выбранному "
+        "полю выражения других target-полей. Формат без дополнительных "
+        "пояснений, каждое значение на отдельной строке:\n"
+        "selected_projection=<выражение AS target_field>\n"
+        "join_predicate=<условие JOIN>\n"
+        "filter_predicate=<условие WHERE>",
     )
     result = exchange.result
 
     _assert_public_answer(result.answer)
-    folded_answer = re.sub(
-        r"\s+",
-        " ",
-        re.sub(r"[`\"']", "", result.answer),
-    ).casefold()
-    assert f"{source_table}.{source_field}".casefold() in folded_answer, result.answer
-    assert f"{target_table}.{target_field}".casefold() in folded_answer, result.answer
-
     expected_values = {
         "selected_projection": f"{selected_expression} AS {target_field}",
-        "join_predicate": normalized.joins[0].condition,
-        "filter_predicate": normalized.filters[0],
+        "join_predicate": effective_join_predicate,
+        "filter_predicate": effective_filter_predicate,
     }
+    actual_values = _extract_named_sql_values(
+        result.answer,
+        tuple(expected_values),
+    )
     for name, expected in expected_values.items():
-        compact_expected = re.sub(r"\s+", " ", expected).casefold()
-        assert re.search(
-            rf"(?<!\w){name}\s*[:=]\s*{re.escape(compact_expected)}(?!\w)",
-            folded_answer,
-        ), {
-            "missing": f"{name}={expected}",
+        actual = actual_values[name]
+        assert _canonical_sql_ast(actual) == _canonical_sql_ast(expected), {
+            "name": name,
+            "expected": expected,
+            "actual": actual,
             "answer": result.answer,
         }
-    if "coalesce" in folded_answer and "coalesce" not in str(
-        selected_expression
-    ).casefold():
-        coalesce_at = folded_answer.index("coalesce")
-        assert "value" in folded_answer[
-            max(0, coalesce_at - 120) : coalesce_at + 240
-        ], result.answer
-
     _assert_agentic_answer_uses_complete_evidence(exchange)
     exact_calls = _assert_exact_s2t_pair_was_read(
         exchange,
@@ -5060,24 +5363,20 @@ def test_live_validation_protocol_source_catalog_dependency(live_chat_client):
 @pytest.mark.live_resolution
 @pytest.mark.skipif(
     LIVE_AGENT_MODE != "multiagent",
-    reason="scenario verifies the multiagent entity resolver",
+    reason="scenario verifies model-owned agentic candidate selection",
 )
 def test_live_agent_resolves_table_typo_before_exact_reader(live_chat_client):
     mention, canonical = _unique_typo_case("target")
     exchange = _chat(
         live_chat_client,
         f"Покажи сохранённые S2T mappings для target table {mention!r}. "
-        "В имени опечатка: сначала разреши её, затем используй exact reader.",
+        "В имени опечатка: сначала прочитай кандидатов обычным read-only "
+        "инструментом, самостоятельно выбери подтверждённое имя, затем "
+        "используй exact reader; автоматический fuzzy resolver не используй.",
     )
 
     _assert_agentic_pipeline(exchange)
-    _assert_resolved_event(
-        exchange,
-        mention=mention,
-        role="target",
-        canonical=canonical,
-        method="fuzzy",
-    )
+    _assert_model_owned_table_candidate_retrieval(exchange)
     _assert_exact_reader_uses_canonical(
         exchange,
         canonical=canonical,
@@ -5090,7 +5389,7 @@ def test_live_agent_resolves_table_typo_before_exact_reader(live_chat_client):
 @pytest.mark.live_resolution
 @pytest.mark.skipif(
     LIVE_AGENT_MODE != "multiagent",
-    reason="scenario verifies the multiagent entity resolver",
+    reason="scenario verifies exact agentic reads need no resolver",
 )
 def test_live_agent_skips_resolution_for_exact_table(live_chat_client):
     canonical = _role_table_names("target")[0]
@@ -5118,24 +5417,20 @@ def test_live_agent_skips_resolution_for_exact_table(live_chat_client):
 @pytest.mark.live_resolution
 @pytest.mark.skipif(
     LIVE_AGENT_MODE != "multiagent",
-    reason="scenario verifies the multiagent entity resolver",
+    reason="scenario verifies model-owned agentic candidate selection",
 )
 def test_live_agent_resolves_partial_table_name(live_chat_client):
     mention, canonical = _unique_partial_case("source")
     exchange = _chat(
         live_chat_client,
         f"Покажи сохранённые S2T mappings для неполного source table mention "
-        f"{mention!r}; сначала разреши каноническое имя, затем вызови exact reader.",
+        f"{mention!r}; сначала прочитай кандидатов обычным read-only "
+        "инструментом, самостоятельно выбери подтверждённое имя, затем "
+        "вызови exact reader; автоматический resolver не используй.",
     )
 
     _assert_agentic_pipeline(exchange)
-    _assert_resolved_event(
-        exchange,
-        mention=mention,
-        role="source",
-        canonical=canonical,
-        method="partial",
-    )
+    _assert_model_owned_table_candidate_retrieval(exchange)
     _assert_exact_reader_uses_canonical(
         exchange,
         canonical=canonical,
@@ -5148,7 +5443,7 @@ def test_live_agent_resolves_partial_table_name(live_chat_client):
 @pytest.mark.live_resolution
 @pytest.mark.skipif(
     LIVE_AGENT_MODE != "multiagent",
-    reason="scenario verifies the multiagent entity resolver",
+    reason="scenario verifies semantic retrieval without an agentic resolver",
 )
 def test_live_agent_resolves_semantic_table_mention(live_chat_client):
     canonical, description = _semantic_table_case("target")
@@ -5160,18 +5455,7 @@ def test_live_agent_resolves_semantic_table_mention(live_chat_client):
     )
 
     _assert_agentic_pipeline(exchange)
-    semantic_events = [
-        event
-        for event in _resolution_events(exchange)
-        if event.get("role") == "target" and event.get("method") == "semantic"
-    ]
-    assert semantic_events, _resolution_events(exchange)
-    event = semantic_events[-1]
-    assert event.get("status") == "resolved", event
-    assert str(event.get("canonical_name") or "").casefold() == canonical.casefold(), event
-    assert event["candidate_set"].get("coverage") in {"complete", "truncated"}, event
-    assert event["candidate_set"].get("source") == "semantic_search_descriptions", event
-    assert "resolve_entities" in _tool_names(exchange)
+    assert "semantic_search_descriptions" in _tool_names(exchange)
     _assert_exact_reader_uses_canonical(
         exchange,
         canonical=canonical,
@@ -5259,7 +5543,7 @@ def test_live_agent_batches_all_semantic_candidates_into_s2t_search(
 @pytest.mark.live_resolution
 @pytest.mark.skipif(
     LIVE_AGENT_MODE != "multiagent",
-    reason="scenario verifies the multiagent entity resolver",
+    reason="scenario verifies explicit ambiguity without an agentic resolver",
 )
 def test_live_agent_does_not_guess_ambiguous_entity(live_chat_client):
     mention, expected_candidates = _ambiguous_partial_case("source")
@@ -5270,14 +5554,7 @@ def test_live_agent_does_not_guess_ambiguous_entity(live_chat_client):
     )
 
     _assert_agentic_pipeline(exchange)
-    event = _resolution_event(exchange, mention=mention, role="source")
-    assert event.get("status") == "ambiguous", event
-    assert event.get("canonical_name") in {None, ""}, event
-    actual_candidates = _candidate_names(event)
-    assert len(actual_candidates) >= 2, event
-    assert {name.casefold() for name in expected_candidates} <= {
-        name.casefold() for name in actual_candidates
-    }, event
+    _assert_model_owned_table_candidate_retrieval(exchange)
     exact_arguments = json.dumps(
         [
             item.arguments
@@ -5294,7 +5571,7 @@ def test_live_agent_does_not_guess_ambiguous_entity(live_chat_client):
 @pytest.mark.live_resolution
 @pytest.mark.skipif(
     LIVE_AGENT_MODE != "multiagent",
-    reason="scenario verifies the multiagent entity resolver",
+    reason="scenario verifies model-owned role-aware candidate selection",
 )
 def test_live_entity_resolution_preserves_source_target_role(live_chat_client):
     source_mention, source = _unique_typo_case("source")
@@ -5307,28 +5584,7 @@ def test_live_entity_resolution_preserves_source_target_role(live_chat_client):
     )
 
     _assert_agentic_pipeline(exchange)
-    source_event = _assert_resolved_event(
-        exchange,
-        mention=source_mention,
-        role="source",
-        canonical=source,
-        method="fuzzy",
-    )
-    target_event = _assert_resolved_event(
-        exchange,
-        mention=target_mention,
-        role="target",
-        canonical=target,
-        method="fuzzy",
-    )
-    assert all(
-        candidate.get("role") == "source"
-        for candidate in source_event["candidate_set"]["candidates"]
-    ), source_event
-    assert all(
-        candidate.get("role") == "target"
-        for candidate in target_event["candidate_set"]["candidates"]
-    ), target_event
+    _assert_model_owned_table_candidate_retrieval(exchange)
     _assert_exact_reader_uses_canonical(
         exchange,
         canonical=source,
@@ -5345,7 +5601,7 @@ def test_live_entity_resolution_preserves_source_target_role(live_chat_client):
 @pytest.mark.live_resolution
 @pytest.mark.skipif(
     LIVE_AGENT_MODE != "multiagent",
-    reason="scenario verifies shared validation/agentic resolution semantics",
+    reason="scenario verifies resolver isolation to validation",
 )
 def test_live_validation_and_agentic_use_same_resolution_semantics(live_chat_client):
     mention, canonical = _unique_typo_case("target")
@@ -5369,7 +5625,8 @@ def test_live_validation_and_agentic_use_same_resolution_semantics(live_chat_cli
     agentic_exchange = _chat(
         live_chat_client,
         f"Покажи S2T mappings для target table mention {mention!r}; в имени "
-        "опечатка, поэтому разреши его перед exact reader.",
+        "опечатка, поэтому прочитай кандидатов обычным read-only инструментом, "
+        "выбери подтверждённое имя моделью и затем используй exact reader.",
     )
 
     _assert_validation_pipeline(validation_exchange)
@@ -5379,18 +5636,17 @@ def test_live_validation_and_agentic_use_same_resolution_semantics(live_chat_cli
         mention=mention,
         role="target",
     )
-    agentic_event = _resolution_event(
+    assert validation_event.get("status") == "resolved", validation_event
+    assert validation_event.get("method") == "fuzzy", validation_event
+    assert (
+        str(validation_event.get("canonical_name") or "").casefold()
+        == canonical.casefold()
+    ), validation_event
+    _assert_model_owned_table_candidate_retrieval(agentic_exchange)
+    _assert_exact_reader_uses_canonical(
         agentic_exchange,
-        mention=mention,
+        canonical=canonical,
         role="target",
+        rejected_mention=mention,
     )
-    for event in (validation_event, agentic_event):
-        assert event.get("status") == "resolved", event
-        assert event.get("method") == "fuzzy", event
-        assert str(event.get("canonical_name") or "").casefold() == canonical.casefold(), event
-    assert {
-        name.casefold() for name in _candidate_names(validation_event)
-    } == {
-        name.casefold() for name in _candidate_names(agentic_event)
-    }
     _assert_no_worker_reroute(agentic_exchange)

@@ -69,7 +69,7 @@ def test_dry_run_never_starts_live_benchmark(monkeypatch, capsys):
     assert "E4/dependency_readers: 2 scenarios" in capsys.readouterr().out
 
 
-def test_experiment_loads_dotenv_before_resolving_ultra_model(
+def test_experiment_loads_dotenv_before_resolving_model(
     monkeypatch,
     tmp_path,
 ):
@@ -80,9 +80,6 @@ def test_experiment_loads_dotenv_before_resolving_ultra_model(
     def fake_load_dotenv(path, *, override):
         events.append(("dotenv", path, override))
         monkeypatch.setenv("MODEL", "GigaChat-3-Ultra")
-
-    def fake_guard(**kwargs):
-        events.append(("guard", kwargs["model"]))
 
     def fake_run_mode(**kwargs):
         events.append(("run", kwargs["model"]))
@@ -95,7 +92,6 @@ def test_experiment_loads_dotenv_before_resolving_ultra_model(
         )
 
     monkeypatch.setattr(experiments, "load_dotenv", fake_load_dotenv)
-    monkeypatch.setattr(experiments, "guard_ultra_budget", fake_guard)
     monkeypatch.setattr(experiments, "_run_mode", fake_run_mode)
     monkeypatch.setattr(experiments, "_write_report", lambda *args, **kwargs: None)
 
@@ -111,92 +107,7 @@ def test_experiment_loads_dotenv_before_resolving_ultra_model(
     ) == 0
 
     assert events[0] == ("dotenv", experiments.PROJECT_ROOT / ".env", False)
-    assert events[1:] == [
-        ("guard", "GigaChat-3-Ultra"),
-        ("run", "GigaChat-3-Ultra"),
-        ("guard", "GigaChat-3-Ultra"),
-    ]
-
-
-def test_experiment_ultra_reserve_counts_http_exchanges(monkeypatch, tmp_path):
-    reserved: list[int] = []
-
-    def record_guard(**kwargs):
-        reserved.append(kwargs["reserved_tokens"])
-
-    monkeypatch.setattr(experiments, "guard_ultra_budget", record_guard)
-    monkeypatch.setattr(
-        experiments,
-        "_run_mode",
-        lambda **kwargs: ModeResult(
-            mode=kwargs["mode"],
-            return_code=0,
-            transcript_path=tmp_path / "trace.md",
-            junit_path=tmp_path / "junit.xml",
-            passed=1,
-        ),
-    )
-    monkeypatch.setattr(experiments, "_write_report", lambda *args, **kwargs: None)
-
-    assert experiments.main(
-        [
-            "--experiment",
-            "E5",
-            "--provider",
-            "gigachat",
-            "--model",
-            "GigaChat-3-Ultra",
-            "--output-dir",
-            str(tmp_path),
-        ]
-    ) == 0
-
-    assert reserved == [12 * 250_000, 0]
-
-
-def test_experiment_guards_ultra_judge_for_remaining_matrix(
-    monkeypatch,
-    tmp_path,
-):
-    guarded = []
-    monkeypatch.setenv("LLM_JUDGE_MODEL", "GigaChat-3-Ultra")
-    monkeypatch.delenv("GIGACHAT_JUDGE_MODEL", raising=False)
-
-    def record_guard(**kwargs):
-        guarded.append((kwargs["model"], kwargs["reserved_tokens"]))
-
-    monkeypatch.setattr(experiments, "guard_ultra_budget", record_guard)
-    monkeypatch.setattr(
-        experiments,
-        "_run_mode",
-        lambda **kwargs: ModeResult(
-            mode=kwargs["mode"],
-            return_code=0,
-            transcript_path=tmp_path / "trace.md",
-            junit_path=tmp_path / "junit.xml",
-            passed=1,
-        ),
-    )
-    monkeypatch.setattr(experiments, "_write_report", lambda *args, **kwargs: None)
-
-    assert experiments.main(
-        [
-            "--experiment",
-            "E4",
-            "--provider",
-            "gigachat",
-            "--model",
-            "GigaChat-2-Pro",
-            "--llm-judge",
-            "--output-dir",
-            str(tmp_path),
-        ]
-    ) == 0
-
-    assert guarded == [
-        ("GigaChat-3-Ultra", 2 * 6 * 250_000),
-        ("GigaChat-3-Ultra", 0),
-    ]
+    assert events[1:] == [("run", "GigaChat-3-Ultra")]
 
 
 def test_skipped_experiment_is_reported_as_incomplete(monkeypatch, tmp_path):
@@ -263,65 +174,3 @@ def test_report_contains_accuracy_and_efficiency_signals(tmp_path: Path):
     assert "Tool errors" in text
     assert "Reader calls" in text
     assert "| E4 | dependency_readers |" in text
-
-
-def test_ultra_guard_runs_before_any_variant(monkeypatch):
-    events: list[str] = []
-
-    def reject(**_kwargs):
-        events.append("guard")
-        raise experiments.UltraBudgetError("below floor")
-
-    monkeypatch.setattr(experiments, "guard_ultra_budget", reject)
-    monkeypatch.setattr(
-        experiments,
-        "_run_mode",
-        lambda **_kwargs: events.append("run"),
-    )
-
-    with pytest.raises(SystemExit) as exc_info:
-        experiments.main(
-            [
-                "--experiment",
-                "E4",
-                "--provider",
-                "gigachat",
-                "--model",
-                "GigaChat-3-Ultra",
-            ]
-        )
-
-    assert exc_info.value.code == 2
-    assert events == ["guard"]
-
-
-def test_ultra_judge_guard_fails_closed_before_any_variant(monkeypatch):
-    events: list[str] = []
-    monkeypatch.setenv("GIGACHAT_JUDGE_MODEL", "GigaChat-3-Ultra")
-
-    def reject(**_kwargs):
-        events.append("guard")
-        raise experiments.UltraBudgetError("judge below floor")
-
-    monkeypatch.setattr(experiments, "guard_ultra_budget", reject)
-    monkeypatch.setattr(
-        experiments,
-        "_run_mode",
-        lambda **_kwargs: events.append("run"),
-    )
-
-    with pytest.raises(SystemExit) as exc_info:
-        experiments.main(
-            [
-                "--experiment",
-                "E4",
-                "--provider",
-                "gigachat",
-                "--model",
-                "GigaChat-2-Pro",
-                "--llm-judge",
-            ]
-        )
-
-    assert exc_info.value.code == 2
-    assert events == ["guard"]

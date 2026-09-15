@@ -53,29 +53,6 @@ class NormalizedTransformation(BaseModel):
     error: Optional[str] = None
 
 
-class FieldValueChangeAnalysis(BaseModel):
-    """Field-scoped value semantics derived from one outer SQL projection."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    source_field: str
-    target_field: str
-    status: Literal[
-        "direct_projection",
-        "value_expression",
-        "different_source_column",
-        "source_provenance_unknown",
-        "target_projection_missing",
-        "ambiguous_target_projection",
-        "set_operation_unsupported",
-        "parse_error",
-    ]
-    may_change_value: Optional[bool] = None
-    target_expression: Optional[str] = None
-    source_columns: List[str] = Field(default_factory=list)
-    expression_kind: Optional[str] = None
-
-
 def quote_dollar_schemas(sql: str) -> str:
     """Quote project-specific ``$$schema`` names for Greenplum parsing."""
 
@@ -274,136 +251,10 @@ def normalize_transformation(rule: str) -> NormalizedTransformation:
     )
 
 
-def analyze_field_value_change(
-    normalized: NormalizedTransformation,
-    *,
-    source_table: str,
-    source_field: str,
-    target_field: str,
-) -> FieldValueChangeAnalysis:
-    """Classify only the exact target projection for one S2T field pair.
-
-    The classifier is deliberately structural.  It never transfers a function
-    from a neighbouring output alias to the requested target field and it does
-    not claim semantic equivalence for arbitrary expressions.  A plain column
-    with the requested source-field name is the sole ``direct_projection``
-    case; everything else remains an explicit expression or an unavailable
-    assessment.
-    """
-
-    clean_source_table = str(source_table or "").strip()
-    clean_source = str(source_field or "").strip()
-    clean_target = str(target_field or "").strip()
-    if normalized.parse_status != "ok":
-        return FieldValueChangeAnalysis(
-            source_field=clean_source,
-            target_field=clean_target,
-            status="parse_error",
-        )
-    if normalized.has_set_operation:
-        return FieldValueChangeAnalysis(
-            source_field=clean_source,
-            target_field=clean_target,
-            status="set_operation_unsupported",
-        )
-
-    matching = [
-        detail
-        for detail in normalized.projection_details
-        if detail.output_name.casefold() == clean_target.casefold()
-    ]
-    if not matching:
-        return FieldValueChangeAnalysis(
-            source_field=clean_source,
-            target_field=clean_target,
-            status="target_projection_missing",
-        )
-    if len(matching) != 1:
-        return FieldValueChangeAnalysis(
-            source_field=clean_source,
-            target_field=clean_target,
-            status="ambiguous_target_projection",
-        )
-
-    detail = matching[0]
-    try:
-        expression = sqlglot.parse_one(
-            detail.expression,
-            read=GREENPLUM_DIALECT,
-        )
-    except (SqlglotError, TypeError, ValueError):
-        return FieldValueChangeAnalysis(
-            source_field=clean_source,
-            target_field=clean_target,
-            status="parse_error",
-            target_expression=detail.expression,
-            source_columns=list(detail.source_columns),
-        )
-
-    expression_kind = type(expression).__name__
-    if isinstance(expression, exp.Column):
-        qualifier = str(expression.table or "").strip().casefold()
-        aliases = normalized.outer_source_aliases
-        resolved_relation: Optional[str] = None
-        if qualifier:
-            resolved_relation = aliases.get(qualifier)
-        else:
-            relations = set(aliases.values())
-            if len(relations) == 1:
-                resolved_relation = next(iter(relations))
-
-        expected = clean_source_table.casefold()
-        resolved = str(resolved_relation or "").casefold()
-        table_matches = bool(resolved and expected) and (
-            resolved == expected
-            or ("." not in expected and resolved.endswith("." + expected))
-        )
-        if expression.name.casefold() == clean_source.casefold():
-            if table_matches:
-                return FieldValueChangeAnalysis(
-                    source_field=clean_source,
-                    target_field=clean_target,
-                    status="direct_projection",
-                    may_change_value=False,
-                    target_expression=detail.expression,
-                    source_columns=list(detail.source_columns),
-                    expression_kind=expression_kind,
-                )
-            return FieldValueChangeAnalysis(
-                source_field=clean_source,
-                target_field=clean_target,
-                status="source_provenance_unknown",
-                target_expression=detail.expression,
-                source_columns=list(detail.source_columns),
-                expression_kind=expression_kind,
-            )
-        return FieldValueChangeAnalysis(
-            source_field=clean_source,
-            target_field=clean_target,
-            status="different_source_column",
-            may_change_value=True,
-            target_expression=detail.expression,
-            source_columns=list(detail.source_columns),
-            expression_kind=expression_kind,
-        )
-
-    return FieldValueChangeAnalysis(
-        source_field=clean_source,
-        target_field=clean_target,
-        status="value_expression",
-        may_change_value=True,
-        target_expression=detail.expression,
-        source_columns=list(detail.source_columns),
-        expression_kind=expression_kind,
-    )
-
-
 __all__ = [
-    "FieldValueChangeAnalysis",
     "NormalizedJoin",
     "NormalizedProjection",
     "NormalizedTransformation",
-    "analyze_field_value_change",
     "normalize_transformation",
     "quote_dollar_schemas",
 ]

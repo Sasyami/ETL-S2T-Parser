@@ -54,7 +54,14 @@ def _raw(
     file_id: int | None = None,
     file_mention: str | None = None,
 ) -> RawTestProtocolContract:
+    if file_id is not None:
+        file_scope_kind = "file_id"
+    elif file_mention is not None:
+        file_scope_kind = "file_mention"
+    else:
+        file_scope_kind = "not_provided"
     return RawTestProtocolContract(
+        file_scope_kind=file_scope_kind,
         file_id=file_id,
         file_mention=file_mention,
         loads=[

@@ -161,6 +161,9 @@ COMMON_ARM_ENVIRONMENT: Mapping[str, str] = {
     "WORKER_CAPABILITY_REROUTE_EXPERIMENT": "1",
     "WORKER_SPLIT_TOOL_CALL_EXPERIMENT": "0",
     "OPERATION_SQL_RISK_ASPECTS_EXPERIMENT": "1",
+    # The protocol matrix compares prompt-only agentic variants; keep the
+    # separate scope extraction/assessment pipeline outside both arms.
+    "OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT": "0",
     "GIGACHAT_JUDGE_MODEL": MODEL,
     "GIGACHAT_TEMPERATURE": "0",
     "GIGACHAT_TIMEOUT": "180",
@@ -172,7 +175,7 @@ COMMON_ARM_ENVIRONMENT: Mapping[str, str] = {
     "NEO4J_PASSWORD": "",
     "NEO4J_DATABASE": "",
     # Experiment rollback must not leave traces in a separate external system.
-    "LANGFUSE_ENABLED": "false",
+    "LANGFUSE_ENABLED": "0",
 }
 
 
@@ -1065,7 +1068,7 @@ def _write_preregistration(
         "- No candidate is promoted automatically",
         "- Every experiment is rolled back by deleting its fresh no-hardlinks clone and disposable DB copies",
         "- All 20 cells exercise the full model-owned upstream decision and answer path",
-        "- Deterministic SQL-risk facts only supplement evidence; they do not render the final answer or suppress reroute",
+        "- The separate SQL-risk scope pipeline is forced off, so its internal extraction/assessment stages are outside this preregistered population",
         "",
         "## Fixed 20-experiment matrix",
         "",

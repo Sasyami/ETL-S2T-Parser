@@ -1,8 +1,8 @@
-import json
 from copy import deepcopy
 from contextlib import nullcontext
 from unittest.mock import patch
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agents.chat_graph import WorkerDisplayItem, WorkerRunResult
@@ -58,8 +58,16 @@ def _supervisor_patches(model):
     )
 
 
-def _payload(model):
-    return json.loads(model.messages[0][1].content)
+def _conversation(model, invocation_index=0):
+    messages = model.messages[invocation_index]
+    assert isinstance(messages[0], SystemMessage)
+    return [
+        (
+            "user" if isinstance(message, HumanMessage) else "assistant",
+            message.content,
+        )
+        for message in messages[1:]
+    ]
 
 
 def test_supervisor_graph_routes_coordinator_directly_to_end():
@@ -75,6 +83,100 @@ def test_supervisor_graph_routes_coordinator_directly_to_end():
     assert ("__start__", "supervisor") in edges
     assert ("coordinator", "__end__") in edges
     assert ("coordinator", "supervisor") not in edges
+
+
+def test_supervisor_graph_keeps_operation_routing_after_supervisor(
+    monkeypatch,
+):
+    from agents.sql_risk_scope_contract import (
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+    )
+    from agents.supervisor import build_supervisor_graph
+
+    monkeypatch.setenv(
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+        "1",
+    )
+    graph = build_supervisor_graph(_SupervisorModel([]))
+    graph_view = graph.get_graph()
+
+    assert "operation_router" not in graph_view.nodes
+    edges = {(edge.source, edge.target) for edge in graph_view.edges}
+    assert ("__start__", "supervisor") in edges
+    assert ("supervisor", "coordinator") in edges
+    assert ("__start__", "coordinator") not in edges
+
+
+def test_operation_scope_request_still_uses_supervisor_handoff(monkeypatch):
+    from agents.sql_risk_scope_contract import (
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+    )
+    from agents.supervisor import supervisor_chat
+
+    monkeypatch.setenv(
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+        "1",
+    )
+    model = _SupervisorModel([_delegate_message()])
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(
+                answer="JOIN может условно размножить строки.",
+                display_refs=[],
+            ),
+        ) as coordinator,
+    ):
+        result = supervisor_chat(
+            "Оцени cardinality для src_alpha → tgt_beta."
+        )
+
+    assert result.answer == "JOIN может условно размножить строки."
+    assert len(model.messages) == 1
+    assert "верхний supervisor" in model.messages[0][0].content
+    coordinator.assert_called_once()
+    assert coordinator.call_args.args == (
+        "Оцени cardinality для src_alpha → tgt_beta.",
+    )
+    assert coordinator.call_args.kwargs["context"] == ""
+    assert "operation_route" not in coordinator.call_args.kwargs
+
+
+def test_non_scope_request_is_delegated_without_stale_preroute(
+    monkeypatch,
+):
+    from agents.sql_risk_scope_contract import (
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+    )
+    from agents.supervisor import supervisor_chat
+
+    monkeypatch.setenv(
+        OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT_ENV,
+        "1",
+    )
+    model = _SupervisorModel([_delegate_message()])
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(answer="Данные прочитаны."),
+        ) as coordinator,
+    ):
+        result = supervisor_chat("Покажи сохранённые данные")
+
+    assert result.answer == "Данные прочитаны."
+    assert len(model.messages) == 1
+    coordinator.assert_called_once()
+    assert coordinator.call_args.args == ("Покажи сохранённые данные",)
+    assert coordinator.call_args.kwargs["context"] == ""
+    assert "operation_route" not in coordinator.call_args.kwargs
 
 
 def test_supervisor_prompt_keeps_decision_and_handoff_llm_driven():
@@ -121,6 +223,10 @@ def test_supervisor_answers_directly_when_coordinator_is_not_needed():
     assert set(parameters["properties"]) == {"resolved_references", "context"}
     assert parameters["required"] == ["resolved_references", "context"]
     assert parameters["properties"]["context"]["maxLength"] == 4000
+    assert (
+        parameters["properties"]["resolved_references"]["maxLength"]
+        == 4000
+    )
     references_description = parameters["properties"]["resolved_references"][
         "description"
     ]
@@ -165,11 +271,10 @@ def test_supervisor_retries_empty_decision_without_changing_history_payload():
 
     assert result.answer == "Тест-протокол сформирован."
     assert len(model.messages) == 2
-    assert json.loads(model.messages[0][1].content) == {
-        "current_query": "Составь стандартный тест-протокол",
-        "recent_history": history,
-    }
-    assert model.messages[1][1].content == model.messages[0][1].content
+    assert _conversation(model) == [
+        (item["role"], item["content"]) for item in history
+    ] + [("user", "Составь стандартный тест-протокол")]
+    assert _conversation(model, 1) == _conversation(model)
     assert "предыдущий вызов не вернул" in model.messages[1][0].content.lower()
     coordinator.assert_called_once_with(
         "Составь стандартный тест-протокол",
@@ -233,13 +338,9 @@ def test_supervisor_keeps_last_six_history_messages_without_mutating_input():
     assert len(model.messages) == 1
     assert isinstance(model.messages[0][0], SystemMessage)
     assert isinstance(model.messages[0][1], HumanMessage)
-    assert _payload(model) == {
-        "current_query": "Текущий запрос отдельно",
-        "recent_history": [
-            {"role": item["role"], "content": item["content"]}
-            for item in history[-6:]
-        ],
-    }
+    assert _conversation(model) == [
+        (item["role"], item["content"]) for item in history[-6:]
+    ] + [("user", "Текущий запрос отдельно")]
     assert history == original_history
 
 
@@ -261,11 +362,136 @@ def test_supervisor_exposes_history_to_direct_answer_model_without_coordinator()
         result = supervisor_chat("Что ты умеешь?", history=history)
 
     assert result == WorkerRunResult(answer="Краткий ответ.", display_items=[])
-    assert _payload(model) == {
-        "current_query": "Что ты умеешь?",
-        "recent_history": history,
-    }
+    assert _conversation(model) == [
+        (item["role"], item["content"]) for item in history
+    ] + [("user", "Что ты умеешь?")]
     coordinator.assert_not_called()
+
+
+def test_supervisor_keeps_assistant_only_assumption_non_authoritative():
+    from agents.supervisor import supervisor_chat
+
+    history = [
+        {
+            "role": "user",
+            "content": "Не выбирай объект за меня: я назову его позже.",
+        },
+        {
+            "role": "assistant",
+            "content": "Буду считать, что выбран объект assistant_choice.",
+        },
+    ]
+    model = _SupervisorModel(
+        [AIMessage(content="Какой именно объект вы выбираете?")]
+    )
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.supervisor.coordinator_chat") as coordinator,
+    ):
+        result = supervisor_chat("Прочитай его.", history=history)
+
+    assert result.answer == "Какой именно объект вы выбираете?"
+    coordinator.assert_not_called()
+    assert _conversation(model) == [
+        ("user", history[0]["content"]),
+        ("assistant", history[1]["content"]),
+        ("user", "Прочитай его."),
+    ]
+
+
+def test_supervisor_preserves_latest_user_confirmed_reference():
+    from agents.supervisor import supervisor_chat
+
+    history = [
+        {"role": "user", "content": "Рабочий объект = first_choice."},
+        {"role": "assistant", "content": "Принял first_choice."},
+        {
+            "role": "user",
+            "content": "Отменяю прежнее правило: рабочий объект = final_choice.",
+        },
+        {"role": "assistant", "content": "Принял final_choice."},
+    ]
+    model = _SupervisorModel(
+        [_delegate_message(context="Рабочий объект = final_choice.")]
+    )
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(answer="Готово."),
+        ) as coordinator,
+    ):
+        result = supervisor_chat("Прочитай рабочий объект.", history=history)
+
+    assert result.answer == "Готово."
+    coordinator.assert_called_once_with(
+        "Прочитай рабочий объект.",
+        context="Рабочий объект = final_choice.",
+    )
+    assert _conversation(model) == [
+        (item["role"], item["content"]) for item in history
+    ] + [("user", "Прочитай рабочий объект.")]
+
+
+def test_supervisor_preserves_ambiguous_user_history_for_clarification():
+    from agents.supervisor import supervisor_chat
+
+    history = [
+        {
+            "role": "user",
+            "content": "Рассматриваю alpha и beta; конкретный объект не выбран.",
+        },
+        {"role": "assistant", "content": "Выбор ещё не сделан."},
+    ]
+    model = _SupervisorModel(
+        [AIMessage(content="Уточните, нужен alpha или beta?")]
+    )
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch("agents.supervisor.coordinator_chat") as coordinator,
+    ):
+        result = supervisor_chat("Прочитай его.", history=history)
+
+    assert result.answer == "Уточните, нужен alpha или beta?"
+    coordinator.assert_not_called()
+    assert _conversation(model) == [
+        (item["role"], item["content"]) for item in history
+    ] + [("user", "Прочитай его.")]
+
+
+def test_supervisor_historyless_request_is_one_user_turn():
+    from agents.supervisor import supervisor_chat
+
+    model = _SupervisorModel([_delegate_message()])
+    model_patch, callback_patch, trace_patch = _supervisor_patches(model)
+    with (
+        model_patch,
+        callback_patch,
+        trace_patch,
+        patch(
+            "agents.supervisor.coordinator_chat",
+            return_value=CoordinatorAnswer(answer="Готово."),
+        ) as coordinator,
+    ):
+        result = supervisor_chat("Прочитай self_contained_object.")
+
+    assert result.answer == "Готово."
+    coordinator.assert_called_once_with(
+        "Прочитай self_contained_object.",
+        context="",
+    )
+    assert _conversation(model) == [
+        ("user", "Прочитай self_contained_object.")
+    ]
 
 
 def test_supervisor_self_contained_delegate_does_not_forward_raw_history():
@@ -397,10 +623,9 @@ def test_supervisor_delegates_whole_goal_and_returns_coordinator_result():
         context=common_context,
     )
     resolve_refs.assert_called_once_with(["ref-sheets"])
-    assert _payload(model) == {
-        "current_query": "Какие в нём листы и сколько их?",
-        "recent_history": history,
-    }
+    assert _conversation(model) == [
+        (item["role"], item["content"]) for item in history
+    ] + [("user", "Какие в нём листы и сколько их?")]
     assert len(model.messages) == 1
 
 
@@ -416,7 +641,7 @@ def test_supervisor_data_path_forwards_only_resolved_history_and_bounded_context
         },
     ]
     resolved_references = "  «в ней» = таблица source.orders.  "
-    context = "  " + "П" * (COORDINATOR_CONTEXT_MAX_CHARS + 5) + "  "
+    context = "П" * COORDINATOR_CONTEXT_MAX_CHARS
     model = _SupervisorModel(
         [
             _delegate_message(
@@ -441,10 +666,9 @@ def test_supervisor_data_path_forwards_only_resolved_history_and_bounded_context
         result = supervisor_chat("  Посчитай строки в ней  ", history=history)
 
     assert result.answer == "В таблице 100 строк."
-    assert _payload(model) == {
-        "current_query": "Посчитай строки в ней",
-        "recent_history": history,
-    }
+    assert _conversation(model) == [
+        (item["role"], item["content"]) for item in history
+    ] + [("user", "Посчитай строки в ней")]
     coordinator.assert_called_once_with(
         "Посчитай строки в ней\n\n"
         "Однозначно разрешённые ссылки из истории:\n"
@@ -453,6 +677,77 @@ def test_supervisor_data_path_forwards_only_resolved_history_and_bounded_context
     )
     delegated_task = coordinator.call_args.args[0]
     assert "неподтверждённый комментарий" not in delegated_task
+
+
+def test_supervisor_native_handoff_accepts_bounded_string_fields():
+    from agents.coordinator import COORDINATOR_CONTEXT_MAX_CHARS
+    from agents.supervisor import _parse_delegate_handoff
+
+    resolved_references = "Р" * COORDINATOR_CONTEXT_MAX_CHARS
+    context = "К" * COORDINATOR_CONTEXT_MAX_CHARS
+
+    assert _parse_delegate_handoff(
+        _delegate_message(resolved_references, context=context)
+    ) == (resolved_references, context)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("resolved_references", None),
+        ("resolved_references", 42),
+        ("context", ["rule"]),
+    ],
+)
+def test_supervisor_native_handoff_rejects_non_string_fields(
+    field_name,
+    field_value,
+):
+    from agents.supervisor import _parse_delegate_handoff
+
+    decision = _delegate_message()
+    decision.tool_calls[0]["args"][field_name] = field_value
+
+    with pytest.raises(RuntimeError, match=f"не-string поле .*{field_name}"):
+        _parse_delegate_handoff(decision)
+
+
+@pytest.mark.parametrize("field_name", ["resolved_references", "context"])
+def test_supervisor_native_handoff_rejects_overlong_fields(field_name):
+    from agents.coordinator import COORDINATOR_CONTEXT_MAX_CHARS
+    from agents.supervisor import _parse_delegate_handoff
+
+    decision = _delegate_message()
+    decision.tool_calls[0]["args"][field_name] = (
+        "X" * (COORDINATOR_CONTEXT_MAX_CHARS + 1)
+    )
+
+    with pytest.raises(RuntimeError, match=f"лимит поля .*{field_name}"):
+        _parse_delegate_handoff(decision)
+
+
+def test_supervisor_native_handoff_rejects_non_mapping_arguments():
+    from agents.supervisor import _parse_delegate_handoff
+
+    decision = _delegate_message()
+    decision.tool_calls[0]["args"] = []
+
+    with pytest.raises(RuntimeError, match="не-object arguments"):
+        _parse_delegate_handoff(decision)
+
+
+def test_supervisor_native_handoff_rejects_wrong_or_multiple_tool_calls():
+    from agents.supervisor import _parse_delegate_handoff
+
+    wrong_name = _delegate_message()
+    wrong_name.tool_calls[0]["name"] = "unexpected_delegate"
+    with pytest.raises(RuntimeError, match="ровно один native call"):
+        _parse_delegate_handoff(wrong_name)
+
+    multiple = _delegate_message()
+    multiple.tool_calls.append(deepcopy(multiple.tool_calls[0]))
+    with pytest.raises(RuntimeError, match="ровно один native call"):
+        _parse_delegate_handoff(multiple)
 
 
 def test_supervisor_ignores_unexpected_llm_task_rewrite():
@@ -522,6 +817,9 @@ def test_supervisor_prompt_is_generic_and_preserves_semantics():
     assert "программно и дословно" in normalized_prompt
     assert "не пересказывай, не сокращай, не исправляй" in normalized_prompt
     assert "устойчивые правила и устоявшиеся идеи" in normalized_prompt
+    assert "исходных ролях user/assistant" in normalized_prompt
+    assert "только user может выбрать или подтвердить" in normalized_prompt
+    assert "имеет приоритет" in normalized_prompt
     assert "разрешения ссылок current_query" in str(_delegate_tool_schema()).lower()
     assert "не помещай в context" in normalized_prompt
     assert "current_query или его сокращённый пересказ" in normalized_prompt

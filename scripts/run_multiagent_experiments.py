@@ -4,7 +4,7 @@
 The experiment runner deliberately reuses the live HTTP scenarios and their
 hard execution assertions.  A passing test is therefore the accuracy signal;
 the benchmark trace supplies reroutes, tool errors, reader calls, tokens and
-latency.  GigaChat Ultra is guarded fail-closed before and after every variant.
+latency.
 """
 
 from __future__ import annotations
@@ -19,38 +19,22 @@ from typing import Mapping, Sequence
 from dotenv import load_dotenv
 
 try:
-    from scripts.gigachat_budget import (
-        DEFAULT_ULTRA_RESERVE_PER_SCENARIO,
-        DEFAULT_ULTRA_TOKEN_FLOOR,
-        UltraBudgetError,
-        guard_ultra_budget,
-        ultra_budget_reservations,
-    )
     from scripts.run_live_agent_benchmark import (
         DEFAULT_OUTPUT_DIR,
         MODEL_ENV_BY_PROVIDER,
         ModeResult,
         _run_mode,
         _configured_model,
-        _selected_scenario_count,
         _scenario_targets,
         _slug,
     )
 except ModuleNotFoundError:  # direct ``python scripts/...`` execution
-    from gigachat_budget import (  # type: ignore[no-redef]
-        DEFAULT_ULTRA_RESERVE_PER_SCENARIO,
-        DEFAULT_ULTRA_TOKEN_FLOOR,
-        UltraBudgetError,
-        guard_ultra_budget,
-        ultra_budget_reservations,
-    )
     from run_live_agent_benchmark import (  # type: ignore[no-redef]
         DEFAULT_OUTPUT_DIR,
         MODEL_ENV_BY_PROVIDER,
         ModeResult,
         _run_mode,
         _configured_model,
-        _selected_scenario_count,
         _scenario_targets,
         _slug,
     )
@@ -179,10 +163,11 @@ EXPERIMENTS: dict[str, ExperimentSpec] = {
         variants=(ExperimentVariant("dependency_readers"),),
     ),
     "E5": ExperimentSpec(
-        title="Shared entity resolution",
+        title="Validation resolver isolation",
         purpose=(
-            "Проверить exact bypass, typo, partial, semantic, ambiguity, role "
-            "preservation и одинаковую семантику validation/agentic."
+            "Проверить validation-only resolution, отсутствие эвристического "
+            "resolver в agentic, model-owned candidate retrieval, exact bypass, "
+            "ambiguity и role preservation."
         ),
         scenarios=(
             "test_live_validation_protocol_table_typo_resolution",
@@ -197,11 +182,21 @@ EXPERIMENTS: dict[str, ExperimentSpec] = {
             "test_live_entity_resolution_preserves_source_target_role",
             "test_live_validation_and_agentic_use_same_resolution_semantics",
         ),
-        variants=(ExperimentVariant("shared_resolver"),),
+        variants=(ExperimentVariant("resolver_isolation"),),
     ),
 }
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_HISTORICAL_SCOPE_ENVIRONMENT = {
+    # E1–E5 predate the separate SQL-risk operation-scope branch. Keep their
+    # registered comparison on the original agentic pipelines even when a
+    # developer has enabled the scope branch in a parent shell or ``.env``.
+    "OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT": "0",
+}
+
+
+def _variant_environment(variant: ExperimentVariant) -> dict[str, str]:
+    return {**_HISTORICAL_SCOPE_ENVIRONMENT, **variant.environment}
 
 
 def selected_experiments(names: Sequence[str]) -> list[tuple[str, ExperimentSpec]]:
@@ -288,23 +283,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pytest-arg", action="append", default=[])
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR / "experiments")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
-        "--ultra-token-floor",
-        type=int,
-        default=DEFAULT_ULTRA_TOKEN_FLOOR,
-    )
-    parser.add_argument(
-        "--ultra-reserve-per-scenario",
-        type=int,
-        default=DEFAULT_ULTRA_RESERVE_PER_SCENARIO,
-    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    # Keep model selection identical to the benchmark subprocess.  Otherwise
-    # an Ultra model configured only in ``.env`` could be discovered too late,
-    # after this process had already skipped the fail-closed budget check.
+    # Keep model selection identical to the benchmark subprocess.
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -320,7 +303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"{name}/{variant.name}: {len(spec.scenarios)} scenarios; "
                 + ", ".join(
-                    f"{key}={value}" for key, value in variant.environment.items()
+                    f"{key}={value}"
+                    for key, value in _variant_environment(variant).items()
                 )
             )
         return 0
@@ -329,28 +313,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = args.output_dir.resolve() / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
     model = _configured_model(args.provider, args.model)
-    remaining_calls = sum(
-        _selected_scenario_count(spec.scenarios, [])
-        for _, spec, _ in run_units
-    )
     rows: list[tuple[str, ExperimentSpec, ExperimentVariant, ModeResult]] = []
 
     for name, spec, variant in run_units:
-        if args.provider == "gigachat":
-            for reservation in ultra_budget_reservations(
-                chat_model=model,
-                exchange_count=remaining_calls,
-                reserve_per_exchange=args.ultra_reserve_per_scenario,
-                judge_enabled=args.llm_judge,
-            ):
-                try:
-                    guard_ultra_budget(
-                        model=reservation.model,
-                        floor_tokens=args.ultra_token_floor,
-                        reserved_tokens=reservation.reserved_tokens,
-                    )
-                except UltraBudgetError as exc:
-                    parser.error(str(exc))
         label = f"{timestamp}_{name.lower()}_{_slug(variant.name)}"
         result = _run_mode(
             mode="multiagent",
@@ -361,7 +326,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir=output_dir,
             run_label=label,
             llm_judge=args.llm_judge,
-            extra_env=variant.environment,
+            extra_env=_variant_environment(variant),
         )
         result.mode = f"{name}/{variant.name}"
         evaluated = result.passed + result.failed + result.errors
@@ -373,22 +338,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             result.return_code = result.return_code or 5
         rows.append((name, spec, variant, result))
-        remaining_calls -= _selected_scenario_count(spec.scenarios, [])
-        if args.provider == "gigachat":
-            for reservation in ultra_budget_reservations(
-                chat_model=model,
-                exchange_count=remaining_calls,
-                reserve_per_exchange=args.ultra_reserve_per_scenario,
-                judge_enabled=args.llm_judge,
-            ):
-                try:
-                    guard_ultra_budget(
-                        model=reservation.model,
-                        floor_tokens=args.ultra_token_floor,
-                        reserved_tokens=reservation.reserved_tokens,
-                    )
-                except UltraBudgetError as exc:
-                    parser.error(str(exc))
 
     report_path = output_dir / f"{timestamp}_experiments.md"
     _write_report(

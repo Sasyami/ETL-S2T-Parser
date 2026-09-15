@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import json
-import os
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -14,6 +13,8 @@ from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional
 
 from langchain_core.callbacks import BaseCallbackHandler
 from pydantic import BaseModel, ConfigDict, Field
+
+from .env_flags import read_binary_env_flag
 
 
 _METRICS_REGISTRY_LIMIT = 100
@@ -150,6 +151,7 @@ class AgentRunMetrics(BaseModel):
     worker_outcomes: List[Dict[str, Any]] = Field(default_factory=list)
     entity_resolution: List[Dict[str, Any]] = Field(default_factory=list)
     sql_risk_facts: List[Dict[str, Any]] = Field(default_factory=list)
+    sql_risk_operation: Optional[Dict[str, Any]] = None
     validation_protocol: Optional[Dict[str, Any]] = None
     upstream_output: Optional[Dict[str, Any]] = None
     display_tools: List[str] = Field(default_factory=list)
@@ -232,15 +234,15 @@ def _bounded_json_value(value: Any, *, depth: int = 0) -> Any:
 
 
 def _metrics_enabled() -> bool:
-    for name in ("AGENT_RUN_METRICS_ENABLED", "RUN_LIVE_AGENT_SCENARIOS"):
-        if (os.getenv(name) or "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            return True
-    return False
+    metrics_enabled = read_binary_env_flag(
+        "AGENT_RUN_METRICS_ENABLED",
+        default=False,
+    )
+    live_scenarios_enabled = read_binary_env_flag(
+        "RUN_LIVE_AGENT_SCENARIOS",
+        default=False,
+    )
+    return metrics_enabled or live_scenarios_enabled
 
 
 def _usage_values(response: Any) -> tuple[int, int, int, int]:
@@ -326,6 +328,7 @@ class _RunCollector:
         self.worker_outcomes: List[Dict[str, Any]] = []
         self.entity_resolution: List[Dict[str, Any]] = []
         self.sql_risk_facts: List[Dict[str, Any]] = []
+        self.sql_risk_operation: Optional[Dict[str, Any]] = None
         self.validation_protocol: Optional[Dict[str, Any]] = None
         self.upstream_output: Optional[Dict[str, Any]] = None
         self.display_tools: List[str] = []
@@ -454,6 +457,11 @@ class _RunCollector:
                     dict(item) for item in self.entity_resolution
                 ],
                 sql_risk_facts=[dict(item) for item in self.sql_risk_facts],
+                sql_risk_operation=(
+                    dict(self.sql_risk_operation)
+                    if self.sql_risk_operation is not None
+                    else None
+                ),
                 validation_protocol=(
                     dict(self.validation_protocol)
                     if self.validation_protocol is not None
@@ -762,6 +770,8 @@ def _entity_resolution_summary(event: Mapping[str, Any]) -> Dict[str, Any]:
         "file_id",
         "error_code",
         "resolver_invoked",
+        "resolution_origin",
+        "resolution_stage",
     ):
         if key in event and event[key] is not None:
             summary[key] = _bounded_json_value(event[key])
@@ -903,6 +913,40 @@ def _sql_risk_fact_summary(value: Any) -> Optional[Dict[str, Any]]:
             for item in list(expressions)[:_SQL_RISK_EXPRESSION_LIMIT]
         ]
 
+    detected_mechanisms = fact.get("detected_mechanisms")
+    if isinstance(detected_mechanisms, (list, tuple)):
+        summary["detected_mechanisms"] = [
+            _clip(item, max_chars=_SQL_RISK_IDENTIFIER_CHARS)
+            for item in list(detected_mechanisms)[:_SQL_RISK_EXPRESSION_LIMIT]
+        ]
+
+    conditions = fact.get("conditions")
+    if isinstance(conditions, (list, tuple)):
+        condition_summaries: List[Dict[str, Any]] = []
+        for raw_condition in list(conditions)[:_SQL_RISK_EXPRESSION_LIMIT]:
+            condition = _sql_risk_fact_mapping(raw_condition)
+            if condition is None:
+                continue
+            item = {
+                key: _clip(value, max_chars=limit)
+                for key, value, limit in (
+                    (
+                        "kind",
+                        condition.get("kind"),
+                        _SQL_RISK_IDENTIFIER_CHARS,
+                    ),
+                    (
+                        "predicate",
+                        condition.get("predicate"),
+                        _SQL_RISK_PREDICATE_CHARS,
+                    ),
+                )
+                if value is not None
+            }
+            if item:
+                condition_summaries.append(item)
+        summary["conditions"] = condition_summaries
+
     joins = fact.get("joins")
     if isinstance(joins, (list, tuple)):
         join_summaries: List[Dict[str, Any]] = []
@@ -983,6 +1027,95 @@ def record_sql_risk_facts(
         collector.sql_risk_facts.extend(payload[:remaining])
 
 
+def record_sql_risk_operation(result: Mapping[str, Any]) -> None:
+    """Retain one bounded direct SQL-risk operation-scope trace.
+
+    The trace contains only the immutable scope, exact reader calls, status
+    and issues. Full reader payloads remain in the run-scoped saved-result
+    store and are never copied into metrics.
+    """
+
+    if collector := _ACTIVE_RUN.get():
+        reads: List[Dict[str, Any]] = []
+        for item in list(result.get("reads") or [])[:8]:
+            if not isinstance(item, Mapping):
+                continue
+            arguments = _bounded_json_value(item.get("arguments") or {})
+            reads.append(
+                {
+                    key: value
+                    for key, value in {
+                        "requirement_index": item.get("requirement_index"),
+                        "tool_name": _clip(item.get("tool_name")),
+                        "arguments": arguments,
+                        "call_id": _clip(item.get("call_id")),
+                        "status": _clip(item.get("status")),
+                        "elapsed_seconds": item.get("elapsed_seconds"),
+                        "row_count": item.get("row_count"),
+                        "source_total": item.get("source_total"),
+                        "truncated": bool(item.get("truncated", False)),
+                        "evidence_id": _clip(item.get("evidence_id")),
+                        "issue_code": _clip(item.get("issue_code")),
+                    }.items()
+                    if value not in (None, "")
+                }
+            )
+        issues: List[Dict[str, Any]] = []
+        for item in list(result.get("issues") or [])[:8]:
+            if not isinstance(item, Mapping):
+                continue
+            issues.append(
+                {
+                    key: value
+                    for key, value in {
+                        "code": _clip(item.get("code")),
+                        "message": _clip(item.get("message")),
+                        "tool_name": _clip(item.get("tool_name")),
+                        "requirement_index": item.get("requirement_index"),
+                    }.items()
+                    if value not in (None, "")
+                }
+            )
+        payload = {
+            "pipeline": _clip(result.get("pipeline")),
+            "status": _clip(result.get("status")),
+            "execution_mode": _clip(result.get("execution_mode")),
+            "scope": _clip(result.get("scope"), max_chars=500),
+            "answer_source": _clip(result.get("answer_source")),
+            "silent_fallback": bool(result.get("silent_fallback", False)),
+            "reads": reads,
+            "issues": issues,
+        }
+        raw_facts = result.get("facts") or []
+        if raw_facts and isinstance(raw_facts[0], Mapping):
+            raw_assessment = raw_facts[0]
+            payload["assessment"] = {
+                key: value
+                for key, value in {
+                    "status": _clip(raw_assessment.get("assessment_status")),
+                    "outcome": _clip(raw_assessment.get("outcome")),
+                    "structure_status": _clip(
+                        raw_assessment.get("structure_status")
+                    ),
+                    "limitations": [
+                        _clip(item)
+                        for item in list(
+                            raw_assessment.get("limitations") or []
+                        )[:12]
+                    ],
+                    "reviewed_rule_ids": [
+                        _clip(item)
+                        for item in list(
+                            raw_assessment.get("reviewed_rule_ids") or []
+                        )[:96]
+                    ],
+                }.items()
+                if value not in (None, "", [])
+            }
+        with collector.lock:
+            collector.sql_risk_operation = payload
+
+
 def record_validation_protocol(result: Mapping[str, Any]) -> None:
     """Retain bounded contracts/check SQL and readiness, never reader rows."""
     if collector := _ACTIVE_RUN.get():
@@ -1044,6 +1177,7 @@ __all__ = [
     "record_display_tools",
     "record_entity_resolution",
     "record_sql_risk_facts",
+    "record_sql_risk_operation",
     "record_supervisor_decision",
     "record_validation_protocol",
     "record_worker_observation",

@@ -1,11 +1,14 @@
 """Explicit read-only and mutating tool registries."""
 
-import os
 from typing import Dict, Iterable, Tuple
 
 from langchain_core.tools import BaseTool
 
 from ..contracts import WorkerCapability
+from ..experiment_flags import (
+    S2T_NARROW_TOOLS_EXPERIMENT_ENV,
+    experiment_flag_enabled,
+)
 
 from .additional_objects import list_additional_objects, search_additional_objects
 from .files import (
@@ -26,7 +29,6 @@ from .columns import (
 )
 from .planning import show_plan
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
-from .entity_resolution import resolve_entities
 from .neo4j import (
     run_cypher,
     trace_neo4j_lineage,
@@ -68,14 +70,11 @@ from .sql_lineage import (
 )
 from .transformation_paths import trace_transformation_path
 
-S2T_NARROW_TOOLS_EXPERIMENT_ENV = "S2T_NARROW_TOOLS_EXPERIMENT"
-
 READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     show_plan,
     search_excel_values,
     get_excel_row,
     semantic_search_descriptions,
-    resolve_entities,
     list_additional_objects,
     search_additional_objects,
     list_column_catalog,
@@ -117,13 +116,13 @@ _LEGACY_NARROW_S2T_TOOLS: Tuple[BaseTool, ...] = (
     list_s2t_field_mapping,
     list_s2t_source_table,
     list_s2t_target_table,
-    list_s2t_source_field,
-    list_s2t_target_field,
 )
 _STRICT_S2T_TOOLS: Tuple[BaseTool, ...] = (
     read_s2t_source_to_target,
     read_s2t_by_source_table,
     read_s2t_by_target_table,
+    list_s2t_source_field,
+    list_s2t_target_field,
 )
 _COMPAT_S2T_TOOLS: Tuple[BaseTool, ...] = (
     read_s2t_mapping,
@@ -158,16 +157,17 @@ _REGISTERED_READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     + _COMPAT_COLUMN_TOOLS
 )
 
-# Worker routing starts with one unambiguous tool per common read operation.
-# Broad query tools and compatibility aliases remain executable and are added
-# to the router only for an explicitly requested missing capability.
+# Worker routing starts with an unambiguous tool for every common read
+# operation. ``run_sql`` is the sole executor for literal or aggregate SQLite
+# reads, while the field readers keep source/target roles exact in their typed
+# signatures. Compatibility aliases remain executable and are added only for
+# an explicitly requested missing capability.
 _WORKER_SPECIALIZED_TOOL_NAMES = frozenset(
     {
         "show_plan",
         "search_excel_values",
         "get_excel_row",
         "semantic_search_descriptions",
-        "resolve_entities",
         "list_additional_objects",
         "search_additional_objects",
         "search_column_catalog",
@@ -176,6 +176,7 @@ _WORKER_SPECIALIZED_TOOL_NAMES = frozenset(
         "parse_sql_column_lineage",
         "parse_sql_table_lineage",
         "visualize_sql_lineage",
+        "run_sql",
         "query_saved_result",
         "trace_neo4j_lineage",
         "trace_neo4j_table_lineage",
@@ -187,6 +188,8 @@ _WORKER_SPECIALIZED_TOOL_NAMES = frozenset(
         "read_s2t_source_to_target",
         "read_s2t_by_source_table",
         "read_s2t_by_target_table",
+        "list_s2t_source_field",
+        "list_s2t_target_field",
         "search_s2t_transformations",
         "get_source_target_column_pair",
         "list_column_metadata",
@@ -209,7 +212,6 @@ WORKER_CAPABILITY_TOOL_NAMES: Dict[WorkerCapability, frozenset[str]] = {
     "sql_read": frozenset({"run_sql"}),
     "saved_result_read": frozenset({"query_saved_result"}),
     "saved_result_aggregate": frozenset({"query_saved_result"}),
-    "entity_resolution": frozenset({"resolve_entities"}),
     "semantic_search": frozenset({"semantic_search_descriptions"}),
     "s2t_search": frozenset({"search_s2t_transformations"}),
     "s2t_read": frozenset(
@@ -217,6 +219,8 @@ WORKER_CAPABILITY_TOOL_NAMES: Dict[WorkerCapability, frozenset[str]] = {
             "read_s2t_source_to_target",
             "read_s2t_by_source_table",
             "read_s2t_by_target_table",
+            "list_s2t_source_field",
+            "list_s2t_target_field",
             "read_s2t_mapping",
             "list_s2t_occurrences",
         }
@@ -275,9 +279,9 @@ ALL_TOOLS_BY_NAME: Dict[str, BaseTool] = {
 
 
 def _narrow_s2t_experiment_enabled() -> bool:
-    return str(
-        os.getenv(S2T_NARROW_TOOLS_EXPERIMENT_ENV, "")
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    return experiment_flag_enabled(
+        S2T_NARROW_TOOLS_EXPERIMENT_ENV,
+    )
 
 
 def get_tools() -> Tuple[BaseTool, ...]:
@@ -306,9 +310,8 @@ def get_worker_tools(
 ) -> Tuple[BaseTool, ...]:
     """Return the initial or explicitly capability-expanded worker catalog.
 
-    ``include_general`` remains as a compatibility/debug switch. Runtime
-    rerouting uses ``required_capabilities`` and never opens general tools merely
-    because an attempt counter reached a threshold.
+    ``include_general`` supports the default counter-based fallback.
+    ``required_capabilities`` supports the opt-in typed reroute experiment.
     """
     if include_general:
         return _REGISTERED_READ_ONLY_TOOLS

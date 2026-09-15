@@ -2,7 +2,10 @@ import json
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
+
 from agents.run_metrics import (
+    _metrics_enabled,
     capture_agent_run,
     count_agent_reroutes,
     consume_agent_run_metrics,
@@ -12,6 +15,7 @@ from agents.run_metrics import (
     record_display_tools,
     record_entity_resolution,
     record_sql_risk_facts,
+    record_sql_risk_operation,
     record_supervisor_decision,
     record_validation_protocol,
     record_worker_observation,
@@ -20,9 +24,6 @@ from agents.run_metrics import (
     record_worker_task,
     record_upstream_output,
 )
-from agents.value_change_analysis import FieldValueChangeFact
-
-
 def test_reroute_count_does_not_treat_worker_observation_cycle_as_data_cycle():
     metrics = SimpleNamespace(
         worker_routes=[
@@ -168,17 +169,17 @@ def test_run_metrics_capture_real_callback_events(monkeypatch):
         )
         record_sql_risk_facts(
             [
-                FieldValueChangeFact(
-                    source_table="src",
-                    source_field="id",
-                    target_table="tgt",
-                    target_field="id",
-                    conclusion="not_detected",
-                    mechanism="direct_column",
-                    matching_rows=1,
-                    target_expressions=["src.id"],
-                    evidence_ids=["evidence-sql"],
-                )
+                {
+                    "source_table": "src",
+                    "source_field": "id",
+                    "target_table": "tgt",
+                    "target_field": "id",
+                    "conclusion": "not_detected",
+                    "mechanism": "direct_column",
+                    "matching_rows": 1,
+                    "target_expressions": ["src.id"],
+                    "evidence_ids": ["evidence-sql"],
+                }
             ],
             cycle=2,
         )
@@ -628,6 +629,60 @@ def test_sql_risk_metrics_preserve_bounded_cardinality_join_fact(monkeypatch):
     assert "must-not-leak" not in serialized
 
 
+def test_sql_risk_operation_trace_round_trips_without_runtime_or_rows(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    session_id = f"metrics-{uuid4()}"
+
+    with capture_agent_run(session_id):
+        record_sql_risk_operation(
+            {
+                "pipeline": "sql_risk_scope",
+                "status": "complete",
+                "execution_mode": "conditional_cardinality",
+                "scope": "src_alpha → tgt_beta",
+                "answer_source": "sql_risk_scope_llm",
+                "silent_fallback": False,
+                "facts": [
+                    {
+                        "assessment_status": "complete",
+                        "outcome": "risk_present",
+                        "structure_status": "ready",
+                        "limitations": ["Uniqueness was not supplied."],
+                        "reviewed_rule_ids": ["sql_rule_1"],
+                        "raw_rows": [{"secret": "must-not-leak"}],
+                    }
+                ],
+                "reads": [
+                    {
+                        "tool_name": "read_s2t_source_to_target",
+                        "arguments": {
+                            "source_table": "src_alpha",
+                            "target_table": "tgt_beta",
+                        },
+                        "dataset_ref": "runtime-secret",
+                        "raw_rows": [{"secret": "must-not-leak"}],
+                    }
+                ],
+            }
+        )
+
+    metrics = consume_agent_run_metrics(session_id)
+    assert metrics is not None
+    assert metrics.sql_risk_operation is not None
+    assert metrics.sql_risk_operation["pipeline"] == "sql_risk_scope"
+    assert metrics.sql_risk_operation["silent_fallback"] is False
+    assert metrics.sql_risk_operation["assessment"] == {
+        "status": "complete",
+        "outcome": "risk_present",
+        "structure_status": "ready",
+        "limitations": ["Uniqueness was not supplied."],
+        "reviewed_rule_ids": ["sql_rule_1"],
+    }
+    serialized = json.dumps(metrics.sql_risk_operation, ensure_ascii=False)
+    assert "runtime-secret" not in serialized
+    assert "must-not-leak" not in serialized
+
+
 def test_run_metrics_are_disabled_by_default(monkeypatch):
     monkeypatch.delenv("AGENT_RUN_METRICS_ENABLED", raising=False)
     monkeypatch.delenv("RUN_LIVE_AGENT_SCENARIOS", raising=False)
@@ -636,3 +691,35 @@ def test_run_metrics_are_disabled_by_default(monkeypatch):
         assert get_run_metrics_callback() is None
 
     assert consume_agent_run_metrics("disabled-session") is None
+
+
+def test_run_metrics_can_be_enabled_by_either_strict_binary_flag(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "1")
+    monkeypatch.setenv("RUN_LIVE_AGENT_SCENARIOS", "0")
+    assert _metrics_enabled() is True
+
+    monkeypatch.setenv("AGENT_RUN_METRICS_ENABLED", "0")
+    monkeypatch.setenv("RUN_LIVE_AGENT_SCENARIOS", "1")
+    assert _metrics_enabled() is True
+
+
+@pytest.mark.parametrize(
+    ("invalid_name", "other_name"),
+    [
+        ("AGENT_RUN_METRICS_ENABLED", "RUN_LIVE_AGENT_SCENARIOS"),
+        ("RUN_LIVE_AGENT_SCENARIOS", "AGENT_RUN_METRICS_ENABLED"),
+    ],
+)
+def test_run_metrics_reject_invalid_values_even_when_other_flag_is_enabled(
+    monkeypatch,
+    invalid_name,
+    other_name,
+):
+    monkeypatch.setenv(invalid_name, "true")
+    monkeypatch.setenv(other_name, "1")
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{invalid_name} must be 0 or 1",
+    ):
+        _metrics_enabled()

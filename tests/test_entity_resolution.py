@@ -403,31 +403,3 @@ def test_truncated_semantic_ambiguity_retains_all_returned_candidates():
     assert [
         candidate.canonical_name for candidate in result.candidate_set.candidates
     ] == ["Risk A.xlsx", "Risk B.xlsx", "Risk C.xlsx"]
-
-
-def test_agent_tool_resolves_batch_without_collapsing_roles():
-    from agents.tools.entity_resolution import resolve_entities
-
-    payload = resolve_entities.invoke(
-        {
-            "entities": [
-                {
-                    "mention": "shared.entity",
-                    "entity_type": "table",
-                    "role": "source",
-                },
-                {
-                    "mention": "shared.entity",
-                    "entity_type": "table",
-                    "role": "target",
-                },
-            ]
-        }
-    )
-
-    assert payload["resolved"] == 2
-    assert payload["ambiguous"] == payload["unresolved"] == 0
-    assert [item["role"] for item in payload["resolutions"]] == [
-        "source",
-        "target",
-    ]

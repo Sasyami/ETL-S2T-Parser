@@ -36,7 +36,6 @@ from .columns import (
     search_column_catalog,
 )
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
-from .entity_resolution import resolve_entities
 from .planning import show_plan
 from .neo4j import (
     run_cypher,
@@ -171,7 +170,6 @@ __all__ = [
     "load_skills",
     "load_upstream_analysis_context",
     "resolve_file",
-    "resolve_entities",
     "parse_sql_column_lineage",
     "parse_sql_table_lineage",
     "visualize_sql_lineage",

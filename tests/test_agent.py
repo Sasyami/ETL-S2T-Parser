@@ -465,13 +465,15 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "Числа из task" in rules_contract["not_for"]
     path_contract = contracts["trace_transformation_path"]
     assert "точной пары table+column" in path_contract["use_when"]
-    assert "target-пары" in path_contract["use_when"]
+    assert "конечных источников/целей" in path_contract["use_when"]
+    assert "одному независимому вызову на endpoint" in path_contract["use_when"]
+    assert "SQLite первичен" in path_contract["use_when"]
     assert "upstream" in path_contract["use_when"]
-    assert "source-пары" in path_contract["use_when"]
     assert "downstream" in path_contract["use_when"]
-    assert "сначала разрешает search" in path_contract["use_when"]
-    assert "Одна точная source→target-пара" in path_contract["not_for"]
-    assert "сама стрелка не означает путь" in path_contract["not_for"]
+    assert "неизвестное имя без поиска" in path_contract["not_for"]
+    previous_contract = _TOOL_ROUTING_CONTRACTS["read_previous_result"]
+    assert "являются входами текущего нового" in previous_contract["use_when"]
+    assert "другому объекту той же операции" in previous_contract["not_for"]
     table_names_description = contracts["list_s2t_table_names"]["use_when"]
     assert "Глобальные множества source/target-таблиц" in table_names_description
     assert "операции над ними" in table_names_description
@@ -483,12 +485,7 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "source/target" in semantic_description
     assert "фильтры колонок" in semantic_description
     assert "Подстрока" in contracts["semantic_search_descriptions"]["not_for"]
-    resolver_contract = contracts["resolve_entities"]
-    assert "Опечатка" in resolver_contract["use_when"]
-    assert "source/target" in resolver_contract["use_when"]
-    assert "одним batch-вызовом" in resolver_contract["use_when"]
-    assert "каноническое имя" in resolver_contract["not_for"]
-    assert "exact reader" in resolver_contract["not_for"]
+    assert "resolve_entities" not in contracts
     list_columns_contract = contracts["list_column_catalog"]
     assert "атрибуты" in (
         list_columns_contract["use_when"]
@@ -522,15 +519,18 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "SQL отсутствует" in parse_table_contract["not_for"]
     assert "колонковый lineage" in parse_table_contract["not_for"]
     column_lineage_description = contracts["trace_neo4j_lineage"]["use_when"]
-    assert "полной точной ссылки ETL-колонки" in column_lineage_description
+    assert "Явно нужен граф Neo4j" in column_lineage_description
     assert "заданную глубину" in column_lineage_description
+    assert "Обычный полный lineage сохранённых S2T" in contracts[
+        "trace_neo4j_lineage"
+    ]["not_for"]
     global_graph_description = contracts["visualize_s2t_table_graph"]["use_when"]
     assert "глобальный" in global_graph_description
     assert "Конкретный SQL" in contracts["visualize_s2t_table_graph"]["not_for"]
     assert sum(
         len(item["use_when"]) + len(item["not_for"])
         for item in payload["available_tools"]
-    ) < 5200
+    ) < 5400
     assert payload["available_skills"] == [
         {"name": name, "description": description}
         for name, description in SKILL_CATALOG.items()
@@ -559,7 +559,11 @@ def test_chat_tool_router_passes_query_history_and_catalog_to_llm():
     assert "Списки выбирай независимо" in router_prompt
     assert "каждый может быть пустым" in router_prompt
     assert "оставляй `tools=[]`" in router_prompt
-    assert len(model.messages[0].content) < 1750
+    assert "Наличие `previous_results` само по себе не создаёт зависимость" in (
+        router_prompt
+    )
+    assert "результат той же операции для другого объекта" in router_prompt
+    assert len(model.messages[0].content) < 1850
     assert "COUNT, DISTINCT, GROUP BY" not in router_prompt
     assert "обязательно включай `run_sql`" not in router_prompt
     assert "самостоятельно составить и выполнить SQL" not in model.messages[0].content
@@ -587,25 +591,68 @@ def test_chat_tool_router_marks_specialized_catalog_stage():
     )
 
 
-def test_chat_tool_router_marks_general_tools_in_fallback_stage():
+@pytest.mark.parametrize(
+    ("tool_name", "task"),
+    [
+        ("run_sql", "Выполни дословно данный read-only SELECT."),
+        (
+            "list_s2t_source_field",
+            "Прочитай все downstream-цели точного source-поля из task.",
+        ),
+        (
+            "list_s2t_target_field",
+            "Прочитай все upstream-источники точного target-поля из task.",
+        ),
+    ],
+)
+def test_chat_tool_router_can_select_core_readers_from_initial_catalog(
+    tool_name,
+    task,
+):
     model = _ToolRouterModel(
-        {"tools": ["run_sql"], "skills": [], "schemas": []}
+        {"tools": [tool_name], "skills": [], "schemas": []}
     )
 
     route = _select_chat_route(
-        "Выполни нестандартный read-only срез",
+        task,
+        model=model,
+        available_tools=get_worker_tools(),
+        catalog_stage="specialized_only",
+    )
+
+    assert route.tools == [tool_name]
+    payload = json.loads(model.messages[1].content)
+    contracts = {
+        item["name"]: item for item in payload["available_tools"]
+    }
+    assert tool_name in contracts
+    assert not contracts[tool_name]["use_when"].startswith(
+        "Общий fallback:"
+    )
+
+
+def test_chat_tool_router_marks_general_tools_in_fallback_stage():
+    model = _ToolRouterModel(
+        {"tools": ["run_cypher"], "skills": [], "schemas": []}
+    )
+
+    route = _select_chat_route(
+        "Выполни нестандартный read-only графовый обход",
         model=model,
         available_tools=get_worker_tools(include_general=True),
         catalog_stage="general_fallback",
     )
 
-    assert route.tools == ["run_sql"]
+    assert route.tools == ["run_cypher"]
     payload = json.loads(model.messages[1].content)
     contracts = {
         item["name"]: item for item in payload["available_tools"]
     }
     assert payload["catalog_stage"] == "general_fallback"
-    assert contracts["run_sql"]["use_when"].startswith("Общий fallback:")
+    assert contracts["run_cypher"]["use_when"].startswith("Общий fallback:")
+    assert not contracts["run_sql"]["use_when"].startswith(
+        "Общий fallback:"
+    )
     assert not contracts["list_files"]["use_when"].startswith(
         "Общий fallback:"
     )
@@ -726,6 +773,43 @@ def test_chat_tool_router_separates_current_task_from_previous_results():
     )
     assert payload["previous_results"] == previous["previous_results"]
     assert "result_previous" not in payload["current_task"]
+
+
+def test_chat_tool_router_routes_only_current_task_not_original_task():
+    from agents.contracts import WORKER_ORIGINAL_TASK_MARKER
+
+    current_task = "Прочитай назначенный S2T-срез."
+    original_task = (
+        "Для `source_stage_731.id` → `target_core_842.id` "
+        "сохрани роли и file_id=917 без переименования."
+    )
+    model = _ToolRouterModel(
+        ToolRoute(
+            tools=["list_s2t_transformations"],
+            skills=[],
+            schemas=[],
+        )
+    )
+
+    route = _select_chat_route(
+        current_task
+        + WORKER_ORIGINAL_TASK_MARKER
+        + json.dumps(
+            {"original_task": original_task},
+            ensure_ascii=False,
+        ),
+        model=model,
+        available_tools=get_tools(),
+    )
+
+    assert route.tools == ["list_s2t_transformations"]
+    payload = json.loads(model.messages[-1].content)
+    assert payload["current_task"] == current_task
+    assert "original_task" not in payload
+    assert original_task not in payload["current_task"]
+    assert "единственный источник выбора операции" in str(
+        model.messages[0].content
+    )
 
 
 def test_chat_tool_router_discards_legacy_stable_context_suffix():
@@ -1214,6 +1298,7 @@ def test_chat_tool_router_uses_general_fallback_after_invalid_llm_repair():
 def test_chat_tool_router_falls_back_for_invalid_llm_plan():
     invalid_routes = [
         {"tools": ["unknown"], "skills": [], "schemas": []},
+        {"tools": ["resolve_entities"], "skills": [], "schemas": []},
         {
             "tools": ["run_sql"],
             "skills": ["unknown"],
@@ -1383,12 +1468,52 @@ def test_observation_carries_typed_capability_reroute_metadata():
             gap="Нужна новая палитра.",
             reroute_reason="missing_capability",
         )
-    with pytest.raises(ValueError, match="only when status is reroute"):
-        Observation(
-            status="continue",
-            gap="Исправить аргументы.",
-            reroute_reason="wrong_arguments",
-        )
+    continue_observation = Observation(
+        status="continue",
+        gap="Исправить аргументы.",
+        reroute_reason="wrong_arguments",
+        required_capabilities=["sql_read"],
+    )
+    assert continue_observation.reroute_reason is None
+    assert continue_observation.required_capabilities == []
+
+
+def test_native_observer_schema_is_provider_compatible_flat_object():
+    from agents.chat_graph import Observation
+
+    schema = Observation.model_json_schema()
+
+    assert schema["type"] == "object"
+    assert "oneOf" not in schema
+    assert schema["properties"]["status"]["enum"] == [
+        "complete",
+        "continue",
+        "reroute",
+    ]
+
+
+def test_observation_status_discards_provider_added_non_reroute_metadata():
+    from agents.chat_graph import Observation
+
+    complete = Observation.model_validate(
+        {
+            "status": "complete",
+            "accepted_tool_call_ids": ["call-exact-read"],
+            "facts": [
+                {
+                    "text": "Точные типы прочитаны.",
+                    "evidence_ids": ["evidence-exact-read"],
+                }
+            ],
+            "reroute_reason": "missing_capability",
+            "required_capabilities": ["sql_read"],
+        }
+    )
+
+    assert complete.status == "complete"
+    assert complete.accepted_tool_call_ids == ["call-exact-read"]
+    assert complete.reroute_reason is None
+    assert complete.required_capabilities == []
 
 
 def test_observer_prompt_requires_semantic_task_comparison():
@@ -1734,7 +1859,10 @@ def test_tool_router_prompt_is_generic_and_catalog_driven():
     assert "catalog_stage=capability_expansion" in normalized_prompt
     assert "не расширяй палитру по числу попыток" in normalized_prompt
     assert "При `wrong_arguments` палитру не меняй" in normalized_prompt
-    assert len(_TOOL_ROUTER_PROMPT) < 1750
+    assert "Наличие `previous_results` само по себе не создаёт зависимость" in (
+        normalized_prompt
+    )
+    assert len(_TOOL_ROUTER_PROMPT) < 1850
     for domain_detail in (
         "trace_neo4j_table_lineage",
         "run_cypher",

@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
-from typing import Any, Dict, List, Literal, Optional, Sequence, TypedDict
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, TypedDict
 
 from langchain_core.messages import (
     AIMessage,
@@ -25,35 +24,22 @@ from pydantic import (
 )
 
 from .agent import chat_model
-from .cardinality_analysis import (
-    CardinalityFact,
-    cardinality_payload,
-    derive_cardinality_facts,
-    render_cardinality_answer,
-)
-from .cardinality_sufficiency import (
-    complete_cardinality_mapping_evidence_ids,
-)
 from .contracts import (
     EvidenceArtifact,
     MAX_PLAN_STEPS,
+    OperationPipeline,
     PlanStep,
     SqlRiskAspect,
-    SqlRiskExecutionMode,
     UpstreamDecision,
     UpstreamOutput,
     WORKER_OPERATION_COMPLETENESS_MARKER,
     WORKER_OPERATION_EXECUTION_MARKER,
+    WORKER_ORIGINAL_TASK_MARKER,
     WORKER_PREVIOUS_RESULTS_MARKER,
     WorkerOutcome,
     WorkerPlan,
 )
-from .constraint_rejection_analysis import (
-    ConstraintRejectionFact,
-    constraint_rejection_payload,
-    derive_constraint_rejection_facts,
-    render_constraint_rejection_answer,
-)
+from .experiment_flags import experiment_flag_enabled
 from .chat_graph import WorkerDisplayItem
 from .observability import get_callback_handler, langfuse_trace_context
 from .operation_protocols import (
@@ -61,26 +47,43 @@ from .operation_protocols import (
     protocol_variant_sha256,
     selected_sql_risk_protocol,
 )
-from .plan_origin import PlanOriginError, validate_worker_plan_origin
 from .run_metrics import (
     get_run_metrics_callback,
     llm_stage,
     record_coordinator_plan,
     record_entity_resolution,
-    record_sql_risk_facts,
+    record_sql_risk_operation,
     record_upstream_output,
     record_validation_protocol,
     record_worker_outcome,
 )
-from .sql_risk_scope_contract import (
-    SqlRiskScopeContract,
-    build_sql_risk_scope_contract,
-    ensure_sql_risk_answer_scope,
-    missing_sql_risk_requirements,
-    render_sql_risk_scope_contract,
-    sql_risk_scope_evidence_architecture,
+from .sql_risk_operation_pipeline import (
+    SqlRiskOperationIssue,
+    SqlRiskOperationPipelineResult,
+    run_sql_risk_operation_pipeline,
 )
-from .sql_risk_typed_plan import build_typed_sql_risk_worker_plan
+from .sql_risk_assessment import (
+    MAX_SQL_RISK_ASSESSMENT_ATTEMPTS,
+    SQL_RISK_ASSESSMENT_PROMPT,
+    SQL_RISK_ASSESSMENT_TOOL_NAME,
+    SqlRiskAssessment,
+    render_sql_risk_assessment_repair,
+    render_sql_risk_assessment_request,
+    validate_sql_risk_assessment,
+)
+from .sql_risk_scope_contract import (
+    build_sql_risk_scope_contract,
+    sql_risk_scope_evidence_enabled,
+)
+from .sql_risk_scope_extraction import (
+    MAX_SQL_RISK_SCOPE_EXTRACTION_ATTEMPTS,
+    SQL_RISK_SCOPE_EXECUTION_MODES,
+    SQL_RISK_SCOPE_EXTRACTION_PROMPT,
+    SQL_RISK_SCOPE_EXTRACTION_TOOL_NAME,
+    SqlRiskScopeExtraction,
+    render_sql_risk_scope_extraction_repair,
+    validate_sql_risk_scope_extraction,
+)
 from .tools.context import (
     OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
     OPERATION_SKILL_CATALOG,
@@ -95,7 +98,6 @@ from .worker import (
     worker_chat,
 )
 from .tools.saved_results import (
-    SavedResultStore,
     get_active_saved_result_store,
     saved_result_store_scope,
 )
@@ -107,60 +109,20 @@ from .test_protocol import (
     compile_test_protocol,
     render_test_protocol_answer,
 )
+from .test_protocol_contract_review import (
+    VALIDATION_CONTRACT_REVIEW_PROMPT,
+    VALIDATION_CONTRACT_REVIEW_TOOL_NAME,
+    ValidationContractReview,
+    render_validation_contract_review_request,
+    validate_validation_contract_review,
+    validation_contract_review_tool_schema,
+)
 from .test_protocol_resolution import (
     resolve_test_protocol_contract,
     validate_raw_contract_origin,
 )
-from .validation_protocol import (
-    LLM_ANALYSES,
-    MAX_ANALYSIS_OBJECTS,
-    REQUESTED_ANALYSES,
-    S2TAnalysisOutput,
-    ValidationProtocolContract,
-    ValidationProtocolDataError,
-    build_deterministic_analysis_items,
-    build_s2t_analysis_display_payloads,
-    build_s2t_analysis_payload,
-    merge_s2t_analysis_output,
-    read_test_protocol_inputs,
-    read_validation_protocol_inputs,
-    render_s2t_analysis_answer,
-    validate_s2t_analysis_output,
-)
-from .value_change_analysis import (
-    FieldValueChangeFact,
-    derive_field_value_change_facts,
-    field_value_change_payload,
-)
-from .write_semantics_analysis import (
-    WriteSemanticsFact,
-    derive_write_semantics_facts,
-    write_semantics_payload,
-)
-
+from .validation_protocol import read_test_protocol_inputs
 logger = logging.getLogger(__name__)
-
-
-_SERIALIZED_EVIDENCE_ID_RE = re.compile(
-    r"(?<![A-Za-z0-9_])evidence_[0-9a-f]+(?![A-Za-z0-9_])"
-)
-_SERIALIZED_EVIDENCE_KEYS = frozenset(
-    {
-        "used_evidence_ids",
-        "display_evidence_ids",
-        "evidence_id",
-        "displayable",
-    }
-)
-_SERIALIZED_EVIDENCE_KEY_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:used_evidence_ids|display_evidence_ids|"
-    r"evidence_id|displayable)(?![A-Za-z0-9_])"
-)
-_SERIALIZED_JSON_LITERAL_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:true|false|null)(?![A-Za-z0-9_])",
-    re.IGNORECASE,
-)
-_SERIALIZED_JSON_NOISE_RE = re.compile(r"^[\s\[\]{},:\"'\\]*$")
 
 COORDINATOR_MAX_WORKERS = MAX_PLAN_STEPS
 COORDINATOR_MAX_CYCLES = 2
@@ -169,9 +131,7 @@ _PLAN_TOOL_NAME = "submit_worker_plan"
 _SQL_RISK_OPERATION_SKILL = "Анализ SQL-рисков"
 _DEFAULT_SQL_RISK_PROTOCOL = "default/current"
 _OPERATION_SKILL_TOOL_NAME = "select_operation_skills"
-_S2T_ANALYSIS_CONTRACT_TOOL_NAME = "submit_s2t_analysis_contract"
 _VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME = "submit_validation_protocol_contract"
-_S2T_ANALYSIS_TOOL_NAME = "submit_s2t_analysis"
 _UPSTREAM_ANSWER_TOOL_NAME = "submit_upstream_answer"
 _UPSTREAM_DATA_DECISION_TOOL_NAME = "submit_upstream_data_decision"
 _UPSTREAM_ANALYSIS_CONTEXT = load_upstream_analysis_context()
@@ -181,23 +141,15 @@ _DOWNSTREAM_TABLE_CONTEXT = get_downstream_table_context()
 
 def _typed_sql_risk_aspects_enabled() -> bool:
     """Return whether E2 routes only explicitly selected SQL-risk aspects."""
-    value = os.getenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV)
-    if value is None:
-        return True
-    return value.strip().casefold() not in {"0", "false", "no", "off"}
+    return experiment_flag_enabled(
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    )
 
 
-def _typed_sql_risk_execution_mode_enabled() -> bool:
-    """Expose the execution-mode field only for the typed-plan candidate."""
+def _sql_risk_operation_scope_enabled() -> bool:
+    """Expose the separate operation-scope route only when opted in."""
 
-    if not _typed_sql_risk_aspects_enabled():
-        return False
-    try:
-        return sql_risk_scope_evidence_architecture() == "typed_plan"
-    except ValueError:
-        # Preserve the existing non-SQL route under an unrelated bad SQL-risk
-        # setting. A selected SQL-risk route validates the setting later.
-        return False
+    return sql_risk_scope_evidence_enabled()
 
 
 def _sql_risk_protocol_attestation(
@@ -232,44 +184,6 @@ def _sql_risk_protocol_attestation(
     }
 
 
-def _scope_evidence_calls(
-    artifacts: Sequence[EvidenceArtifact],
-    store: Optional[SavedResultStore],
-) -> List[Dict[str, Any]]:
-    """Project accepted artifacts onto source-completeness call evidence.
-
-    ``EvidenceArtifact.truncated`` combines two different boundaries: source
-    truncation and harmless model-preview clipping.  Required SQLite readers
-    are materialized, so their saved descriptor is authoritative whenever a
-    dataset reference exists.
-    """
-
-    calls: List[Dict[str, Any]] = []
-    for artifact in artifacts:
-        source_truncated = artifact.truncated
-        if artifact.dataset_ref is not None:
-            descriptor = (
-                store.descriptor(artifact.dataset_ref)
-                if store is not None
-                else None
-            )
-            source_truncated = not (
-                descriptor is not None
-                and descriptor.source_tool == artifact.tool_name
-                and not descriptor.truncated
-                and descriptor.source_total is not None
-                and descriptor.source_total == descriptor.row_count
-            )
-        calls.append(
-            {
-                "tool_name": artifact.tool_name,
-                "args": artifact.compact_args,
-                "truncated": source_truncated,
-            }
-        )
-    return calls
-
-
 class CoordinatorAnswer(BaseModel):
     """Coordinator output consumed by the top-level supervisor."""
 
@@ -284,45 +198,29 @@ class OperationSkillSelection(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    pipeline: Literal[
-        "agentic",
-        "validation_protocol",
-    ] = "agentic"
+    pipeline: OperationPipeline
     skills: List[str]
     sql_risk_aspects: List[SqlRiskAspect] = Field(default_factory=list)
-    sql_risk_execution_mode: SqlRiskExecutionMode = "agentic"
 
     @model_validator(mode="after")
     def _aspects_match_selected_skill(self) -> "OperationSkillSelection":
         self.skills = list(dict.fromkeys(self.skills))
         self.sql_risk_aspects = list(dict.fromkeys(self.sql_risk_aspects))
-        typed_execution_enabled = _typed_sql_risk_execution_mode_enabled()
-        if (
-            typed_execution_enabled
-            and "sql_risk_execution_mode" not in self.model_fields_set
+        if self.pipeline in {"validation_protocol", "sql_risk_scope"} and (
+            self.skills or self.sql_risk_aspects
         ):
             raise ValueError(
-                "typed_plan operation route requires an explicit "
-                "sql_risk_execution_mode"
+                f"pipeline={self.pipeline} requires no operation skills and "
+                "no sql_risk_aspects"
             )
-        if (
-            self.sql_risk_execution_mode != "agentic"
-            and not typed_execution_enabled
-        ):
+        if self.sql_risk_aspects and "Анализ SQL-рисков" not in self.skills:
             raise ValueError(
-                "typed SQL-risk execution requires typed_plan architecture"
+                "sql_risk_aspects require Анализ SQL-рисков skill"
             )
         if not _typed_sql_risk_aspects_enabled():
             # E2 baseline deliberately loads the complete legacy profile.
             self.sql_risk_aspects = []
             return self
-        if (
-            self.sql_risk_aspects
-            and "Анализ SQL-рисков" not in self.skills
-        ):
-            raise ValueError(
-                "sql_risk_aspects require Анализ SQL-рисков skill"
-            )
         if (
             "Анализ SQL-рисков" in self.skills
             and not self.sql_risk_aspects
@@ -330,22 +228,6 @@ class OperationSkillSelection(BaseModel):
             raise ValueError(
                 "Анализ SQL-рисков requires at least one sql_risk_aspect"
             )
-        typed_modes: dict[SqlRiskExecutionMode, SqlRiskAspect] = {
-            "conditional_cardinality": "cardinality",
-            "nullable_constraint": "constraint_rejection",
-        }
-        if self.sql_risk_execution_mode != "agentic":
-            required_aspect = typed_modes[self.sql_risk_execution_mode]
-            if (
-                self.pipeline != "agentic"
-                or self.skills != [_SQL_RISK_OPERATION_SKILL]
-                or self.sql_risk_aspects != [required_aspect]
-            ):
-                raise ValueError(
-                    f"{self.sql_risk_execution_mode} requires "
-                    "pipeline=agentic, exactly one SQL-risk skill and "
-                    f"sql_risk_aspects=[{required_aspect!r}]"
-                )
         return self
 
 
@@ -360,13 +242,9 @@ class CoordinatorGraphState(TypedDict):
     context: str
     operation_skills: Optional[List[str]]
     operation_sql_risk_aspects: Optional[List[SqlRiskAspect]]
-    operation_sql_risk_execution_mode: Optional[SqlRiskExecutionMode]
-    operation_pipeline: Optional[
-        Literal["agentic", "s2t_analysis", "validation_protocol"]
-    ]
+    operation_pipeline: Optional[OperationPipeline]
     cycle: int
     plan: List[Dict[str, Any]]
-    scope_evidence_step_index: Optional[int]
     next_step: int
     worker_runs: List[CoordinatorWorkerRun]
     upstream_problem: Optional[str]
@@ -384,43 +262,58 @@ _SQL_RISK_TYPED_ROUTER_GUIDANCE = """
 Если выбрана `Анализ SQL-рисков`, заполни `sql_risk_aspects` только аспектами,
 которые прямо нужны результату: `row_filtering`, `cardinality`,
 `constraint_rejection`, `value_changes`, `write_semantics`. Для остальных
-skills и при `skills=[]` верни `sql_risk_aspects=[]`. Не добавляй все аспекты
+agentic skills верни `sql_risk_aspects=[]`. Не добавляй все аспекты
 автоматически.
 """.strip()
 
-_SQL_RISK_EXECUTION_MODE_ROUTER_GUIDANCE = """
-`sql_risk_execution_mode="agentic"` — безопасное значение по умолчанию и для
-любого составного, неоднозначного либо расширенного результата.
-`conditional_cardinality` допустим только для одного условного вывода о
-возможности размножения строк по полному exact directed S2T mapping одной
-буквально заданной пары таблиц; режим не устанавливает фактические дубликаты,
-числа строк или уникальность ключей.
-`nullable_constraint` допустим только для одного вывода о совместимости
-catalogued nullable/NOT NULL контрактов одной буквально заданной пары полей с
-явным `file_id`; режим не исследует фактические NULL, типы или другие
-constraints. Оба специальных режима требуют `pipeline="agentic"`, ровно skill
-`Анализ SQL-рисков` и ровно соответствующий единственный аспект; они не
-разрешают дополнительные результаты. Если хотя бы одно условие не выполнено,
-верни `agentic`.
+_SQL_RISK_SCOPE_PIPELINE_GUIDANCE = """
+Сначала определи, от каких сохранённых фактов зависит запрошенный вывод.
+Если его полностью определяет прямое сравнение catalog-атрибутов двух колонок
+— `data_type`, `not_null` или признака ключа — выбери `pipeline="agentic"` и
+профиль `Совместимость колонок`; transformation SQL для этого не нужен. Это
+правило определяется требуемым evidence, а не лексикой запроса: условная
+совместимость nullable source с NOT NULL target остаётся catalog-сравнением.
+`sql_risk_scope` нужен только когда вывод зависит от того, может ли именно
+сохранённая SQL-проекция, выражение или predicate породить NULL.
+The same evidence boundary applies regardless of the query language: a result
+determined by source/target catalog attributes (`data_type`, `not_null`, key
+flags) is `agentic` column compatibility; select `sql_risk_scope` only when the
+result depends on transformation SQL structure.
+
+`pipeline="sql_risk_scope"` выбирай для одной узкой задачи анализа риска
+сохранённого SQL по одной явно указанной направленной source → target паре.
+Конкретный вид риска, точный scope и optional file_id извлечёт отдельный
+внутренний native LLM-вызов этого pipeline; здесь их не выбирай и не извлекай.
+Просьба назвать или дословно привести подтверждающий JOIN, predicate,
+выражение целевого поля либо корневой SQL-оператор остаётся частью такого
+узкого статического анализа сохранённого SQL и сама по себе не делает задачу
+составной или agentic.
+При `sql_risk_scope` верни `skills=[]`.
+Для составной задачи, исполнения/вычисления фактических метрик по данным,
+перечня самих строк, нескольких пар либо результата шире одного SQL-risk
+аспекта выбери `pipeline="agentic"`.
 """.strip()
 
-_SQL_RISK_LEGACY_ROUTER_GUIDANCE = """
-Эксперимент выбора аспектов отключён: для любого маршрута всегда верни
-`sql_risk_aspects=[]`. При выборе `Анализ SQL-рисков` код загрузит полный
-legacy-профиль риска; не перечисляй отдельные аспекты.
-""".strip()
+_SQL_RISK_LEGACY_ROUTER_GUIDANCE = ""
 
 _OPERATION_SKILL_PROMPT = f"""
 Ты operation router. Один раз для всей `original_task` выбери исполнительный
 `pipeline` и operation-skills. Верни ровно один native call
 `{_OPERATION_SKILL_TOOL_NAME}`.
 
+`stable_context` используй только для устойчивой терминологии, intent и границ
+результата при выборе pipeline/skills. Не извлекай из него разовые identifiers
+или scope и не подменяй им буквальные значения из `original_task`.
+
 `pipeline="validation_protocol"` выбирай для явной просьбы составить explicit,
 standard либо exhaustive SQL test protocol внешней Greenplum-проверки
 source→target S2T-загрузки. Файл необязателен: без него catalog-dependent checks
 будут помечены unavailable, а остальные всё равно компилируются. Сюда относятся
 row/key/field/schema/aggregate reconciliation, uniqueness, NULL и статический
-preflight. SQL только проектируется и не исполняется.
+preflight. SQL только проектируется и не исполняется. Для этой отдельной ветки
+верни `skills=[]`.
+
+{_SQL_RISK_SCOPE_PIPELINE_GUIDANCE}
 
 Во всех остальных случаях выбирай `pipeline="agentic"`; выбранные
 operation-skills направят downstream, workers и upstream внутри общего потока.
@@ -433,8 +326,6 @@ Operation-skill — профиль результата, которого доб
 разных видов анализа; не добавляй смежный анализ «на всякий случай».
 
 {_SQL_RISK_TYPED_ROUTER_GUIDANCE}
-
-{_SQL_RISK_EXECUTION_MODE_ROUTER_GUIDANCE}
 
 `skills=[]` — нормальный вариант по умолчанию. Оставляй массив пустым для
 простого чтения, списка либо объяснения одной сохранённой трансформации, если
@@ -454,18 +345,36 @@ _OPERATION_SKILL_REPAIR_PROMPT = f"""
 `skills` и `sql_risk_aspects`. Pipeline — `agentic` либо
 `validation_protocol`; массив skills может быть пустым. Аспекты допустимы только
 для `Анализ SQL-рисков`; при выборе этого профиля верни хотя бы один нужный
-аспект, иначе верни пустой массив. Используй только дословные имена из каталогов.
+аспект, иначе верни пустой массив. Для `validation_protocol` верни пустые skills
+и aspects. Используй только дословные имена из каталогов.
 """.strip()
 
-_OPERATION_SKILL_TYPED_EXECUTION_REPAIR_PROMPT = f"""
+_OPERATION_SKILL_SCOPE_REPAIR_PROMPT = f"""
 Предыдущий native call `{_OPERATION_SKILL_TOOL_NAME}` нарушает схему или содержит
 имя вне каталога. Верни ровно один исправленный call с полями `pipeline`,
-`skills`, `sql_risk_aspects` и `sql_risk_execution_mode`. Pipeline — `agentic`
-либо `validation_protocol`; массив skills может быть пустым. Аспекты допустимы
-только для `Анализ SQL-рисков`; при выборе этого профиля верни хотя бы один
-нужный аспект, иначе верни пустой массив. Специальный execution mode допустим
-только при точном соответствии pipeline/skill/единственному аспекту; иначе
-верни `agentic`. Используй только дословные имена из каталогов.
+`skills` и `sql_risk_aspects`. Pipeline — `agentic`, `validation_protocol`
+либо `sql_risk_scope`. Для `validation_protocol` и `sql_risk_scope` массивы
+skills и sql_risk_aspects пусты. Для agentic используй только дословные enum и
+имена из каталогов. Заново выбери согласованный pipeline по исходному intent;
+не исправляй смешанный route механическим удалением skills/aspects. Если вывод
+полностью определяется source/target catalog-атрибутами (`data_type`,
+`not_null`, признаки ключа) без анализа transformation SQL, верни `agentic` и
+`Совместимость колонок`. Выбирай по требуемому evidence, а не по лексике или
+языку запроса. `sql_risk_scope` выбирай только когда вывод зависит от SQL
+projection, expression, predicate либо корневого SQL-оператора.
+""".strip()
+
+_OPERATION_SKILL_SCOPE_BASELINE_REPAIR_PROMPT = f"""
+Предыдущий native call `{_OPERATION_SKILL_TOOL_NAME}` нарушает схему или содержит
+имя вне каталога. Верни ровно один исправленный call с полями `pipeline` и
+`skills`. Pipeline — `agentic`, `validation_protocol` либо `sql_risk_scope`.
+Для `validation_protocol` и `sql_risk_scope` верни `skills=[]`; для agentic
+используй только дословные имена профилей из каталога. Заново выбери
+согласованный pipeline по исходному intent, а не механически удаляй skills.
+Если вывод полностью определяется source/target catalog-атрибутами без анализа
+transformation SQL, верни `agentic` и `Совместимость колонок`.
+`sql_risk_scope` выбирай только когда вывод зависит от SQL projection,
+expression, predicate либо корневого SQL-оператора.
 """.strip()
 
 
@@ -477,9 +386,9 @@ def _operation_skill_prompt() -> str:
             _SQL_RISK_TYPED_ROUTER_GUIDANCE,
             _SQL_RISK_LEGACY_ROUTER_GUIDANCE,
         )
-    if not _typed_sql_risk_execution_mode_enabled():
+    if not _sql_risk_operation_scope_enabled():
         prompt = prompt.replace(
-            _SQL_RISK_EXECUTION_MODE_ROUTER_GUIDANCE,
+            _SQL_RISK_SCOPE_PIPELINE_GUIDANCE,
             "",
         )
     return prompt
@@ -487,50 +396,37 @@ def _operation_skill_prompt() -> str:
 
 def _operation_skill_repair_prompt() -> str:
     """Build repair instructions that match the active E2 schema."""
-    if _typed_sql_risk_execution_mode_enabled():
-        return _OPERATION_SKILL_TYPED_EXECUTION_REPAIR_PROMPT
+    if _sql_risk_operation_scope_enabled():
+        return (
+            _OPERATION_SKILL_SCOPE_REPAIR_PROMPT
+            if _typed_sql_risk_aspects_enabled()
+            else _OPERATION_SKILL_SCOPE_BASELINE_REPAIR_PROMPT
+        )
     if _typed_sql_risk_aspects_enabled():
         return _OPERATION_SKILL_REPAIR_PROMPT
     return (
         f"Предыдущий native call `{_OPERATION_SKILL_TOOL_NAME}` нарушает "
         "схему или содержит имя вне каталога. Верни ровно один исправленный "
-        "call с полями `pipeline`, `skills` и `sql_risk_aspects`. Pipeline — "
+        "call с полями `pipeline` и `skills`. Pipeline — "
         "`agentic` либо `validation_protocol`; массив skills может быть "
-        "пустым. Эксперимент выбора SQL-risk aspects отключён, поэтому всегда "
-        "верни `sql_risk_aspects=[]`. Используй только дословные имена из "
-        "каталога."
+        "пустым; для `validation_protocol` он обязан быть пустым. Используй "
+        "только дословные имена из каталога."
     )
-
-_S2T_ANALYSIS_CONTRACT_PROMPT = f"""
-Извлеки только явно заданный контракт S2T-анализа из `original_task`. Верни
-ровно один native call `{_S2T_ANALYSIS_CONTRACT_TOOL_NAME}`.
-
-- Каждый элемент `source_tables` и `target_tables` копируй дословно; направление
-  задаёт source→target в запросе. Сохрани все явно перечисленные таблицы
-  соответствующей роли. Файл копируй как явно заданный `file_id` либо
-  `filename`; если он не задан и каталог не нужен, не придумывай scope.
-- `requested_analyses` содержит только явно запрошенные классы:
-  `row_loss_risk`, `duplicate_risk`, `unmapped_required_fields`,
-  `transformation_consistency`.
-- Не придумывай идентификаторы, scope-поля, SQL и дополнительные виды анализа.
-""".strip()
-
-_S2T_ANALYSIS_CONTRACT_REPAIR_PROMPT = f"""
-Предыдущий `{_S2T_ANALYSIS_CONTRACT_TOOL_NAME}` нарушает строгую схему. Верни один
-исправленный native call с непустыми точными массивами
-`source_tables`/`target_tables` и `requested_analyses` из разрешённого enum.
-`file_id` и `filename` необязательны и допустимы только при явном наличии в
-`original_task`. Остальные значения также копируй только из `original_task`.
-""".strip()
 
 _VALIDATION_PROTOCOL_CONTRACT_PROMPT = f"""
 Извлеки только явно заданный контракт SQL test protocol из `original_task`.
 Верни ровно один native call `{_VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME}`.
 
-- Файл необязателен. Явный числовой идентификатор копируй как `file_id`, а
-  буквальное имя или смысловое описание — как `file_mention`; не заполняй оба.
+- Всегда явно выбери `file_scope_kind`: `file_id`, если в original_task дан
+  числовой file_id; `file_mention`, если дано буквальное имя или смысловое
+  описание файла; `not_provided` только если original_task вообще не задаёт
+  файловый scope. Опциональность файла не разрешает терять явно названный scope.
+  Заполни ровно соответствующее поле `file_id` либо `file_mention`; не помещай
+  filename в source/target mentions.
 - `loads` содержит отдельный элемент для каждой явно заданной загрузки;
   `source_mentions` — все исходные mentions именно этого `target_mention`.
+  Явную запись `source → target` разделяй на два атомарных значения правильных
+  ролей; не копируй всю запись со стрелкой в один mention.
   Копируй mention дословно, включая опечатку, неполное или смысловое имя:
   канонизацию выполнит код после этого native call.
 - `mode="explicit"`, когда пользователь перечислил проверки; сохрани их в
@@ -540,116 +436,26 @@ _VALIDATION_PROTOCOL_CONTRACT_PROMPT = f"""
 - Допустимые checks: {', '.join(PROTOCOL_CHECKS)}.
 - Явно заданные поля ключа копируй в `explicit_key` contract/load.
 - Не придумывай таблицы, колонки, SQL, проверки и scope-поля.
+- Перед native call ещё раз сопоставь каждый явно заданный file scope, load,
+  source, target, check и key с отдельным полем результата; ничего не опускай.
 """.strip()
 
 _VALIDATION_PROTOCOL_CONTRACT_REPAIR_PROMPT = f"""
-Предыдущий `{_VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME}` нарушает строгую схему.
+Предыдущий `{_VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME}` нарушает схему,
+полноту либо роли исходной задачи.
 Верни один исправленный native call с `mode`, `requested_checks` и непустым
-`loads`; в каждом load нужны непустые literal `source_mentions`, один
+`file_scope_kind` и `loads`; в каждом load нужны непустые literal
+`source_mentions`, один
 `target_mention`, `requested_checks` и при наличии `explicit_key`. Файл
-необязателен; допустим только исходный `file_id` либо `file_mention`. Копируй
-только значения из `original_task`, не исправляй mentions самостоятельно.
+необязателен только если его нет в original_task: тогда выбери `not_provided`.
+Явный file scope обязан сохраниться как `file_id` либо `file_mention`, и filename
+нельзя помещать в table mentions. Разделяй literal `source → target` на
+атомарные значения соответствующих ролей. Копируй только значения из
+`original_task`, не исправляй mentions самостоятельно.
 """.strip()
-
-_S2T_ANALYSIS_PROMPT = f"""
-Ты S2T analyzer. Получаешь строгий contract, lossless-компактные результаты
-readers и детерминированные derived_facts. Верни ровно один native call
-`{_S2T_ANALYSIS_TOOL_NAME}`.
-
-Для каждой `target_tables` дай один вывод `transformation_consistency`; в
-`target_table` дословно укажи текущий target. Сопоставь явно запрошенные
-`source_tables` со
-  `derived_facts.mapping_coverage.s2t_source_tables`. Missing/additional S2T
-  sources, покрытие catalog-полей, числа и physical_source_tables бери дословно
-  только из готового mapping_coverage. Если `unmapped_catalog_fields` не пуст,
-  не утверждай полного покрытия каталога; не путай его с отдельным покрытием
-  обязательных полей. Физические таблицы обязательно перечисли отдельно как
-  SQL-зависимости, но отличие физического имени от логического S2T-имени само по
-  себе не является противоречием. Оцени пустые/разные точные правила и
-  неоднозначные source→target маппинги.
-
-`mappings` сохраняет каждое raw-вхождение, а `rules` хранит каждый точный SQL
-один раз; `rule_id` связывает их. Анализируй только переданные данные. Не
-выполняй и не сочиняй запросы к
-логическим ETL-таблицам, не возвращай `row_loss_risk`, `duplicate_risk` или
-`unmapped_required_fields` (их считает код), не генерируй SQL-шаблоны и не
-сообщай физические метрики. В evidence называй конкретные подтверждённые поля,
-строки или фрагменты правила. Ограничения данных записывай в limitations.
-""".strip()
-
-_S2T_ANALYSIS_REPAIR_PROMPT = f"""
-Предыдущий `{_S2T_ANALYSIS_TOOL_NAME}` нарушает строгую схему либо не покрывает
-ровно все `llm_requested_analyses`. Верни один исправленный native call,
-используя только исходный contract, reader_results и derived_facts. Не добавляй
-виды анализа и факты.
-""".strip()
-
 
 class CoordinatorResponseError(RuntimeError):
     """Raised when an LLM response violates a structural coordinator contract."""
-
-
-def _recover_serialized_evidence_ids(
-    value: str,
-    available_evidence_ids: set[str],
-) -> Optional[List[str]]:
-    """Recover only known opaque IDs from an obvious JSON/list fragment.
-
-    Some providers occasionally put a serialized evidence-id list (and even
-    adjacent schema keys) into one string item of the otherwise valid native
-    array. Recovery is intentionally narrower than generic JSON repair: every
-    opaque ID must already be available, and after removing known output keys,
-    JSON literals, and IDs, only serialization punctuation may remain.
-    """
-
-    clean_value = str(value or "").strip()
-    if clean_value in available_evidence_ids:
-        return [clean_value]
-
-    recovered_ids = _SERIALIZED_EVIDENCE_ID_RE.findall(clean_value)
-    key_tokens = _SERIALIZED_EVIDENCE_KEY_RE.findall(clean_value)
-    if any(
-        evidence_id not in available_evidence_ids
-        for evidence_id in recovered_ids
-    ):
-        return None
-    if not recovered_ids and not key_tokens:
-        return None
-
-    has_list_or_json_marker = any(
-        marker in clean_value for marker in '[]{}",:'
-    )
-    if not has_list_or_json_marker and (
-        recovered_ids or clean_value not in _SERIALIZED_EVIDENCE_KEYS
-    ):
-        return None
-
-    remainder = _SERIALIZED_EVIDENCE_ID_RE.sub("", clean_value)
-    remainder = _SERIALIZED_EVIDENCE_KEY_RE.sub("", remainder)
-    remainder = _SERIALIZED_JSON_LITERAL_RE.sub("", remainder)
-    if not _SERIALIZED_JSON_NOISE_RE.fullmatch(remainder):
-        return None
-    return list(dict.fromkeys(recovered_ids))
-
-
-def _normalize_upstream_evidence_id_list(
-    values: Sequence[str],
-    available_evidence_ids: set[str],
-) -> List[str]:
-    """Normalize provider serialization noise without accepting new IDs."""
-
-    normalized: List[str] = []
-    for value in values:
-        clean_value = str(value or "").strip()
-        recovered = _recover_serialized_evidence_ids(
-            clean_value,
-            available_evidence_ids,
-        )
-        candidates = [clean_value] if recovered is None else recovered
-        for candidate in candidates:
-            if candidate and candidate not in normalized:
-                normalized.append(candidate)
-    return normalized
 
 
 _DOWNSTREAM_PLAN_PROMPT = f"""
@@ -666,20 +472,16 @@ S2T-строкой; роль результата не задаёт роль к�
 бери только из original_task/context, пиши в обратных кавычках без внешней
 пунктуации. Не превращай бизнес-термин в техническое имя или tool.
 
-Если файловый scope задан одним или несколькими полными `filename`, а чтению
-нужен внутренний `file_id`, сначала запланируй точное разрешение всех имён и
-только затем зависимые чтения с соответствующими принятыми результатами.
+Если scope задан полным `filename`, а чтению нужен внутренний `file_id`, сначала
+запланируй точное разрешение имён, затем зависимые чтения.
 `file_id` допустим лишь из original_task либо принятого результата разрешения.
-Каждая task самодостаточна: повторяй нужные идентификаторы, роли, scope и
-фильтры. Результат предыдущего worker может
+Каждая task должна быть самодостаточной: дословно повторяй в ней все нужные
+точные идентификаторы, роли, scope и фильтры из original_task/context. Worker
+видит `original_task` только как immutable reference; поручение задаёт task.
+Результат предыдущего worker может
 добавить ранее неизвестное значение, но не заменить уже заданный идентификатор
 другой сущности: `filename` даёт `file_id`, но не определяет и не заменяет
-`table_name`. Не используй вместо известного имени ссылки «эта таблица»,
-«разрешённый объект», «та же target_table» или «найденное имя».
-
-Context заканчивается здесь: перенеси нужные условия в `constraints`,
-сущность/scope/полноту — в `entity`/`scope`/`coverage`, зависимости — в
-`dependencies` (1-based номера прошлых steps).
+`table_name`.
 
 Сохраняй тип поиска из original_task:
 - смысл/бизнес-смысл/описание/назначение/«наиболее вероятный» при неизвестном
@@ -701,6 +503,11 @@ SQLite-каталоги хранят метаданные. Значения `tab
 это действие вместо описания. Для вывода по сохранённому выражению сначала читай
 само выражение; дополнительные данные запрашивай лишь когда они действительно
 нужны исходной задаче.
+
+Полный/transitive lineage `table.column` — одна task пути до
+конечных endpoint с branches/subqueries/rules, без catalog/hops/assembly.
+Сравнение: отдельная task для каждого endpoint с table/column/direction;
+чужой result не вход, сравнит upstream.
 Не создавай значения для неподтверждённых физических объектов и полей. Передавай
 upstream только подтверждённые имена, а нехватку данных опиши явно.
 
@@ -727,8 +534,7 @@ _DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
 Предыдущий native call `{_PLAN_TOOL_NAME}` нарушает схему или смысловой контракт.
 Верни исправленный native call ровно один раз. Массив `steps` должен содержать
 от 1 до {COORDINATOR_MAX_WORKERS} элементов; каждый элемент должен иметь
-непустую `task` и может содержать только разрешённые structured-поля
-`constraints`, `entity`, `scope`, `coverage`, `dependencies`.
+только одну непустую `task`.
 Сохрани запрошенные роли, объекты, фильтры и результаты. Не придумывай
 идентификаторы, функции, tools или требования. Используй только реальные таблицы
 хранилища из system prompt; неизвестные бизнес-объекты оставляй текстом поиска.
@@ -740,17 +546,13 @@ _DOWNSTREAM_PLAN_REPAIR_PROMPT = f"""
 """.strip()
 
 _UPSTREAM_DATA_DECISION_PROMPT = f"""
-Ты проверяешь достаточность `evidence` для `original_task`. `worker_outcomes`
-различает complete, partial и failed чтения, причины остановки и
-незакрытые требования. Partial evidence можно использовать только в его
-подтверждённой границе; failed/unavailable нельзя считать полным. Верни один native call
+Проверь `evidence` для `original_task`. Верни один native call
 `{_UPSTREAM_DATA_DECISION_TOOL_NAME}`:
 
 - `decision="pass"`, если можно дать конечный ответ;
 - `decision="reroute"`, если нужен новый цикл чтения.
 
-При reroute необязательный `problem` кратко описывает недостающие данные новому
-downstream-плану.
+При reroute `problem` кратко описывает недостающие данные downstream-плану.
 Не формируй пользовательский ответ и не выбирай display-results.
 
 В `problem` не предлагай имена таблиц, колонок, схем, технические синонимы или
@@ -760,9 +562,10 @@ downstream-плану.
 `truncated`, `displayable`. Args подтверждают область чтения, preview — данные.
 Не додумывай; `truncated=true` не подтверждает полный набор.
 
-Сопоставь каждый запрошенный исходный результат и его scope с прямым
-подтверждением в evidence. Нельзя считать значение одной метрики подтверждением
-другой.
+Сопоставь каждый запрошенный результат и scope с прямым evidence. Для сравнения,
+разности множеств или производной метрики нужны evidence всех операндов;
+отсутствующий операнд не равен пустому множеству или нулю. Нельзя считать
+значение одной метрики подтверждением другой.
 
 Промежуточный список кандидатов не подтверждает связь, правило, маппинг или
 lineage. Если original_task требует следующего источника, верни `reroute`.
@@ -770,8 +573,7 @@ lineage. Если original_task требует следующего источн
 
 _UPSTREAM_ANSWER_PROMPT = f"""
 Ты upstream answer coordinator. Предварительная проверка уже вернула `pass`.
-Вход содержит `original_task`, состояния `worker_outcomes` и принятые
-`evidence`. Сам выполни запрошенный
+Вход содержит `original_task` и принятые `evidence`. Сам выполни запрошенный
 анализ и верни ровно один native call `{_UPSTREAM_ANSWER_TOOL_NAME}` с готовым
 `answer`. При наличии подтверждающих evidence передай `used_evidence_ids` и
 нужные `display_evidence_ids`.
@@ -783,10 +585,18 @@ Evidence содержит `evidence_id`, `tool_name`, точные `args`, фа�
 как `evidence_id` только у результатов с `displayable=true` и включай также в
 `used_evidence_ids`.
 
+Если `answer` вводит физический идентификатор таблицы, поля или схемы, которого
+нет в `original_task`, выбери подтверждающий его displayable evidence также в
+`display_evidence_ids`. Если такого displayable evidence нет, не вводи этот
+идентификатор как подтверждённый факт.
+
 Перед `answer` сопоставь каждый запрошенный результат и его scope с прямым
 подтверждением в evidence. Нельзя повторять значение одной метрики вместо
 отсутствующей другой. Если данных всё же недостаточно, явно укажи это в ответе:
 на этом линейном этапе возврата к чтению уже нет.
+
+Для сравнения, разности множеств и производной метрики используй evidence всех
+операндов; отсутствие одного из них не доказывает пустое множество или ноль.
 
 Соблюдай запрошенный формат. Если буквальный компактный формат не задан, ответ
 должен быть самодостаточным: подпиши смысл каждого значения и не возвращай
@@ -835,16 +645,24 @@ def _operation_skill_tool_schema() -> Dict[str, Any]:
             )
         ),
     }
+    pipeline_values = ["agentic", "validation_protocol"]
+    if _sql_risk_operation_scope_enabled():
+        pipeline_values.append("sql_risk_scope")
     properties: Dict[str, Any] = {
         "pipeline": {
             "type": "string",
-            "enum": [
-                "agentic",
-                "validation_protocol",
-            ],
+            "enum": pipeline_values,
             "description": (
-                "Общий агентный поток либо компиляция внешнего "
-                "SQL test protocol."
+                "Общий агентный поток или компиляция внешнего SQL test "
+                "protocol"
+                + (
+                    "; также отдельный LLM-анализ риска, зависящего от "
+                    "структуры transformation SQL. Прямое сравнение catalog "
+                    "атрибутов колонок остаётся agentic"
+                    if _sql_risk_operation_scope_enabled()
+                    else ""
+                )
+                + "."
             ),
         },
         "skills": {
@@ -859,30 +677,17 @@ def _operation_skill_tool_schema() -> Dict[str, Any]:
                 "означает, что специальный профиль не нужен."
             ),
         },
-        "sql_risk_aspects": sql_risk_aspects_schema,
     }
-    required = ["pipeline", "skills", "sql_risk_aspects"]
-    if _typed_sql_risk_execution_mode_enabled():
-        properties["sql_risk_execution_mode"] = {
-            "type": "string",
-            "enum": [
-                "agentic",
-                "conditional_cardinality",
-                "nullable_constraint",
-            ],
-            "description": (
-                "Структурный режим исполнения SQL-risk. Специальные "
-                "режимы допустимы только для одного закрытого результата "
-                "и согласованного аспекта; иначе agentic."
-            ),
-        }
-        required.append("sql_risk_execution_mode")
+    required = ["pipeline", "skills"]
+    if typed_sql_risk_aspects:
+        properties["sql_risk_aspects"] = sql_risk_aspects_schema
+        required.append("sql_risk_aspects")
     return {
         "type": "function",
         "function": {
             "name": _OPERATION_SKILL_TOOL_NAME,
             "description": (
-                "Выбрать применимые prompt-профили для всей операции."
+                "Выбрать pipeline и применимые prompt-профили для всей операции."
             ),
             "parameters": {
                 "type": "object",
@@ -894,72 +699,147 @@ def _operation_skill_tool_schema() -> Dict[str, Any]:
     }
 
 
-def _s2t_analysis_contract_tool_schema() -> Dict[str, Any]:
+def _required_model_tool_schema(
+    *,
+    name: str,
+    description: str,
+    payload_model: type[BaseModel],
+) -> Dict[str, Any]:
+    """Expose one strict Pydantic payload as a required native tool."""
+
+    def without_titles(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                key: without_titles(item)
+                for key, item in value.items()
+                if key != "title"
+            }
+        if isinstance(value, list):
+            return [without_titles(item) for item in value]
+        return value
+
+    parameters = without_titles(payload_model.model_json_schema())
     return {
         "type": "function",
         "function": {
-            "name": _S2T_ANALYSIS_CONTRACT_TOOL_NAME,
-            "description": "Извлечь строгий контракт S2T-анализа.",
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        },
+    }
+
+
+def _sql_risk_scope_extraction_tool_schema() -> Dict[str, Any]:
+    """Return a flat native schema accepted by GigaChat function calling.
+
+    Optional values are represented by absent keys. This avoids JSON Schema
+    ``anyOf``/``$ref`` constructs without weakening Pydantic validation of the
+    returned payload.
+    """
+
+    endpoint = {
+        "type": "object",
+        "properties": {
+            "table_name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact technical table name from original_task.",
+            },
+            "field_name": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Exact technical field name; omit for table-level mode."
+                ),
+            },
+        },
+        "required": ["table_name"],
+        "additionalProperties": False,
+    }
+    attestation_endpoint = {
+        "type": "object",
+        "properties": {
+            "table_name": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Exact table-name component copied verbatim from "
+                    "original_task."
+                ),
+            },
+            "field_name": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Exact field-name component copied verbatim from "
+                    "original_task; omit for a table-level mode."
+                ),
+            },
+        },
+        "required": ["table_name"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "function",
+        "function": {
+            "name": SQL_RISK_SCOPE_EXTRACTION_TOOL_NAME,
+            "description": (
+                "Выбрать внутренний SQL-risk mode и дословно извлечь exact scope."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "execution_mode": {
+                        "type": "string",
+                        "enum": list(SQL_RISK_SCOPE_EXECUTION_MODES),
+                    },
+                    "source": endpoint,
+                    "target": endpoint,
                     "file_id": {
                         "type": "integer",
                         "minimum": 1,
                         "description": (
-                            "Необязательный внутренний scope каталога; только "
-                            "если file_id явно дан в запросе."
+                            "Literal positive file_id; omit when absent."
                         ),
                     },
-                    "filename": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 500,
-                        "description": (
-                            "Необязательное точное имя загруженного файла; "
-                            "только если оно явно дано в запросе."
-                        ),
-                    },
-                    "source_tables": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": MAX_ANALYSIS_OBJECTS,
-                        "uniqueItems": True,
-                        "items": {"type": "string"},
-                        "description": "Все точные source-table из запроса.",
-                    },
-                    "target_tables": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": MAX_ANALYSIS_OBJECTS,
-                        "uniqueItems": True,
-                        "items": {"type": "string"},
-                        "description": "Все точные target-table из запроса.",
-                    },
-                    "requested_analyses": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": len(REQUESTED_ANALYSES),
-                        "uniqueItems": True,
-                        "items": {
-                            "type": "string",
-                            "enum": list(REQUESTED_ANALYSES),
+                    "origin": {
+                        "type": "object",
+                        "properties": {
+                            "source": attestation_endpoint,
+                            "target": attestation_endpoint,
+                            "file_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": (
+                                    "Verbatim decimal file_id token; omit when "
+                                    "file_id is absent."
+                                ),
+                            },
                         },
-                        "description": (
-                            "Только явно запрошенные виды анализа сохранённого "
-                            "S2T."
-                        ),
+                        "required": ["source", "target"],
+                        "additionalProperties": False,
                     },
                 },
                 "required": [
-                    "source_tables",
-                    "target_tables",
-                    "requested_analyses",
+                    "execution_mode",
+                    "source",
+                    "target",
+                    "origin",
                 ],
                 "additionalProperties": False,
             },
         },
     }
+
+
+def _sql_risk_assessment_tool_schema() -> Dict[str, Any]:
+    return _required_model_tool_schema(
+        name=SQL_RISK_ASSESSMENT_TOOL_NAME,
+        description=(
+            "Проанализировать exact evidence и нейтральную SQLGlot-структуру риска."
+        ),
+        payload_model=SqlRiskAssessment,
+    )
 
 
 def _validation_protocol_contract_tool_schema() -> Dict[str, Any]:
@@ -984,6 +864,15 @@ def _validation_protocol_contract_tool_schema() -> Dict[str, Any]:
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "file_scope_kind": {
+                        "type": "string",
+                        "enum": ["not_provided", "file_id", "file_mention"],
+                        "description": (
+                            "Обязательное LLM-решение о наличии файлового "
+                            "scope в original_task; not_provided допустим "
+                            "только при его полном отсутствии."
+                        ),
+                    },
                     "file_id": {
                         "type": "integer",
                         "minimum": 1,
@@ -994,7 +883,8 @@ def _validation_protocol_contract_tool_schema() -> Dict[str, Any]:
                         "minLength": 1,
                         "maxLength": 500,
                         "description": (
-                            "Дословное имя либо смысловое описание файла; "
+                            "Только дословное имя либо смысловое описание "
+                            "файла, не source/target table mention; "
                             "канонизацию выполняет deterministic resolver."
                         ),
                     },
@@ -1021,11 +911,21 @@ def _validation_protocol_contract_tool_schema() -> Dict[str, Any]:
                                         "minLength": 1,
                                         "maxLength": 300,
                                     },
+                                    "description": (
+                                        "Отдельные source-table mentions; "
+                                        "не filename и не выражение со "
+                                        "стрелкой."
+                                    ),
                                 },
                                 "target_mention": {
                                     "type": "string",
                                     "minLength": 1,
                                     "maxLength": 300,
+                                    "description": (
+                                        "Один отдельный target-table mention; "
+                                        "не filename и не выражение со "
+                                        "стрелкой."
+                                    ),
                                 },
                                 "requested_checks": checks_schema,
                                 "explicit_key": key_schema,
@@ -1039,67 +939,12 @@ def _validation_protocol_contract_tool_schema() -> Dict[str, Any]:
                         },
                     },
                 },
-                "required": ["mode", "requested_checks", "loads"],
-                "additionalProperties": False,
-            },
-        },
-    }
-
-
-def _s2t_analysis_tool_schema() -> Dict[str, Any]:
-    item_schema = {
-        "type": "object",
-        "properties": {
-            "kind": {
-                "type": "string",
-                "enum": list(LLM_ANALYSES),
-            },
-            "target_table": {
-                "type": "string",
-                "description": "Точный target текущего вывода из contract.",
-            },
-            "conclusion": {
-                "type": "string",
-                "description": "Вывод только по переданным S2T/catalog данным.",
-            },
-            "evidence": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Конкретные подтверждённые основания вывода.",
-            },
-            "limitations": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Что нельзя установить по переданным данным.",
-            },
-        },
-        "required": [
-            "target_table",
-            "kind",
-            "conclusion",
-            "evidence",
-            "limitations",
-        ],
-        "additionalProperties": False,
-    }
-    return {
-        "type": "function",
-        "function": {
-            "name": _S2T_ANALYSIS_TOOL_NAME,
-            "description": "Вернуть выводы анализа сохранённого S2T.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "analyses": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": (
-                            MAX_ANALYSIS_OBJECTS * len(LLM_ANALYSES)
-                        ),
-                        "items": item_schema,
-                    }
-                },
-                "required": ["analyses"],
+                "required": [
+                    "file_scope_kind",
+                    "mode",
+                    "requested_checks",
+                    "loads",
+                ],
                 "additionalProperties": False,
             },
         },
@@ -1136,69 +981,6 @@ def _plan_tool_schema() -> Dict[str, Any]:
                                         "данных; производный анализ выполняется "
                                         "upstream"
                                     ),
-                                },
-                                "constraints": {
-                                    "type": "array",
-                                    "maxItems": 20,
-                                    "items": {"type": "string"},
-                                    "description": (
-                                        "Релевантные ограничения из context, "
-                                        "материализованные для этого worker."
-                                    ),
-                                },
-                                "entity": {
-                                    "type": "object",
-                                    "properties": {
-                                        "role": {
-                                            "type": "string",
-                                            "enum": [
-                                                "source",
-                                                "target",
-                                                "unknown",
-                                            ],
-                                        },
-                                        "table": {"type": "string"},
-                                        "field": {"type": "string"},
-                                    },
-                                    "additionalProperties": False,
-                                },
-                                "scope": {
-                                    "type": "object",
-                                    "properties": {
-                                        "file_id": {
-                                            "type": "integer",
-                                            "minimum": 1,
-                                        },
-                                        "filename": {"type": "string"},
-                                        "sheet_name": {"type": "string"},
-                                        "filters": {
-                                            "type": "object",
-                                            # GigaChat validates every object
-                                            # node as a complete JSON Schema
-                                            # object, including open maps.
-                                            "properties": {},
-                                            "additionalProperties": True,
-                                        },
-                                    },
-                                    "additionalProperties": False,
-                                },
-                                "coverage": {
-                                    "type": "string",
-                                    "enum": [
-                                        "single",
-                                        "all_matches",
-                                        "top_k",
-                                        "aggregate",
-                                    ],
-                                },
-                                "dependencies": {
-                                    "type": "array",
-                                    "maxItems": COORDINATOR_MAX_WORKERS - 1,
-                                    "uniqueItems": True,
-                                    "items": {
-                                        "type": "integer",
-                                        "minimum": 1,
-                                    },
                                 },
                             },
                             "required": ["task"],
@@ -1237,7 +1019,9 @@ def _upstream_answer_tool_schema() -> Dict[str, Any]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Подмножество used evidence для отдельного display."
+                            "Подмножество used evidence для display; обязательно "
+                            "включает evidence, подтверждающее новые физические "
+                            "идентификаторы в answer."
                         ),
                     },
                 },
@@ -1289,15 +1073,17 @@ def _native_payload(
         raise CoordinatorResponseError(
             f"Coordinator ожидал AIMessage с native call {tool_name}."
         )
-    matching_calls = [
-        call for call in message.tool_calls if call.get("name") == tool_name
-    ]
-    if len(matching_calls) != 1:
+    if (
+        len(message.tool_calls) != 1
+        or message.tool_calls[0].get("name") != tool_name
+    ):
         raise CoordinatorResponseError(
             f"Coordinator должен вернуть ровно один native call {tool_name}."
         )
     try:
-        return payload_model.model_validate(matching_calls[0].get("args") or {})
+        return payload_model.model_validate(
+            message.tool_calls[0].get("args") or {}
+        )
     except ValidationError as exc:
         details: List[str] = []
         for item in exc.errors():
@@ -1316,6 +1102,28 @@ def _native_payload(
             f"Coordinator вернул невалидную структуру {tool_name}: "
             + str(exc)[:1200]
         ) from exc
+
+
+def _native_call_arguments(message: Any, tool_name: str) -> Mapping[str, Any]:
+    """Return one native-call argument mapping without semantic validation."""
+
+    if not isinstance(message, AIMessage):
+        raise CoordinatorResponseError(
+            f"Coordinator ожидал AIMessage с native call {tool_name}."
+        )
+    if (
+        len(message.tool_calls) != 1
+        or message.tool_calls[0].get("name") != tool_name
+    ):
+        raise CoordinatorResponseError(
+            f"Coordinator должен вернуть ровно один native call {tool_name}."
+        )
+    arguments = message.tool_calls[0].get("args")
+    if not isinstance(arguments, Mapping):
+        raise CoordinatorResponseError(
+            f"Coordinator вернул не-object arguments для {tool_name}."
+        )
+    return arguments
 
 
 def _native_upstream_decision(message: Any) -> UpstreamDecision:
@@ -1345,19 +1153,16 @@ def _native_operation_route(message: Any) -> OperationSkillSelection:
             "Operation router выбрал неизвестные skills: "
             + ", ".join(dict.fromkeys(unknown))
         )
+    if (
+        selection.pipeline == "sql_risk_scope"
+        and not _sql_risk_operation_scope_enabled()
+    ):
+        raise CoordinatorResponseError(
+            "Operation router выбрал отключённый pipeline=sql_risk_scope."
+        )
     return selection.model_copy(
         update={"skills": list(dict.fromkeys(selection.skills))}
     )
-
-
-def _native_s2t_analysis_contract(message: Any) -> ValidationProtocolContract:
-    contract = _native_payload(
-        message,
-        _S2T_ANALYSIS_CONTRACT_TOOL_NAME,
-        ValidationProtocolContract,
-    )
-    assert isinstance(contract, ValidationProtocolContract)
-    return contract
 
 
 def _native_validation_protocol_contract(message: Any) -> RawTestProtocolContract:
@@ -1370,47 +1175,32 @@ def _native_validation_protocol_contract(message: Any) -> RawTestProtocolContrac
     return contract
 
 
-def _native_s2t_analysis(message: Any) -> S2TAnalysisOutput:
-    output = _native_payload(
+def _native_validation_contract_review(message: Any) -> ValidationContractReview:
+    """Parse one model-owned semantic review without inspecting task text."""
+
+    arguments = _native_call_arguments(
         message,
-        _S2T_ANALYSIS_TOOL_NAME,
-        S2TAnalysisOutput,
+        VALIDATION_CONTRACT_REVIEW_TOOL_NAME,
     )
-    assert isinstance(output, S2TAnalysisOutput)
-    return output
-
-
-def _validate_contract_origin(
-    contract: Any,
-    original_task: str,
-) -> None:
-    """Reject identifiers invented by the typed-contract model."""
-    task = str(original_task or "")
-    missing = [
-        value
-        for value in (*contract.source_tables, *contract.target_tables)
-        if value not in task
-    ]
-    file_id_missing = (
-        contract.file_id is not None
-        and f"file_id={contract.file_id}" not in task.replace(" ", "")
-    )
-    filename = str(getattr(contract, "filename", None) or "").strip()
-    filename_missing = bool(
-        filename and filename.casefold() not in task.casefold()
-    )
-    if missing or file_id_missing or filename_missing:
-        details = (
-            ", ".join(missing)
-            if missing
-            else f"file_id={contract.file_id}"
-            if file_id_missing
-            else filename
-        )
+    validation = validate_validation_contract_review(arguments)
+    if validation.status != "valid" or validation.review is None:
+        details = "; ".join(
+            f"{item.location}: {item.message}"
+            for item in validation.errors
+        )[:1200]
         raise CoordinatorResponseError(
-            "Typed contract содержит идентификатор не из original_task: "
-            + details
+            "Coordinator вернул невалидный review validation contract: "
+            + (details or "unknown schema error")
         )
+    return validation.review
+
+
+def _validation_review_issue_text(review: ValidationContractReview) -> str:
+    """Serialize only closed issue codes; never promote free text to repair."""
+
+    return ", ".join(
+        dict.fromkeys(item.code for item in review.issues)
+    )
 
 
 def _validation_contract_issue(error: Exception) -> Dict[str, Any]:
@@ -1431,6 +1221,17 @@ def _validation_contract_issue(error: Exception) -> Dict[str, Any]:
     }
 
 
+def _validation_contract_unavailable_issue(error: Exception) -> Dict[str, Any]:
+    """Represent an unavailable extraction/review provider boundary safely."""
+
+    detail = str(error).strip()[:1200]
+    return {
+        "code": "unavailable",
+        "message": detail or "LLM review validation contract недоступен.",
+        "candidates": [],
+    }
+
+
 def _render_validation_failure(
     status: str,
     issues: Sequence[Dict[str, Any]],
@@ -1442,6 +1243,7 @@ def _render_validation_failure(
         "unsupported_check": "Запрошена неподдерживаемая проверка",
         "unresolved_entity": "Сущность не разрешена",
         "ambiguous_entity": "Сущность неоднозначна",
+        "unavailable": "Validation contract недоступен",
     }
     lines = [
         "Тест-протокол не сформирован.",
@@ -1507,6 +1309,84 @@ def _repair_messages(
     return messages
 
 
+def select_operation_route(
+    task: str,
+    *,
+    model: Any,
+    callbacks: Optional[Sequence[Any]] = None,
+    stable_context: str = "",
+) -> OperationSkillSelection:
+    """Select the pipeline once from the resolved task and stable context.
+
+    This is the public front door shared by the top-level graph and the
+    coordinator fallback. It classifies intent only through the structured LLM
+    enum; downstream code never reclassifies natural-language wording. Stable
+    context may clarify intent but is never used as identifier provenance.
+    """
+
+    callback_list = list(callbacks or [])
+    model_config = {"callbacks": callback_list} if callback_list else None
+    schema = _operation_skill_tool_schema()
+    try:
+        try:
+            selected_model = model.bind_tools(
+                [schema],
+                tool_choice=_OPERATION_SKILL_TOOL_NAME,
+            )
+        except TypeError:
+            selected_model = model.bind_tools([schema])
+        messages: List[BaseMessage] = [
+            SystemMessage(content=_operation_skill_prompt()),
+            HumanMessage(
+                content=json.dumps(
+                    {
+                        "original_task": str(task or "").strip(),
+                        "stable_context": str(stable_context or "").strip(),
+                    },
+                    ensure_ascii=False,
+                )
+            ),
+        ]
+        with llm_stage("operation_router"):
+            result = (
+                selected_model.invoke(messages, config=model_config)
+                if model_config is not None
+                else selected_model.invoke(messages)
+            )
+    except Exception as exc:
+        if isinstance(exc, CoordinatorResponseError):
+            raise
+        raise CoordinatorResponseError(
+            f"Ошибка LLM coordinator: {type(exc).__name__}"
+        ) from exc
+
+    try:
+        return _native_operation_route(result)
+    except CoordinatorResponseError as first_error:
+        logger.warning(
+            "Operation route violated selection schema; requesting one "
+            "LLM repair: %s",
+            first_error,
+        )
+        repair_messages = _repair_messages(
+            messages,
+            result,
+            _operation_skill_repair_prompt() + "\nОшибка: " + str(first_error),
+        )
+        try:
+            with llm_stage("operation_router"):
+                repaired = (
+                    selected_model.invoke(repair_messages, config=model_config)
+                    if model_config is not None
+                    else selected_model.invoke(repair_messages)
+                )
+        except Exception as exc:
+            raise CoordinatorResponseError(
+                f"Ошибка LLM coordinator: {type(exc).__name__}"
+            ) from exc
+        return _native_operation_route(repaired)
+
+
 def build_coordinator_graph(
     model: Any,
     *,
@@ -1523,10 +1403,6 @@ def build_coordinator_graph(
         except TypeError:
             return model.bind_tools([schema])
 
-    operation_skill_model = bind_required_tool(
-        _operation_skill_tool_schema(),
-        _OPERATION_SKILL_TOOL_NAME,
-    )
     plan_model = bind_required_tool(_plan_tool_schema(), _PLAN_TOOL_NAME)
     upstream_data_decision_model = bind_required_tool(
         _upstream_data_decision_tool_schema(),
@@ -1555,69 +1431,168 @@ def build_coordinator_graph(
                 f"Ошибка LLM coordinator: {type(exc).__name__}"
             ) from exc
 
+    def extract_sql_risk_scope(
+        original_task: str,
+        stable_context: str = "",
+    ) -> tuple[SqlRiskScopeExtraction | None, List[str]]:
+        """Run the internal mode/scope extractor with one bounded repair."""
+
+        messages: List[BaseMessage] = [
+            SystemMessage(content=SQL_RISK_SCOPE_EXTRACTION_PROMPT),
+            HumanMessage(
+                content=json.dumps(
+                    {
+                        "original_task": original_task,
+                        "stable_context": stable_context,
+                    },
+                    ensure_ascii=False,
+                )
+            ),
+        ]
+        try:
+            sql_risk_scope_extraction_model = bind_required_tool(
+                _sql_risk_scope_extraction_tool_schema(),
+                SQL_RISK_SCOPE_EXTRACTION_TOOL_NAME,
+            )
+        except Exception as exc:
+            return None, [
+                "scope extraction transport setup failed: "
+                f"{type(exc).__name__}: {exc}"
+            ]
+        result: Any = None
+        last_errors: List[str] = []
+        for attempt in range(MAX_SQL_RISK_SCOPE_EXTRACTION_ATTEMPTS):
+            try:
+                result = invoke(
+                    sql_risk_scope_extraction_model,
+                    messages,
+                    stage="sql_risk_scope_contract",
+                )
+            except CoordinatorResponseError as exc:
+                return None, [str(exc)]
+            try:
+                arguments = _native_call_arguments(
+                    result,
+                    SQL_RISK_SCOPE_EXTRACTION_TOOL_NAME,
+                )
+            except CoordinatorResponseError as error:
+                validation = None
+                last_errors = [str(error)]
+            else:
+                validation = validate_sql_risk_scope_extraction(
+                    arguments,
+                    original_task=original_task,
+                )
+                if validation.status == "valid":
+                    assert validation.contract is not None
+                    return validation.contract, []
+                last_errors = [
+                    f"{item.code}:{item.location}:{item.message}"
+                    for item in validation.issues
+                ]
+            if attempt + 1 >= MAX_SQL_RISK_SCOPE_EXTRACTION_ATTEMPTS:
+                break
+            repair_prompt = (
+                render_sql_risk_scope_extraction_repair(validation.issues)
+                if validation is not None
+                else (
+                    "Предыдущий native call не прошёл fail-closed validation. "
+                    "Верни ровно один исправленный call "
+                    f"`{SQL_RISK_SCOPE_EXTRACTION_TOOL_NAME}`; не меняй intent, "
+                    "не придумывай literals и не предлагай agentic fallback. "
+                    "Ошибка: "
+                    + "; ".join(last_errors)
+                )
+            )
+            messages = _repair_messages(messages, result, repair_prompt)
+        return None, last_errors
+
+    def assess_sql_risk_scope(context: Any) -> Any:
+        """Run the bounded scope-analysis LLM and validate its provenance."""
+
+        messages: List[BaseMessage] = [
+            SystemMessage(content=SQL_RISK_ASSESSMENT_PROMPT),
+            HumanMessage(content=render_sql_risk_assessment_request(context)),
+        ]
+        sql_risk_assessment_model = bind_required_tool(
+            _sql_risk_assessment_tool_schema(),
+            SQL_RISK_ASSESSMENT_TOOL_NAME,
+        )
+        result: Any = None
+        validation: Any = None
+        for attempt in range(MAX_SQL_RISK_ASSESSMENT_ATTEMPTS):
+            result = invoke(
+                sql_risk_assessment_model,
+                messages,
+                stage="sql_risk_scope_analysis",
+            )
+            try:
+                arguments = _native_call_arguments(
+                    result,
+                    SQL_RISK_ASSESSMENT_TOOL_NAME,
+                )
+            except CoordinatorResponseError as error:
+                arguments = {"invalid_native_call": str(error)}
+            validation = validate_sql_risk_assessment(
+                arguments,
+                context=context,
+            )
+            if validation.status == "valid":
+                return validation
+            if attempt + 1 >= MAX_SQL_RISK_ASSESSMENT_ATTEMPTS:
+                break
+            messages = _repair_messages(
+                messages,
+                result,
+                render_sql_risk_assessment_repair(validation.issues),
+            )
+        return validation
+
     def downstream_plan_node(state: CoordinatorGraphState) -> Dict[str, Any]:
         operation_skills = state.get("operation_skills")
         operation_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
-        operation_sql_risk_execution_mode = (
-            state.get("operation_sql_risk_execution_mode") or "agentic"
-        )
         operation_pipeline = state.get("operation_pipeline")
         if operation_skills is None:
-            operation_payload = {
-                "original_task": state["task"],
-            }
-            operation_messages: List[BaseMessage] = [
-                SystemMessage(content=_operation_skill_prompt()),
-                HumanMessage(
-                    content=json.dumps(operation_payload, ensure_ascii=False)
-                ),
-            ]
-            operation_result = invoke(
-                operation_skill_model,
-                operation_messages,
-                stage="operation_router",
+            operation_route = select_operation_route(
+                state["task"],
+                model=model,
+                callbacks=callback_list,
+                stable_context=state["context"],
             )
-            try:
-                operation_route = _native_operation_route(operation_result)
-            except CoordinatorResponseError as first_error:
-                logger.warning(
-                    "Operation skill call violated selection schema; "
-                    "requesting one LLM repair: %s",
-                    first_error,
-                )
-                operation_result = invoke(
-                    operation_skill_model,
-                    _repair_messages(
-                        operation_messages,
-                        operation_result,
-                        _operation_skill_repair_prompt()
-                        + "\nОшибка: "
-                        + str(first_error),
-                    ),
-                    stage="operation_router",
-                )
-                operation_route = _native_operation_route(operation_result)
             operation_skills = operation_route.skills
             operation_sql_risk_aspects = (
                 operation_route.sql_risk_aspects
             )
-            operation_sql_risk_execution_mode = (
-                operation_route.sql_risk_execution_mode
-            )
             operation_pipeline = operation_route.pipeline
         if operation_pipeline is None:
             operation_pipeline = "agentic"
+        if _SQL_RISK_OPERATION_SKILL in operation_skills:
+            # Surface a bad experiment setting only for a selected SQL-risk
+            # route; unrelated requests keep their default behavior.
+            sql_risk_scope_evidence_enabled()
+
+        if operation_pipeline == "sql_risk_scope":
+            if not _sql_risk_operation_scope_enabled():
+                raise CoordinatorResponseError(
+                    "pipeline=sql_risk_scope отключён конфигурацией."
+                )
+            # This is a separate graph branch. Do not synthesize a worker plan
+            # and do not load an operation-skill prompt profile.
+            return {
+                "operation_skills": [],
+                "operation_sql_risk_aspects": [],
+                "operation_pipeline": "sql_risk_scope",
+                "plan": [],
+                "next_step": 0,
+            }
 
         if operation_pipeline == "validation_protocol":
             protocol_display_refs: List[str] = []
             protocol_reader_results: List[Dict[str, Any]] = []
             protocol_trace: Dict[str, Any]
-            protocol_contract_model = bind_required_tool(
-                _validation_protocol_contract_tool_schema(),
-                _VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME,
-            )
+            contract_review_trace: List[Dict[str, Any]] = []
             protocol_payload = {"original_task": state["task"]}
             protocol_messages: List[BaseMessage] = [
                 SystemMessage(content=_VALIDATION_PROTOCOL_CONTRACT_PROMPT),
@@ -1625,54 +1600,138 @@ def build_coordinator_graph(
                     content=json.dumps(protocol_payload, ensure_ascii=False)
                 ),
             ]
-            protocol_result = invoke(
-                protocol_contract_model,
-                protocol_messages,
-                stage="validation_protocol_contract",
-            )
             raw_protocol_contract: Optional[RawTestProtocolContract] = None
             extraction_issue: Optional[Dict[str, Any]] = None
             try:
-                raw_protocol_contract = _native_validation_protocol_contract(
-                    protocol_result
+                protocol_contract_model = bind_required_tool(
+                    _validation_protocol_contract_tool_schema(),
+                    _VALIDATION_PROTOCOL_CONTRACT_TOOL_NAME,
                 )
-                validate_raw_contract_origin(
-                    raw_protocol_contract,
-                    state["task"],
+                protocol_review_model = bind_required_tool(
+                    validation_contract_review_tool_schema(),
+                    VALIDATION_CONTRACT_REVIEW_TOOL_NAME,
                 )
-            except (CoordinatorResponseError, ValueError) as first_error:
-                logger.warning(
-                    "Typed test protocol contract was invalid; requesting "
-                    "one LLM repair: %s",
-                    first_error,
+            except Exception as bind_error:
+                extraction_issue = _validation_contract_unavailable_issue(
+                    bind_error
                 )
-                protocol_result = invoke(
-                    protocol_contract_model,
-                    _repair_messages(
-                        protocol_messages,
-                        protocol_result,
-                        _VALIDATION_PROTOCOL_CONTRACT_REPAIR_PROMPT
-                        + "\nОшибка: "
-                        + str(first_error),
-                    ),
-                    stage="validation_protocol_contract",
-                )
-                try:
-                    raw_protocol_contract = _native_validation_protocol_contract(
-                        protocol_result
+            else:
+                extraction_messages = protocol_messages
+                for extraction_attempt in range(2):
+                    try:
+                        protocol_result = invoke(
+                            protocol_contract_model,
+                            extraction_messages,
+                            stage="validation_protocol_contract",
+                        )
+                    except CoordinatorResponseError as invoke_error:
+                        extraction_issue = (
+                            _validation_contract_unavailable_issue(invoke_error)
+                        )
+                        break
+
+                    try:
+                        candidate_contract = (
+                            _native_validation_protocol_contract(
+                                protocol_result
+                            )
+                        )
+                        validate_raw_contract_origin(
+                            candidate_contract,
+                            state["task"],
+                        )
+                    except (CoordinatorResponseError, ValueError) as error:
+                        if extraction_attempt == 0:
+                            logger.warning(
+                                "Typed test protocol contract was invalid; "
+                                "requesting one LLM repair: %s",
+                                error,
+                            )
+                            extraction_messages = _repair_messages(
+                                protocol_messages,
+                                protocol_result,
+                                _VALIDATION_PROTOCOL_CONTRACT_REPAIR_PROMPT
+                                + "\nОшибка schema/origin: "
+                                + str(error),
+                            )
+                            continue
+                        extraction_issue = _validation_contract_issue(error)
+                        break
+
+                    try:
+                        review_messages: List[BaseMessage] = [
+                            SystemMessage(
+                                content=VALIDATION_CONTRACT_REVIEW_PROMPT
+                            ),
+                            HumanMessage(
+                                content=(
+                                    render_validation_contract_review_request(
+                                        state["task"],
+                                        candidate_contract,
+                                    )
+                                )
+                            ),
+                        ]
+                        review_result = invoke(
+                            protocol_review_model,
+                            review_messages,
+                            stage="validation_protocol_contract_review",
+                        )
+                        contract_review = _native_validation_contract_review(
+                            review_result
+                        )
+                    except (CoordinatorResponseError, ValueError) as error:
+                        contract_review_trace.append(
+                            {
+                                "attempt": extraction_attempt + 1,
+                                "status": "unavailable",
+                                "error": str(error)[:1200],
+                            }
+                        )
+                        extraction_issue = (
+                            _validation_contract_unavailable_issue(error)
+                        )
+                        break
+
+                    review_entry = {
+                        "attempt": extraction_attempt + 1,
+                        "status": contract_review.decision,
+                        "issues": [
+                            item.model_dump(mode="json")
+                            for item in contract_review.issues
+                        ],
+                    }
+                    contract_review_trace.append(review_entry)
+                    if contract_review.decision == "accept":
+                        raw_protocol_contract = candidate_contract
+                        break
+
+                    review_issue_text = _validation_review_issue_text(
+                        contract_review
                     )
-                    validate_raw_contract_origin(
-                        raw_protocol_contract,
-                        state["task"],
+                    if extraction_attempt == 0:
+                        logger.warning(
+                            "Model-owned validation contract review requested "
+                            "one extraction repair: %s",
+                            review_issue_text,
+                        )
+                        extraction_messages = _repair_messages(
+                            protocol_messages,
+                            protocol_result,
+                            _VALIDATION_PROTOCOL_CONTRACT_REPAIR_PROMPT
+                            + "\nReview полноты/ролей: "
+                            + review_issue_text,
+                        )
+                        continue
+
+                    extraction_issue = _validation_contract_issue(
+                        ValueError(
+                            "Model-owned review повторно отклонил validation "
+                            "contract: "
+                            + review_issue_text
+                        )
                     )
-                except (CoordinatorResponseError, ValueError) as second_error:
-                    logger.warning(
-                        "Typed test protocol contract remained invalid; "
-                        "returning structured validation state: %s",
-                        second_error,
-                    )
-                    raw_protocol_contract = None
-                    extraction_issue = _validation_contract_issue(second_error)
+                    break
 
             if raw_protocol_contract is None:
                 assert extraction_issue is not None
@@ -1808,6 +1867,7 @@ def build_coordinator_graph(
                             }
                         )
 
+            protocol_trace["contract_reviews"] = contract_review_trace
             record_validation_protocol(protocol_trace)
             direct_plan = [
                 {
@@ -1818,14 +1878,13 @@ def build_coordinator_graph(
                     "sql_risk_aspects": list(
                         operation_sql_risk_aspects
                     ),
-                    "sql_risk_execution_mode": (
-                        operation_sql_risk_execution_mode
-                    ),
                     "pipeline": "validation_protocol",
                 }
                 for index, task in enumerate(
                     (
                         "Извлечь RawTestProtocolContract из запроса.",
+                        "Проверить полноту и роли contract отдельным "
+                        "model-owned review.",
                         "Разрешить неподтверждённые сущности и прочитать "
                         "только зависимости checks.",
                         "Выполнить static preflight и скомпилировать Phase 0–3.",
@@ -1845,9 +1904,6 @@ def build_coordinator_graph(
                 "operation_sql_risk_aspects": list(
                     operation_sql_risk_aspects
                 ),
-                "operation_sql_risk_execution_mode": (
-                    operation_sql_risk_execution_mode
-                ),
                 "operation_pipeline": "validation_protocol",
                 "plan": [],
                 "next_step": 0,
@@ -1856,344 +1912,76 @@ def build_coordinator_graph(
                 "selected_display_refs": protocol_display_refs,
             }
 
-        if operation_pipeline == "s2t_analysis":
-            analysis_display_refs: List[str] = []
-            contract_model = bind_required_tool(
-                _s2t_analysis_contract_tool_schema(),
-                _S2T_ANALYSIS_CONTRACT_TOOL_NAME,
-            )
-            contract_payload = {"original_task": state["task"]}
-            contract_messages: List[BaseMessage] = [
-                SystemMessage(content=_S2T_ANALYSIS_CONTRACT_PROMPT),
-                HumanMessage(
-                    content=json.dumps(contract_payload, ensure_ascii=False)
-                ),
-            ]
-            contract_result = invoke(
-                contract_model,
-                contract_messages,
-                stage="s2t_analysis_contract",
-            )
-            try:
-                contract = _native_s2t_analysis_contract(contract_result)
-                _validate_contract_origin(contract, state["task"])
-            except CoordinatorResponseError as first_error:
-                logger.warning(
-                    "Typed validation contract was invalid; requesting one "
-                    "LLM repair: %s",
-                    first_error,
-                )
-                contract_result = invoke(
-                    contract_model,
-                    _repair_messages(
-                        contract_messages,
-                        contract_result,
-                        _S2T_ANALYSIS_CONTRACT_REPAIR_PROMPT
-                        + "\nОшибка: "
-                        + str(first_error),
-                    ),
-                    stage="s2t_analysis_contract",
-                )
-                try:
-                    contract = _native_s2t_analysis_contract(contract_result)
-                    _validate_contract_origin(contract, state["task"])
-                except CoordinatorResponseError as second_error:
-                    logger.warning(
-                        "Typed legacy S2T contract remained invalid; refusing "
-                        "an implicit pipeline change: %s",
-                        second_error,
-                    )
-                    raise CoordinatorResponseError(
-                        "Невалидный контракт legacy S2T pipeline после repair; "
-                        "agentic fallback запрещён."
-                    ) from second_error
-                else:
-                    operation_pipeline = "s2t_analysis"
-
-            if operation_pipeline == "s2t_analysis":
-                try:
-                    reader_results = read_validation_protocol_inputs(
-                        contract,
-                        callbacks=callback_list,
-                    )
-                except ValidationProtocolDataError as exc:
-                    answer = (
-                        "S2T-анализ не выполнен: подтверждённые данные "
-                        f"недостаточны ({exc})."
-                    )
-                else:
-                    analysis_payload = build_s2t_analysis_payload(
-                        contract,
-                        reader_results=reader_results,
-                    )
-                    deterministic_items = build_deterministic_analysis_items(
-                        contract,
-                        reader_results=reader_results,
-                    )
-                    if analysis_payload["llm_requested_analyses"]:
-                        analysis_model = bind_required_tool(
-                            _s2t_analysis_tool_schema(),
-                            _S2T_ANALYSIS_TOOL_NAME,
-                        )
-                        analysis_messages: List[BaseMessage] = [
-                            SystemMessage(content=_S2T_ANALYSIS_PROMPT),
-                            HumanMessage(
-                                content=json.dumps(
-                                    analysis_payload,
-                                    ensure_ascii=False,
-                                )
-                            ),
-                        ]
-                        analysis_result = invoke(
-                            analysis_model,
-                            analysis_messages,
-                            stage="s2t_analysis",
-                        )
-                        try:
-                            analysis = _native_s2t_analysis(analysis_result)
-                            validate_s2t_analysis_output(contract, analysis)
-                        except (
-                            CoordinatorResponseError,
-                            ValueError,
-                        ) as first_error:
-                            logger.warning(
-                                "S2T analysis violated its contract; requesting "
-                                "one LLM repair: %s",
-                                first_error,
-                            )
-                            analysis_result = invoke(
-                                analysis_model,
-                                _repair_messages(
-                                    analysis_messages,
-                                    analysis_result,
-                                    _S2T_ANALYSIS_REPAIR_PROMPT
-                                    + "\nОшибка: "
-                                    + str(first_error),
-                                ),
-                                stage="s2t_analysis",
-                            )
-                            analysis = _native_s2t_analysis(analysis_result)
-                            try:
-                                validate_s2t_analysis_output(contract, analysis)
-                            except ValueError as second_error:
-                                raise CoordinatorResponseError(
-                                    str(second_error)
-                                ) from second_error
-                    else:
-                        analysis = S2TAnalysisOutput(analyses=[])
-                    analysis = merge_s2t_analysis_output(
-                        analysis,
-                        deterministic_items,
-                    )
-                    answer = render_s2t_analysis_answer(contract, analysis)
-                    analysis_display_refs = register_worker_display_items(
-                        [
-                            WorkerDisplayItem(**item)
-                            for item in build_s2t_analysis_display_payloads(
-                                reader_results
-                            )
-                        ]
-                    )
-                    if collected_display_refs is not None:
-                        collected_display_refs.extend(analysis_display_refs)
-                direct_plan = [
-                    {
-                        "cycle": state["cycle"],
-                        "step": index,
-                        "task": task,
-                        "operation_skills": list(operation_skills),
-                        "sql_risk_aspects": list(
-                            operation_sql_risk_aspects
-                        ),
-                        "sql_risk_execution_mode": (
-                            operation_sql_risk_execution_mode
-                        ),
-                        "pipeline": "s2t_analysis",
-                    }
-                    for index, task in enumerate(
-                        (
-                            "Прочитать все S2T-строки каждого target.",
-                            "Прочитать target-каталог каждого file/table.",
-                            "Проанализировать только подтверждённые S2T и каталог.",
-                        ),
-                        start=1,
-                    )
-                ]
-                record_coordinator_plan(direct_plan)
-                direct_output = {
-                    "answer": answer,
-                    "pipeline": "s2t_analysis",
-                }
-                record_upstream_output(direct_output)
-                return {
-                    "operation_skills": list(operation_skills),
-                    "operation_sql_risk_aspects": list(
-                        operation_sql_risk_aspects
-                    ),
-                    "operation_sql_risk_execution_mode": (
-                        operation_sql_risk_execution_mode
-                    ),
-                    "operation_pipeline": "s2t_analysis",
-                    "plan": [],
-                    "next_step": 0,
-                    "upstream_output": direct_output,
-                    "final_answer": answer,
-                    "selected_display_refs": analysis_display_refs,
-                }
-
         plan_operation_context = load_operation_skills(
             operation_skills,
             stage="plan",
             sql_risk_aspects=operation_sql_risk_aspects,
         )
-        scope_evidence_architecture = (
-            sql_risk_scope_evidence_architecture()
-            if "Анализ SQL-рисков" in operation_skills
-            else "off"
-        )
-        candidate_scope_evidence_contract = (
-            build_sql_risk_scope_contract(
-                state["task"],
-                operation_sql_risk_aspects,
-                execution_mode=operation_sql_risk_execution_mode,
-            )
-            if (
-                scope_evidence_architecture == "typed_plan"
-                and operation_skills == ["Анализ SQL-рисков"]
-            )
-            else None
-        )
-        typed_scope_plan = (
-            build_typed_sql_risk_worker_plan(
-                state["task"],
-                candidate_scope_evidence_contract,
-                sql_risk_execution_mode=(
-                    operation_sql_risk_execution_mode
-                ),
-            )
-            if (
-                scope_evidence_architecture == "typed_plan"
-                and operation_pipeline == "agentic"
-                and operation_skills == ["Анализ SQL-рисков"]
-            )
-            else None
-        )
-        scope_evidence_contract = (
-            typed_scope_plan.contract
-            if typed_scope_plan is not None
-            else None
-        )
-        scope_evidence_attestation: Dict[str, Any] = {}
-        if scope_evidence_contract is not None:
-            scope_evidence_attestation = {
-                "operation_sql_risk_scope_contract": {
-                    "scope": scope_evidence_contract.scope.label,
-                    "required_evidence": [
-                        {
-                            "tool_name": requirement.tool_name,
-                            "arguments": dict(requirement.arguments),
-                        }
-                        for requirement in scope_evidence_contract.requirements
-                    ],
-                }
-            }
         sql_risk_protocol_attestation = _sql_risk_protocol_attestation(
             operation_skills,
             operation_sql_risk_aspects,
         )
-        def validate_plan_contract(candidate: WorkerPlan) -> None:
-            contract_errors: List[str] = []
-            try:
-                validate_worker_plan_origin(
-                    candidate,
-                    state["task"],
-                    context=state["context"],
-                )
-            except PlanOriginError as exc:
-                contract_errors.append(str(exc))
-            if contract_errors:
-                raise CoordinatorResponseError("; ".join(contract_errors))
 
-        if typed_scope_plan is not None:
-            plan = typed_scope_plan.plan
-            # Typed construction validates enum/aspect/requirements and exact
-            # literal origin. Do not reclassify its code-owned task prose.
-            scope_step_index = typed_scope_plan.evidence_step_index
-            plan_source_attestation = {
-                "plan_source": typed_scope_plan.plan_source,
-            }
-        else:
-            plan_payload: Dict[str, Any] = {
-                "original_task": state["task"],
-                "context": state["context"],
-            }
-            if state["upstream_problem"] is not None:
-                plan_payload["problem"] = state["upstream_problem"]
-            plan_messages: List[BaseMessage] = [
-                SystemMessage(
-                    content="\n\n".join(
-                        part
-                        for part in (
-                            _DOWNSTREAM_PLAN_PROMPT,
-                            plan_operation_context,
-                        )
-                        if part
+        plan_payload: Dict[str, Any] = {
+            "original_task": state["task"],
+            "context": state["context"],
+        }
+        if state["upstream_problem"] is not None:
+            plan_payload["problem"] = state["upstream_problem"]
+        plan_messages: List[BaseMessage] = [
+            SystemMessage(
+                content="\n\n".join(
+                    part
+                    for part in (
+                        _DOWNSTREAM_PLAN_PROMPT,
+                        plan_operation_context,
                     )
-                ),
-                HumanMessage(
-                    content=json.dumps(
-                        plan_payload,
-                        ensure_ascii=False,
-                    )
-                ),
-            ]
-            plan_result = invoke(
+                    if part
+                )
+            ),
+            HumanMessage(
+                content=json.dumps(
+                    plan_payload,
+                    ensure_ascii=False,
+                )
+            ),
+        ]
+        plan_result = invoke(
+            plan_model,
+            plan_messages,
+            stage="downstream_plan",
+        )
+        try:
+            plan = _native_payload(
+                plan_result,
+                _PLAN_TOOL_NAME,
+                WorkerPlan,
+            )
+        except CoordinatorResponseError as first_error:
+            logger.warning(
+                "Coordinator plan call violated plan schema; requesting "
+                "one LLM repair: %s",
+                first_error,
+            )
+            repaired_result = invoke(
                 plan_model,
-                plan_messages,
+                _repair_messages(
+                    plan_messages,
+                    plan_result,
+                    _DOWNSTREAM_PLAN_REPAIR_PROMPT.replace(
+                        "{validation_error}",
+                        str(first_error),
+                    ),
+                ),
                 stage="downstream_plan",
             )
-            try:
-                plan = _native_payload(
-                    plan_result,
-                    _PLAN_TOOL_NAME,
-                    WorkerPlan,
-                )
-                assert isinstance(plan, WorkerPlan)
-                validate_plan_contract(plan)
-            except CoordinatorResponseError as first_error:
-                logger.warning(
-                    "Coordinator plan call violated plan schema; requesting "
-                    "one LLM repair: %s",
-                    first_error,
-                )
-                repaired_result = invoke(
-                    plan_model,
-                    _repair_messages(
-                        plan_messages,
-                        plan_result,
-                        _DOWNSTREAM_PLAN_REPAIR_PROMPT.replace(
-                            "{validation_error}",
-                            str(first_error),
-                        ),
-                    ),
-                    stage="downstream_plan",
-                )
-                plan = _native_payload(
-                    repaired_result,
-                    _PLAN_TOOL_NAME,
-                    WorkerPlan,
-                )
-                assert isinstance(plan, WorkerPlan)
-                try:
-                    validate_plan_contract(plan)
-                except CoordinatorResponseError as second_error:
-                    raise CoordinatorResponseError(
-                        "Исправленный worker plan нарушает plan contract: "
-                        + str(second_error)
-                    ) from second_error
+            plan = _native_payload(
+                repaired_result,
+                _PLAN_TOOL_NAME,
+                WorkerPlan,
+            )
             assert isinstance(plan, WorkerPlan)
-            scope_step_index = None
-            plan_source_attestation = {}
+        assert isinstance(plan, WorkerPlan)
         recorded_plan = [
             {
                 "cycle": state["cycle"],
@@ -2201,15 +1989,8 @@ def build_coordinator_graph(
                 **step.model_dump(mode="json", exclude_none=True),
                 "operation_skills": list(operation_skills),
                 "sql_risk_aspects": list(operation_sql_risk_aspects),
-                "sql_risk_execution_mode": operation_sql_risk_execution_mode,
                 "pipeline": operation_pipeline,
                 **sql_risk_protocol_attestation,
-                **plan_source_attestation,
-                **(
-                    scope_evidence_attestation
-                    if index - 1 == scope_step_index
-                    else {}
-                ),
             }
             for index, step in enumerate(plan.steps, start=1)
         ]
@@ -2224,13 +2005,75 @@ def build_coordinator_graph(
             "operation_sql_risk_aspects": list(
                 operation_sql_risk_aspects
             ),
-            "operation_sql_risk_execution_mode": (
-                operation_sql_risk_execution_mode
-            ),
             "operation_pipeline": operation_pipeline,
             "plan": [step.model_dump() for step in plan.steps],
-            "scope_evidence_step_index": scope_step_index,
             "next_step": 0,
+        }
+
+    def sql_risk_scope_node(
+        state: CoordinatorGraphState,
+    ) -> Dict[str, Any]:
+        """Extract, read, structure and assess one closed SQL-risk scope."""
+
+        extraction, extraction_errors = extract_sql_risk_scope(
+            state["task"],
+            state["context"],
+        )
+        if extraction is None:
+            result = SqlRiskOperationPipelineResult(
+                status="unavailable",
+                execution_mode="unresolved",
+                scope="unresolved model-owned scope",
+                answer=(
+                    "Оценка SQL-риска недоступна: внутренний typed LLM-контракт "
+                    "режима и exact source → target scope не прошёл проверку. "
+                    "Agentic fallback не выполнялся."
+                ),
+                answer_source="sql_risk_scope_unavailable",
+                issues=[
+                    SqlRiskOperationIssue(
+                        code="invalid_contract",
+                        message=(
+                            "; ".join(extraction_errors)[:600]
+                            or "Model-owned scope extraction remained invalid."
+                        ),
+                    )
+                ],
+            )
+        else:
+            contract = build_sql_risk_scope_contract(extraction)
+            result = run_sql_risk_operation_pipeline(
+                contract,
+                original_task=state["task"],
+                stable_context=state["context"],
+                assessment_runner=assess_sql_risk_scope,
+                callbacks=callback_list,
+                evidence_namespace=f"cycle-{state['cycle']}",
+            )
+
+        operation_trace = {
+            **result.metrics_payload(),
+            "silent_fallback": False,
+        }
+        record_sql_risk_operation(operation_trace)
+        selected_display_refs = register_worker_display_items(
+            result.display_items
+        )
+        if collected_display_refs is not None:
+            collected_display_refs.extend(selected_display_refs)
+        upstream_output = {
+            "answer": result.answer,
+            "used_evidence_ids": list(result.used_evidence_ids),
+            "display_evidence_ids": list(result.display_evidence_ids),
+            "answer_source": result.answer_source,
+            "pipeline": "sql_risk_scope",
+            "status": result.status,
+        }
+        record_upstream_output(upstream_output)
+        return {
+            "upstream_output": upstream_output,
+            "final_answer": result.answer,
+            "selected_display_refs": selected_display_refs,
         }
 
     def worker_node(state: CoordinatorGraphState) -> Dict[str, Any]:
@@ -2242,36 +2085,17 @@ def build_coordinator_graph(
                 "Coordinator вызвал worker с пустой task из плана."
             )
         worker_task = planned_task
-        structured_constraints = plan_step.model_dump(
-            mode="json",
-            exclude={"task", "dependencies"},
-            exclude_none=True,
-            exclude_defaults=True,
-        )
-        if structured_constraints:
-            worker_task += (
-                "\n\nСтруктурированные ограничения шага:\n"
-                + json.dumps(structured_constraints, ensure_ascii=False)
+        worker_task += (
+            WORKER_ORIGINAL_TASK_MARKER
+            + json.dumps(
+                {"original_task": state["task"]},
+                ensure_ascii=False,
             )
+        )
         selected_operation_skills = state.get("operation_skills") or []
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
-        selected_sql_risk_execution_mode = (
-            state.get("operation_sql_risk_execution_mode") or "agentic"
-        )
-        step_scope_contract: SqlRiskScopeContract | None = None
-        if state.get("scope_evidence_step_index") == step_index:
-            step_scope_contract = build_sql_risk_scope_contract(
-                state["task"],
-                selected_sql_risk_aspects,
-                execution_mode=selected_sql_risk_execution_mode,
-            )
-            if step_scope_contract is None:
-                raise CoordinatorResponseError(
-                    "Active SQL-risk scope/evidence contract disappeared "
-                    "before worker execution."
-                )
         planner_context = load_operation_skills(
             selected_operation_skills,
             stage="planner",
@@ -2282,26 +2106,6 @@ def build_coordinator_graph(
             stage="observer",
             sql_risk_aspects=selected_sql_risk_aspects,
         )
-        scope_planner_context = render_sql_risk_scope_contract(
-            step_scope_contract,
-            stage="planner",
-        )
-        scope_observer_context = render_sql_risk_scope_contract(
-            step_scope_contract,
-            stage="observer",
-        )
-        if scope_planner_context:
-            planner_context = "\n\n".join(
-                part
-                for part in (planner_context, scope_planner_context)
-                if part
-            )
-        if scope_observer_context:
-            observer_context = "\n\n".join(
-                part
-                for part in (observer_context, scope_observer_context)
-                if part
-            )
         if planner_context:
             worker_task += (
                 WORKER_OPERATION_EXECUTION_MARKER + planner_context
@@ -2311,19 +2115,10 @@ def build_coordinator_graph(
                 WORKER_OPERATION_COMPLETENESS_MARKER
                 + observer_context
             )
-        dependency_steps = (
-            None
-            if plan_step.dependencies is None
-            else set(plan_step.dependencies)
-        )
         previous_results = [
             reference
             for run in state["worker_runs"]
             if run["cycle"] == state["cycle"]
-            and (
-                dependency_steps is None
-                or run["step"] in dependency_steps
-            )
             for reference in run["outcome"].previous_results
         ]
         if previous_results:
@@ -2345,14 +2140,7 @@ def build_coordinator_graph(
             step_index + 1,
             worker_task[:1000],
         )
-        outcome = (
-            worker_chat(
-                worker_task,
-                required_evidence=step_scope_contract.requirements,
-            )
-            if step_scope_contract is not None
-            else worker_chat(worker_task)
-        )
+        outcome = worker_chat(worker_task)
         record_worker_outcome(
             cycle=state["cycle"],
             step=step_index + 1,
@@ -2395,27 +2183,6 @@ def build_coordinator_graph(
         require_used_evidence: bool = False,
     ) -> UpstreamOutput:
         output = _native_upstream_answer(message)
-        normalized_used_ids = _normalize_upstream_evidence_id_list(
-            output.used_evidence_ids,
-            available_evidence_ids,
-        )
-        normalized_display_ids = _normalize_upstream_evidence_id_list(
-            output.display_evidence_ids,
-            available_evidence_ids,
-        )
-        try:
-            output = UpstreamOutput.model_validate(
-                {
-                    "answer": output.answer,
-                    "used_evidence_ids": normalized_used_ids,
-                    "display_evidence_ids": normalized_display_ids,
-                }
-            )
-        except ValidationError as exc:
-            raise CoordinatorResponseError(
-                "Upstream coordinator вернул несогласованный выбор "
-                "evidence_id после безопасной нормализации."
-            ) from exc
         unknown_ids = sorted(
             (
                 set(output.used_evidence_ids)
@@ -2447,26 +2214,6 @@ def build_coordinator_graph(
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
         )
-        selected_sql_risk_execution_mode = (
-            state.get("operation_sql_risk_execution_mode") or "agentic"
-        )
-        scope_evidence_architecture = (
-            sql_risk_scope_evidence_architecture()
-            if "Анализ SQL-рисков" in selected_operation_skills
-            else "off"
-        )
-        scope_evidence_contract: SqlRiskScopeContract | None = None
-        if state.get("scope_evidence_step_index") is not None:
-            scope_evidence_contract = build_sql_risk_scope_contract(
-                state["task"],
-                selected_sql_risk_aspects,
-                execution_mode=selected_sql_risk_execution_mode,
-            )
-            if scope_evidence_contract is None:
-                raise CoordinatorResponseError(
-                    "Active SQL-risk scope/evidence contract disappeared "
-                    "before upstream verification."
-                )
         decision_context = load_operation_skills(
             selected_operation_skills,
             stage="upstream_decision",
@@ -2477,59 +2224,12 @@ def build_coordinator_graph(
             stage="upstream",
             sql_risk_aspects=selected_sql_risk_aspects,
         )
-        scope_decision_context = render_sql_risk_scope_contract(
-            scope_evidence_contract,
-            stage="upstream_decision",
-        )
-        scope_analysis_context = render_sql_risk_scope_contract(
-            scope_evidence_contract,
-            stage="upstream",
-        )
-        if scope_decision_context:
-            decision_context = "\n\n".join(
-                part
-                for part in (decision_context, scope_decision_context)
-                if part
-            )
-        if scope_analysis_context:
-            analysis_context = "\n\n".join(
-                part
-                for part in (analysis_context, scope_analysis_context)
-                if part
-            )
-
-        def scoped_answer(answer: str) -> str:
-            if scope_evidence_contract is None:
-                return answer
-            return ensure_sql_risk_answer_scope(
-                answer,
-                state["task"],
-                selected_sql_risk_aspects,
-                execution_mode=selected_sql_risk_execution_mode,
-            )
         available_evidence_ids: set[str] = set()
         available_display_refs: Dict[str, str] = {}
-        accepted_artifacts: List[EvidenceArtifact] = []
         evidence_payload: List[Dict[str, Any]] = []
-        worker_outcomes: List[Dict[str, Any]] = []
         for run in state["worker_runs"]:
             outcome_payload = run["outcome"].upstream_payload()
             evidence_payload.extend(outcome_payload["evidence"])
-            worker_outcomes.append(
-                {
-                    "cycle": run["cycle"],
-                    "step": run["step"],
-                    "status": outcome_payload["status"],
-                    "stop_reason": outcome_payload["stop_reason"],
-                    "unmet_requirements": outcome_payload[
-                        "unmet_requirements"
-                    ],
-                    "evidence_ids": [
-                        item["evidence_id"]
-                        for item in outcome_payload["evidence"]
-                    ],
-                }
-            )
             for artifact in run["outcome"].evidence:
                 if artifact.evidence_id in available_evidence_ids:
                     raise CoordinatorResponseError(
@@ -2537,163 +2237,14 @@ def build_coordinator_graph(
                         + artifact.evidence_id
                     )
                 available_evidence_ids.add(artifact.evidence_id)
-                accepted_artifacts.append(artifact)
                 if artifact.display_ref is not None:
                     available_display_refs[
                         artifact.evidence_id
                     ] = artifact.display_ref
         upstream_payload = {
             "original_task": state["task"],
-            "worker_outcomes": worker_outcomes,
             "evidence": evidence_payload,
         }
-        saved_result_store = get_active_saved_result_store()
-        missing_scope_requirements = missing_sql_risk_requirements(
-            scope_evidence_contract,
-            _scope_evidence_calls(
-                accepted_artifacts,
-                saved_result_store,
-            ),
-        )
-        if missing_scope_requirements:
-            upstream_payload["missing_scope_evidence"] = [
-                {
-                    "tool_name": requirement.tool_name,
-                    "arguments": dict(requirement.arguments),
-                }
-                for requirement in missing_scope_requirements
-            ]
-        constraint_rejection_facts: List[ConstraintRejectionFact] = []
-        if (
-            scope_evidence_architecture == "typed_plan"
-            and scope_evidence_contract is not None
-            and selected_sql_risk_execution_mode == "nullable_constraint"
-            and selected_operation_skills == ["Анализ SQL-рисков"]
-            and selected_sql_risk_aspects == ["constraint_rejection"]
-            and saved_result_store is not None
-        ):
-            constraint_rejection_facts = (
-                derive_constraint_rejection_facts(
-                    scope_evidence_contract,
-                    accepted_artifacts,
-                    saved_result_store,
-                )
-            )
-            if constraint_rejection_facts:
-                deterministic_constraint_rejection = (
-                    constraint_rejection_payload(
-                        constraint_rejection_facts
-                    )
-                )
-                upstream_payload["deterministic_constraint_rejection"] = (
-                    deterministic_constraint_rejection
-                )
-                record_sql_risk_facts(
-                    deterministic_constraint_rejection,
-                    cycle=state["cycle"],
-                )
-        cardinality_sufficient_evidence_ids: List[str] = []
-        cardinality_facts: List[CardinalityFact] = []
-        if (
-            scope_evidence_contract is not None
-            and selected_sql_risk_execution_mode
-            == "conditional_cardinality"
-            and selected_operation_skills == ["Анализ SQL-рисков"]
-            and selected_sql_risk_aspects == ["cardinality"]
-        ):
-            saved_store = get_active_saved_result_store()
-            if saved_store is not None:
-                cardinality_sufficient_evidence_ids = (
-                    complete_cardinality_mapping_evidence_ids(
-                        scope_evidence_contract,
-                        accepted_artifacts,
-                        saved_store,
-                    )
-                )
-                if (
-                    scope_evidence_architecture == "typed_plan"
-                    and scope_evidence_contract is not None
-                    and cardinality_sufficient_evidence_ids
-                ):
-                    cardinality_facts = derive_cardinality_facts(
-                        scope_evidence_contract,
-                        accepted_artifacts,
-                        saved_store,
-                    )
-                    if cardinality_facts:
-                        deterministic_cardinality = cardinality_payload(
-                            cardinality_facts
-                        )
-                        upstream_payload["deterministic_cardinality"] = (
-                            deterministic_cardinality
-                        )
-                        record_sql_risk_facts(
-                            deterministic_cardinality,
-                            cycle=state["cycle"],
-                        )
-        if (
-            scope_evidence_architecture == "typed_plan"
-            and scope_evidence_contract is not None
-            and selected_sql_risk_execution_mode
-            == "conditional_cardinality"
-            and selected_sql_risk_aspects == ["cardinality"]
-            and not cardinality_sufficient_evidence_ids
-        ):
-            # In the code-owned lane a successful call is not by itself
-            # sufficient evidence: require a complete, non-empty exact saved
-            # mapping whose rows stay in scope and contain transformation
-            # rules.  Otherwise repeat the same deterministic plan once and
-            # then return structured not-assessed.
-            missing_scope_requirements = (
-                scope_evidence_contract.requirements
-            )
-            upstream_payload["missing_scope_evidence"] = [
-                {
-                    "tool_name": requirement.tool_name,
-                    "arguments": dict(requirement.arguments),
-                }
-                for requirement in missing_scope_requirements
-            ]
-        value_change_facts: List[FieldValueChangeFact] = []
-        if "value_changes" in selected_sql_risk_aspects:
-            saved_store = get_active_saved_result_store()
-            if saved_store is not None:
-                value_change_facts = derive_field_value_change_facts(
-                    state["task"],
-                    accepted_artifacts,
-                    saved_store,
-                )
-            if value_change_facts:
-                deterministic_sql_risk = field_value_change_payload(
-                    value_change_facts
-                )
-                upstream_payload["deterministic_sql_risk"] = (
-                    deterministic_sql_risk
-                )
-                record_sql_risk_facts(
-                    deterministic_sql_risk,
-                    cycle=state["cycle"],
-                )
-        write_semantics_facts: List[WriteSemanticsFact] = []
-        if "write_semantics" in selected_sql_risk_aspects:
-            saved_store = get_active_saved_result_store()
-            if saved_store is not None:
-                write_semantics_facts = derive_write_semantics_facts(
-                    state["task"],
-                    accepted_artifacts,
-                    saved_store,
-                )
-            if write_semantics_facts:
-                deterministic_write_semantics = write_semantics_payload(
-                    write_semantics_facts
-                )
-                upstream_payload["deterministic_write_semantics"] = (
-                    deterministic_write_semantics
-                )
-                record_sql_risk_facts(
-                    deterministic_write_semantics,
-                    cycle=state["cycle"],
-                )
         decision_messages: List[BaseMessage] = [
             SystemMessage(
                 content="\n\n".join(
@@ -2829,7 +2380,6 @@ def build_coordinator_graph(
             return {
                 "cycle": state["cycle"] + 1,
                 "plan": [],
-                "scope_evidence_step_index": None,
                 "next_step": 0,
                 "worker_runs": [],
                 "upstream_problem": problem,
@@ -2838,163 +2388,12 @@ def build_coordinator_graph(
                 "selected_display_refs": [],
             }
 
-        if missing_scope_requirements:
-            missing_text = "; ".join(
-                requirement.tool_name
-                + "("
-                + json.dumps(
-                    requirement.arguments,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-                + ")"
-                for requirement in missing_scope_requirements
-            )
-            if state["cycle"] < COORDINATOR_MAX_CYCLES:
-                return data_request_update(
-                    "Opt-in SQL-risk scope/evidence contract не закрыт: "
-                    + missing_text
-                )
-            assert scope_evidence_contract is not None
-            incomplete_answer = (
-                "Не удалось завершить оценку SQL-риска для exact scope "
-                f"`{scope_evidence_contract.scope.label}`: не получены "
-                "обязательные подтверждения "
-                f"{missing_text}. Результат: not assessed."
-            )
-            evidence = UpstreamOutput(
-                answer=incomplete_answer,
-                used_evidence_ids=[],
-                display_evidence_ids=[],
-            )
-            upstream_output = evidence.model_dump()
-            record_upstream_output(
-                {
-                    **upstream_output,
-                    "answer_source": (
-                        "deterministic_scope_evidence_unavailable"
-                    ),
-                }
-            )
-            return {
-                "upstream_output": upstream_output,
-                "final_answer": evidence.answer,
-                "selected_display_refs": [],
-            }
-
-        if (
-            len(constraint_rejection_facts) == 1
-            and selected_sql_risk_execution_mode == "nullable_constraint"
-        ):
-            deterministic_answer = render_constraint_rejection_answer(
-                constraint_rejection_facts
-            ).strip()
-            if deterministic_answer:
-                used_evidence_ids = list(
-                    dict.fromkeys(
-                        evidence_id
-                        for fact in constraint_rejection_facts
-                        for evidence_id in fact.evidence_ids
-                        if evidence_id in available_evidence_ids
-                    )
-                )
-                evidence = UpstreamOutput(
-                    answer=scoped_answer(deterministic_answer),
-                    used_evidence_ids=used_evidence_ids,
-                    display_evidence_ids=[],
-                )
-                upstream_output = evidence.model_dump()
-                record_upstream_output(
-                    {
-                        **upstream_output,
-                        "answer_source": (
-                            "deterministic_constraint_rejection"
-                        ),
-                    }
-                )
-                logger.info(
-                    "Deterministic constraint-rejection result: %s",
-                    json.dumps(
-                        upstream_output,
-                        ensure_ascii=False,
-                    )[:8000],
-                )
-                return {
-                    "upstream_output": upstream_output,
-                    "final_answer": evidence.answer,
-                    "selected_display_refs": [],
-                }
-
-        if (
-            scope_evidence_architecture == "typed_plan"
-            and scope_evidence_contract is not None
-            and selected_sql_risk_execution_mode
-            == "conditional_cardinality"
-            and selected_operation_skills == ["Анализ SQL-рисков"]
-            and selected_sql_risk_aspects == ["cardinality"]
-            and len(cardinality_facts) == 1
-        ):
-            deterministic_answer = render_cardinality_answer(
-                cardinality_facts
-            ).strip()
-            if deterministic_answer:
-                used_evidence_ids = list(
-                    dict.fromkeys(
-                        evidence_id
-                        for fact in cardinality_facts
-                        for evidence_id in fact.evidence_ids
-                        if evidence_id in available_evidence_ids
-                    )
-                )
-                display_evidence_ids = [
-                    evidence_id
-                    for evidence_id in used_evidence_ids
-                    if evidence_id in available_display_refs
-                ]
-                evidence = UpstreamOutput(
-                    answer=scoped_answer(deterministic_answer),
-                    used_evidence_ids=used_evidence_ids,
-                    display_evidence_ids=display_evidence_ids,
-                )
-                upstream_output = evidence.model_dump()
-                record_upstream_output(
-                    {
-                        **upstream_output,
-                        "answer_source": "deterministic_cardinality",
-                    }
-                )
-                logger.info(
-                    "Deterministic cardinality result: %s",
-                    json.dumps(upstream_output, ensure_ascii=False)[:8000],
-                )
-                return {
-                    "upstream_output": upstream_output,
-                    "final_answer": evidence.answer,
-                    "selected_display_refs": [
-                        available_display_refs[evidence_id]
-                        for evidence_id in display_evidence_ids
-                    ],
-                }
-
         _, decision = invoke_decision(decision_messages)
-        ignored_cardinality_reroute = bool(
-            decision.decision == "reroute"
-            and cardinality_sufficient_evidence_ids
-        )
-        if decision.decision == "reroute" and not ignored_cardinality_reroute:
+        if decision.decision == "reroute":
             return data_request_update(decision.problem)
 
-        if ignored_cardinality_reroute:
-            logger.info(
-                "Ignoring redundant upstream reroute because a complete "
-                "exact directed mapping is sufficient for the conditional "
-                "cardinality answer: evidence_ids=%s problem=%s",
-                cardinality_sufficient_evidence_ids,
-                decision.problem,
-            )
-
         answer_payload = dict(upstream_payload)
-        if decision.problem and not ignored_cardinality_reroute:
+        if decision.problem:
             answer_payload["data_problem"] = decision.problem
         answer_messages: List[BaseMessage] = [
             SystemMessage(
@@ -3014,11 +2413,6 @@ def build_coordinator_graph(
         ]
         _, evidence = invoke_answer(answer_messages)
 
-        scoped_model_answer = scoped_answer(evidence.answer)
-        if scoped_model_answer != evidence.answer:
-            evidence = evidence.model_copy(
-                update={"answer": scoped_model_answer}
-            )
         upstream_output = evidence.model_dump()
         selected_display_refs = [
             available_display_refs[evidence_id]
@@ -3046,9 +2440,11 @@ def build_coordinator_graph(
 
     def route_after_downstream(
         state: CoordinatorGraphState,
-    ) -> Literal["worker", "end"]:
+    ) -> Literal["worker", "sql_risk_scope", "end"]:
         if str(state.get("final_answer") or "").strip():
             return "end"
+        if state.get("operation_pipeline") == "sql_risk_scope":
+            return "sql_risk_scope"
         return "worker"
 
     def route_after_upstream(
@@ -3064,6 +2460,7 @@ def build_coordinator_graph(
 
     graph = StateGraph(CoordinatorGraphState)
     graph.add_node("downstream_plan", downstream_plan_node)
+    graph.add_node("sql_risk_scope", sql_risk_scope_node)
     graph.add_node("worker", worker_node)
     graph.add_node("upstream", upstream_node)
     graph.add_edge(START, "downstream_plan")
@@ -3072,9 +2469,11 @@ def build_coordinator_graph(
         route_after_downstream,
         {
             "worker": "worker",
+            "sql_risk_scope": "sql_risk_scope",
             "end": END,
         },
     )
+    graph.add_edge("sql_risk_scope", END)
     graph.add_conditional_edges(
         "worker",
         route_after_worker,
@@ -3094,7 +2493,11 @@ def build_coordinator_graph(
     return graph.compile()
 
 
-def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
+def coordinator_chat(
+    task: str,
+    *,
+    context: str = "",
+) -> CoordinatorAnswer:
     """Send tasks downstream to workers and return verified results upstream."""
     clean_task = str(task or "").strip()
     clean_context = str(context or "").strip()[:COORDINATOR_CONTEXT_MAX_CHARS]
@@ -3109,6 +2512,7 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
     metrics_callback = get_run_metrics_callback()
     if metrics_callback is not None and metrics_callback not in callbacks:
         callbacks.append(metrics_callback)
+
     collected_display_refs: List[str] = []
     graph = build_coordinator_graph(
         chat_model,
@@ -3120,11 +2524,9 @@ def coordinator_chat(task: str, *, context: str = "") -> CoordinatorAnswer:
         "context": clean_context,
         "operation_skills": None,
         "operation_sql_risk_aspects": None,
-        "operation_sql_risk_execution_mode": None,
         "operation_pipeline": None,
         "cycle": 1,
         "plan": [],
-        "scope_evidence_step_index": None,
         "next_step": 0,
         "worker_runs": [],
         "upstream_problem": None,
@@ -3184,7 +2586,9 @@ __all__ = [
     "CoordinatorAnswer",
     "CoordinatorGraphState",
     "CoordinatorResponseError",
+    "OperationSkillSelection",
     "WorkerPlan",
     "build_coordinator_graph",
     "coordinator_chat",
+    "select_operation_route",
 ]

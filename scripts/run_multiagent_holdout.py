@@ -141,6 +141,9 @@ HOLDOUT_SCENARIOS = tuple(case.name for case in HOLDOUT_CASES)
 
 _COMMON_ARM_ENVIRONMENT = {
     "WORKER_SPLIT_TOOL_CALL_EXPERIMENT": "0",
+    # This preregistered holdout measures the historical agentic arms. Do not
+    # let a developer's ambient operation-scope opt-in change that population.
+    "OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT": "0",
     "GIGACHAT_JUDGE_MODEL": HOLDOUT_MODEL,
     "GIGACHAT_TEMPERATURE": "0",
     "GIGACHAT_TIMEOUT": "180",

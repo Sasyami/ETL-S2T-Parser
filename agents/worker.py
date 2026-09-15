@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from threading import Lock
 from typing import Any, Dict, List, Sequence, Tuple
 from uuid import uuid4
@@ -33,6 +32,11 @@ from .contracts import (
     WorkerCapability,
     WorkerOutcome,
 )
+from .experiment_flags import (
+    WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
+    WORKER_SPLIT_TOOL_CALL_EXPERIMENT_ENV,
+    experiment_flag_enabled,
+)
 from .observability import get_callback_handler
 from .run_metrics import (
     get_run_metrics_callback,
@@ -40,7 +44,6 @@ from .run_metrics import (
     record_worker_route,
     record_worker_task,
 )
-from .sql_risk_scope_contract import SqlRiskEvidenceRequirement
 from .tools import get_worker_tools, load_schemas, load_skills
 from .tools.saved_results import (
     bind_saved_result_schemas,
@@ -57,29 +60,21 @@ _REROUTE_FEEDBACK_MAX_CHARS = 4000
 _TOOL_ARGUMENTS_MAX_CHARS = 2000
 _HANDOFF_DESCRIPTION_MAX_CHARS = 600
 _READ_PREVIOUS_RESULT_TOOL_NAME = "read_previous_result"
-WORKER_SPLIT_TOOL_CALL_EXPERIMENT_ENV = "WORKER_SPLIT_TOOL_CALL_EXPERIMENT"
 _SPLIT_TOOL_CALL_PLANNING_ENV = WORKER_SPLIT_TOOL_CALL_EXPERIMENT_ENV
-WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV = (
-    "WORKER_CAPABILITY_REROUTE_EXPERIMENT"
-)
 _DISPLAY_RESULTS: Dict[str, WorkerDisplayItem] = {}
 _DISPLAY_RESULTS_LOCK = Lock()
 
 
 def _split_tool_call_planning_enabled() -> bool:
-    return str(os.getenv(_SPLIT_TOOL_CALL_PLANNING_ENV, "")).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return experiment_flag_enabled(
+        _SPLIT_TOOL_CALL_PLANNING_ENV,
+    )
 
 
 def _capability_reroute_enabled() -> bool:
-    value = os.getenv(WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV)
-    if value is None:
-        return True
-    return value.strip().casefold() not in {"0", "false", "no", "off"}
+    return experiment_flag_enabled(
+        WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
+    )
 
 
 def _compact_tool_arguments(
@@ -217,11 +212,15 @@ def discard_worker_display_refs(refs: Sequence[str]) -> None:
 def _planner_reroute_feedback(context: Dict[str, Any]) -> str:
     payload = {
         "gap": str(context.get("gap") or "").strip(),
-        "reason": str(context.get("reason") or "").strip(),
-        "required_capabilities": list(
-            context.get("required_capabilities") or []
-        ),
     }
+    capability_reroute = (
+        "reason" in context or "required_capabilities" in context
+    )
+    if capability_reroute:
+        payload["reason"] = str(context.get("reason") or "").strip()
+        payload["required_capabilities"] = list(
+            context.get("required_capabilities") or []
+        )
     serialized = json.dumps(payload, ensure_ascii=False)
     if len(serialized) > _REROUTE_FEEDBACK_MAX_CHARS:
         serialized = serialized[: _REROUTE_FEEDBACK_MAX_CHARS - 1] + "…"
@@ -229,38 +228,23 @@ def _planner_reroute_feedback(context: Dict[str, Any]) -> str:
         "Повторный запуск worker после неуспешной попытки. Ниже только "
         "диагностическая выжимка предыдущего запуска, а не новая task. "
         "Учти её при первом следующем вызове data tool и исправь описанную "
-        "проблему с помощью палитры требуемых возможностей.\n"
-        f"<reroute_feedback>{serialized}</reroute_feedback>"
+        "проблему с помощью "
+        + (
+            "палитры требуемых возможностей.\n"
+            if capability_reroute
+            else "расширенной палитры.\n"
+        )
+        + f"<reroute_feedback>{serialized}</reroute_feedback>"
     )
 
 
 def _required_reroute_capabilities(
     graph_result: Any,
 ) -> List[WorkerCapability]:
-    """Keep legacy reroutes useful while preferring typed capabilities."""
-    explicit = list(
+    """Use only the observer's typed reroute contract."""
+    return list(
         dict.fromkeys(graph_result.required_capabilities or [])
     )
-    if explicit:
-        return explicit
-    reason = str(graph_result.reroute_reason or "").strip()
-    if reason in {"wrong_arguments", "tool_error"}:
-        return []
-    if reason == "unresolved_entity":
-        return ["entity_resolution"]
-    if reason == "truncated_result":
-        return ["saved_result_read", "saved_result_aggregate"]
-
-    gap = str(graph_result.gap or "").casefold()
-    if any(marker in gap for marker in ("sql", "агрегац", "group by", "срез")):
-        return ["sql_read"]
-    if any(marker in gap for marker in ("разреш", "неизвестн", "кандидат", "опечат")):
-        return ["entity_resolution"]
-    if any(marker in gap for marker in ("обрез", "truncated", "полный результат")):
-        return ["saved_result_read", "saved_result_aggregate"]
-    if any(marker in gap for marker in ("cypher", "neo4j", "граф")):
-        return ["graph_read"]
-    return ["general_read"]
 
 
 def _final_outcome_summary(
@@ -280,11 +264,7 @@ def _final_outcome_summary(
     return f"{clean_answer}\nПричина незавершённости: {clean_gap}"
 
 
-def worker_chat(
-    task: str,
-    *,
-    required_evidence: Sequence[SqlRiskEvidenceRequirement] = (),
-) -> WorkerOutcome:
+def worker_chat(task: str) -> WorkerOutcome:
     """Execute one self-contained task in an isolated generic worker."""
     clean_task = str(task or "").strip()
     if not clean_task:
@@ -331,24 +311,53 @@ def worker_chat(
     cycle_history: List[WorkerCycleTrace] = []
     reroute_context: Dict[str, Any] | None = None
     reroute_count = 0
+    capability_reroute_enabled = _capability_reroute_enabled()
 
     while True:
-        required_capabilities = tuple(
-            (reroute_context or {}).get("required_capabilities") or ()
-        )
-        previous_palette_names = set(
-            ((reroute_context or {}).get("previous_tool_palettes") or [[]])[-1]
-        )
         available_tools = bind_saved_result_schemas(
             get_worker_tools(include_general=True),
             worker_request,
         )
-        routable_tool_names = {
-            item.name
-            for item in get_worker_tools(
-                required_capabilities=required_capabilities,
+        if capability_reroute_enabled:
+            required_capabilities = tuple(
+                (reroute_context or {}).get("required_capabilities") or ()
             )
-        } | previous_palette_names
+            previous_palette_names = set(
+                (
+                    (reroute_context or {}).get("previous_tool_palettes")
+                    or [[]]
+                )[-1]
+            )
+            routable_tool_names = {
+                item.name
+                for item in get_worker_tools(
+                    required_capabilities=required_capabilities,
+                )
+            } | previous_palette_names
+            catalog_stage = (
+                "capability_expansion"
+                if required_capabilities
+                else (
+                    "reroute_palette"
+                    if reroute_context is not None
+                    else "specialized_only"
+                )
+            )
+            general_tools_available = False
+        else:
+            required_capabilities = ()
+            general_tools_available = reroute_count >= 2
+            routable_tool_names = {
+                item.name
+                for item in get_worker_tools(
+                    include_general=general_tools_available,
+                )
+            }
+            catalog_stage = (
+                "general_fallback"
+                if general_tools_available
+                else "specialized_only"
+            )
         routable_tools = tuple(
             item
             for item in available_tools
@@ -359,23 +368,12 @@ def worker_chat(
             "model": chat_model,
             "available_tools": routable_tools,
             "callbacks": callbacks,
-            "catalog_stage": (
-                "capability_expansion"
-                if required_capabilities
-                else (
-                    "reroute_palette"
-                    if reroute_context is not None
-                    else "specialized_only"
-                )
-            ),
+            "catalog_stage": catalog_stage,
         }
         if reroute_context is not None:
             route_kwargs["reroute_context"] = reroute_context
         route = select_chat_route(worker_request, **route_kwargs)
         selected_names = set(route.tools)
-        selected_names.update(
-            requirement.tool_name for requirement in required_evidence
-        )
         if any(
             item.name == _READ_PREVIOUS_RESULT_TOOL_NAME
             for item in available_tools
@@ -415,6 +413,8 @@ def worker_chat(
                     "schemas": list(route.schemas),
                     "gap": reroute_gap or None,
                     "required_capabilities": list(required_capabilities),
+                    "capability_reroute_enabled": capability_reroute_enabled,
+                    "general_fallback_available": general_tools_available,
                 },
                 ensure_ascii=False,
             )[:8000],
@@ -442,7 +442,6 @@ def worker_chat(
                 split_tool_call_planning=(
                     _split_tool_call_planning_enabled()
                 ),
-                required_evidence=required_evidence,
             )
         except WorkerResponseError as exc:
             logger.warning("Worker contract failed: %s", exc)
@@ -565,25 +564,25 @@ def worker_chat(
             )
 
         reroute_count += 1
-        typed_capabilities = _required_reroute_capabilities(graph_result)
-        reason = str(graph_result.reroute_reason or "").strip()
-        required_capabilities = (
-            typed_capabilities
-            if _capability_reroute_enabled()
-            or reason in {"wrong_arguments", "tool_error"}
-            else ["general_read"]
-        )
         reroute_context = {
             "gap": str(graph_result.gap or ""),
-            "reason": str(
-                graph_result.reroute_reason or "missing_capability"
-            ),
-            "required_capabilities": list(required_capabilities),
             "previous_tool_palettes": [
                 list(item) for item in attempted_palettes
             ],
             "attempt": reroute_count,
         }
+        if capability_reroute_enabled:
+            reroute_context.update(
+                {
+                    "reason": str(
+                        graph_result.reroute_reason
+                        or "missing_capability"
+                    ),
+                    "required_capabilities": (
+                        _required_reroute_capabilities(graph_result)
+                    ),
+                }
+            )
         logger.info(
             "Worker returns to tool-router: attempt=%s gap=%s",
             reroute_count,

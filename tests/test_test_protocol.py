@@ -57,6 +57,7 @@ def test_protocol_contract_allows_protocol_without_file_selector():
 
 def test_raw_contract_preserves_load_roles_mode_key_and_explicit_file_id():
     contract = RawTestProtocolContract(
+        file_scope_kind="file_id",
         file_id=17,
         mode="exhaustive",
         explicit_key="business_id",

@@ -53,10 +53,6 @@ from .contracts import (
 )
 from .observability import get_callback_handler, langfuse_trace_context
 from .run_metrics import llm_stage
-from .sql_risk_scope_contract import (
-    SqlRiskEvidenceRequirement,
-    missing_sql_risk_requirements,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +71,6 @@ DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS = 6000
 _FINISH_WORKER_TOOL_NAME = "finish_worker"
 _ANALYZE_KNOWN_FACTS_TOOL_NAME = "analyze_known_facts"
 _SELECT_WORKER_TOOL_NAME = "select_worker_tool"
-_READ_PREVIOUS_RESULT_TOOL_NAME = "read_previous_result"
-_SEARCH_S2T_TRANSFORMATIONS_TOOL_NAME = "search_s2t_transformations"
 _OBSERVER_MAX_RETRIES = 5
 _NO_ACCEPTED_DATA_RESULT_GAP = (
     "Worker завершил task без принятого data-tool результата."
@@ -124,8 +118,10 @@ tools либо один native call `finish_worker`. Обычный текст �
 После каждого результата оцени task,
 последний tool exchange и накопленную выжимку observer, затем либо вызови
 следующий tool, либо заверши работу через finish_worker. Читай description и
-схему выбранного tool, сохраняй смысл,
- ограничения и точные значения task. Не придумывай факты и не повторяй успешный
+схему выбранного tool, сохраняй смысл, ограничения и точные значения task.
+Immutable `original_task` разрешено использовать только как справочник точных
+литералов уже назначенного чтения; оно не меняет операцию, dataset или границы
+task. Не придумывай факты и не повторяй успешный
  вызов без новой причины. Не считай производный результат готовым входным фактом
  и не переименовывай заданную операцию. Не конструируй отсутствующий объект
  анализа только для заполнения обязательного аргумента tool: аргументы бери из
@@ -141,6 +137,10 @@ tools либо один native call `finish_worker`. Обычный текст �
 сохраняется отдельно: не копируй результаты и не формулируй финальный ответ.
 Если доступны несколько нужных `previous_results`, прочитай их одним вызовом
 `read_previous_result(result_ids=[...])`, чтобы сохранить шаги для data-tools.
+Сами ссылки не делают текущую task зависимой. Если task уже содержит все точные
+аргументы нового чтения, вызови соответствующий data-tool прямо по ним. Результат
+той же операции для другого объекта — отдельный operand будущего upstream-
+сравнения, а не вход и не замена текущего объекта; его не нужно перечитывать.
 `result_schema` рядом с description описывает сохранённую таблицу результата,
 но не заменяет её строки. Если строки предыдущего результата задают входы нового
 чтения, сначала прочитай нужный result. Если data-tool принимает список входов,
@@ -171,8 +171,8 @@ ToolMessage.
 
 _OBSERVER_PROMPT = """
 Ты observer worker. Верни structured output Observation по схеме, без Markdown.
-Сверь `user_request`, `prior_state`, текущий tool call и result. Не выполняй
-производный анализ: upstream сделает его.
+Сверь `user_request` (единственную текущую task), call/result.
+Не выполняй производный анализ: upstream сделает его.
 
 `status`: `complete` — все данные task приняты; `continue` — gap закрывается
 текущей палитрой; `reroute` — ни один available tool gap не закрывает.
@@ -180,29 +180,31 @@ _OBSERVER_PROMPT = """
 `gap` — одна консолидированная строка незакрытых требований. При `complete`
 верни JSON null. Не повторяй одну причину и её следствия.
 
-`accepted_tool_call_ids` накапливает только релевантные успешные results.
-`facts` содержат подтверждённые факты с `evidence_ids`, `limitations` —
-ограничения.
+`accepted_tool_call_ids` накапливает релевантные успешные results; `facts`
+содержат подтверждённое с `evidence_ids`, `limitations` — ограничения.
 Результат внутреннего `analyze_known_facts` не является новым evidence.
+
+Результат подтверждает task, только если совпали операция и тип dataset. Чтение
+prerequisite не завершает task; данные соседнего шага не завершают её.
 
 Вызов не подтверждает task, если его аргументы потеряли или изменили объект,
 scope, фильтр или операцию. Нулевой результат подтверждает отсутствие данных только
 при точных аргументах из task/evidence. Объект, который planner сам составил,
 не подтверждает исходную операцию: верни `gap`.
-`previous_results` и `saved_result` — служебные ссылки; `truncated=true` не
-доказывает полноту. Зависимый result сначала читается по `result_id`. Если его
-строки задают входы нового чтения, `complete` требует подтверждённый вызов для
-каждого различающегося нужного входа; общий запрос или часть строк оставляет gap.
+`previous_results` и `saved_result` — ссылки; `truncated=true` не доказывает
+полноту. Зависимый result сначала читается по `result_id`. Если строки задают
+входы нового чтения, `complete` требует вызов для каждого нужного входа; общий
+запрос или часть строк оставляет gap.
 В compact result с `row_format=named_records_with_dictionary_refs` row уже
 содержит явные имена полей. Индексы только в полях из `dictionaries` являются
 transport references, не database/group IDs; не схлопывай отдельные rows.
 
-Выбирай `reroute`, только если ни один `available_tools` не закрывает gap. Если
-достаточно изменить аргументы текущего tool, выбери `continue`.
+Выбирай `reroute`, только если ни один `available_tools` не закрывает gap;
+исправление аргументов — `continue`.
 
 При `reroute` заполни `reroute_reason` и только недостающие
-`required_capabilities` из schema. Исправление аргументов — `continue`, не
-reroute; обрезанный result — `truncated_result` с read/aggregate capability.
+`required_capabilities`; обрезанный result — `truncated_result` с
+read/aggregate capability.
 
 {{PRIOR_STATE_RULE}}
 
@@ -256,7 +258,8 @@ Observer вернул status=continue: завершать worker сейчас з
 _WORKER_TOOL_SELECTOR_PROMPT = """
 Ты выбираешь одну следующую операцию read-only worker. Не заполняй аргументы и
 не выполняй операцию. Верни ровно один native call `select_worker_tool`, указав
-имя одной доступной операции. Учитывай исходную task и последний gap. При
+имя одной доступной операции. Только task задаёт операцию и dataset. Учитывай
+task и последний gap; не выбирай чтение для соседнего шага или общей цели. При
 `continue` нельзя выбирать `finish_worker`.
 
 Доступные операции:
@@ -266,7 +269,9 @@ _WORKER_TOOL_SELECTOR_PROMPT = """
 _WORKER_ARGUMENT_BUILDER_PROMPT = """
 Операция уже выбрана: `{tool_name}`. Верни ровно один native call только этой
 операции. Заполни аргументы по её native-схеме и описаниям полей, используя
-точные значения task и подтверждённых результатов. Не выбирай другую операцию,
+точные значения task, подтверждённых результатов и immutable `original_task`
+только как справочник литералов уже выбранной операции. Не меняй по нему
+операцию или dataset, не выбирай другую операцию,
 не добавляй пояснения и не заполняй отсутствующие значения догадками.
 """.strip()
 
@@ -279,17 +284,6 @@ task либо подтверждённых tool results.
 
 Отброшенные calls:
 {invalid_calls}
-""".strip()
-
-_CANDIDATE_BATCH_REPAIR_PROMPT = """
-Предыдущий native call отброшен до исполнения: semantic
-CandidateSet нельзя проверять по одному кандидату или неполным
-набором. Сначала заверши `read_previous_result`, затем вызови ровно один
-`search_s2t_transformations`: опусти `needle` и передай в `needles`
-все различающиеся технические имена CandidateSet одним batch-вызовом.
-
-Причина отклонения: {validation_error}
-Обязательные технические имена: {candidate_names}
 """.strip()
 
 _OBSERVER_REPAIR_PROMPT = """
@@ -322,6 +316,7 @@ class WorkerCycleTrace(BaseModel):
 class AgentGraphState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     system_prompt: str
+    original_task: str
     planner_operation_context: str
     observer_operation_context: str
     planner_message: Optional[AIMessage]
@@ -821,6 +816,21 @@ def _planner_instruction(
     return template.replace("{{AVAILABLE_TOOLS}}", available)
 
 
+def _original_task_message(
+    state: AgentGraphState,
+) -> Optional[HumanMessage]:
+    """Expose the immutable coordinator task as a separate JSON message."""
+    original_task = state.get("original_task") or ""
+    if not original_task:
+        return None
+    return HumanMessage(
+        content=json.dumps(
+            {"original_task": original_task},
+            ensure_ascii=False,
+        )
+    )
+
+
 def _planner_messages(
     state: AgentGraphState,
     available_tool_names: Sequence[str] = (),
@@ -857,21 +867,42 @@ def _planner_messages(
     if runtime_context is not None:
         system_parts.append(runtime_context)
 
-    messages: List[BaseMessage] = [
-        SystemMessage(content="\n\n".join(system_parts))
-    ]
+    messages: List[BaseMessage] = [SystemMessage(content="\n\n".join(system_parts))]
+    original_task_message = _original_task_message(state)
+    if original_task_message is not None:
+        messages.append(original_task_message)
+
+    task_message = next(
+        (
+            message
+            for message in state["messages"]
+            if isinstance(message, HumanMessage)
+        ),
+        None,
+    )
+    task_parts = (
+        parse_worker_request(task_message.content)
+        if task_message is not None
+        else None
+    )
+    if task_parts is not None and task_parts.previous_results is not None:
+        messages.append(
+            HumanMessage(
+                content=json.dumps(
+                    {
+                        "previous_results": [
+                            item.model_dump(mode="json", exclude_none=True)
+                            for item in task_parts.previous_results
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
 
     if worker_finish:
-        task_message = next(
-            (
-                message
-                for message in state["messages"]
-                if isinstance(message, HumanMessage)
-            ),
-            None,
-        )
-        if task_message is not None:
-            messages.append(task_message)
+        if task_parts is not None:
+            messages.append(HumanMessage(content=task_parts.current_task))
         try:
             latest_call, latest_results = _latest_tool_exchange(
                 state["messages"]
@@ -883,7 +914,14 @@ def _planner_messages(
             messages.append(latest_call)
             messages.extend(latest_results)
     else:
-        messages.extend(state["messages"])
+        for message in state["messages"]:
+            if message is task_message and task_parts is not None:
+                # Keep lazy references visible as compact context while the
+                # authoritative current task remains the last user message
+                # before its tool exchange.
+                messages.append(HumanMessage(content=task_parts.current_task))
+            else:
+                messages.append(message)
     return messages
 
 
@@ -1030,171 +1068,6 @@ def _tool_message_has_error(message: ToolMessage) -> bool:
     return isinstance(payload, dict) and bool(payload.get("error"))
 
 
-def _decoded_tool_payload(content: Any) -> Any:
-    """Decode one retained result without expanding or rewriting its rows."""
-    from .tools.saved_results import _decode_tool_content
-
-    decoded = _decode_tool_content(content)
-    return decoded if decoded is not None else content
-
-
-def _candidate_sets_in_payload(value: Any) -> List[Mapping[str, Any]]:
-    """Find typed CandidateSet envelopes in a single lazy-read payload."""
-    found: List[Mapping[str, Any]] = []
-    if isinstance(value, Mapping):
-        candidate_set = value.get("candidate_set")
-        if isinstance(candidate_set, Mapping) and isinstance(
-            candidate_set.get("candidates"),
-            list,
-        ):
-            found.append(candidate_set)
-        for key, nested in value.items():
-            if key != "candidate_set":
-                found.extend(_candidate_sets_in_payload(nested))
-    elif isinstance(value, list):
-        for nested in value:
-            found.extend(_candidate_sets_in_payload(nested))
-    return found
-
-
-def _technical_candidate_names(value: Any) -> List[str]:
-    """Return all distinct S2T-relevant names from semantic CandidateSets."""
-    names: Dict[str, str] = {}
-    for candidate_set in _candidate_sets_in_payload(value):
-        for candidate in candidate_set.get("candidates", []):
-            if not isinstance(candidate, Mapping):
-                continue
-            scope = str(candidate.get("scope") or "").strip()
-            if scope in {"source_columns", "target_columns"}:
-                raw_name = candidate.get("column_name") or candidate.get("name")
-            elif scope in {"source_tables", "target_tables"}:
-                raw_name = candidate.get("table_name") or candidate.get("name")
-            else:
-                continue
-            name = str(raw_name or "").strip()
-            if name:
-                names.setdefault(name.casefold(), name)
-    return list(names.values())
-
-
-def _pending_semantic_candidate_names(
-    messages: Sequence[ToolMessage],
-) -> List[str]:
-    """Track semantic names read but not yet covered by one prior batch."""
-    pending: Dict[str, str] = {}
-    for message in messages:
-        if _tool_message_has_error(message):
-            continue
-        payload = _decoded_tool_payload(message.content)
-        if str(message.name or "") == _READ_PREVIOUS_RESULT_TOOL_NAME:
-            for name in _technical_candidate_names(payload):
-                pending.setdefault(name.casefold(), name)
-            continue
-        if (
-            str(message.name or "")
-            != _SEARCH_S2T_TRANSFORMATIONS_TOOL_NAME
-            or not pending
-            or not isinstance(payload, Mapping)
-        ):
-            continue
-        raw_queries = payload.get("queries")
-        if isinstance(raw_queries, list):
-            queries = raw_queries
-        elif payload.get("query") is not None:
-            queries = [payload.get("query")]
-        else:
-            queries = []
-        covered = {
-            str(item or "").strip().casefold()
-            for item in queries
-            if str(item or "").strip()
-        }
-        if set(pending) <= covered:
-            pending.clear()
-    return list(pending.values())
-
-
-def _prospective_semantic_candidate_names(
-    tool_calls: Sequence[Mapping[str, Any]],
-) -> List[str]:
-    """Inspect referenced run-scoped results to reject parallel read/search."""
-    read_calls = [
-        call
-        for call in tool_calls
-        if str(call.get("name") or "") == _READ_PREVIOUS_RESULT_TOOL_NAME
-    ]
-    if not read_calls:
-        return []
-    from .tools.saved_results import get_active_saved_result_store
-
-    store = get_active_saved_result_store()
-    if store is None:
-        return []
-    names: Dict[str, str] = {}
-    for call in read_calls:
-        arguments = call.get("args") or {}
-        if not isinstance(arguments, Mapping):
-            continue
-        raw_ids = []
-        if arguments.get("result_id") is not None:
-            raw_ids.append(arguments.get("result_id"))
-        if isinstance(arguments.get("result_ids"), list):
-            raw_ids.extend(arguments["result_ids"])
-        for result_id in dict.fromkeys(
-            str(item or "").strip() for item in raw_ids if str(item or "").strip()
-        ):
-            for name in _technical_candidate_names(
-                store.read_previous_result(result_id)
-            ):
-                names.setdefault(name.casefold(), name)
-    return list(names.values())
-
-
-def _semantic_candidate_batch_error(
-    tool_calls: Sequence[Mapping[str, Any]],
-    pending_names: Sequence[str],
-) -> Optional[str]:
-    """Validate one lossless CandidateSet -> S2T batch transition."""
-    search_calls = [
-        call
-        for call in tool_calls
-        if str(call.get("name") or "")
-        == _SEARCH_S2T_TRANSFORMATIONS_TOOL_NAME
-    ]
-    prospective_names = _prospective_semantic_candidate_names(tool_calls)
-    if prospective_names and search_calls:
-        return (
-            "read_previous_result и зависимый S2T search "
-            "нельзя выполнять параллельно"
-        )
-    required: Dict[str, str] = {}
-    for name in pending_names:
-        clean_name = str(name or "").strip()
-        if clean_name:
-            required.setdefault(clean_name.casefold(), clean_name)
-    if not required or not search_calls:
-        return None
-    if len(search_calls) != 1:
-        return "требуется ровно один batch search call"
-    arguments = search_calls[0].get("args") or {}
-    if not isinstance(arguments, Mapping):
-        return "аргументы search call не являются object"
-    if str(arguments.get("needle") or "").strip():
-        return "одиночный needle не сохраняет CandidateSet"
-    raw_needles = arguments.get("needles")
-    if not isinstance(raw_needles, list):
-        return "отсутствует batch-список needles"
-    actual = {
-        str(item or "").strip().casefold()
-        for item in raw_needles
-        if str(item or "").strip()
-    }
-    missing = [required[key] for key in required if key not in actual]
-    if missing:
-        return "не переданы кандидаты: " + ", ".join(missing)
-    return None
-
-
 def _tool_result_truncated(message: ToolMessage) -> bool:
     content = message.content
     if isinstance(content, dict):
@@ -1268,7 +1141,6 @@ def build_agent_graph(
     tool_message_preview_chars: Optional[int] = None,
     worker_finish: bool = False,
     split_tool_call_planning: bool = False,
-    required_evidence: Sequence[SqlRiskEvidenceRequirement] = (),
 ):
     """Build planner -> tools -> observer -> planner."""
     tool_list = _normalize_tools(tools)
@@ -1277,19 +1149,6 @@ def build_agent_graph(
         raw_tool_results if raw_tool_results is not None else {}
     )
     retained_tool_calls: Dict[str, Dict[str, Any]] = {}
-    required_evidence = tuple(required_evidence)
-    missing_tools = sorted(
-        {
-            requirement.tool_name
-            for requirement in required_evidence
-            if requirement.tool_name not in tool_names
-        }
-    )
-    if missing_tools:
-        raise WorkerResponseError(
-            "SQL-risk scope contract requires unavailable worker tools: "
-            + ", ".join(missing_tools)
-        )
     evidence_ids = (
         evidence_ids_by_tool_call
         if evidence_ids_by_tool_call is not None
@@ -1626,77 +1485,6 @@ def build_agent_graph(
                 )
             reply = repaired_reply
 
-        pending_candidate_names = _pending_semantic_candidate_names(
-            list(retained_tool_results.values())
-        )
-        candidate_batch_error = _semantic_candidate_batch_error(
-            reply.tool_calls,
-            pending_candidate_names,
-        )
-        if candidate_batch_error:
-            expected_candidate_names = list(
-                dict.fromkeys(
-                    [
-                        *pending_candidate_names,
-                        *_prospective_semantic_candidate_names(
-                            reply.tool_calls
-                        ),
-                    ]
-                )
-            )
-            logger.warning(
-                "Worker planner returned an incomplete semantic candidate "
-                "batch; discarding calls before execution: %s",
-                candidate_batch_error,
-            )
-            repaired_reply = invoke_with_fallback(
-                selected_model,
-                [
-                    *planner_messages,
-                    HumanMessage(
-                        content=_CANDIDATE_BATCH_REPAIR_PROMPT.format(
-                            validation_error=candidate_batch_error,
-                            candidate_names=json.dumps(
-                                expected_candidate_names,
-                                ensure_ascii=False,
-                            )[:6000],
-                        )
-                    ),
-                ],
-                stage=planner_stage,
-                fallback_model=selected_fallback,
-            )
-            if not isinstance(repaired_reply, AIMessage):
-                repaired_reply = AIMessage(
-                    content=_message_content_text(repaired_reply)
-                )
-            repaired_batch_error = _semantic_candidate_batch_error(
-                repaired_reply.tool_calls,
-                pending_candidate_names,
-            )
-            repaired_continue_finish = bool(
-                must_continue
-                and any(
-                    call.get("name") == _FINISH_WORKER_TOOL_NAME
-                    for call in repaired_reply.tool_calls
-                )
-            )
-            if (
-                not repaired_reply.tool_calls
-                or repaired_continue_finish
-                or repaired_batch_error
-                or _tool_calls_with_provider_markup(
-                    repaired_reply.tool_calls
-                )
-            ):
-                repaired_reply = AIMessage(
-                    content=(
-                        "Worker planner после repair снова нарушил "
-                        "CandidateSet batch contract."
-                    )
-                )
-            reply = repaired_reply
-
         if finish_only and worker_finish and reply.tool_calls and not any(
             call.get("name") == _FINISH_WORKER_TOOL_NAME
             for call in reply.tool_calls
@@ -1753,18 +1541,6 @@ def build_agent_graph(
         last_message = state["messages"][-1]
         if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
             raise RuntimeError("ToolNode вызван без AIMessage.tool_calls.")
-
-        candidate_batch_error = _semantic_candidate_batch_error(
-            last_message.tool_calls,
-            _pending_semantic_candidate_names(
-                list(retained_tool_results.values())
-            ),
-        )
-        if candidate_batch_error:
-            raise WorkerResponseError(
-                "CandidateSet batch contract rejected tool execution: "
-                + candidate_batch_error
-            )
 
         logger.info(
             "Executing tool step %s: %s",
@@ -2004,33 +1780,6 @@ def build_agent_graph(
                     "status=complete требует хотя бы один принятый "
                     "внешний tool result в accepted_tool_call_ids"
                 )
-            if parsed_observation.status == "complete" and required_evidence:
-                accepted_calls = [
-                    retained_tool_calls[tool_call_id]
-                    for tool_call_id in accepted_ids
-                    if tool_call_id in retained_tool_calls
-                ]
-                missing_requirements = missing_sql_risk_requirements(
-                    required_evidence,
-                    accepted_calls,
-                )
-                if missing_requirements:
-                    missing_text = "; ".join(
-                        requirement.tool_name
-                        + "("
-                        + json.dumps(
-                            requirement.arguments,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        )
-                        + ")"
-                        for requirement in missing_requirements
-                    )
-                    raise ValueError(
-                        "status=complete не закрывает обязательный SQL-risk "
-                        "evidence contract: "
-                        + missing_text
-                    )
             accepted_evidence_ids = {
                 evidence_ids[tool_call_id]
                 for tool_call_id in accepted_ids
@@ -2289,6 +2038,7 @@ def run_agent_graph(
     initial_state: AgentGraphState = {
         "messages": initial_messages,
         "system_prompt": system_prompt,
+        "original_task": "",
         "planner_operation_context": "",
         "observer_operation_context": "",
         "planner_message": None,
@@ -2358,7 +2108,6 @@ def run_worker_graph(
     tool_message_preview_chars: int = DEFAULT_TOOL_MESSAGE_PREVIEW_CHARS,
     callbacks: Optional[List[Any]] = None,
     split_tool_call_planning: bool = False,
-    required_evidence: Sequence[SqlRiskEvidenceRequirement] = (),
 ) -> WorkerRunResult:
     """Run the internal worker graph and retain its selected UI results locally."""
     raw_task = str(task or "").strip()
@@ -2395,12 +2144,12 @@ def run_worker_graph(
         tool_message_preview_chars=preview_chars,
         worker_finish=True,
         split_tool_call_planning=split_tool_call_planning,
-        required_evidence=required_evidence,
     )
 
     initial_state: AgentGraphState = {
         "messages": [HumanMessage(content=clean_task)],
         "system_prompt": system_prompt,
+        "original_task": request_parts.original_task,
         "planner_operation_context": (
             request_parts.operation_execution_context
         ),

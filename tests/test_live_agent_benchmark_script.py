@@ -287,7 +287,16 @@ def test_benchmark_parser_accepts_resolution_group():
     assert _group_pytest_args(args.group) == ["-m", "live_resolution"]
 
 
-def test_run_mode_applies_extra_environment_last(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("llm_judge", "expected_judge_flag"),
+    [(False, "0"), (True, "1")],
+)
+def test_run_mode_applies_binary_environment_and_extra_values_last(
+    monkeypatch,
+    tmp_path,
+    llm_judge,
+    expected_judge_flag,
+):
     observed = {}
 
     def fake_run(command, *, cwd, env, check):
@@ -308,28 +317,17 @@ def test_run_mode_applies_extra_environment_last(monkeypatch, tmp_path):
         pytest_args=[],
         output_dir=tmp_path,
         run_label="extra-env",
-        llm_judge=False,
+        llm_judge=llm_judge,
         extra_env={"OLLAMA_MODEL": "experiment-model", "E1_VARIANT": "capability"},
     )
 
     assert observed["env"]["OLLAMA_MODEL"] == "experiment-model"
     assert observed["env"]["E1_VARIANT"] == "capability"
+    assert observed["env"]["RUN_LIVE_AGENT_SCENARIOS"] == "1"
+    assert observed["env"]["LIVE_AGENT_LLM_JUDGE"] == expected_judge_flag
 
 
-def test_benchmark_ultra_budget_defaults_are_fail_closed(monkeypatch):
-    monkeypatch.delenv("GIGACHAT_ULTRA_TOKEN_FLOOR", raising=False)
-    monkeypatch.delenv(
-        "GIGACHAT_ULTRA_RESERVE_PER_SCENARIO",
-        raising=False,
-    )
-
-    args = build_parser().parse_args([])
-
-    assert args.ultra_token_floor == 15_000_000
-    assert args.ultra_reserve_per_scenario == 250_000
-
-
-def test_benchmark_loads_dotenv_before_resolving_ultra_model(
+def test_benchmark_loads_dotenv_before_resolving_model(
     monkeypatch,
     tmp_path,
 ):
@@ -339,12 +337,8 @@ def test_benchmark_loads_dotenv_before_resolving_ultra_model(
 
     def fake_load_dotenv(path, *, override):
         events.append(("dotenv", path, override))
-        # The runtime factory supports legacy MODEL as a GigaChat fallback;
-        # the parent guard must resolve the same effective model.
+        # The runtime factory supports legacy MODEL as a GigaChat fallback.
         monkeypatch.setenv("MODEL", "GigaChat-3-Ultra")
-
-    def fake_guard(**kwargs):
-        events.append(("guard", kwargs["model"]))
 
     def fake_run_mode(**kwargs):
         events.append(("run", kwargs["model"]))
@@ -356,7 +350,6 @@ def test_benchmark_loads_dotenv_before_resolving_ultra_model(
         )
 
     monkeypatch.setattr(benchmark, "load_dotenv", fake_load_dotenv)
-    monkeypatch.setattr(benchmark, "guard_ultra_budget", fake_guard)
     monkeypatch.setattr(benchmark, "_run_mode", fake_run_mode)
     monkeypatch.setattr(benchmark, "_comparison_report", lambda **kwargs: None)
 
@@ -374,56 +367,7 @@ def test_benchmark_loads_dotenv_before_resolving_ultra_model(
     ) == 0
 
     assert events[0] == ("dotenv", benchmark.PROJECT_ROOT / ".env", False)
-    assert events[1:] == [
-        ("guard", "GigaChat-3-Ultra"),
-        ("run", "GigaChat-3-Ultra"),
-        ("guard", "GigaChat-3-Ultra"),
-    ]
-
-
-def test_benchmark_guards_ultra_judge_with_retry_reserve(
-    monkeypatch,
-    tmp_path,
-):
-    guards = []
-    monkeypatch.setenv("GIGACHAT_JUDGE_MODEL", "GigaChat-3-Ultra")
-
-    def fake_guard(**kwargs):
-        guards.append((kwargs["model"], kwargs["reserved_tokens"]))
-
-    monkeypatch.setattr(benchmark, "guard_ultra_budget", fake_guard)
-    monkeypatch.setattr(
-        benchmark,
-        "_run_mode",
-        lambda **kwargs: ModeResult(
-            mode=kwargs["mode"],
-            return_code=0,
-            transcript_path=tmp_path / "run.md",
-            junit_path=tmp_path / "run.xml",
-        ),
-    )
-    monkeypatch.setattr(benchmark, "_comparison_report", lambda **kwargs: None)
-
-    assert benchmark.main(
-        [
-            "--provider",
-            "gigachat",
-            "--model",
-            "GigaChat-2-Pro",
-            "--modes",
-            "multiagent",
-            "--scenario",
-            "test_live_agent_resolves_history_reference_into_task",
-            "--llm-judge",
-            "--output-dir",
-            str(tmp_path),
-        ]
-    ) == 0
-
-    assert guards == [
-        ("GigaChat-3-Ultra", 6 * 250_000),
-        ("GigaChat-3-Ultra", 0),
-    ]
+    assert events[1:] == [("run", "GigaChat-3-Ultra")]
 
 
 def test_selected_scenario_count_supports_group_and_exact_target():

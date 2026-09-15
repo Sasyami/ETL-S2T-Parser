@@ -79,31 +79,42 @@ flowchart TD
     F --> U["Upstream data decision"]
     U -->|reroute, максимум один раз| C
     U -->|pass| UA["Upstream answer + display selection"]
-    OR -.->|ОТКЛЮЧЁН| SC["S2T analysis<br/>(экспериментальный резерв)"]
     OR -->|тест-протокол| VRAW["LLM: RawTestProtocolContract"]
-    VRAW --> VRES["Shared entity resolution"]
+    VRAW --> VREV["LLM: completeness + role review"]
+    VREV --> VRES["Shared entity resolution"]
     VRES --> VC["Resolved contract → dependency readers → Phase 0–3"]
-    SC -.->|не используется| UI["Ответ + scrollable results"]
+    OR -->|SQL-risk scope, opt-in| SX["LLM: mode + exact directed scope"]
+    SX --> SR["Exact readers → run-scoped evidence"]
+    SR --> SS["SQLGlot: neutral structure"]
+    SS --> SA["LLM: risk conclusion + answer + display"]
     VC --> UI
+    SA --> UI
     UA --> UI
-    style SC fill:#f3f4f6,stroke:#b6bbc3,color:#8a9099,stroke-width:1px,stroke-dasharray:5 5
 ```
 
 Основные контракты:
 
 - supervisor отдельно формирует исполнимую `task` и устойчивый `context`;
-- operation router один раз выбирает общий agentic-поток либо специализированный
-  пайплайн и подключает только относящиеся к операции stage-skills;
-- неявного «активного файла» нет: полный `filename` разрешается через
-  `resolve_file`, а внутренний `file_id` берётся только из запроса или принятого
-  результата разрешения; одна операция может ссылаться на несколько файлов;
+- после supervisor operation router один раз выбирает общий agentic-поток либо
+  специализированный pipeline. Для `sql_risk_scope` он выбирает только pipeline:
+  mode, exact source/target и optional `file_id` извлекаются отдельным native
+  LLM-вызовом уже внутри ветки;
+- неявного «активного файла» нет. В общем agentic-потоке downstream при
+  необходимости создаёт отдельную задачу разрешения имени файла, а worker
+  выбирает public `resolve_file` и передаёт принятый `file_id` следующему worker через
+  lazy result reference. Coordinator не извлекает идентификаторы из текста и не
+  переписывает model-owned план;
 - в общем потоке downstream сразу создаёт полный план из 1–8 задач чтения;
   workers выполняются последовательно и могут лениво прочитать принятые
   результаты предыдущих workers по коротким `result_id`;
-- worker получает текущую задачу и короткие ссылки на доступные зависимости;
-  router независимо выбирает tools, retrieval-skills и schemas, а planner
-  вызывает только выбранные read-only tools;
-- planner видит исходную задачу, последний обмен с инструментом и накопительную observer-выжимку;
+- worker получает текущую задачу и короткие ссылки на все принятые результаты
+  предыдущих шагов текущего цикла; router выбирает tools, retrieval-skills и
+  schemas только для операции текущей task. Planner дополнительно получает
+  исходную coordinator-task как immutable справочник точных литералов, но не
+  может менять по ней операцию или dataset текущего шага;
+- planner видит текущую задачу, immutable справочник, последний обмен с
+  инструментом и накопительную observer-выжимку; observer оценивает полноту
+  только текущей task;
 - observer вызывается после каждого data-tool result и возвращает только
   `complete`, `continue` или `reroute`; невалидная структура повторно
   запрашивается на том же payload без повторного data-tool;
@@ -116,19 +127,22 @@ flowchart TD
 
 Worker завершается самим planner только через native `finish_worker(summary)`. Обычный финальный текст отклоняется; полноту исходных данных определяет тот же structured observer.
 
-Для повторяемых операций предусмотрены два специализированных маршрута:
+Для повторяемых операций предусмотрены специализированные маршруты:
 
-- `s2t_analysis`: **ОТКЛЮЧЁН** — исключён из схемы operation-router и не может
-  быть выбран в штатном запросе. Реализация сохранена только как
-  экспериментальный резерв; обычные запросы анализа идут через общий
-  agentic-поток и operation-skills;
 - `validation_protocol`: LLM извлекает только пользовательский
-  `RawTestProtocolContract`; общий resolver подтверждает роли source/target и
+  `RawTestProtocolContract`, а отдельный native LLM-review сверяет его полноту
+  и роли с исходной задачей; общий resolver подтверждает source/target и
   формирует канонический `ResolvedTestProtocolContract`, после чего
   dependency-based readers и deterministic compiler строят Greenplum
   SQL-шаблоны без исполнения SQL во внешней БД. Ошибка extraction, unresolved
   или ambiguous entity возвращается как структурированный validation-status и
-  не переключает запрос молча в agentic-поток.
+  не переключает запрос молча в agentic-поток;
+- `sql_risk_scope` (opt-in): внутренний native LLM с учётом устойчивого context
+  извлекает один closed mode и точный directed scope только из исходной task,
+  exact readers получают данные, SQLGlot строит
+  нейтральную структуру, а второй native LLM делает вывод о риске, формирует
+  ответ и выбирает display evidence. Эта ветка не запускает обычные
+  downstream/workers/upstream и не откатывается молча в agentic-поток.
 
 ### Validation protocol
 
@@ -137,6 +151,7 @@ Worker завершается самим planner только через native 
 
 ```text
 RawTestProtocolContract
+→ model-owned completeness/role review
 → shared entity resolution
 → ResolvedTestProtocolContract
 → dependency-based exact readers
@@ -144,6 +159,14 @@ RawTestProtocolContract
 → declarative check registry
 → Phase 0–3 protocol
 ```
+
+Первый native LLM-вызов явно выбирает `file_scope_kind` (`file_id`,
+`file_mention` либо подтверждённое отсутствие scope) и сохраняет отдельные
+literal source/target mentions. Код не извлекает эти значения из естественного
+языка и не переписывает model-owned контракт. Отдельный native LLM-review
+сверяет, что extraction не потерял явно заданный файл, load, check, mode, key
+или роль source/target. При замечаниях разрешён один повтор extraction; второй
+отказ либо ошибка review возвращает structured failure без agentic fallback.
 
 Exact identifier сначала проверяется без approximate search. Общий resolver
 запускается только для неподтверждённого typo, partial или semantic mention;
@@ -244,6 +267,12 @@ uv run python app.py
 
 По умолчанию используется GigaChat.
 
+Все проектные boolean-переменные окружения принимают только `0` или `1`;
+текстовые aliases (`true`, `false`, `on`, `off` и подобные) считаются ошибкой
+конфигурации. Это относится к live/judge, metrics, Langfuse, SSL/reasoning и
+всем бинарным флагам с суффиксом `_EXPERIMENT`. Многовариантный
+`OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT` остаётся enum-selector.
+
 ### GigaChat
 
 ```ini
@@ -252,7 +281,7 @@ GIGACHAT_API_KEY=your_key
 GIGACHAT_MODEL=GigaChat
 GIGACHAT_API_URL=https://api.giga.chat/v1
 GIGACHAT_SCOPE=GIGACHAT_API_PERS
-GIGACHAT_VERIFY_SSL=false
+GIGACHAT_VERIFY_SSL=0
 GIGACHAT_TIMEOUT=120
 ```
 
@@ -273,7 +302,7 @@ OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_NUM_CTX=16384
 OLLAMA_TIMEOUT=120
 OLLAMA_TEMPERATURE=0
-OLLAMA_REASONING=false
+OLLAMA_REASONING=0
 ```
 
 ### OpenRouter
@@ -380,7 +409,7 @@ Neo4j-пути, validation-протоколы, shared entity resolution и ка�
 | `handoff` | `live_handoff` | зависимые workers и передача результатов |
 | `graph` | `live_graph` | Neo4j lineage и точные пути |
 | `validation` | `live_validation` | анализ рисков и validation-протоколы |
-| `resolution` | `live_resolution` | общий resolver в validation и agentic flows, exact bypass, typo/partial/semantic и ambiguity |
+| `resolution` | `live_resolution` | validation-resolver и его изоляция от agentic; model-owned retrieval кандидатов, exact bypass и ambiguity |
 | `catalog` | `live_catalog` | S2T-каталог, semantic search и impact analysis |
 
 Локально группу можно выбрать обычным pytest marker:
@@ -414,14 +443,13 @@ uv run python scripts/run_live_agent_benchmark.py \
 JUnit и сводный Markdown-отчёт.
 Матрица считается неполной и возвращает ненулевой exit code, если хотя бы один
 её сценарий пропущен либо не выполнен (например, из-за отсутствующей live DB).
-
 | Эксперимент | Что сравнивается | Управляющие flags/env |
 |---|---|---|
 | E1 | capability-based reroute и разделение selector/arguments | `WORKER_CAPABILITY_REROUTE_EXPERIMENT`, `WORKER_SPLIT_TOOL_CALL_EXPERIMENT` |
 | E2 | выбор SQL-risk аспектов | `OPERATION_SQL_RISK_ASPECTS_EXPERIMENT` |
 | E3 | modes, preflight, 13 checks, expressions, keys и phases | текущий deterministic compiler |
 | E4 | минимальные dependency-based readers | текущий dependency planner |
-| E5 | единый entity resolver для validation и agentic flows | текущий shared resolver |
+| E5 | validation-resolver и model-owned agentic candidate selection | resolver isolation |
 
 ```bash
 uv run python scripts/run_multiagent_experiments.py \
@@ -433,22 +461,9 @@ uv run python scripts/run_multiagent_experiments.py \
 ```
 
 `--experiment` можно повторять; без него запускаются E1–E5. Доступны также
-`--pytest-arg`, `--output-dir`, `--dry-run`, `--ultra-token-floor` и
-`--ultra-reserve-per-scenario`. `scripts/run_live_agent_benchmark.py`
-дополнительно принимает `--modes`, `--scenario`, `--group` и
-`--allow-failures`.
-
-Для модели GigaChat с `Ultra` в имени оба runner-а используют fail-closed
-token guard до и после запуска. По умолчанию подтверждённый прогнозируемый
-остаток не должен опуститься ниже **15 000 000** токенов; дополнительно
-резервируется 250 000 токенов на каждый фактический HTTP `/chat`-обмен (в том
-числе несколько обменов внутри одного сценария). Если balance API не
-подтвердил остаток или `remaining - reserve < floor`, запуск блокируется.
-Если `--llm-judge` настроен на Ultra отдельно, его баланс также проверяется;
-резерв учитывает обе structured стадии judge и до трёх попыток каждой.
-Порог и резерв можно только повысить одноимёнными CLI-флагами; жёсткие
-минимумы 15 000 000 и 250 000 на `/chat`-обмен понизить нельзя. Live benchmark также читает
-`GIGACHAT_ULTRA_TOKEN_FLOOR` и `GIGACHAT_ULTRA_RESERVE_PER_SCENARIO`.
+`--pytest-arg`, `--output-dir` и `--dry-run`.
+`scripts/run_live_agent_benchmark.py` дополнительно принимает `--modes`,
+`--scenario`, `--group` и `--allow-failures`.
 
 ### Независимый multiagent holdout
 
@@ -510,9 +525,10 @@ development evidence, поэтому потенциальному победит
 holdout.
 
 Все 20 ячеек, включая `value_changes` и `write_semantics`, проходят
-полный model-owned upstream decision и upstream answer. Детерминированный
-SQLGlot-анализ добавляет только structured facts к evidence payload и не
-формирует финальный ответ и не подавляет reroute.
+полный model-owned upstream decision и upstream answer. Runner фиксирует
+`OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT=0`, поэтому отдельная scope-ветка
+с внутренними extraction/assessment вызовами не входит в эту preregistered
+популяцию.
 
 Confirmatory Max/Max-run `20260910_021405` завершил все 20 пар и откаты, но ни
 одно семейство не прошло preregistered gate. Combined score изменился с 7/20 до
@@ -521,49 +537,43 @@ Confirmatory Max/Max-run `20260910_021405` завершил все 20 пар и 
 Продвигать варианты нельзя; подробности —
 [`LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md`](LIVE_OPERATION_PROTOCOL_EXPERIMENT_REPORT_2026-09-10.md).
 
-Для development-проверки SQL-risk evidence scope доступен отдельный
-opt-in `OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT=typed_plan`.
-В этом режиме operation router возвращает typed execution mode native enum;
-ниже по цепочке нет regex/keyword-классификации пользовательской формулировки.
-Для conditional-cardinality или exact nullable-constraint запроса coordinator
-сам строит один typed worker-plan и evidence slots, не вызывая downstream planner. Cardinality
-требует полную сохранённую exact S2T relation и детерминированно извлекает
-только JOIN внешнего SELECT: `WHERE`/`COALESCE` не могут стать
-механизмом размножения или доказательством уникальности. Nullable-constraint компилирует
-ответ из exact mapping и source/target metadata. Оба terminal verdict
-возвращаются без модельного upstream answer. Любой более широкий или
-неоднозначный запрос fail-closed остаётся на default agentic path без
-scope-аттестации. Literal arrow/file_id parsing проверяет только происхождение
-scope и не определяет intent. Default выключен; старый prompt-mediated режим
-удалён, а его truthy-значения теперь отклоняются. Форматтер `value_changes`
-отдельно не публикует внутренние SQL aliases; полное выражение остаётся в
-structured metrics.
+Для development-проверки SQL-risk operation scope доступен отдельный
+opt-in `OPERATION_SQL_RISK_SCOPE_EVIDENCE_EXPERIMENT=1`.
+Operation scope не является operation skill: router возвращает
+`pipeline=sql_risk_scope` и `skills=[]`; поле risk-aspects в default router
+schema отсутствует, execution mode верхний router не выбирает. После router внутренний native LLM-вызов
+`submit_sql_risk_scope` с учётом устойчивого context извлекает один mode из `row_filtering`,
+`conditional_cardinality`, `nullable_constraint`, `value_changes` и
+`write_semantics`, точную направленную source → target пару и optional
+`file_id`. Идентификаторы и attestations берутся только из исходной task; context
+может уточнять лишь intent и терминологию. Код только проверяет typed schema и дословное происхождение этих
+значений из исходной task; literal/NL parser, regex/keyword-классификации и
+эвристического исправления identifiers нет. После одного невалидного ответа
+допускается один repair-вызов той же модели.
 
-Max/Max development A/B на пяти раскрытых baseline failures не подтвердил
-scope/evidence toggle: combined осталось 3/5, semantic снизилось с 4/5 до 3/5,
-а HTTP 500 выросли с одного до двух. Toggle остаётся выключенным; общий
-alias-safe formatter `value_changes` прошёл обе руки. Разбор и rollback-аудит —
-[`LIVE_SQL_RISK_SCOPE_EVIDENCE_DEV_REPORT_2026-09-10.md`](LIVE_SQL_RISK_SCOPE_EVIDENCE_DEV_REPORT_2026-09-10.md).
+Прямое сравнение каталоговых `data_type`, `not_null` или ключевых признаков
+двух колонок, включая совместимость nullable source с NOT NULL target, идёт по
+обычному agentic-профилю `Совместимость колонок`. `nullable_constraint` внутри
+scope используется только когда вопрос требует анализа сохранённой
+SQL-проекции, выражения или predicate, способных породить NULL.
 
-После этого prompt-mediated roundtrip заменён typed plan и deterministic
-nullable/cardinality compilers. На первом пятисценарном development A/B
-candidate дал combined `4/5 → 5/5`, semantic `5/5 → 5/5`, без HTTP 500, и
-снизил agent tokens на 29,2%. Ручной аудит обнаружил, что Max-agent и Max-judge
-одинаково ошибочно называли `WHERE` условием уникальности. После cardinality
-compiler три повторные пары дали hard/combined `0/3 → 3/3`, tokens
-`53 827 → 27 338` и ноль ошибок, но preregistered `strict_semantic_gain` не
-выполнен: Max-judge снова поставил baseline `3/3`. Default не меняется;
-полный разбор —
-[`LIVE_SQL_RISK_TYPED_PLAN_CARDINALITY_DEV_REPORT_2026-09-10.md`](LIVE_SQL_RISK_TYPED_PLAN_CARDINALITY_DEV_REPORT_2026-09-10.md).
+Contract задаёт fixed exact readers. Полные results сохраняются в run-scoped
+store, а SQLGlot формирует нейтральный structural bundle с полными predicates,
+joins, projections, DML targets и parse diagnostics — без семантического
+вывода о риске. Затем второй native LLM-вызов `submit_sql_risk_assessment`
+получает исходную task, устойчивый context, exact evidence и весь bundle, самостоятельно формирует
+risk conclusion, пользовательский ответ и display selection. Код проверяет
+полноту provenance и допускает один assessment repair. Эта ветка не вызывает
+downstream planner/model, workers, worker planner, observer либо обычные
+upstream decision/answer. Invalid extraction/assessment, reader/structure
+error или incomplete evidence возвращают structured `unavailable` с
+`silent_fallback=false`; молчаливого перехода в agentic pipeline нет. Default
+выключен.
 
-Затем удалены NL keyword/fullmatch-классификаторы и fixture-shaped prompt
-example; live-oracles переведены с проверки русских фраз на mandatory Max
-semantic judge плюс structured facts/tools/evidence. На шести RU/EN/reordered
-переформулировках `typed_plan` прошёл hard+semantic `6/6`, без HTTP/tool/judge
-errors, и использовал 75 665 против 194 217 agent tokens baseline. Это
-раскрытая regression-проверка, не confirmation; default остаётся выключен.
-Полный anti-overfit и rollback-аудит —
-[`LIVE_SQL_RISK_ANTI_OVERFIT_PARAPHRASE_REPORT_2026-09-10.md`](LIVE_SQL_RISK_ANTI_OVERFIT_PARAPHRASE_REPORT_2026-09-10.md).
+Прежние development-прототипы с code-owned risk verdicts и NL/literal parsers
+удалены. Связанные отчёты остаются историческими артефактами и не описывают
+текущий runtime. В актуальной ветке вывод о риске принадлежит только внутреннему
+LLM assessment; scope default по-прежнему выключен.
 
 ## Структура проекта
 
@@ -578,13 +588,16 @@ services/graph_sync.py         проекция SQLite → Neo4j
 graph_storage/                 lifecycle и настройки Neo4j
 agents/supervisor.py           верхний LangGraph
 agents/coordinator.py          выбор pipeline, downstream/workers/upstream
-agents/cardinality_analysis.py deterministic cardinality facts из exact S2T
-agents/constraint_rejection_analysis.py  deterministic nullable-risk facts
+agents/sql_risk_scope_extraction.py  native LLM contract режима и exact scope
+agents/sql_risk_operation_pipeline.py  orchestration exact readers → structure → assessment
+agents/sql_risk_structure.py     нейтральный SQLGlot structural bundle
+agents/sql_risk_assessment.py    native LLM contract вывода, ответа и display
 agents/worker.py               worker runtime и работа с зависимостями
 agents/chat_graph.py           planner/tool/observer loop
-agents/entity_resolution.py    общий exact/partial/fuzzy/semantic resolver
+agents/entity_resolution.py    внутренний exact/partial/fuzzy/semantic resolver validation
+agents/test_protocol_contract_review.py  model-owned review полноты/ролей Raw contract
 agents/test_protocol_resolution.py  Raw → Resolved validation contract
-agents/validation_protocol.py  dependency-based readers и S2T-анализ
+agents/validation_protocol.py  dependency-based readers test protocol
 agents/transformation_ast.py   SQLGlot-нормализация transformation
 agents/test_protocol.py        phased compiler 13 SQL checks
 agents/tools/routing.py        LLM router tools и skills
@@ -594,7 +607,7 @@ agents/prompts/                runtime prompts и skills
 agents/run_metrics.py          метрики live-запусков
 config/                        JSON-конфигурации извлечения
 templates/chat_app.html        единый интерфейс
-scripts/                       live benchmark, E1–E5/holdout/protocol runners и Ultra guard
+scripts/                       live benchmark и E1–E5/holdout/protocol runners
 docs/history/                  архив старых демонстраций и live-отчётов
 tests/                         unit, integration и live tests
 samples/                       примеры S2T Excel
@@ -604,7 +617,7 @@ samples/                       примеры S2T Excel
 
 Логи пишутся в консоль и в ротационный UTF-8 файл `logs/agent.log`. Уровень и размер задаются через `LOG_LEVEL`, `LOG_FILE`, `LOG_MAX_BYTES` и `LOG_BACKUP_COUNT`.
 
-Langfuse необязателен. Для включения задайте `LANGFUSE_ENABLED=true`, `LANGFUSE_PUBLIC_KEY` и `LANGFUSE_SECRET_KEY`.
+Langfuse необязателен. Для включения задайте `LANGFUSE_ENABLED=1`, `LANGFUSE_PUBLIC_KEY` и `LANGFUSE_SECRET_KEY`.
 
 ## Безопасность данных
 

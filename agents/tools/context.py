@@ -5,6 +5,10 @@ import os
 from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
 from ..contracts import SqlRiskAspect
+from ..experiment_flags import (
+    OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    experiment_flag_enabled,
+)
 from ..operation_protocols import (
     OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT_ENV,
     configured_sql_risk_protocol,
@@ -14,10 +18,6 @@ from .common import PROJECT_ROOT
 
 PROMPTS_DIR = PROJECT_ROOT / "agents" / "prompts"
 CONFIG_DIR = PROJECT_ROOT / "config"
-OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV = (
-    "OPERATION_SQL_RISK_ASPECTS_EXPERIMENT"
-)
-
 SchemaName = Literal[
     "SQLite ETL",
     "S2T-маппинг",
@@ -115,7 +115,17 @@ _SQL_RISK_ASPECT_RULES: Dict[
         "upstream": (
             "Оцени JOIN multiplicity, DISTINCT, GROUP BY и дедупликацию. "
             "Без уникальности полных join keys размножение условно; прямой "
-            "field mapping не доказывает 1:1."
+            "field mapping не доказывает 1:1. Не назначай качественный "
+            "уровень риска и не утверждай фактические дубликаты без evidence "
+            "о данных и уникальности. Не переноси сюда write semantics, PK "
+            "или поведение повторного запуска: если они не запрошены и не "
+            "прочитаны, итог ограничен условным механизмом кардинальности. "
+            "Для LEFT JOIN ноль или одно совпадение справа дают одну строку; "
+            "fan-out возникает только при нескольких совпадениях. Если в "
+            "ответе называешь join-поля из mapping, выбери это mapping также "
+            "для display. "
+            "Конъюнкт `TRUE AND predicate` эквивалентен `predicate`: сам "
+            "литерал TRUE не ослабляет условие JOIN."
         ),
     },
     "constraint_rejection": {
@@ -211,10 +221,9 @@ _MAPPING_DEPENDENT_SQL_RISK_ASPECTS = {
 
 
 def _sql_risk_aspects_enabled() -> bool:
-    value = os.getenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV)
-    if value is None:
-        return True
-    return value.strip().casefold() not in {"0", "false", "no", "off"}
+    return experiment_flag_enabled(
+        OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    )
 
 
 def _sql_risk_aspect_context(

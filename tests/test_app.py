@@ -8,6 +8,30 @@ from storage.database import init_db, get_db_connection
 import io
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("0", False), ("1", True)],
+)
+def test_flask_debug_uses_strict_binary_flag(monkeypatch, value, expected):
+    from app import _flask_debug_enabled
+
+    if value is None:
+        monkeypatch.delenv("FLASK_DEBUG", raising=False)
+    else:
+        monkeypatch.setenv("FLASK_DEBUG", value)
+
+    assert _flask_debug_enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["", "true", "false", " 1 ", "2"])
+def test_flask_debug_rejects_non_binary_values(monkeypatch, value):
+    from app import _flask_debug_enabled
+
+    monkeypatch.setenv("FLASK_DEBUG", value)
+    with pytest.raises(ValueError, match="FLASK_DEBUG must be 0 or 1"):
+        _flask_debug_enabled()
+
+
 def test_console_streams_are_reconfigured_to_utf8():
     from services.logging_setup import _configure_utf8_console_streams
 

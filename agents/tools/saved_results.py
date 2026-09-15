@@ -17,7 +17,6 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool
 
 from ..contracts import (
-    CandidateSet,
     PreviousResultReference,
     PreviousResultSchema,
     SavedResultColumn,
@@ -326,36 +325,6 @@ class SavedResultStore:
             "source_tool": payload["source_tool"],
             "result": decoded if decoded is not None else content,
         }
-        if (
-            payload["source_tool"] == "semantic_search_descriptions"
-            and isinstance(decoded, Mapping)
-            and isinstance(decoded.get("rows"), list)
-        ):
-            rows = [
-                dict(item)
-                for item in decoded["rows"]
-                if isinstance(item, Mapping)
-            ]
-            truncated = bool(decoded.get("truncated"))
-            total_candidates = decoded.get("total_candidates")
-            if (
-                isinstance(total_candidates, int)
-                and not isinstance(total_candidates, bool)
-                and total_candidates > len(rows)
-            ):
-                truncated = True
-            candidate_set = CandidateSet(
-                candidates=rows,
-                coverage="truncated" if truncated else "complete",
-                source_result_id=clean_id,
-            )
-            # Candidate rows have one canonical typed representation. Keeping
-            # them in both ``result.rows`` and ``candidate_set.candidates``
-            # doubles a potentially large planner prompt without adding facts.
-            result["result"] = {
-                key: value for key, value in decoded.items() if key != "rows"
-            }
-            result["candidate_set"] = candidate_set.model_dump(mode="json")
         return result
 
     def descriptors_for_result_ids(
@@ -696,10 +665,13 @@ def read_previous_result(
     """Прочитать один или несколько результатов прошлых workers по ID.
 
     Используй только точные ID из блока `previous_results`, когда краткого
-    description недостаточно для текущей task. Semantic-result дополнительно
-    возвращается как typed `candidate_set`: сохрани все строки и роли, затем
-    передай различающиеся технические имена одним batch-вызовом следующего
-    search tool. Не перебирай кандидатов по одному. Если нужны несколько результатов,
+    description недостаточно для текущей task. Сохраняй строки и роли
+    semantic-result; если следующий search поддерживает batch, передавай ему
+    различающиеся технические имена одним вызовом, а не перебирай кандидатов по
+    одному. Само наличие ссылки не требует чтения: если текущая task уже содержит
+    точные аргументы независимого нового data-вызова, выполняй его напрямую.
+    Результат той же операции для другого endpoint не является входом текущего
+    endpoint и уже доступен upstream отдельно. Если нужны несколько результатов,
     передай их одним вызовом в `result_ids`. Инструмент не читает новые внешние
     данные и лениво возвращает только принятые tool results текущего запуска.
 

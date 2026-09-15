@@ -156,7 +156,7 @@ def test_arm_contract_is_max_multiagent_typed_and_protocol_specific(tmp_path):
         assert environment["WORKER_SPLIT_TOOL_CALL_EXPERIMENT"] == "0"
         assert environment["OPERATION_SQL_RISK_ASPECTS_EXPERIMENT"] == "1"
         assert environment["GIGACHAT_JUDGE_MODEL"] == runner.MODEL
-        assert environment["LANGFUSE_ENABLED"] == "false"
+        assert environment["LANGFUSE_ENABLED"] == "0"
     assert baseline[runner.PROTOCOL_ENV] == "default"
     assert candidate[runner.PROTOCOL_ENV] == case.protocol
     assert runner.HARD_CORRECTNESS_PYTEST_ARGS == (

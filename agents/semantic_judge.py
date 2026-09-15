@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Literal, Mapping, Sequence
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -15,6 +16,9 @@ JUDGE_MAX_DISPLAY_CHARS = 24_000
 JUDGE_MAX_HISTORY_MESSAGES = 12
 JUDGE_MAX_HISTORY_MESSAGE_CHARS = 8_000
 JUDGE_MAX_HISTORY_CHARS = 16_000
+
+_IDENTIFIER_QUOTES = str.maketrans("", "", "`\"")
+_DOT_WHITESPACE_RE = re.compile(r"\s*\.\s*")
 
 
 class SemanticJudgeVerdict(BaseModel):
@@ -34,24 +38,51 @@ class SemanticJudgeVerdict(BaseModel):
         return clean_value
 
 
-class IdentifierEvidenceAudit(BaseModel):
-    """Physical identifiers introduced without user-visible evidence."""
+class IdentifierEvidenceFinding(BaseModel):
+    """One model-classified answer surface absent from visible evidence."""
 
-    unconfirmed_identifiers: list[str] = Field(
+    model_config = ConfigDict(extra="forbid")
+
+    surface: str = Field(min_length=1)
+    kind: Literal["physical_identifier", "generic_technical_term"]
+
+    @field_validator("surface")
+    @classmethod
+    def _strip_surface(cls, value: str) -> str:
+        clean_value = value.strip()
+        if not clean_value:
+            raise ValueError("surface must not be blank")
+        return clean_value
+
+
+class IdentifierEvidenceAudit(BaseModel):
+    """Model-owned classification of answer surfaces absent from evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    findings: list[IdentifierEvidenceFinding] = Field(
         default_factory=list,
         description=(
-            "Все конкретные физические идентификаторы answer, которых дословно "
-            "нет в query, пользовательских сообщениях history и "
-            "display_results.content."
+            "Термины из answer, отсутствующие в пользовательском запросе и "
+            "видимых display-results, с классификацией каждого термина."
         ),
     )
 
 
 _IDENTIFIER_AUDIT_PROMPT = """
-Ты выполняешь только evidence-аудит физических идентификаторов, без оценки полноты
-или полезности ответа. Извлеки все конкретные имена таблиц, колонок, ключей,
-справочников и полей фильтра, которые встречаются в answer, но дословно отсутствуют
-в query, пользовательских сообщениях history и `display_results[*].content`.
+Ты выполняешь только evidence-аудит терминов, без оценки полноты или полезности
+ответа. Найди встречающиеся в answer термины, которые дословно отсутствуют в query,
+пользовательских сообщениях history и `display_results[*].content`, и классифицируй
+каждый термин:
+
+- `physical_identifier` — конкретное собственное имя физической таблицы, колонки,
+  схемы, ключа, справочника или поля фильтра;
+- `generic_technical_term` — общий тип ограничения, SQL-конструкция, имя атрибута
+  метаданных, роль сущности, служебная категория или иное нарицательное понятие.
+
+Evidence требуется только для `physical_identifier`. Общий технический термин не
+становится физическим идентификатором из-за подчёркивания, верхнего регистра,
+косой черты или использования в техническом описании.
 
 History передана в хронологическом порядке с явными ролями. Сообщение assistant
 само по себе не подтверждает физический идентификатор; подтверждением считается
@@ -59,17 +90,21 @@ History передана в хронологическом порядке с я�
 
 `display_results=[]` означает ноль evidence. Сам answer не подтверждает собственные
 утверждения. SQL-шаблон, план и тест-протокол не являются исключениями. Не считай
-логическое продолжение или правдоподобие подтверждением. Не включай SQL-ключевые
-слова, псевдонимы и placeholders в угловых скобках. Не включай имя, если answer
-явно предлагает его только как неподтверждённый вариант в уточняющем вопросе и не
-использует как факт. Ничего не объясняй: верни только структурированный список
-unconfirmed_identifiers.
+логическое продолжение или правдоподобие подтверждением. Не включай псевдонимы и
+placeholders в угловых скобках. Не включай имя, если answer явно предлагает его
+только как неподтверждённый вариант в уточняющем вопросе и не использует как факт.
+Ничего не объясняй: верни только структурированный список `findings`.
 """.strip()
 
 
 _JUDGE_PROMPT = """
 Ты независимый LLM-as-judge. Оцени выполнение текущего query с учётом
 role-aware history по пользовательским answer и display_results.
+
+Каждый элемент `display_results` уже является отдельным пользовательским
+scrollable UI-блоком; его `content` — показанное пользователю полное содержимое
+этого блока. Не требуй от answer повторять эти строки или дополнительно описывать
+механизм отображения.
 
 History передана в хронологическом порядке. Явные факты, определения и правила
 user считаются условиями задачи; текст assistant сам по себе не делает факт
@@ -115,15 +150,22 @@ source→target-пара, правило либо явный результат 
 """.strip()
 
 
-def _needs_identifier_audit(
-    query: str,
-    history: Sequence[Mapping[str, str]],
-) -> bool:
-    normalized = "\n".join(
-        [str(query or ""), *(item["content"] for item in history)]
-    ).casefold()
-    markers = ("file_id", "s2t", "mapping", "маппинг", "схем", "каталог", "sql")
-    return any(marker in normalized for marker in markers)
+def _normalize_identifier_surface(value: Any) -> str:
+    """Normalize only quoting and dot spacing in an identifier surface."""
+
+    without_identifier_quotes = str(value or "").translate(_IDENTIFIER_QUOTES)
+    return _DOT_WHITESPACE_RE.sub(".", without_identifier_quotes).casefold()
+
+
+def _identifier_surface_occurs(name: str, text: str) -> bool:
+    """Match an identifier surface without accepting longer-name substrings."""
+
+    if not name:
+        return False
+    return re.search(
+        rf"(?<![\w$]){re.escape(name)}(?![\w$])",
+        text,
+    ) is not None
 
 
 def _invoke_structured(model: Any, schema: type[BaseModel], messages: list[Any]) -> Any:
@@ -196,6 +238,11 @@ def judge_agent_response(
         "query": str(query or ""),
         "answer": answer,
         "display_results": compact_display,
+        "display_contract": {
+            "each_item_is_separate_ui": True,
+            "each_item_is_scrollable": True,
+            "content_is_user_visible": True,
+        },
     }
     if compact_history:
         payload["history"] = compact_history
@@ -203,14 +250,17 @@ def judge_agent_response(
         content=json.dumps(payload, ensure_ascii=False)
     )
 
-    if _needs_identifier_audit(str(query or ""), compact_history):
-        audit_result = _invoke_structured(
-            judge_model,
-            IdentifierEvidenceAudit,
-            [SystemMessage(content=_IDENTIFIER_AUDIT_PROMPT), human_message],
-        )
-        audit = IdentifierEvidenceAudit.model_validate(audit_result)
-        confirmed_request_text = "\n".join(
+    # Run the evidence boundary for every judged response. Deciding whether a
+    # query is "about data" from natural-language keywords is itself an
+    # unreliable intent heuristic.
+    audit_result = _invoke_structured(
+        judge_model,
+        IdentifierEvidenceAudit,
+        [SystemMessage(content=_IDENTIFIER_AUDIT_PROMPT), human_message],
+    )
+    audit = IdentifierEvidenceAudit.model_validate(audit_result)
+    confirmed_request_text = _normalize_identifier_surface(
+        "\n".join(
             [
                 str(query or ""),
                 *(
@@ -219,29 +269,47 @@ def judge_agent_response(
                     if item["role"] == "user"
                 ),
             ]
-        ).casefold()
-        answer_text = str(answer or "").casefold()
-        display_text = "\n".join(
-            item.get("content", "") for item in compact_display
-        ).casefold()
-        unconfirmed = [
-            name.strip()
-            for name in audit.unconfirmed_identifiers
-            if name.strip()
-            and "<" not in name
-            and ">" not in name
-            and f"<{name.strip().casefold()}>" not in answer_text
-            and name.strip().casefold() not in confirmed_request_text
-            and name.strip().casefold() not in display_text
-        ]
-        if unconfirmed:
-            return SemanticJudgeVerdict(
-                status="failed",
-                reason=(
-                    "В ответе используется неподтверждённый физический "
-                    f"идентификатор: {unconfirmed[0]}."
-                ),
-            )
+        )
+    )
+    answer_text = _normalize_identifier_surface(answer)
+    display_text = _normalize_identifier_surface(
+        "\n".join(item.get("content", "") for item in compact_display)
+    )
+    unconfirmed: list[str] = []
+    for finding in audit.findings:
+        if finding.kind != "physical_identifier":
+            continue
+        name = finding.surface.strip()
+        normalized_name = _normalize_identifier_surface(name)
+        if not name or not normalized_name or "<" in name or ">" in name:
+            continue
+        # The audit model extracts identifiers *from the answer*. Treat that
+        # provenance as a code-side invariant. SQL identifier quotes and dot
+        # spacing are surface syntax; no other spelling conversion (for
+        # example, underscore <-> dot) is accepted.
+        if not _identifier_surface_occurs(normalized_name, answer_text):
+            continue
+        if re.search(
+            rf"<\s*{re.escape(normalized_name)}\s*>",
+            answer_text,
+        ):
+            continue
+        if _identifier_surface_occurs(
+            normalized_name,
+            confirmed_request_text,
+        ):
+            continue
+        if _identifier_surface_occurs(normalized_name, display_text):
+            continue
+        unconfirmed.append(name)
+    if unconfirmed:
+        return SemanticJudgeVerdict(
+            status="failed",
+            reason=(
+                "В ответе используется неподтверждённый физический "
+                f"идентификатор: {unconfirmed[0]}."
+            ),
+        )
 
     result = _invoke_structured(
         judge_model,
@@ -253,6 +321,7 @@ def judge_agent_response(
 
 __all__ = [
     "IdentifierEvidenceAudit",
+    "IdentifierEvidenceFinding",
     "SemanticJudgeVerdict",
     "judge_agent_response",
 ]

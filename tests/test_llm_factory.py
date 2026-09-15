@@ -38,6 +38,24 @@ def test_gigachat_factory_uses_model_fallback(monkeypatch):
     assert get_chat_model_name() == "GigaChat-Pro"
 
 
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("1", True)])
+def test_gigachat_factory_passes_binary_verify_ssl(
+    monkeypatch,
+    value,
+    expected,
+):
+    from langchain_gigachat import GigaChat
+
+    monkeypatch.setenv("LLM_PROVIDER", "gigachat")
+    monkeypatch.setenv("GIGACHAT_API_KEY", "test-credentials")
+    monkeypatch.setenv("GIGACHAT_VERIFY_SSL", value)
+
+    model = create_chat_model(timeout=5)
+
+    assert isinstance(model, GigaChat)
+    assert model.verify_ssl_certs is expected
+
+
 def test_gigachat_judge_uses_pro_independently_from_agent(monkeypatch):
     from langchain_gigachat import GigaChat
 
@@ -111,11 +129,38 @@ def test_ollama_factory_passes_configured_context_window(monkeypatch):
     assert model.num_ctx == 16384
 
 
-def test_ollama_factory_passes_configured_reasoning(monkeypatch):
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("1", True)])
+def test_ollama_factory_passes_configured_reasoning(
+    monkeypatch,
+    value,
+    expected,
+):
     monkeypatch.setenv("LLM_PROVIDER", "ollama")
-    monkeypatch.setenv("OLLAMA_REASONING", "true")
+    monkeypatch.setenv("OLLAMA_REASONING", value)
 
     model = create_chat_model()
 
     assert isinstance(model, ChatOllama)
-    assert model.reasoning is True
+    assert model.reasoning is expected
+
+
+@pytest.mark.parametrize(
+    ("provider", "flag"),
+    [
+        ("gigachat", "GIGACHAT_VERIFY_SSL"),
+        ("ollama", "OLLAMA_REASONING"),
+    ],
+)
+@pytest.mark.parametrize("invalid", ["", "true", "false", " 1 "])
+def test_llm_service_binary_flags_reject_non_binary_values(
+    monkeypatch,
+    provider,
+    flag,
+    invalid,
+):
+    monkeypatch.setenv("LLM_PROVIDER", provider)
+    monkeypatch.setenv("GIGACHAT_API_KEY", "test-credentials")
+    monkeypatch.setenv(flag, invalid)
+
+    with pytest.raises(ValueError, match=rf"{flag} must be 0 or 1"):
+        create_chat_model()

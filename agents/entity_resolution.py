@@ -84,8 +84,7 @@ class EntityCandidateSet(BaseModel):
     minimum_gap: Optional[float] = None
 
 
-# Public domain alias. ``agents.contracts.CandidateSet`` remains the generic
-# saved-result transport, while this model carries resolver-specific metadata.
+# Public domain alias for resolver-specific candidate metadata.
 CandidateSet = EntityCandidateSet
 
 

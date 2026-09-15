@@ -23,23 +23,6 @@ from typing import Mapping, Sequence
 
 from dotenv import load_dotenv
 
-try:
-    from scripts.gigachat_budget import (
-        DEFAULT_ULTRA_RESERVE_PER_SCENARIO,
-        DEFAULT_ULTRA_TOKEN_FLOOR,
-        UltraBudgetError,
-        guard_ultra_budget,
-        ultra_budget_reservations,
-    )
-except ModuleNotFoundError:  # direct ``python scripts/...`` execution
-    from gigachat_budget import (  # type: ignore[no-redef]
-        DEFAULT_ULTRA_RESERVE_PER_SCENARIO,
-        DEFAULT_ULTRA_TOKEN_FLOOR,
-        UltraBudgetError,
-        guard_ultra_budget,
-        ultra_budget_reservations,
-    )
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCENARIO_FILE = PROJECT_ROOT / "tests" / "test_live_agent_scenarios.py"
@@ -128,7 +111,7 @@ def _configured_model(provider: str, explicit_model: str = "") -> str:
     if configured:
         return configured
     # ``agents.llm_factory.get_chat_model_name`` keeps this compatibility
-    # fallback for GigaChat.  The parent budget guard must see it too.
+    # fallback for GigaChat.  Resolve it only after loading dotenv.
     if provider == "gigachat":
         return str(os.getenv("MODEL", "")).strip()
     return ""
@@ -187,7 +170,7 @@ def _selected_scenario_count(
     scenario_names: Sequence[str],
     groups: Sequence[str],
 ) -> int:
-    """Count selected live HTTP exchanges for a conservative Ultra reserve."""
+    """Count selected live HTTP exchanges."""
     tree = ast.parse(SCENARIO_FILE.read_text(encoding="utf-8"))
     requested_names: set[str] = set()
     whole_scenario_file = False
@@ -747,41 +730,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Вернуть код 0 после benchmark, даже если acceptance-тесты упали.",
     )
-    parser.add_argument(
-        "--ultra-token-floor",
-        type=int,
-        default=int(
-            os.getenv(
-                "GIGACHAT_ULTRA_TOKEN_FLOOR",
-                str(DEFAULT_ULTRA_TOKEN_FLOOR),
-            )
-        ),
-        help=(
-            "Минимальный подтверждённый остаток после GigaChat Ultra run; "
-            "значение можно только поднять выше жёсткого floor 15 000 000."
-        ),
-    )
-    parser.add_argument(
-        "--ultra-reserve-per-scenario",
-        type=int,
-        default=int(
-            os.getenv(
-                "GIGACHAT_ULTRA_RESERVE_PER_SCENARIO",
-                str(DEFAULT_ULTRA_RESERVE_PER_SCENARIO),
-            )
-        ),
-        help=(
-            "Консервативный резерв токенов на один Ultra-сценарий; значение "
-            "можно только поднять выше жёсткого минимума 250 000."
-        ),
-    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     # Resolve the same project-local configuration that the Flask subprocess
-    # will use.  In particular, an Ultra model selected only in ``.env`` must
-    # never bypass the parent-process balance guard.
+    # will use.
     load_dotenv(PROJECT_ROOT / ".env", override=False)
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -808,40 +762,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         *args.pytest_arg,
     ]
     try:
-        selected_scenarios = _selected_scenario_count(
-            args.scenario,
-            args.group,
-        )
+        _selected_scenario_count(args.scenario, args.group)
     except ValueError as exc:
         parser.error(str(exc))
     results = []
     for mode in args.modes:
-        if args.provider == "gigachat":
-            reservations = ultra_budget_reservations(
-                chat_model=model,
-                exchange_count=selected_scenarios,
-                reserve_per_exchange=args.ultra_reserve_per_scenario,
-                judge_enabled=args.llm_judge,
-            )
-            for reservation in reservations:
-                try:
-                    budget = guard_ultra_budget(
-                        model=reservation.model,
-                        floor_tokens=args.ultra_token_floor,
-                        reserved_tokens=reservation.reserved_tokens,
-                    )
-                except UltraBudgetError as exc:
-                    parser.error(str(exc))
-                if budget is not None:
-                    print(
-                        "Ultra budget verified: "
-                        f"model={reservation.model}, "
-                        f"remaining={budget.remaining_tokens}, "
-                        f"reserved={budget.reserved_tokens}, "
-                        f"projected={budget.projected_remaining_tokens}, "
-                        f"floor={budget.floor_tokens}",
-                        flush=True,
-                    )
         result = _run_mode(
             mode=mode,
             provider=args.provider,
@@ -853,24 +778,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             llm_judge=args.llm_judge,
         )
         results.append(result)
-        if args.provider == "gigachat":
-            for reservation in ultra_budget_reservations(
-                chat_model=model,
-                exchange_count=0,
-                reserve_per_exchange=args.ultra_reserve_per_scenario,
-                judge_enabled=args.llm_judge,
-            ):
-                try:
-                    guard_ultra_budget(
-                        model=reservation.model,
-                        floor_tokens=args.ultra_token_floor,
-                        reserved_tokens=0,
-                    )
-                except UltraBudgetError as exc:
-                    parser.error(
-                        "Post-run Ultra balance check failed; further runs stopped: "
-                        + str(exc)
-                    )
     report_path = output_dir / f"{run_label}_comparison.md"
     _comparison_report(
         provider=args.provider,

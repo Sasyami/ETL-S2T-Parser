@@ -118,17 +118,6 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
         ),
         "not_for": "Подстрока, точное имя, Excel-значения, S2T или lineage.",
     },
-    "resolve_entities": {
-        "use_when": (
-            "Опечатка, частичное имя, смысловое описание или неоднозначный "
-            "mention файла либо ролевой source/target S2T-таблицы; все mentions "
-            "передавай одним batch-вызовом."
-        ),
-        "not_for": (
-            "Уже подтверждённое полное каноническое имя: его передавай сразу "
-            "ролевому exact reader; resolver не заменяет чтение фактов."
-        ),
-    },
     "list_s2t_transformations": {
         "use_when": (
             "Точная S2T-пара source_table.source_field → target_table.target_field "
@@ -167,12 +156,13 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     },
     "trace_transformation_path": {
         "use_when": (
-            "Многошаговый S2T-путь от точной пары table+column с rules/SQL. "
-            "Для известной target-пары путь строится upstream, для source-пары — "
-            "downstream; неизвестное точное имя сначала разрешает search."
+            "Полный упорядоченный/транзитивный S2T-lineage от точной пары "
+            "table+column до конечных источников/целей с ветвями и rules/SQL; "
+            "по одному независимому вызову на endpoint. Target идёт upstream, "
+            "source — downstream; SQLite первичен, Neo4j лишь дополняет."
         ),
         "not_for": (
-            "Одна точная source→target-пара или rule; сама стрелка не означает путь."
+            "Одна точная source→target-пара/rule или неизвестное имя без поиска."
         ),
     },
     "visualize_s2t_table_graph": {
@@ -201,12 +191,12 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
     },
     "read_previous_result": {
         "use_when": (
-            "Для текущей task недостаточно краткого description принятого "
-            "результата прошлого worker и нужен его точный result по result_id."
+            "Строки прошлого результата являются входами текущего нового "
+            "чтения, а краткого description недостаточно; нужен точный result_id."
         ),
         "not_for": (
-            "Новое чтение из SQLite/Neo4j/Excel, ответ уже следует из description "
-            "либо result_id отсутствует в previous_results."
+            "Текущая task уже даёт все точные входы; прошлый result относится к "
+            "другому объекту той же операции; ответ виден из description."
         ),
     },
     "parse_sql_column_lineage": {
@@ -240,8 +230,14 @@ _TOOL_ROUTING_CONTRACTS: Dict[str, Dict[str, Any]] = {
         "not_for": "Готовый lineage/path, S2T, SQL-текст или SQLite.",
     },
     "trace_neo4j_lineage": {
-        "use_when": "Upstream/downstream полной точной ссылки ETL-колонки на заданную глубину.",
-        "not_for": "Таблица без колонки, SQL, rules или объяснимый S2T-путь.",
+        "use_when": (
+            "Явно нужен граф Neo4j: upstream/downstream точной ETL-колонки "
+            "на заданную глубину."
+        ),
+        "not_for": (
+            "Обычный полный lineage сохранённых S2T с rules/порядком, fallback "
+            "после Neo4j error, таблица без колонки или SQL."
+        ),
     },
     "trace_neo4j_table_lineage": {
         "use_when": "Непосредственные upstream/downstream соседи точной ETL-таблицы.",
@@ -428,31 +424,31 @@ _TOOL_ROUTER_PROMPT = """
 Ты router read-only worker. Выбери необходимую planner-палитру `tools`,
 `skills`, `schemas`. Используй точные имена из каталогов.
 
-`current_task` — самодостаточная операция с материализованными downstream
-ограничениями; `operation_context` — профиль выполнения.
-`previous_results` содержит result_id, description и result_schema. Внутренний
-reader уже доступен planner; не выбирай внешний tool лишь из-за result_id.
+`current_task` — единственное чтение и единственный источник выбора операции;
+`operation_context` — её профиль. Сначала определи вид чтения и dataset, затем
+выбери только выполняющие их tools. Не выбирай операцию соседнего шага или всей
+coordinator-задачи. `previous_results` содержит ссылки и schemas; внутренний
+reader уже доступен planner, внешний tool из-за одной ссылки не нужен.
 
 Выбери все необходимые tools с совпавшим `use_when`; `not_for` — запрет. Покрой
 обязательные входы, не дублируя одну операцию общим и специализированным tools.
 `catalog_stage=capability_expansion` означает, что после typed reroute добавлены
-только tools недостающей возможности. Выбери минимум один tool для каждой
-возможности из `required_capabilities`; не расширяй палитру по числу попыток.
-Тип поиска сохраняй: смысл/назначение — semantic, явно данный фрагмент —
-substring. Tool выбирай, только если вход дан или получается выбранным tool;
-opaque ID берётся только из принятого результата. Не придумывай входы.
+tools недостающей возможности: покрой `required_capabilities`, но не расширяй
+палитру по числу попыток. Сохраняй semantic/substring тип поиска. Tool выбирай,
+только если вход дан или получается выбранным tool. Не придумывай входы.
 
 Если description даёт фильтр нового чтения, выбери источник этого чтения.
 `query_saved_result` — только для строк сохранённого dataset с совместимой schema.
+Наличие `previous_results` само по себе не создаёт зависимость. Если current_task
+уже содержит все точные входы независимого нового чтения, выбери его data-tool;
+результат той же операции для другого объекта уже сохранён для upstream.
 
 Списки выбирай независимо; каждый может быть пустым. Для уже данных фактов
 оставляй `tools=[]`.
 
-При `reroute_context` следуй `reason` и `required_capabilities`. Для
-`missing_capability`, `unresolved_entity` или `truncated_result` сохрани нужные
+При `reroute_context` следуй `reason` и `required_capabilities`, сохрани нужные
 прежние tools и добавь нужную capability. При `wrong_arguments` палитру не
-меняй: аргументы исправляет planner. При `tool_error` без новой capability
-также оставь прежнюю палитру для исправленного/повторного вызова.
+меняй; то же для `tool_error` без новой capability.
 
 Не отвечай и не вызывай tools. Верни только structured-поля `tools`, `skills`,
 `schemas`.

@@ -5,6 +5,7 @@ import datetime
 from threading import Lock
 from typing import List, Any, Dict, Optional
 from flask import Flask, request, jsonify, render_template, send_from_directory
+from agents.env_flags import read_binary_env_flag
 from services.logging_setup import configure_logging
 from agents.agent import agent_chat, get_model_name
 from agents.supervisor import supervisor_chat
@@ -59,6 +60,12 @@ analysis_progress = {}
 analysis_progress_lock = Lock()
 
 init_db()
+
+
+def _flask_debug_enabled() -> bool:
+    """Return the strict binary debug setting for direct Flask startup."""
+
+    return read_binary_env_flag("FLASK_DEBUG", default=False)
 
 
 def _normalize_chat_history(value: Any) -> List[Dict[str, str]]:
@@ -470,5 +477,5 @@ if __name__ == '__main__':
         logger.warning("Graph outbox recovery incomplete: %s", recovery_error)
     elif recovery_report and recovery_report.get("pending"):
         logger.info("Graph outbox recovery: %s", recovery_report)
-    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    debug = _flask_debug_enabled()
     app.run(debug=debug, use_reloader=debug)

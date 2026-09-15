@@ -119,6 +119,7 @@ class RawTestProtocolContract(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    file_scope_kind: Literal["not_provided", "file_id", "file_mention"]
     file_id: Optional[int] = Field(default=None, gt=0)
     file_mention: Optional[str] = Field(default=None, max_length=500)
     loads: List[RawTestProtocolLoad] = Field(
@@ -143,8 +144,18 @@ class RawTestProtocolContract(BaseModel):
 
     @model_validator(mode="after")
     def keep_one_file_mention(self) -> "RawTestProtocolContract":
-        if self.file_id is not None and str(self.file_mention or "").strip():
-            raise ValueError("Укажи только file_id или file_mention.")
+        has_file_id = self.file_id is not None
+        has_file_mention = bool(str(self.file_mention or "").strip())
+        expected_presence = {
+            "not_provided": (False, False),
+            "file_id": (True, False),
+            "file_mention": (False, True),
+        }[self.file_scope_kind]
+        if (has_file_id, has_file_mention) != expected_presence:
+            raise ValueError(
+                "file_scope_kind должен точно соответствовать одному из "
+                "file_id/file_mention либо их подтверждённому отсутствию."
+            )
         if self.mode == "explicit" and any(
             not (load.requested_checks or self.requested_checks)
             for load in self.loads

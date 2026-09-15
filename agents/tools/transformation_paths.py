@@ -358,8 +358,12 @@ def trace_transformation_path(
 ) -> Dict[str, Any]:
     """Построить многоуровневый объяснимый путь из сохранённых S2T-фактов.
 
-    Используй, когда нужны порядок нескольких S2T-шагов, правила/SQL,
-    additional objects или готовая схема пути. Для одной точной пары
+    Это основной reader для полного, упорядоченного или транзитивного lineage
+    сохранённых S2T-фактов. Один вызов проходит от точного endpoint до всех
+    достижимых конечных endpoint, включая ветви, subquery, правила/SQL,
+    additional objects и готовую схему пути. Для сравнения нескольких известных
+    endpoint вызови tool независимо для каждого со своей точной парой; результат
+    другого endpoint не является входом. Для одной точной пары
     source_table.source_field → target_table.target_field и её правила используй
     four-role exact S2T tool; сама стрелка не означает многошаговый путь.
 
@@ -373,11 +377,13 @@ def trace_transformation_path(
     table_name.column_name разделяй по последней точке; tool также нормализует
     совместимые полные ссылки детерминированно.
 
-    Tool читает глобальную s2t_transformations без автоматического file_id и не
-    склеивает одноимённые объекты разных файлов. Каждый шаг содержит сохранённое
+    Точную пару из task не нужно предварительно искать в каталоге. Tool читает
+    глобальную s2t_transformations без автоматического file_id и не склеивает
+    одноимённые объекты разных файлов. Каждый шаг содержит сохранённое
     правило, разобранный SQL и связанные additional objects. include_neo4j
-    добавляет подтверждение, но не заменяет SQLite и не удаляет неподтверждённые
-    SQLite-пути. Результат уже содержит paths, text_diagram, Mermaid-код и edges;
+    добавляет необязательное подтверждение, но не заменяет SQLite и не удаляет
+    SQLite-пути при недоступности либо ошибке Neo4j. Результат уже содержит
+    paths, text_diagram, Mermaid-код и edges;
     не дублируй его отдельными list/Neo4j-вызовами. Пустой paths означает только
     отсутствие пути от переданной точной стартовой пары в выбранном направлении.
 
@@ -472,15 +478,17 @@ def trace_transformation_path(
         "direction": direction,
         "max_depth": clean_depth,
         "returned_paths": len(paths),
+        # Put compact complete lineage before verbose per-step SQL so bounded
+        # model previews still expose every branch and endpoint.
+        "text_diagram": _text_path_diagram(paths),
+        "edges": display_edges,
+        "mermaid": _mermaid_path_diagram(display_edges),
         "paths": paths,
         "neo4j_evidence": (
             _neo4j_evidence(transformation_ids)
             if include_neo4j
             else {"included": False, "rows": []}
         ),
-        "text_diagram": _text_path_diagram(paths),
-        "mermaid": _mermaid_path_diagram(display_edges),
-        "edges": display_edges,
     }
 
 

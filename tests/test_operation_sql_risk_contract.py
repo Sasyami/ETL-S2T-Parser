@@ -18,7 +18,8 @@ def _typed_context(aspect: str, stage: str) -> str:
     )
 
 
-def test_value_changes_is_scoped_to_exact_target_projection():
+def test_value_changes_is_scoped_to_exact_target_projection(monkeypatch):
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
     plan = _typed_context("value_changes", "plan")
     decision = _typed_context("value_changes", "upstream_decision")
     answer = _typed_context("value_changes", "upstream")
@@ -42,7 +43,10 @@ def test_value_change_guidance_states_invariants_without_fixture_sql(monkeypatch
     )
 
 
-def test_write_semantics_accepts_complete_mapping_as_terminal_evidence():
+def test_write_semantics_accepts_complete_mapping_as_terminal_evidence(
+    monkeypatch,
+):
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
     contexts = {
         stage: _typed_context("write_semantics", stage)
         for stage in (
@@ -60,6 +64,20 @@ def test_write_semantics_accepts_complete_mapping_as_terminal_evidence():
     assert "достаточен для pass" in contexts["upstream_decision"]
     assert "не reroute" in contexts["upstream_decision"]
     assert "не оценено" in contexts["upstream"]
+
+
+def test_cardinality_upstream_stays_conditional_without_other_risk_layers(
+    monkeypatch,
+):
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    answer = _typed_context("cardinality", "upstream")
+
+    assert "Не назначай качественный уровень риска" in answer
+    assert "не утверждай фактические дубликаты" in answer
+    assert "Не переноси сюда write semantics" in answer
+    assert "ноль или одно совпадение справа дают одну строку" in answer
+    assert "выбери это mapping также для display" in answer
+    assert "TRUE не ослабляет условие JOIN" in answer
 
 
 def test_legacy_profile_has_the_same_terminal_and_field_scope_rules(monkeypatch):

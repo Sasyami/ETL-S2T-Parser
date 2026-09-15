@@ -345,6 +345,252 @@ def test_worker_operation_contexts_are_isolated_by_role():
     assert planner_rule not in observer_system
 
 
+def test_worker_original_task_is_exact_and_separate_from_current_task():
+    from agents.contracts import (
+        WORKER_OPERATION_COMPLETENESS_MARKER,
+        WORKER_OPERATION_EXECUTION_MARKER,
+        WORKER_ORIGINAL_TASK_MARKER,
+        parse_worker_request,
+    )
+
+    def lookup():
+        return {"value": "confirmed"}
+
+    current_task = "Прочитай назначенный S2T-срез."
+    original_task = (
+        "Для `source_stage_731.id` → `target_core_842.id` "
+        "используй файл `Load Contract 917.xlsx`."
+    )
+    planner_rule = "PLANNER_ONLY_RULE_917"
+    observer_rule = "OBSERVER_ONLY_RULE_842"
+    raw_task = (
+        current_task
+        + WORKER_ORIGINAL_TASK_MARKER
+        + json.dumps(
+            {"original_task": original_task},
+            ensure_ascii=False,
+        )
+        + WORKER_OPERATION_EXECUTION_MARKER
+        + planner_rule
+        + WORKER_OPERATION_COMPLETENESS_MARKER
+        + observer_rule
+    )
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-original-task-envelope",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Готово."),
+        ]
+    )
+
+    parts = parse_worker_request(raw_task)
+    result = run_worker_graph(
+        task=raw_task,
+        system_prompt="Системный контекст",
+        model=model,
+        tools={"lookup": _as_tool(lookup)},
+    )
+
+    assert parts.current_task == current_task
+    assert parts.original_task == original_task
+    assert parts.operation_execution_context == planner_rule
+    assert parts.operation_completeness_context == observer_rule
+    assert result.status == "complete"
+
+    for planner_messages in model.messages:
+        human_messages = [
+            message
+            for message in planner_messages
+            if message.__class__.__name__ == "HumanMessage"
+        ]
+        assert json.loads(human_messages[0].content) == {
+            "original_task": original_task
+        }
+        assert human_messages[1].content == current_task
+        assert original_task not in str(human_messages[1].content)
+
+    observer_payload = json.loads(model.observer.messages[0][-1].content)
+    assert observer_payload["user_request"] == current_task
+    assert "original_task" not in observer_payload
+    observer_system = str(model.observer.messages[0][0].content)
+    assert "`user_request` (единственную текущую task)" in observer_system
+    assert "соседнего шага не" in observer_system
+
+
+def test_worker_presents_independent_endpoint_after_lazy_result_context():
+    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
+
+    calls = []
+    previous_table = "mart_alpha_731"
+    current_table = "mart_beta_842"
+    column_name = "status_code"
+    current_task = (
+        f"Построй полный upstream lineage `{current_table}.{column_name}` "
+        "до конечных источников."
+    )
+
+    def trace_transformation_path(
+        table_name: str,
+        column_name: str,
+        direction: str,
+    ):
+        calls.append((table_name, column_name, direction))
+        return {
+            "table_name": table_name,
+            "column_name": column_name,
+            "direction": direction,
+            "returned_paths": 1,
+            "text_diagram": f"raw_origin.{column_name} -> {table_name}.{column_name}",
+        }
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "trace_transformation_path",
+                        "args": {
+                            "table_name": current_table,
+                            "column_name": column_name,
+                            "direction": "upstream",
+                        },
+                        "id": "call-current-lineage",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Текущий lineage прочитан."),
+        ]
+    )
+    task = (
+        current_task
+        + WORKER_PREVIOUS_RESULTS_MARKER
+        + "\n"
+        + json.dumps(
+            {
+                "previous_results": [
+                    {
+                        "result_id": "result_previous_lineage",
+                        "description": (
+                            "trace_transformation_path: args="
+                            + json.dumps(
+                                {
+                                    "table_name": previous_table,
+                                    "column_name": column_name,
+                                    "direction": "upstream",
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        ),
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    result = run_worker_graph(
+        task=task,
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(trace_transformation_path),),
+    )
+
+    assert result.status == "complete"
+    assert calls == [(current_table, column_name, "upstream")]
+    first_planner_humans = [
+        message
+        for message in model.messages[0]
+        if message.__class__.__name__ == "HumanMessage"
+    ]
+    assert json.loads(first_planner_humans[0].content)["previous_results"][0][
+        "result_id"
+    ] == "result_previous_lineage"
+    assert first_planner_humans[-1].content == current_task
+    assert previous_table not in first_planner_humans[-1].content
+    assert WORKER_PREVIOUS_RESULTS_MARKER not in first_planner_humans[-1].content
+    planner_system = str(model.messages[0][0].content)
+    assert "Сами ссылки не делают текущую task зависимой" in planner_system
+    assert "другого объекта" in planner_system
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "not-json",
+        json.dumps({"original_task": 731}),
+        json.dumps({"original_task": "Исходная.", "extra": "forbidden"}),
+    ],
+)
+def test_worker_original_task_envelope_rejects_non_exact_json(encoded):
+    from agents.contracts import (
+        WORKER_ORIGINAL_TASK_MARKER,
+        parse_worker_request,
+    )
+
+    parts = parse_worker_request(
+        "Прочитай назначенный срез."
+        + WORKER_ORIGINAL_TASK_MARKER
+        + encoded
+    )
+
+    assert parts.current_task == "Прочитай назначенный срез."
+    assert parts.original_task == ""
+
+
+def test_worker_original_task_composes_with_all_coordinator_suffixes():
+    from agents.contracts import (
+        WORKER_OPERATION_COMPLETENESS_MARKER,
+        WORKER_OPERATION_EXECUTION_MARKER,
+        WORKER_ORIGINAL_TASK_MARKER,
+        WORKER_PREVIOUS_RESULTS_MARKER,
+        parse_worker_request,
+    )
+
+    current_task = "Прочитай следующий зависимый срез."
+    original_task = "Сопоставь `source_611.id` → `target_722.id`."
+    parts = parse_worker_request(
+        current_task
+        + WORKER_ORIGINAL_TASK_MARKER
+        + json.dumps({"original_task": original_task}, ensure_ascii=False)
+        + WORKER_OPERATION_EXECUTION_MARKER
+        + "EXECUTION_RULE"
+        + WORKER_OPERATION_COMPLETENESS_MARKER
+        + "COMPLETENESS_RULE"
+        + WORKER_PREVIOUS_RESULTS_MARKER
+        + "\n"
+        + json.dumps(
+            {
+                "previous_results": [
+                    {
+                        "result_id": "result_611",
+                        "description": "Предыдущий exact result.",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    assert parts.current_task == current_task
+    assert parts.original_task == original_task
+    assert parts.operation_execution_context == "EXECUTION_RULE"
+    assert parts.operation_completeness_context == "COMPLETENESS_RULE"
+    assert parts.previous_results is not None
+    assert [item.result_id for item in parts.previous_results] == ["result_611"]
+
+
 def test_direct_worker_discards_legacy_stable_context_before_planner():
     from agents.contracts import parse_worker_request
 
@@ -493,6 +739,8 @@ class _SplitToolCallModel:
 
 
 def test_worker_can_select_tool_and_build_arguments_in_separate_calls():
+    from agents.contracts import WORKER_ORIGINAL_TASK_MARKER
+
     executed_arguments = []
 
     def lookup(table_name: str):
@@ -500,8 +748,17 @@ def test_worker_can_select_tool_and_build_arguments_in_separate_calls():
         return {"table_name": table_name}
 
     model = _SplitToolCallModel()
+    current_task = "Прочитай назначенную таблицу."
+    original_task = "Прочитай таблицу `orders` для проверки нового ID 731."
     result = run_worker_graph(
-        task="Прочитай таблицу orders.",
+        task=(
+            current_task
+            + WORKER_ORIGINAL_TASK_MARKER
+            + json.dumps(
+                {"original_task": original_task},
+                ensure_ascii=False,
+            )
+        ),
         system_prompt="Системный контекст",
         model=model,
         tools=(_as_tool(lookup),),
@@ -524,6 +781,24 @@ def test_worker_can_select_tool_and_build_arguments_in_separate_calls():
     assert "Операция уже выбрана: `lookup`" in str(
         argument_messages[0].content
     )
+    selector_humans = [
+        message
+        for message in selector_messages
+        if message.__class__.__name__ == "HumanMessage"
+    ]
+    assert [message.content for message in selector_humans] == [current_task]
+    argument_humans = [
+        message
+        for message in argument_messages
+        if message.__class__.__name__ == "HumanMessage"
+    ]
+    assert json.loads(argument_humans[0].content) == {
+        "original_task": original_task
+    }
+    assert argument_humans[1].content == current_task
+    observer_payload = json.loads(model.observer.messages[0][-1].content)
+    assert observer_payload["user_request"] == current_task
+    assert "original_task" not in observer_payload
     assert all(
         not (
             isinstance(message, AIMessage)
@@ -598,6 +873,56 @@ def test_worker_repairs_observer_without_repeating_data_tool():
         "observer",
         "finish_worker",
     ]
+
+
+def test_worker_accepts_complete_evidence_despite_provider_reroute_defaults():
+    tool_calls = []
+
+    def lookup():
+        tool_calls.append("lookup")
+        return {"data_type": "uuid"}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "lookup",
+                        "args": {},
+                        "id": "call-exact-read",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            _finish_message("Точный тип прочитан."),
+        ],
+        observer_responses=[
+            {
+                "status": "complete",
+                "gap": None,
+                "accepted_tool_call_ids": ["call-exact-read"],
+                "facts": [],
+                "limitations": [],
+                "reroute_reason": "missing_capability",
+                "required_capabilities": ["sql_read"],
+            }
+        ],
+    )
+
+    result = run_worker_graph(
+        task="Прочитай точный тип.",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+    )
+
+    assert result.answer == "Точный тип прочитан."
+    assert result.accepted_tool_call_ids == ["call-exact-read"]
+    assert [item.name for item in result.display_items] == ["lookup"]
+    assert tool_calls == ["lookup"]
+    assert len(model.observer.messages) == 1
 
 
 def test_worker_repairs_provider_markup_before_executing_tool():
@@ -1538,160 +1863,6 @@ def test_worker_requires_dependent_value_in_current_tool_filter():
     assert queries == [wrong_query, correct_query]
 
 
-def test_worker_repairs_incomplete_semantic_candidate_s2t_batch_before_execution():
-    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
-    from agents.tools.saved_results import (
-        read_previous_result,
-        saved_result_store_scope,
-    )
-
-    executed = []
-
-    def search_s2t_transformations(
-        needle: str | None = None,
-        needles: list[str] | None = None,
-    ):
-        executed.append({"needle": needle, "needles": list(needles or [])})
-        return {
-            "queries": list(needles or []),
-            "rows": [{"matched": value} for value in (needles or [])],
-        }
-
-    semantic_rows = [
-        {
-            "scope": "source_columns",
-            "record_id": 1,
-            "column_name": "customer_id",
-            "name": "customer_id",
-            "score": 0.95,
-        },
-        {
-            "scope": "target_columns",
-            "record_id": 2,
-            "column_name": "order_id",
-            "name": "order_id",
-            "score": 0.91,
-        },
-    ]
-    model = _WorkerModel(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "read_previous_result",
-                        "args": {},  # populated after the opaque ID is known
-                        "id": "call-read-candidates",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "search_s2t_transformations",
-                        "args": {"needles": ["customer_id"]},
-                        "id": "call-incomplete-batch",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "search_s2t_transformations",
-                        "args": {
-                            "needles": ["customer_id", "order_id"]
-                        },
-                        "id": "call-complete-batch",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            _finish_message("Все кандидаты проверены."),
-        ],
-        observer_responses=[
-            Observation(
-                status="continue",
-                gap="Нужен один S2T batch для всех кандидатов.",
-                accepted_tool_call_ids=["call-read-candidates"],
-            ),
-            Observation(
-                goal_satisfied=True,
-                accepted_tool_call_ids=[
-                    "call-read-candidates",
-                    "call-complete-batch",
-                ],
-            ),
-        ],
-    )
-
-    with saved_result_store_scope() as store:
-        reference = store.register_previous_result(
-            source_tool="semantic_search_descriptions",
-            source_tool_call_id="call-semantic",
-            content=json.dumps(
-                {
-                    "scope": "columns",
-                    "total_candidates": 2,
-                    "returned_rows": 2,
-                    "truncated": False,
-                    "rows": semantic_rows,
-                },
-                ensure_ascii=False,
-            ),
-            description="Два semantic-кандида колонок.",
-        )
-        model.responses[0].tool_calls[0]["args"] = {
-            "result_id": reference.result_id
-        }
-        task = (
-            "Проверь все semantic-кандидаты одним S2T batch."
-            + WORKER_PREVIOUS_RESULTS_MARKER
-            + "\n"
-            + json.dumps(
-                {
-                    "previous_results": [
-                        reference.model_dump(mode="json", exclude_none=True)
-                    ]
-                },
-                ensure_ascii=False,
-            )
-        )
-
-        result = run_worker_graph(
-            task=task,
-            system_prompt="Системный контекст",
-            model=model,
-            tools=(
-                read_previous_result,
-                _as_tool(search_s2t_transformations),
-            ),
-            max_steps=3,
-        )
-
-    assert executed == [
-        {"needle": None, "needles": ["customer_id", "order_id"]}
-    ]
-    assert result.status == "complete"
-    assert result.accepted_tool_call_ids == [
-        "call-read-candidates",
-        "call-complete-batch",
-    ]
-    assert [
-        call["name"]
-        for cycle in result.cycle_history
-        for call in cycle.tool_calls
-    ] == ["read_previous_result", "search_s2t_transformations"]
-    assert any(
-        "CandidateSet" in str(message.content)
-        for messages in model.messages
-        for message in messages
-    )
-
-
 def test_worker_reroutes_when_description_is_claimed_as_s2t_rule():
     calls = []
 
@@ -1802,6 +1973,8 @@ def test_structured_observer_trims_only_surrounding_call_name_spaces():
                                 "accepted_tool_call_ids": [],
                                 "facts": [],
                                 "limitations": [],
+                                "reroute_reason": "missing_capability",
+                                "required_capabilities": ["sql_read"],
                             },
                             "id": "observation-1",
                             "type": "tool_call",
@@ -3426,8 +3599,15 @@ def test_public_worker_adds_previous_result_reader_outside_router():
     ] == ["list_s2t_transformations", "read_previous_result"]
 
 
-def test_public_worker_reroutes_original_task_after_observer_request():
-    from agents.worker import worker_chat
+def test_public_worker_reroutes_original_task_after_observer_request(
+    monkeypatch,
+):
+    from agents.worker import (
+        WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
+        worker_chat,
+    )
+
+    monkeypatch.setenv(WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV, "1")
 
     routes = [
         ToolRoute(
@@ -3527,9 +3707,16 @@ def test_public_worker_reroutes_original_task_after_observer_request():
     }
 
 
-def test_public_worker_adds_only_required_capability_on_first_reroute():
+def test_public_worker_adds_only_required_graph_capability_on_first_reroute(
+    monkeypatch,
+):
     from agents.tools import WORKER_GENERAL_FALLBACK_TOOL_NAMES
-    from agents.worker import worker_chat
+    from agents.worker import (
+        WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
+        worker_chat,
+    )
+
+    monkeypatch.setenv(WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV, "1")
 
     routes = [
         ToolRoute(
@@ -3540,7 +3727,7 @@ def test_public_worker_adds_only_required_capability_on_first_reroute():
         ToolRoute(
             tools=[
                 "read_s2t_by_target_table",
-                "run_sql",
+                "run_cypher",
             ],
             skills=[],
             schemas=[],
@@ -3554,7 +3741,7 @@ def test_public_worker_adds_only_required_capability_on_first_reroute():
             problem="Нужен нестандартный срез данных.",
             stop_reason="missing_capability",
             reroute_reason="missing_capability",
-            required_capabilities=["sql_read"],
+            required_capabilities=["graph_read"],
             unmet_requirements=["Нужен нестандартный срез данных."],
         ),
         WorkerRunResult(answer="Срез получен."),
@@ -3580,11 +3767,11 @@ def test_public_worker_adds_only_required_capability_on_first_reroute():
     ]
     assert routed_names[0].isdisjoint(WORKER_GENERAL_FALLBACK_TOOL_NAMES)
     assert "read_s2t_by_target_table" in routed_names[0]
-    assert "run_sql" not in routed_names[0]
-    assert "run_sql" in routed_names[1]
+    assert "run_cypher" not in routed_names[0]
+    assert "run_cypher" in routed_names[1]
     assert (
         routed_names[1] & WORKER_GENERAL_FALLBACK_TOOL_NAMES
-    ) == {"run_sql"}
+    ) == {"run_cypher"}
     assert router.call_args_list[0].kwargs["catalog_stage"] == "specialized_only"
     assert router.call_args_list[1].kwargs["catalog_stage"] == (
         "capability_expansion"
@@ -3593,14 +3780,16 @@ def test_public_worker_adds_only_required_capability_on_first_reroute():
     assert router.call_args_list[1].kwargs["reroute_context"]["attempt"] == 1
     assert router.call_args_list[1].kwargs["reroute_context"][
         "required_capabilities"
-    ] == ["sql_read"]
-    assert "run_sql" in {
+    ] == ["graph_read"]
+    assert "run_cypher" in {
         tool.name for tool in run_graph.call_args_list[1].kwargs["tools"]
     }
 
 
-def test_capability_reroute_experiment_has_immediate_general_baseline(
+@pytest.mark.parametrize("flag_value", [None, "0"])
+def test_default_reroute_opens_general_fallback_only_after_two_failures(
     monkeypatch,
+    flag_value,
 ):
     from agents.tools import WORKER_GENERAL_FALLBACK_TOOL_NAMES
     from agents.worker import (
@@ -3608,7 +3797,16 @@ def test_capability_reroute_experiment_has_immediate_general_baseline(
         worker_chat,
     )
 
-    monkeypatch.setenv(WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV, "0")
+    if flag_value is None:
+        monkeypatch.delenv(
+            WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
+            raising=False,
+        )
+    else:
+        monkeypatch.setenv(
+            WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
+            flag_value,
+        )
     routes = [
         ToolRoute(
             tools=["read_s2t_by_target_table"],
@@ -3616,20 +3814,41 @@ def test_capability_reroute_experiment_has_immediate_general_baseline(
             schemas=[],
         ),
         ToolRoute(
-            tools=["read_s2t_by_target_table", "run_sql"],
+            tools=[
+                "read_s2t_by_target_table",
+                "trace_transformation_path",
+            ],
+            skills=[],
+            schemas=[],
+        ),
+        ToolRoute(
+            tools=[
+                "read_s2t_by_target_table",
+                "trace_transformation_path",
+                "run_cypher",
+            ],
             skills=[],
             schemas=[],
         ),
     ]
     graph_results = [
         WorkerRunResult(
-            answer="Нужна SQL capability.",
+            answer="Нужна другая специализированная операция.",
             goal_satisfied=False,
             reroute_required=True,
-            problem="Нужен SQL срез.",
+            problem="Нужно проверить полный путь.",
             stop_reason="missing_capability",
             reroute_reason="missing_capability",
-            required_capabilities=["sql_read"],
+            required_capabilities=["graph_read"],
+        ),
+        WorkerRunResult(
+            answer="Специализированной палитры недостаточно.",
+            goal_satisfied=False,
+            reroute_required=True,
+            problem="Нужен общий graph reader.",
+            stop_reason="missing_capability",
+            reroute_reason="missing_capability",
+            required_capabilities=["graph_read"],
         ),
         WorkerRunResult(answer="Готово."),
     ]
@@ -3647,17 +3866,48 @@ def test_capability_reroute_experiment_has_immediate_general_baseline(
         result = worker_chat("Получи нестандартный срез")
 
     assert result.status == "complete"
-    second_catalog = {
-        tool.name for tool in router.call_args_list[1].kwargs["available_tools"]
+    catalogs = [
+        {tool.name for tool in call.kwargs["available_tools"]}
+        for call in router.call_args_list
+    ]
+    assert catalogs[0].isdisjoint(WORKER_GENERAL_FALLBACK_TOOL_NAMES)
+    assert catalogs[1].isdisjoint(WORKER_GENERAL_FALLBACK_TOOL_NAMES)
+    assert WORKER_GENERAL_FALLBACK_TOOL_NAMES.issubset(catalogs[2])
+    assert [
+        call.kwargs["catalog_stage"] for call in router.call_args_list
+    ] == ["specialized_only", "specialized_only", "general_fallback"]
+    assert router.call_args_list[1].kwargs["reroute_context"] == {
+        "gap": "Нужно проверить полный путь.",
+        "previous_tool_palettes": [["read_s2t_by_target_table"]],
+        "attempt": 1,
     }
-    assert WORKER_GENERAL_FALLBACK_TOOL_NAMES.issubset(second_catalog)
-    assert router.call_args_list[1].kwargs["reroute_context"][
-        "required_capabilities"
-    ] == ["general_read"]
+    assert router.call_args_list[2].kwargs["reroute_context"] == {
+        "gap": "Нужен общий graph reader.",
+        "previous_tool_palettes": [
+            ["read_s2t_by_target_table"],
+            [
+                "read_s2t_by_target_table",
+                "trace_transformation_path",
+            ],
+        ],
+        "attempt": 2,
+    }
+    assert all(
+        "required_capabilities" not in call.kwargs.get(
+            "reroute_context", {}
+        )
+        and "reason" not in call.kwargs.get("reroute_context", {})
+        for call in router.call_args_list
+    )
 
 
-def test_public_worker_can_execute_repeated_reroute_palette():
-    from agents.worker import worker_chat
+def test_public_worker_can_execute_repeated_reroute_palette(monkeypatch):
+    from agents.worker import (
+        WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
+        worker_chat,
+    )
+
+    monkeypatch.setenv(WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV, "1")
 
     repeated_route = ToolRoute(
         tools=["list_s2t_transformations"],
@@ -3712,8 +3962,15 @@ def test_public_worker_can_execute_repeated_reroute_palette():
     }
 
 
-def test_wrong_arguments_retains_previously_expanded_general_tool():
-    from agents.worker import worker_chat
+def test_wrong_arguments_retains_previously_expanded_general_tool(
+    monkeypatch,
+):
+    from agents.worker import (
+        WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
+        worker_chat,
+    )
+
+    monkeypatch.setenv(WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV, "1")
 
     routes = [
         ToolRoute(
@@ -3778,166 +4035,3 @@ def test_wrong_arguments_retains_previously_expanded_general_tool():
     assert router.call_args_list[2].kwargs["reroute_context"][
         "required_capabilities"
     ] == []
-
-
-def test_required_evidence_expands_router_palette_before_worker_graph():
-    from agents.sql_risk_scope_contract import (
-        GetSourceTargetColumnPairRequirement,
-        ReadS2TSourceToTargetRequirement,
-    )
-    from agents.worker import worker_chat
-
-    requirements = (
-        ReadS2TSourceToTargetRequirement(
-            source_table="src_alpha",
-            target_table="tgt_beta",
-        ),
-        GetSourceTargetColumnPairRequirement(
-            file_id=17,
-            source_table="src_alpha",
-            source_column="code",
-            target_table="tgt_beta",
-            target_column="code",
-        ),
-    )
-    route = ToolRoute(
-        tools=["get_source_target_column_pair"],
-        skills=[],
-        schemas=[],
-    )
-
-    with (
-        patch("agents.worker.select_chat_route", return_value=route),
-        patch(
-            "agents.worker.run_worker_graph",
-            return_value=WorkerRunResult(answer="Evidence complete."),
-        ) as run_graph,
-    ):
-        result = worker_chat(
-            "Read exact evidence for src_alpha.code → tgt_beta.code.",
-            required_evidence=requirements,
-        )
-
-    assert result.status == "complete"
-    assert {tool.name for tool in run_graph.call_args.kwargs["tools"]} == {
-        "read_s2t_source_to_target",
-        "get_source_target_column_pair",
-    }
-    assert run_graph.call_args.kwargs["required_evidence"] == requirements
-
-
-def test_required_evidence_repairs_metadata_only_complete_then_accumulates_mapping():
-    from agents.sql_risk_scope_contract import (
-        GetSourceTargetColumnPairRequirement,
-        ReadS2TSourceToTargetRequirement,
-    )
-
-    calls = []
-
-    def read_s2t_source_to_target(source_table: str, target_table: str):
-        calls.append(("mapping", source_table, target_table))
-        return {"rows": [{"transformation_rule": "source.code"}]}
-
-    def get_source_target_column_pair(
-        file_id: int,
-        source_table: str,
-        source_column: str,
-        target_table: str,
-        target_column: str,
-    ):
-        calls.append(
-            (
-                "metadata",
-                file_id,
-                source_table,
-                source_column,
-                target_table,
-                target_column,
-            )
-        )
-        return {"source": {"not_null": False}, "target": {"not_null": True}}
-
-    mapping_args = {
-        "source_table": "src_alpha",
-        "target_table": "tgt_beta",
-    }
-    metadata_args = {
-        "file_id": 17,
-        "source_table": "src_alpha",
-        "source_column": "code",
-        "target_table": "tgt_beta",
-        "target_column": "code",
-    }
-    requirements = (
-        ReadS2TSourceToTargetRequirement(**mapping_args),
-        GetSourceTargetColumnPairRequirement(**metadata_args),
-    )
-    model = _WorkerModel(
-        [
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "get_source_target_column_pair",
-                        "args": metadata_args,
-                        "id": "call-metadata",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "read_s2t_source_to_target",
-                        "args": mapping_args,
-                        "id": "call-mapping",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            _finish_message("Both exact reads accepted."),
-        ],
-        observer_responses=[
-            Observation(
-                status="complete",
-                accepted_tool_call_ids=["call-metadata"],
-                facts=[],
-            ),
-            Observation(
-                status="continue",
-                gap="The directed mapping is still required.",
-                accepted_tool_call_ids=["call-metadata"],
-                facts=[],
-            ),
-            Observation(
-                status="complete",
-                accepted_tool_call_ids=["call-metadata", "call-mapping"],
-                facts=[],
-            ),
-        ],
-    )
-
-    result = run_worker_graph(
-        task="Read exact evidence for src_alpha.code → tgt_beta.code.",
-        system_prompt="System context",
-        model=model,
-        tools=(
-            _as_tool(read_s2t_source_to_target),
-            _as_tool(get_source_target_column_pair),
-        ),
-        max_steps=3,
-        required_evidence=requirements,
-    )
-
-    assert result.status == "complete"
-    assert result.accepted_tool_call_ids == ["call-metadata", "call-mapping"]
-    assert [item.name for item in result.display_items] == [
-        "get_source_target_column_pair",
-        "read_s2t_source_to_target",
-    ]
-    assert [item[0] for item in calls] == ["metadata", "mapping"]
-    assert len(model.observer.messages) == 3
-    repair_prompt = str(model.observer.messages[1][-1].content)
-    assert "evidence contract" in repair_prompt
-    assert "read_s2t_source_to_target" in repair_prompt

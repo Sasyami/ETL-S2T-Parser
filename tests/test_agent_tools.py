@@ -529,7 +529,7 @@ def test_previous_result_is_lazy_and_scoped_to_coordinator_run():
     assert missing["error"] == "No active saved-result store"
 
 
-def test_semantic_previous_result_exposes_lossless_candidate_set():
+def test_semantic_previous_result_preserves_full_result_rows():
     from agents.tools.saved_results import (
         read_previous_result,
         saved_result_store_scope,
@@ -584,14 +584,11 @@ def test_semantic_previous_result_exposes_lossless_candidate_set():
             {"result_id": reference.result_id}
         )
 
-    assert "rows" not in resolved["result"]
+    assert resolved["result"]["rows"] == rows
     assert resolved["result"]["total_candidates"] == 10
-    assert resolved["candidate_set"] == {
-        "candidates": rows,
-        "coverage": "truncated",
-        "source_result_id": reference.result_id,
-    }
-    assert "одним batch" in read_previous_result.description
+    assert "candidate_set" not in resolved
+    assert "batch" in read_previous_result.description
+    assert "одним вызовом" in read_previous_result.description
 
 
 def test_search_excel_values_and_restore_source_row():
@@ -1215,6 +1212,10 @@ def test_trace_transformation_path_combines_s2t_sql_and_additional_objects():
     ]
     assert result["mermaid"].startswith("flowchart LR\n")
     assert [edge["transformation_id"] for edge in result["edges"]] == [23, 25]
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert serialized.index('"text_diagram"') < serialized.index('"paths"')
+    assert serialized.index('"edges"') < serialized.index('"paths"')
+    assert serialized.index('"paths"') < serialized.index('"neo4j_evidence"')
 
     qualified = trace_transformation_path.invoke(
         {
@@ -1425,6 +1426,11 @@ def test_registered_tools_expose_annotation_derived_argument_schemas():
         "trace_transformation_path"
     ].args_schema.model_json_schema()["required"] == ["table_name"]
     path_description = tools["trace_transformation_path"].description
+    assert "основной reader" in path_description
+    assert "до всех\nдостижимых конечных endpoint" in path_description
+    assert "другого endpoint не является входом" in path_description
+    assert "не нужно предварительно искать в каталоге" in path_description
+    assert "при недоступности либо ошибке Neo4j" in path_description
     assert "source_table + source_field" in path_description
     assert "target_table + target_field" in path_description
     assert "search_s2t_transformations" in path_description
@@ -3473,11 +3479,13 @@ def test_narrow_s2t_experiment_uses_strict_public_retrieval_surface(monkeypatch)
     monkeypatch.delenv(S2T_NARROW_TOOLS_EXPERIMENT_ENV, raising=False)
     default_names = {tool.name for tool in get_tools()}
     assert "list_s2t_transformations" in default_names
+    assert "resolve_entities" not in default_names
     assert "list_s2t_source_field" not in default_names
     assert "get_source_target_column_pair" not in default_names
 
     monkeypatch.setenv(S2T_NARROW_TOOLS_EXPERIMENT_ENV, "1")
     experiment_names = {tool.name for tool in get_tools()}
+    assert "resolve_entities" not in experiment_names
     assert {
         "get_s2t_rules_by_ids",
         "list_s2t_table_mapping",
@@ -3485,8 +3493,6 @@ def test_narrow_s2t_experiment_uses_strict_public_retrieval_surface(monkeypatch)
         "list_s2t_field_mapping",
         "list_s2t_source_table",
         "list_s2t_target_table",
-        "list_s2t_source_field",
-        "list_s2t_target_field",
         "list_column_catalog",
         "filter_column_catalog",
         "read_s2t_mapping",
@@ -3496,6 +3502,8 @@ def test_narrow_s2t_experiment_uses_strict_public_retrieval_surface(monkeypatch)
         "read_s2t_source_to_target",
         "read_s2t_by_source_table",
         "read_s2t_by_target_table",
+        "list_s2t_source_field",
+        "list_s2t_target_field",
         "get_source_target_column_pair",
         "list_column_metadata",
         "list_source_column_catalog",
@@ -3530,14 +3538,15 @@ def test_worker_tool_catalog_stages_general_fallback_tools():
         "read_s2t_source_to_target",
         "read_s2t_by_source_table",
         "read_s2t_by_target_table",
+        "list_s2t_source_field",
+        "list_s2t_target_field",
         "get_source_target_column_pair",
         "list_column_metadata",
-        "resolve_entities",
+        "run_sql",
     }.issubset(specialized_names)
     assert {
         "list_s2t_transformations",
         "list_column_catalog",
-        "run_sql",
         "run_cypher",
     }.issubset(WORKER_GENERAL_FALLBACK_TOOL_NAMES)
     assert full_names == (
@@ -3547,10 +3556,9 @@ def test_worker_tool_catalog_stages_general_fallback_tools():
         tool.name
         for tool in get_worker_tools(required_capabilities=["sql_read"])
     }
-    assert sql_expanded - specialized_names == {"run_sql"}
-    assert WORKER_CAPABILITY_TOOL_NAMES["entity_resolution"] == frozenset(
-        {"resolve_entities"}
-    )
+    assert sql_expanded == specialized_names
+    assert "entity_resolution" not in WORKER_CAPABILITY_TOOL_NAMES
+    assert "resolve_entities" not in full_names
 
 
 def test_second_iteration_strict_tools_are_saved_result_relations():
@@ -3560,6 +3568,8 @@ def test_second_iteration_strict_tools_are_saved_result_relations():
         "read_s2t_source_to_target",
         "read_s2t_by_source_table",
         "read_s2t_by_target_table",
+        "list_s2t_source_field",
+        "list_s2t_target_field",
         "get_source_target_column_pair",
         "list_column_metadata",
     }.issubset(SQLITE_RESULT_TOOL_NAMES)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, TypedDict
 
@@ -11,7 +10,10 @@ from langgraph.graph import END, START, StateGraph
 
 from .agent import chat_model
 from .chat_graph import WorkerRunResult
-from .coordinator import COORDINATOR_CONTEXT_MAX_CHARS, coordinator_chat
+from .coordinator import (
+    COORDINATOR_CONTEXT_MAX_CHARS,
+    coordinator_chat,
+)
 from .observability import get_callback_handler, langfuse_trace_context
 from .run_metrics import (
     capture_agent_run,
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _DELEGATE_TOOL_NAME = "delegate_to_coordinator"
 _EMPTY_DECISION_MAX_RETRIES = 1
+_RESOLVED_REFERENCES_MAX_CHARS = COORDINATOR_CONTEXT_MAX_CHARS
 
 
 class SupervisorGraphState(TypedDict):
@@ -41,6 +44,9 @@ class SupervisorGraphState(TypedDict):
 _SUPERVISOR_PROMPT = """
 Ты верхний supervisor read-only приложения. По `current_query` и
 `recent_history` реши, ответить сразу или вызвать `delegate_to_coordinator`.
+После этого system-сообщения сначала идут сообщения
+`recent_history` в их исходных ролях user/assistant, а последнее
+user-сообщение — это дословный `current_query`, не часть истории.
 
 Делегируй, когда для ответа нужно получить или проверить данные приложения.
 Если ответ уже следует из диалога и не требует таких данных, ответь обычным
@@ -71,6 +77,15 @@ coordinator программно и дословно: не пересказыв�
 правило установленным, если пользователь его явно задал, подтвердил или
 последовательно применял и позднее не отменял. Предложение assistant само по
 себе не является договорённостью.
+
+Авторитет сообщений задаётся их реальной ролью. Только user может
+выбрать или подтвердить недостающий объект, правило или ограничение.
+Сообщение assistant может повторить выбор user, но не может само сделать его
+подтверждённым или переопределить user. Более позднее релевантное сообщение
+user имеет приоритет над более ранним и над любым текстом assistant. Если user
+оставил выбор на будущее, запретил его делать или не подтвердил вариант
+assistant, ссылка остаётся неразрешённой: задай уточняющий вопрос и не вызывай
+`delegate_to_coordinator`.
 
 Не помещай в context:
 - current_query или его сокращённый пересказ;
@@ -130,6 +145,7 @@ def _delegate_tool_schema() -> Dict[str, Any]:
                 "properties": {
                     "resolved_references": {
                         "type": "string",
+                        "maxLength": _RESOLVED_REFERENCES_MAX_CHARS,
                         "description": (
                             "Только точные разовые факты из истории для "
                             "разрешения ссылок current_query с указанием их "
@@ -174,6 +190,77 @@ def _message_text(result: Any) -> str:
     return str(content or "").strip()
 
 
+def _parse_delegate_handoff(decision: Any) -> tuple[str, str]:
+    """Validate the native supervisor handoff without interpreting its text."""
+
+    if not isinstance(decision, AIMessage):
+        raise RuntimeError(
+            "Supervisor ожидал AIMessage с native call "
+            f"{_DELEGATE_TOOL_NAME}."
+        )
+    tool_calls = decision.tool_calls
+    if len(tool_calls) != 1:
+        raise RuntimeError(
+            "Supervisor должен вернуть ровно один native call "
+            f"{_DELEGATE_TOOL_NAME}."
+        )
+    call = tool_calls[0]
+    if not isinstance(call, Mapping) or call.get("name") != _DELEGATE_TOOL_NAME:
+        raise RuntimeError(
+            "Supervisor должен вернуть ровно один native call "
+            f"{_DELEGATE_TOOL_NAME}."
+        )
+    arguments = call.get("args")
+    if not isinstance(arguments, Mapping):
+        raise RuntimeError(
+            "Supervisor вернул не-object arguments для "
+            f"{_DELEGATE_TOOL_NAME}."
+        )
+
+    values: Dict[str, str] = {}
+    limits = {
+        "resolved_references": _RESOLVED_REFERENCES_MAX_CHARS,
+        "context": COORDINATOR_CONTEXT_MAX_CHARS,
+    }
+    for field_name, max_chars in limits.items():
+        value = arguments.get(field_name)
+        if not isinstance(value, str):
+            raise RuntimeError(
+                "Supervisor вернул не-string поле "
+                f"{_DELEGATE_TOOL_NAME}.{field_name}."
+            )
+        if len(value) > max_chars:
+            raise RuntimeError(
+                "Supervisor превысил лимит поля "
+                f"{_DELEGATE_TOOL_NAME}.{field_name}: "
+                f"{len(value)} > {max_chars}."
+            )
+        values[field_name] = value.strip()
+    return values["resolved_references"], values["context"]
+
+
+def _supervisor_messages(
+    *,
+    current_query: str,
+    recent_history: Sequence[Mapping[str, str]],
+    repair_empty: bool = False,
+) -> List[BaseMessage]:
+    """Build role-aware model input without interpreting conversation text."""
+
+    system_prompt = _SUPERVISOR_PROMPT
+    if repair_empty:
+        system_prompt = f"{system_prompt}\n\n{_EMPTY_DECISION_REPAIR_PROMPT}"
+    messages: List[BaseMessage] = [SystemMessage(content=system_prompt)]
+    for item in recent_history:
+        content = str(item.get("content") or "")
+        if item.get("role") == "user":
+            messages.append(HumanMessage(content=content))
+        else:
+            messages.append(AIMessage(content=content))
+    messages.append(HumanMessage(content=current_query))
+    return messages
+
+
 def build_supervisor_graph(
     model: Any,
     *,
@@ -202,16 +289,11 @@ def build_supervisor_graph(
         return result
 
     def supervisor_node(state: SupervisorGraphState) -> Dict[str, Any]:
-        payload = {
-            "current_query": state["current_query"],
-            "recent_history": state["recent_history"],
-        }
-        serialized_payload = json.dumps(payload, ensure_ascii=False)
         decision = invoke_supervisor(
-            [
-                SystemMessage(content=_SUPERVISOR_PROMPT),
-                HumanMessage(content=serialized_payload),
-            ]
+            _supervisor_messages(
+                current_query=state["current_query"],
+                recent_history=state["recent_history"],
+            )
         )
         for retry_index in range(_EMPTY_DECISION_MAX_RETRIES):
             if decision.tool_calls or _message_text(decision):
@@ -222,15 +304,11 @@ def build_supervisor_graph(
                 _EMPTY_DECISION_MAX_RETRIES,
             )
             decision = invoke_supervisor(
-                [
-                    SystemMessage(
-                        content=(
-                            f"{_SUPERVISOR_PROMPT}\n\n"
-                            f"{_EMPTY_DECISION_REPAIR_PROMPT}"
-                        )
-                    ),
-                    HumanMessage(content=serialized_payload),
-                ]
+                _supervisor_messages(
+                    current_query=state["current_query"],
+                    recent_history=state["recent_history"],
+                    repair_empty=True,
+                )
             )
         final_answer = None if decision.tool_calls else _message_text(decision)
         if not decision.tool_calls and not final_answer:
@@ -251,14 +329,10 @@ def build_supervisor_graph(
             raise RuntimeError(
                 "Supervisor вызвал coordinator без delegate_to_coordinator."
             )
-        call = decision.tool_calls[0]
         delegated_task = str(state["current_query"]).strip()
-        resolved_references = str(
-            call["args"].get("resolved_references") or ""
-        ).strip()
-        delegated_context = str(call["args"].get("context") or "").strip()[
-            :COORDINATOR_CONTEXT_MAX_CHARS
-        ]
+        resolved_references, delegated_context = _parse_delegate_handoff(
+            decision
+        )
         if not state["recent_history"]:
             if resolved_references or delegated_context:
                 logger.warning(
