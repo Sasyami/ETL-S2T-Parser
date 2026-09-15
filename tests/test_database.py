@@ -9,15 +9,18 @@ from storage.database import (
     DatabaseSchemaError,
     FILES_COLUMNS,
     FILE_SHEET_HEADER_COLUMNS,
+    GRAPH_SYNC_OUTBOX_COLUMNS,
     INTERNAL_TABLES,
     PXF_TO_A_COLUMNS,
     S2T_TRANSFORMATION_COLUMNS,
     S2T_FIELDS,
     S2T_LAYER_FIELDS,
+    SOURCE_COLUMN_COLUMNS,
     SOURCE_TABLE_COLUMNS,
     STORAGE_SCHEMA_COLUMNS,
     STORAGE_SCHEMA_TABLE_ORDER,
     TARGET_TABLE_COLUMNS,
+    TARGET_COLUMN_COLUMNS,
     USER_FACING_TABLES,
     clear_all_data,
     get_file,
@@ -27,6 +30,7 @@ from storage.database import (
     update_file_description,
     update_file_summary,
     get_columns_by_sheet,
+    migrate_column_catalog_schema,
     migrate_s2t_layer_columns,
 )
 from storage.s2t import backfill_s2t_layers
@@ -49,6 +53,8 @@ def test_init_db(temp_db):
     for table_name, expected_columns in (
         ("source_tables", SOURCE_TABLE_COLUMNS),
         ("target_tables", TARGET_TABLE_COLUMNS),
+        ("source_columns", SOURCE_COLUMN_COLUMNS),
+        ("target_columns", TARGET_COLUMN_COLUMNS),
         ("additional_objects", ADDITIONAL_OBJECT_COLUMNS),
         ("pxf_to_a", PXF_TO_A_COLUMNS),
     ):
@@ -58,6 +64,9 @@ def test_init_db(temp_db):
     cursor.execute("PRAGMA table_info(data)")
     data_columns = [row[1] for row in cursor.fetchall()]
     assert data_columns == list(DATA_COLUMNS)
+    cursor.execute("PRAGMA table_info(graph_sync_outbox)")
+    outbox_columns = [row[1] for row in cursor.fetchall()]
+    assert outbox_columns == list(GRAPH_SYNC_OUTBOX_COLUMNS)
 
 
 def test_store_excel_data_preserves_long_cell_values(temp_db):
@@ -96,17 +105,25 @@ def test_storage_schema_constants_cover_current_tables():
         "file_sheet_headers",
         "source_tables",
         "target_tables",
+        "source_columns",
+        "target_columns",
         "additional_objects",
         "pxf_to_a",
         "s2t_transformations",
         "data",
     )
-    assert INTERNAL_TABLES == ()
+    assert INTERNAL_TABLES == ("graph_sync_outbox",)
     assert tuple(get_usefull_col_extraction_target("source_tables")["fields"]) == tuple(
         SOURCE_TABLE_COLUMNS[4:-1]
     )
     assert tuple(get_usefull_col_extraction_target("target_tables")["fields"]) == tuple(
         TARGET_TABLE_COLUMNS[4:-1]
+    )
+    assert tuple(get_usefull_col_extraction_target("source_columns")["fields"]) == tuple(
+        SOURCE_COLUMN_COLUMNS[4:-1]
+    )
+    assert tuple(get_usefull_col_extraction_target("target_columns")["fields"]) == tuple(
+        TARGET_COLUMN_COLUMNS[4:-1]
     )
     assert tuple(get_usefull_col_extraction_target("additional_objects")["fields"]) == tuple(
         ADDITIONAL_OBJECT_COLUMNS[4:]
@@ -237,6 +254,8 @@ def test_clear_all_data_deletes_every_row_and_keeps_schema(temp_db):
         "file_sheet_headers": 1,
         "source_tables": 1,
         "target_tables": 1,
+        "source_columns": 0,
+        "target_columns": 0,
         "additional_objects": 1,
         "pxf_to_a": 1,
         "s2t_transformations": 1,
@@ -250,9 +269,10 @@ def test_clear_all_data_deletes_every_row_and_keeps_schema(temp_db):
     }
     assert tables == set(CORE_TABLES)
     for table_name, expected_columns in STORAGE_SCHEMA_COLUMNS.items():
+        expected_count = 1 if table_name == "graph_sync_outbox" else 0
         assert temp_db.execute(
             f'SELECT COUNT(*) FROM "{table_name}"'
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == expected_count
         actual_columns = tuple(
             row[1]
             for row in temp_db.execute(
@@ -260,6 +280,13 @@ def test_clear_all_data_deletes_every_row_and_keeps_schema(temp_db):
             ).fetchall()
         )
         assert actual_columns == tuple(expected_columns)
+    outbox = temp_db.execute(
+        """
+        SELECT file_id, desired_revision, applied_revision
+        FROM graph_sync_outbox
+        """
+    ).fetchone()
+    assert tuple(outbox) == (10, 1, 0)
 
 
 def test_init_db_rejects_old_table_catalog_schema_without_mutating_data(temp_db):
@@ -309,6 +336,95 @@ def test_init_db_rejects_old_table_catalog_schema_without_mutating_data(temp_db)
     assert cursor.execute(
         "SELECT name FROM sqlite_master WHERE name LIKE '%_numeric'"
     ).fetchall() == []
+
+
+def test_init_db_adds_column_catalog_tables_to_previous_current_schema(temp_db):
+    temp_db.execute(
+        "INSERT INTO files (filename, upload_time, model_used) VALUES (?, ?, ?)",
+        ("existing.xlsx", "2026-08-21", "model"),
+    )
+    temp_db.execute("DROP TABLE source_columns")
+    temp_db.execute("DROP TABLE target_columns")
+    temp_db.commit()
+
+    init_db()
+
+    assert temp_db.execute("SELECT filename FROM files").fetchone()[0] == "existing.xlsx"
+    for table_name, expected_columns in (
+        ("source_columns", SOURCE_COLUMN_COLUMNS),
+        ("target_columns", TARGET_COLUMN_COLUMNS),
+    ):
+        actual_columns = tuple(
+            row[1]
+            for row in temp_db.execute(
+                f'PRAGMA table_info("{table_name}")'
+            ).fetchall()
+        )
+        assert actual_columns == tuple(expected_columns)
+
+
+@pytest.mark.parametrize("with_description_aliases", [False, True])
+def test_init_db_removes_obsolete_column_catalog_fields(
+    temp_db, with_description_aliases
+):
+    legacy_tail = ("metadata_source", "description_embedding") + (
+        ("description_aliases",) if with_description_aliases else ()
+    )
+    previous_columns = {
+        "source_columns": SOURCE_COLUMN_COLUMNS[:-1] + legacy_tail,
+        "target_columns": TARGET_COLUMN_COLUMNS[:-1] + legacy_tail,
+    }
+    for table_name, columns in previous_columns.items():
+        temp_db.execute(f'ALTER TABLE "{table_name}" RENAME TO "{table_name}_old"')
+        definitions = []
+        for column in columns:
+            if column == "id":
+                definitions.append('"id" INTEGER PRIMARY KEY')
+            elif column in {"primary_key", "not_null"}:
+                definitions.append(f'"{column}" INTEGER')
+            elif column == "description_embedding":
+                definitions.append('"description_embedding" BLOB')
+            else:
+                definitions.append(f'"{column}" TEXT')
+        temp_db.execute(
+            f'CREATE TABLE "{table_name}" ({", ".join(definitions)})'
+        )
+        temp_db.execute(
+            f"""
+            INSERT INTO "{table_name}"
+            (id, file_id, sheet_name, row_num, table_name, column_name,
+             description, metadata_source, description_embedding)
+            VALUES (1, 10, 'Columns', 0, 'orders', 'id', 'Identifier', 's2t', X'0102')
+            """
+        )
+        temp_db.execute(f'DROP TABLE "{table_name}_old"')
+    temp_db.commit()
+
+    init_db()
+
+    for table_name, expected_columns in (
+        ("source_columns", SOURCE_COLUMN_COLUMNS),
+        ("target_columns", TARGET_COLUMN_COLUMNS),
+    ):
+        actual_columns = tuple(
+            row[1]
+            for row in temp_db.execute(
+                f'PRAGMA table_info("{table_name}")'
+            ).fetchall()
+        )
+        assert actual_columns == tuple(expected_columns)
+        row = temp_db.execute(
+            f'SELECT description, description_embedding '
+            f'FROM "{table_name}"'
+        ).fetchone()
+        assert tuple(row) == (
+            "Identifier",
+            None if with_description_aliases else b"\x01\x02",
+        )
+    assert migrate_column_catalog_schema() == {
+        "changed": False,
+        "tables_rebuilt": [],
+    }
 
 
 def test_init_db_rejects_incompatible_identifier_schema(temp_db):

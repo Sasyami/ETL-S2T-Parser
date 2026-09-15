@@ -1,0 +1,93 @@
+"""Focused contracts for field-scoped and negative-evidence SQL risks."""
+
+import re
+
+from agents.tools.context import (
+    OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV,
+    load_operation_skills,
+)
+
+
+def _typed_context(aspect: str, stage: str) -> str:
+    return " ".join(
+        load_operation_skills(
+            ["Анализ SQL-рисков"],
+            stage=stage,
+            sql_risk_aspects=[aspect],
+        ).split()
+    )
+
+
+def test_value_changes_is_scoped_to_exact_target_projection(monkeypatch):
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    plan = _typed_context("value_changes", "plan")
+    decision = _typed_context("value_changes", "upstream_decision")
+    answer = _typed_context("value_changes", "upstream")
+
+    assert "source.field→target.field" in plan
+    assert "проекции точного target field" in decision
+    assert "другом output alias не доказывают" in answer
+    assert "прямая проекция" in answer
+
+
+def test_value_change_guidance_states_invariants_without_fixture_sql(monkeypatch):
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "0")
+    answer = _typed_context("value_changes", "upstream")
+
+    assert "выражение output alias целевого поля" in answer
+    assert "Выражения соседних output aliases" in answer
+    assert not re.search(
+        r"\b[a-z]\w*\.[a-z_]\w*\s+AS\s+[a-z_]\w*",
+        answer,
+        flags=re.IGNORECASE,
+    )
+
+
+def test_write_semantics_accepts_complete_mapping_as_terminal_evidence(
+    monkeypatch,
+):
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    contexts = {
+        stage: _typed_context("write_semantics", stage)
+        for stage in (
+            "plan",
+            "planner",
+            "observer",
+            "upstream_decision",
+            "upstream",
+        )
+    }
+
+    assert "один полный exact directed mapping" in contexts["plan"]
+    assert "один полный mapping" in contexts["planner"]
+    assert "terminal negative evidence, а не gap" in contexts["observer"]
+    assert "достаточен для pass" in contexts["upstream_decision"]
+    assert "не reroute" in contexts["upstream_decision"]
+    assert "не оценено" in contexts["upstream"]
+
+
+def test_cardinality_upstream_stays_conditional_without_other_risk_layers(
+    monkeypatch,
+):
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "1")
+    answer = _typed_context("cardinality", "upstream")
+
+    assert "Не назначай качественный уровень риска" in answer
+    assert "не утверждай фактические дубликаты" in answer
+    assert "Не переноси сюда write semantics" in answer
+    assert "ноль или одно совпадение справа дают одну строку" in answer
+    assert "выбери это mapping также для display" in answer
+    assert "TRUE не ослабляет условие JOIN" in answer
+
+
+def test_legacy_profile_has_the_same_terminal_and_field_scope_rules(monkeypatch):
+    monkeypatch.setenv(OPERATION_SQL_RISK_ASPECTS_EXPERIMENT_ENV, "0")
+
+    observer = _typed_context("write_semantics", "observer")
+    decision = _typed_context("write_semantics", "upstream_decision")
+    answer = _typed_context("value_changes", "upstream")
+
+    assert "terminal negative evidence, а не gap" in observer
+    assert "достаточен для `pass`" in decision
+    assert "SQL-проекцию именно target.field" in answer
+    assert "соседних output aliases" in answer

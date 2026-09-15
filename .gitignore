@@ -21,6 +21,8 @@ env/
 # Database
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 
@@ -37,13 +39,21 @@ env/
 
 # Logs
 *.log
+*.log.*
+logs/
 
 # Jupyter
 .ipynb_checkpoints/
 
 # Coverage
 .coverage
+.coverage.*
 htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+coverage.xml
+coverage.json
 .pytest_tmp_*/
 .pytest_codex/
 .test_runs/
@@ -59,3 +69,6 @@ file_bytes_cache.pkl
 
 # Generated SQL exports
 exports/
+
+# Local user artifacts
+artifacts/

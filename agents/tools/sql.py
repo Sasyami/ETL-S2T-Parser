@@ -8,7 +8,6 @@ import sqlite3
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
-
 from .common import PROJECT_ROOT, clamped_int
 
 logger = logging.getLogger(__name__)
@@ -17,7 +16,6 @@ SQL_EXPORT_DIR = PROJECT_ROOT / "exports" / "sql_exports"
 SQL_EXPORT_URL_PREFIX = "/exports/sql"
 MAX_INLINE_SQL_ROWS = 100
 SQL_FETCH_BATCH_SIZE = 1000
-
 
 def _write_sql_export_cursor(
     query: str,
@@ -118,24 +116,33 @@ def run_sql(
 ) -> Dict[str, Any]:
     """Выполнить составленный агентом или переданный read-only SQL по SQLite.
 
+    Используй для read-only агрегаций, JOIN, UNION, подзапросов, оконных функций,
+    произвольных выражений и других срезов, которых нет в готовых tools.
+    Точные S2T-строки получай специализированными ролевыми tools; этот tool
+    оставляй только нестандартным срезам, которых их схемы не выражают.
     Для стандартных списков source/target, их пересечения, объединения и разности
-    выбирай list_s2t_table_names, а не этот tool. Используй для произвольных
-    табличных срезов, фильтрации, подсчётов, нестандартных агрегаций, строк
-    S2T-маппинга и обычных связей source → target.
+    выбирай list_s2t_table_names, а не этот tool.
     Если нестандартная аналитика всё же требует пересечения двух множеств, SQL
     должен явно доказать присутствие значения с обеих сторон через INNER JOIN,
     EXISTS, INTERSECT или GROUP BY с HAVING. UNION ALL с сортировкой по COUNT без
     HAVING не доказывает пересечение и может вернуть значение только из одного
     множества.
     Доступная пользовательская схема включает files, file_sheet_headers,
-    source_tables, target_tables, additional_objects, pxf_to_a,
+    source_tables, target_tables, source_columns, target_columns,
+    additional_objects, pxf_to_a,
     s2t_transformations и data. Логические ETL-таблицы вида t_* не являются
     физическими SQLite-таблицами: не выполняй для них PRAGMA и не пиши `FROM t_*`;
     ищи их имена в source_table/target_table и связанных строках.
 
     Таблица s2t_transformations глобальная: запросы к ней не должны содержать
-    фильтр по file_id, активному UI-файлу или последней загрузке.
-    Не используй для lineage, путей, цепочек зависимостей и impact analysis:
+    неявный фильтр по file_id или последней загрузке.
+    Правила найденного lineage дочитывает сам trace_neo4j_lineage с
+    include_transformation_rules=true. Не составляй SQL по transformation_id:
+    числа из task или имён объектов не подтверждают происхождение ID.
+    Условия по атрибутам S2T-строк применяй непосредственно к
+    s2t_transformations. Не связывай её с каталогами или сырыми данными, если
+    задача не требует сведений из этих таблиц.
+    Не используй для самостоятельного построения lineage, путей и цепочек:
     это сценарий Neo4j. Не используй также для разбора переданного пользователем
     SQL-текста без выполнения: для этого предназначены parse_sql_column_lineage
     и parse_sql_table_lineage. Поддерживаются SELECT, WITH и EXPLAIN QUERY PLAN.
@@ -183,6 +190,13 @@ def run_sql(
             "returned_rows": len(visible_rows),
             "truncated": truncated,
             "max_inline_rows": MAX_INLINE_SQL_ROWS,
+        }
+    except sqlite3.Error as exc:
+        logger.exception("SQL execution failed")
+        return {
+            "error": "SQL query failed",
+            "error_message": str(exc),
+            "query": text,
         }
     except Exception:
         logger.exception("SQL execution failed")

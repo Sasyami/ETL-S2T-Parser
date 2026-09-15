@@ -14,6 +14,7 @@ from sheet_skills.s2t import (
     _build_sheet_llm_prompt,
     _deterministic_sheet_mapping,
     _inspect_candidate_sheets,
+    _sheet_mapping_from_column_roles,
     run_s2t_extraction_subagent,
     verify_s2t_transformations,
     write_s2t_transformations_from_plan,
@@ -25,9 +26,18 @@ from sheet_skills.additional_objects import (
 )
 from sheet_skills.structured_metadata import extract_structured_metadata
 from sheet_skills.table_catalog import extract_table_catalogs
+from sheet_skills.column_catalog import (
+    ColumnCatalogExtractionError,
+    _is_null_question,
+    _merge_catalog,
+    _normalise_flag,
+    backfill_column_description_embeddings,
+    extract_column_catalogs,
+)
 from storage.database import get_db_connection, init_db, store_excel_data
 from storage.s2t import (
     clear_s2t_transformations,
+    insert_s2t_transformations,
     list_s2t_transformations,
 )
 
@@ -47,7 +57,14 @@ def s2t_db(tmp_path, monkeypatch, mock_embeddings):
                     "source_field": ["Source Column"],
                     "transformation_rule": ["SQL Transform"],
                     "primary_key": ["Primary Key"],
-                    "target_field_data_type": ["Target Data Type"],
+                    "source_primary_key": ["Primary Key"],
+                    "target_primary_key": ["Primary Key"],
+                    "source_not_null": ["not null"],
+                    "target_not_null": ["not null"],
+                    "source_description": ["Description"],
+                    "target_description": ["Description"],
+                    "source_field_data_type": ["Data Type"],
+                    "target_field_data_type": ["Target Data Type", "Data Type"],
                 },
                 "source_tables": {
                     "table_name": ["Название таблицы-источника"],
@@ -56,6 +73,22 @@ def s2t_db(tmp_path, monkeypatch, mock_embeddings):
                 "target_tables": {
                     "table_name": ["Table Name"],
                     "description": ["Table Entity Definition"],
+                },
+                "source_columns": {
+                    "table_name": ["table", "Название таблицы"],
+                    "column_name": ["column", "Название поля"],
+                    "data_type": ["datatype", "Тип поля"],
+                    "primary_key": ["pk", "PK"],
+                    "not_null": ["notnull", "not null", "NULL?"],
+                    "description": ["comment", "Описание поля"],
+                },
+                "target_columns": {
+                    "table_name": ["table", "Column Table Name"],
+                    "column_name": ["column", "Column Name"],
+                    "data_type": ["datatype", "Column Datatype"],
+                    "primary_key": ["pk", "Column IsPK"],
+                    "not_null": ["notnull", "Column Null Option"],
+                    "description": ["comment", "Column Attribute Definition"],
                 },
                 "additional_objects": {
                     "name": ["name", "Название объекта", "Имя объекта для S2T"],
@@ -235,7 +268,7 @@ def test_s2t_llm_prompt_uses_only_sheet_mapping_and_column_names(s2t_db):
     sheet = inspection["sheets"][0]
     draft = _deterministic_sheet_mapping(sheet)
 
-    prompt = _build_sheet_llm_prompt(sheet)
+    prompt = _build_sheet_llm_prompt(sheet, draft)
 
     assert prompt.startswith("Сопоставь полезные колонки")
     assert "Map useful columns" not in prompt
@@ -246,6 +279,9 @@ def test_s2t_llm_prompt_uses_only_sheet_mapping_and_column_names(s2t_db):
     assert "column_name" in prompt
     assert "Target > Target Tbl" in prompt
     assert "sample_values" in prompt
+    assert "occurrence" in prompt
+    assert "side_hint" in prompt
+    assert "previous_column" in prompt
     assert "mapping_field" in prompt
     assert "column_id" not in prompt
     assert "sheet_id" not in prompt
@@ -258,6 +294,30 @@ def test_s2t_llm_prompt_uses_only_sheet_mapping_and_column_names(s2t_db):
     assert "critical_roles" not in prompt
     assert "nullable_roles" not in prompt
     assert "role_to_column_mapping_field" not in prompt
+
+
+def test_s2t_llm_mapping_distinguishes_equal_headers_by_occurrence(s2t_db):
+    file_id = _store_s2t(
+        ["Target Table", "Same Name", "Source Table", "Same Name"],
+        [["mart.t", "target_id", "raw.t", "source_id"]],
+    )
+    sheet = _inspect_candidate_sheets(file_id)["sheets"][0]
+
+    mapping = _sheet_mapping_from_column_roles(
+        {
+            "sheet_name": "S2T",
+            "column_roles": [
+                {"column_name": "Target Table", "occurrence": 1, "mapping_field": "target_table"},
+                {"column_name": "Same Name", "occurrence": 1, "mapping_field": "target_field"},
+                {"column_name": "Source Table", "occurrence": 1, "mapping_field": "source_table"},
+                {"column_name": "Same Name", "occurrence": 2, "mapping_field": "source_field"},
+            ],
+        },
+        sheet,
+    )
+
+    assert mapping["field_column_ids"]["target_field"] == 2
+    assert mapping["field_column_ids"]["source_field"] == 4
 
 
 def test_s2t_subagent_exact_multilevel_headers_write_minimal_rows(s2t_db):
@@ -294,8 +354,15 @@ def test_s2t_subagent_exact_multilevel_headers_write_minimal_rows(s2t_db):
     assert report["attempts"] == 0
     assert mock_llm.call_count == 0
     assert report["sheets"] == [
-        {"sheet_name": "S2T", "method": "deterministic", "attempts": 0}
+        {
+            "sheet_name": "S2T",
+            "method": "deterministic",
+            "attempts": 0,
+            "rows_written": 1,
+            "empty_target_columns_count": 0,
+        }
     ]
+    assert report["empty_target_columns_count"] == 0
     mapping = _deterministic_sheet_mapping(_inspect_candidate_sheets(file_id)["sheets"][0])
     assert set(mapping["field_column_ids"]) == set(S2T_FIELDS)
     assert not any(key.endswith("_column_id") for key in mapping)
@@ -375,6 +442,40 @@ def test_s2t_upload_pipeline_assigns_source_and_target_layers(s2t_db):
     ]
 
 
+def test_s2t_upload_pipeline_reports_empty_target_columns_per_sheet(s2t_db):
+    file_id = _store_s2t(
+        [
+            "Target Table",
+            "Target Column",
+            "Source Table",
+            "Source Column",
+            "SQL Transform",
+        ],
+        [
+            ["t_customer", "customer_id", "src_customer", "id", "copy"],
+            ["t_customer", None, "src_customer", "name", "trim(name)"],
+        ],
+    )
+
+    report = run_s2t_extraction_subagent(file_id)
+
+    assert report["written"] == 2
+    assert report["verification"]["count"] == 2
+    assert report["empty_target_columns_count"] == 1
+    assert report["sheets"] == [
+        {
+            "sheet_name": "S2T",
+            "method": "deterministic",
+            "attempts": 0,
+            "rows_written": 2,
+            "empty_target_columns_count": 1,
+        }
+    ]
+    assert verify_s2t_transformations(file_id, limit=10)["rows"][1][
+        "target_field"
+    ] is None
+
+
 def test_s2t_subagent_uses_deterministic_fuzzy_header_mapping(s2t_db):
     file_id = _store_s2t(
         [
@@ -437,7 +538,13 @@ def test_s2t_subagent_uses_sheet_group_subagent_to_find_s2t_sheet(s2t_db):
     assert mock_sheet_llm.call_count == 0
     assert report["status"] == "ok"
     assert report["sheets"] == [
-        {"sheet_name": "SourceToTargt", "method": "deterministic", "attempts": 0}
+        {
+            "sheet_name": "SourceToTargt",
+            "method": "deterministic",
+            "attempts": 0,
+            "rows_written": 1,
+            "empty_target_columns_count": 0,
+        }
     ]
     mock_add_alias.assert_called_once_with("s2t", "SourceToTargt")
     assert report["verification"]["rows"][0]["target_table"] == "t_sheet_fuzzy"
@@ -715,6 +822,87 @@ def test_write_tool_reports_missing_target_table_and_keeps_existing_rows(s2t_db)
     assert dict(old_row) == {"target_table": "old_target", "target_field": "old_column"}
 
 
+def test_write_tool_ignores_rows_without_any_mapped_s2t_values(s2t_db):
+    file_id = _store_s2t(
+        ["Target Table", "Target Column", "Дата"],
+        [
+            ["t1", "c1", None],
+            [None, None, "2024-03-19"],
+        ],
+    )
+    sheet, column_ids = _column_ids(file_id)
+    mapping = {
+        "sheet_name": sheet["sheet_name"],
+        "field_column_ids": {
+            "target_table": column_ids["Target Table"],
+            "target_field": column_ids["Target Column"],
+        },
+        "evidence": {
+            **_evidence("target_table", column_ids["Target Table"]),
+            **_evidence("target_field", column_ids["Target Column"]),
+        },
+    }
+
+    result = write_s2t_transformations_from_plan(file_id, [mapping])
+
+    assert result["count"] == 1
+    assert verify_s2t_transformations(file_id)["count"] == 1
+
+
+def test_write_tool_keeps_all_rows_with_empty_target_columns_and_reports_count(
+    s2t_db,
+):
+    file_id = _store_s2t(
+        [
+            "Target Table",
+            "Target Column",
+            "Source Table",
+            "Source Column",
+            "SQL Transform",
+        ],
+        [
+            ["t1", "c1", "src", "src_c1", "copy"],
+            ["t1", None, "src", "src_c2", "coalesce(src_c2, 0)"],
+            ["t1", None, "src", "src_c2", "coalesce(src_c2, 0)"],
+            [None, None, None, None, None],
+        ],
+    )
+    sheet, column_ids = _column_ids(file_id)
+    mapping = {
+        "sheet_name": sheet["sheet_name"],
+        "field_column_ids": {
+            "target_table": column_ids["Target Table"],
+            "target_field": column_ids["Target Column"],
+            "source_table": column_ids["Source Table"],
+            "source_field": column_ids["Source Column"],
+            "transformation_rule": column_ids["SQL Transform"],
+        },
+        "evidence": {
+            **_evidence("target_table", column_ids["Target Table"]),
+            **_evidence("target_field", column_ids["Target Column"]),
+            **_evidence("source_table", column_ids["Source Table"]),
+            **_evidence("source_field", column_ids["Source Column"]),
+            **_evidence("transformation_rule", column_ids["SQL Transform"]),
+        },
+    }
+
+    result = write_s2t_transformations_from_plan(file_id, [mapping])
+
+    assert result["count"] == 3
+    assert result["empty_target_columns_count"] == 2
+    assert result["sheet_results"] == [
+        {
+            "sheet_name": "S2T",
+            "rows_written": 3,
+            "empty_target_columns_count": 2,
+        }
+    ]
+    rows = verify_s2t_transformations(file_id, limit=10)["rows"]
+    assert [row["row_num"] for row in rows] == [0, 1, 2]
+    assert [row["target_field"] for row in rows] == ["c1", None, None]
+    assert rows[1] == rows[2] | {"row_num": 1}
+
+
 def test_s2t_extraction_appends_without_deleting_stored_rows(s2t_db):
     file_id = _store_s2t(
         ["Target Table", "Target Column", "Source Table", "Source Column", "SQL Transform"],
@@ -897,6 +1085,878 @@ def test_table_catalog_extraction_writes_name_description_and_preserves_duplicat
             "description": "Same description",
             "description_embedding": b"embedding:Same description",
         },
+    ]
+
+
+def test_column_catalog_uses_dedicated_values_and_raw_s2t_fallback(s2t_db):
+    file_id = store_excel_data(
+        "column_catalogs.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "S2T",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": [
+                    "Target Table",
+                    "Target Column",
+                    "Data Type",
+                    "not null",
+                    "Primary Key",
+                    "Description",
+                    "Source Table",
+                    "Source Column",
+                    "Data Type",
+                    "not null",
+                    "Primary Key",
+                    "Description",
+                    "SQL Transform",
+                ],
+                "data_rows": [
+                    [
+                        "mart.customer",
+                        "customer_id",
+                        "bigint",
+                        "yes",
+                        "yes",
+                        "Target identifier",
+                        "raw.customer",
+                        "id",
+                        "bigint",
+                        "yes",
+                        "yes",
+                        "Raw identifier",
+                        "copy",
+                    ],
+                    [
+                        "mart.customer",
+                        "customer_name",
+                        "text",
+                        "no",
+                        "no",
+                        "Target name",
+                        "raw.customer",
+                        "name",
+                        "varchar(100)",
+                        "no",
+                        "no",
+                        "Raw name",
+                        "trim(name)",
+                    ],
+                ],
+            },
+            {
+                "sheet_name": "Source columns",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": ["table", "column", "datatype", "notnull", "pk", "comment"],
+                "data_rows": [
+                    [
+                        "raw.customer",
+                        "id",
+                        "numeric(20)",
+                        "yes",
+                        "yes",
+                        "Dedicated identifier",
+                    ]
+                ],
+            },
+        ],
+    )
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    s2t_report = run_s2t_extraction_subagent(
+        file_id, sheet_group_analysis=analysis
+    )
+
+    report = extract_column_catalogs(
+        file_id,
+        analysis,
+        s2t_sheet_mappings=s2t_report["sheet_mappings"],
+    )
+
+    assert report["status"] == "ok"
+    assert report["count"] == 4
+    assert report["embedded_description_count"] == 4
+    assert report["targets"]["target_columns"]["sheet_count"] == 0
+    assert report["targets"]["target_columns"]["source_counts"] == {
+        "columns_sheet": 0,
+        "s2t": 2,
+        "mixed": 0,
+    }
+    assert report["targets"]["source_columns"]["source_counts"] == {
+        "columns_sheet": 0,
+        "s2t": 1,
+        "mixed": 1,
+    }
+    assert any(
+        conflict["field"] == "data_type"
+        for conflict in report["targets"]["source_columns"]["conflicts"]
+    )
+
+    conn = get_db_connection()
+    try:
+        source_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT table_name, column_name, data_type, primary_key,
+                       not_null, description, description_embedding
+                FROM source_columns
+                WHERE file_id = ?
+                ORDER BY column_name
+                """,
+                (file_id,),
+            ).fetchall()
+        ]
+        target_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT table_name, column_name, data_type, primary_key,
+                       not_null, description, description_embedding
+                FROM target_columns
+                WHERE file_id = ?
+                ORDER BY column_name
+                """,
+                (file_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert source_rows == [
+        {
+            "table_name": "raw.customer",
+            "column_name": "id",
+            "data_type": "numeric(20)",
+            "primary_key": 1,
+            "not_null": 1,
+            "description": "Dedicated identifier",
+            "description_embedding": (
+                "embedding:Название колонки: id\nОписание: Dedicated identifier".encode(
+                    "utf-8"
+                )
+            ),
+        },
+        {
+            "table_name": "raw.customer",
+            "column_name": "name",
+            "data_type": "varchar(100)",
+            "primary_key": 0,
+            "not_null": 0,
+            "description": "Raw name",
+            "description_embedding": (
+                "embedding:Название колонки: name\nОписание: Raw name".encode(
+                    "utf-8"
+                )
+            ),
+        },
+    ]
+    assert target_rows == [
+        {
+            "table_name": "mart.customer",
+            "column_name": "customer_id",
+            "data_type": "bigint",
+            "primary_key": 1,
+            "not_null": 1,
+            "description": "Target identifier",
+            "description_embedding": (
+                "embedding:Название колонки: customer_id\n"
+                "Описание: Target identifier"
+            ).encode(
+                "utf-8"
+            ),
+        },
+        {
+            "table_name": "mart.customer",
+            "column_name": "customer_name",
+            "data_type": "text",
+            "primary_key": 0,
+            "not_null": 0,
+            "description": "Target name",
+            "description_embedding": (
+                "embedding:Название колонки: customer_name\nОписание: Target name"
+            ).encode(
+                "utf-8"
+            ),
+        },
+    ]
+
+
+def test_column_catalog_recovers_headers_from_first_stored_data_row(s2t_db):
+    file_id = store_excel_data(
+        "recovered_column_headers.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "S2T",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": [
+                    "Target Table",
+                    "Target Column",
+                    "Source Table",
+                    "Source Column",
+                    "SQL Transform",
+                ],
+                "data_rows": [
+                    ["mart.orders", "order_id", "raw.orders", "id", "copy"]
+                ],
+            },
+            {
+                "sheet_name": "Source columns",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": ["Column_1", "Column_2", "Column_3", "4", "5", "6"],
+                "data_rows": [
+                    ["Название таблицы", "Название поля", "Тип поля", "NULL?", "PK", "Описание поля"],
+                    ["raw.orders", "id", "uuid", "нет", "да", "Идентификатор заказа"],
+                    ["raw.orders", "payload", "jsonb", None, None, "Тело заказа"],
+                ],
+            },
+        ],
+    )
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    s2t_report = run_s2t_extraction_subagent(
+        file_id, sheet_group_analysis=analysis
+    )
+
+    report = extract_column_catalogs(
+        file_id,
+        analysis,
+        s2t_sheet_mappings=s2t_report["sheet_mappings"],
+    )
+
+    source_report = report["targets"]["source_columns"]
+    assert source_report["sheet_mappings"][0]["header_recovered"] is True
+    assert source_report["sheet_mappings"][0]["header_row_num"] == 0
+    conn = get_db_connection()
+    try:
+        row = dict(
+            conn.execute(
+                """
+                SELECT table_name, column_name, data_type, primary_key,
+                       not_null, description
+                FROM source_columns
+                WHERE file_id = ? AND column_name = 'id'
+                """,
+                (file_id,),
+            ).fetchone()
+        )
+        blank_flags = tuple(
+            conn.execute(
+                """
+                SELECT primary_key, not_null
+                FROM source_columns
+                WHERE file_id = ? AND column_name = 'payload'
+                """,
+                (file_id,),
+            ).fetchone()
+        )
+    finally:
+        conn.close()
+    assert row == {
+        "table_name": "raw.orders",
+        "column_name": "id",
+        "data_type": "uuid",
+        "primary_key": 1,
+        "not_null": 1,
+        "description": "Идентификатор заказа",
+    }
+    assert blank_flags == (0, None)
+
+
+def test_column_catalog_uses_one_llm_check_for_unmapped_header_and_saves_alias(
+    s2t_db,
+):
+    file_id = store_excel_data(
+        "column_catalog_llm.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "S2T",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": [
+                    "Target Table",
+                    "Target Column",
+                    "Source Table",
+                    "Source Column",
+                    "SQL Transform",
+                ],
+                "data_rows": [
+                    ["mart.orders", "order_id", "raw.orders", "id", "copy"]
+                ],
+            },
+            {
+                "sheet_name": "Source columns",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": [
+                    "table",
+                    "column",
+                    "datatype",
+                    "notnull",
+                    "pk",
+                    "Business label",
+                ],
+                "data_rows": [
+                    [
+                        "raw.orders",
+                        "id",
+                        "uuid",
+                        "yes",
+                        "yes",
+                        "Идентификатор заказа",
+                    ]
+                ],
+            },
+        ],
+    )
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    s2t_report = run_s2t_extraction_subagent(
+        file_id, sheet_group_analysis=analysis
+    )
+    response = {
+        "sheet_name": "Source columns",
+        "column_roles": [
+            {"column_name": "table", "mapping_field": "table_name"},
+            {"column_name": "column", "mapping_field": "column_name"},
+            {"column_name": "datatype", "mapping_field": "data_type"},
+            {"column_name": "notnull", "mapping_field": "not_null"},
+            {"column_name": "pk", "mapping_field": "primary_key"},
+            {"column_name": "Business label", "mapping_field": "description"},
+        ],
+    }
+
+    with patch(
+        "sheet_skills.s2t._invoke_llm_plain_text",
+        return_value=json.dumps(response, ensure_ascii=False),
+    ) as mock_llm:
+        report = extract_column_catalogs(
+            file_id,
+            analysis,
+            s2t_sheet_mappings=s2t_report["sheet_mappings"],
+        )
+
+    mock_llm.assert_called_once()
+    prompt = mock_llm.call_args.args[0]
+    assert '"source_columns"' in prompt
+    assert "Business label" in prompt
+    assert "Идентификатор заказа" in prompt
+    assert "side_hint" not in prompt
+    assert "previous_column" not in prompt
+    assert "column_id" not in prompt
+    source_report = report["targets"]["source_columns"]
+    assert source_report["attempts"] == 1
+    assert source_report["aliases_added"] == 1
+    assert source_report["sheet_mappings"][0]["method"] == "llm"
+    assert source_report["sheet_mappings"][0]["attempts"] == 1
+    assert "Business label" in column_mapping_config.get_field_aliases(
+        "source_columns", "description"
+    )
+
+    conn = get_db_connection()
+    try:
+        description = conn.execute(
+            """
+            SELECT description
+            FROM source_columns
+            WHERE file_id = ? AND table_name = 'raw.orders' AND column_name = 'id'
+            """,
+            (file_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert description == "Идентификатор заказа"
+
+
+def test_column_catalog_rejects_invalid_llm_mapping_without_partial_write(s2t_db):
+    file_id = store_excel_data(
+        "column_catalog_bad_llm.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "S2T",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": [
+                    "Target Table",
+                    "Target Column",
+                    "Source Table",
+                    "Source Column",
+                    "SQL Transform",
+                ],
+                "data_rows": [
+                    ["mart.orders", "order_id", "raw.orders", "id", "copy"]
+                ],
+            },
+            {
+                "sheet_name": "Source columns",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": [
+                    "table",
+                    "column",
+                    "datatype",
+                    "notnull",
+                    "pk",
+                    "Unknown description header",
+                ],
+                "data_rows": [
+                    ["raw.orders", "id", "uuid", "yes", "yes", "Identifier"]
+                ],
+            },
+        ],
+    )
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    s2t_report = run_s2t_extraction_subagent(
+        file_id, sheet_group_analysis=analysis
+    )
+
+    with patch(
+        "sheet_skills.s2t._invoke_llm_plain_text", return_value="not-json"
+    ) as mock_llm:
+        with pytest.raises(ColumnCatalogExtractionError, match="Source columns"):
+            extract_column_catalogs(
+                file_id,
+                analysis,
+                s2t_sheet_mappings=s2t_report["sheet_mappings"],
+            )
+
+    mock_llm.assert_called_once()
+    conn = get_db_connection()
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM source_columns WHERE file_id = ?",
+            (file_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 0
+
+
+def test_column_catalog_resolves_missing_sheet_table_from_unique_s2t_pair(s2t_db):
+    file_id = store_excel_data(
+        "missing_column_table.xlsx",
+        "model",
+        [
+            {
+                "sheet_name": "S2T",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": [
+                    "Target Table",
+                    "Target Column",
+                    "Source Table",
+                    "Source Column",
+                    "SQL Transform",
+                ],
+                "data_rows": [
+                    ["mart.orders", "order_id", "raw.orders", "id", "copy"],
+                    ["mart.orders", "payload_id", "raw.payload", "payload", "copy"],
+                ],
+            },
+            {
+                "sheet_name": "Source columns",
+                "skip_reason": None,
+                "header": {"start_row": 0, "row_count": 1, "nested": False},
+                "columns": [
+                    "table",
+                    "column",
+                    "datatype",
+                    "notnull",
+                    "pk",
+                    "comment",
+                ],
+                "data_rows": [
+                    ["raw.orders", "id", "uuid", "yes", "yes", "Ключ"],
+                    [None, "payload", "jsonb", "no", "no", "Тело"],
+                ],
+            },
+        ],
+    )
+    analysis = classify_file_sheet_groups(file_id, use_llm=False)
+    s2t_report = run_s2t_extraction_subagent(
+        file_id, sheet_group_analysis=analysis
+    )
+
+    report = extract_column_catalogs(
+        file_id,
+        analysis,
+        s2t_sheet_mappings=s2t_report["sheet_mappings"],
+    )
+
+    source_report = report["targets"]["source_columns"]
+    assert source_report["missing_table_rows"] == [
+        {
+            "sheet_name": "Source columns",
+            "row_num": 1,
+            "column_name": "payload",
+        }
+    ]
+    assert source_report["resolved_missing_tables"] == [
+        {
+            "sheet_name": "Source columns",
+            "row_num": 1,
+            "column_name": "payload",
+            "table_name": "raw.payload",
+        }
+    ]
+    conn = get_db_connection()
+    try:
+        rows = [
+            tuple(row)
+            for row in conn.execute(
+                """
+                SELECT table_name, column_name, description
+                FROM source_columns WHERE file_id = ?
+                ORDER BY table_name, column_name
+                """,
+                (file_id,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert ("raw.payload", "payload", "Тело") in rows
+    assert not any(
+        table_name == "raw.orders" and column_name == "payload"
+        for table_name, column_name, _ in rows
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "header", "expected"),
+    [
+        (None, "Not Null", (None, False)),
+        ("", "NULL?", (None, False)),
+        ("Yes", "NULL?", (0, False)),
+        ("No", "NULL?", (1, False)),
+        ("Да", "Допускается пустое значение?", (0, False)),
+        ("Нет", "Допускается пустое значение?", (1, False)),
+        ("True", "Обязательное поле", (1, False)),
+        ("False", "Обязательное поле", (0, False)),
+        ("Истина", "Not Null", (1, False)),
+        ("Ложь", "Not Null", (0, False)),
+        ("Истина", "NULL?", (0, False)),
+        ("Ложь", "NULL?", (1, False)),
+        ("mandatory", "NULL?", (1, False)),
+        ("optional", "Not Null", (0, False)),
+        ("обязательно", "NULL?", (1, False)),
+        ("необязательно", "Not Null", (0, False)),
+        ("неизвестно", "Not Null", (None, True)),
+    ],
+)
+def test_column_catalog_normalises_nullable_and_not_null_values(
+    value, header, expected
+):
+    assert _normalise_flag(value, header) == expected
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("NULL?", True),
+        ("Column Null Option", True),
+        ("Nullable", True),
+        ("Допускается NULL", True),
+        ("Допускается пустое значение?", True),
+        ("Not Null", False),
+        ("notnullsource", False),
+        ("Required", False),
+        ("Обязательное поле", False),
+        ("NULL не допускается", False),
+    ],
+)
+def test_column_catalog_detects_header_polarity(header, expected):
+    assert _is_null_question(header) is expected
+
+
+def test_column_catalog_unknown_not_null_does_not_override_known_value():
+    rows, report = _merge_catalog(
+        "target_columns",
+        [],
+        [
+            {
+                "file_id": 1,
+                "sheet_name": "Target columns",
+                "row_num": 770,
+                "table_name": "T_PROD",
+                "column_name": "START_DT",
+                "data_type": None,
+                "primary_key": None,
+                "not_null": None,
+                "description": "Дата начала",
+            },
+            {
+                "file_id": 1,
+                "sheet_name": "Target columns",
+                "row_num": 1136,
+                "table_name": "T_PROD",
+                "column_name": "START_DT",
+                "data_type": None,
+                "primary_key": None,
+                "not_null": 1,
+                "description": None,
+            },
+        ],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["not_null"] == 1
+    assert not [
+        conflict
+        for conflict in report["conflicts"]
+        if conflict["field"] == "not_null"
+    ]
+
+
+def test_column_catalog_reports_conflicting_repeated_descriptions():
+    common = {
+        "file_id": 1,
+        "sheet_name": "Source columns",
+        "table_name": "b3080000460006_payments_2_0_posting_dto",
+        "column_name": "codecommission_uid",
+        "data_type": "uuid",
+        "primary_key": 0,
+        "not_null": 0,
+    }
+    rows, report = _merge_catalog(
+        "source_columns",
+        [],
+        [
+            {
+                **common,
+                "row_num": 132,
+                "description": "Код типа комиссии",
+            },
+            {
+                **common,
+                "row_num": 455,
+                "description": "SK(codecommission)",
+            },
+        ],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["description"] == "Код типа комиссии"
+    assert report["conflicts"] == [
+        {
+            "table_name": "b3080000460006_payments_2_0_posting_dto",
+            "column_name": "codecommission_uid",
+            "field": "description",
+            "selected_source": "columns_sheet",
+            "selected_value": "Код типа комиссии",
+            "other_value": "SK(codecommission)",
+        }
+    ]
+
+
+def test_column_catalog_uses_s2t_not_null_when_columns_sheet_value_is_empty():
+    rows, report = _merge_catalog(
+        "target_columns",
+        [
+            {
+                "file_id": 1,
+                "sheet_name": "S2T",
+                "row_num": 10,
+                "table_name": "mart.orders",
+                "column_name": "order_id",
+                "data_type": None,
+                "primary_key": None,
+                "not_null": 1,
+                "description": None,
+            }
+        ],
+        [
+            {
+                "file_id": 1,
+                "sheet_name": "Target columns",
+                "row_num": 20,
+                "table_name": "mart.orders",
+                "column_name": "order_id",
+                "data_type": "uuid",
+                "primary_key": None,
+                "not_null": None,
+                "description": "Идентификатор заказа",
+            }
+        ],
+    )
+
+    assert rows[0]["not_null"] == 1
+    assert report["source_counts"]["mixed"] == 1
+    assert report["conflicts"] == []
+
+
+def test_column_catalog_does_not_guess_missing_table_with_ambiguous_s2t_pairs():
+    s2t_rows = [
+        {
+            "file_id": 1,
+            "sheet_name": "S2T",
+            "row_num": row_num,
+            "table_name": table_name,
+            "column_name": "id",
+            "description": None,
+        }
+        for row_num, table_name in ((1, "raw.orders"), (2, "raw.clients"))
+    ]
+    sheet_row = {
+        "file_id": 1,
+        "sheet_name": "Source columns",
+        "row_num": 10,
+        "table_name": None,
+        "column_name": "id",
+        "description": "Идентификатор",
+    }
+
+    rows, report = _merge_catalog("source_columns", s2t_rows, [sheet_row])
+
+    assert len(rows) == 3
+    assert any(row["table_name"] is None for row in rows)
+    assert report["resolved_missing_tables"] == []
+    assert report["ambiguous_missing_tables"] == [
+        {
+            "sheet_name": "Source columns",
+            "row_num": 10,
+            "column_name": "id",
+            "candidate_tables": ["raw.clients", "raw.orders"],
+        }
+    ]
+
+
+def test_column_catalog_reports_explicit_not_null_conflict():
+    rows, report = _merge_catalog(
+        "source_columns",
+        [],
+        [
+            {
+                "file_id": 1,
+                "sheet_name": "Source columns",
+                "row_num": 1,
+                "table_name": "raw.orders",
+                "column_name": "id",
+                "not_null": 0,
+            },
+            {
+                "file_id": 1,
+                "sheet_name": "Source columns",
+                "row_num": 2,
+                "table_name": "raw.orders",
+                "column_name": "id",
+                "not_null": 1,
+            },
+        ],
+    )
+
+    assert rows[0]["not_null"] == 0
+    assert report["conflicts"] == [
+        {
+            "table_name": "raw.orders",
+            "column_name": "id",
+            "field": "not_null",
+            "selected_source": "columns_sheet",
+            "selected_value": 0,
+            "other_value": 1,
+        }
+    ]
+
+
+def test_column_catalog_preserves_sheet_column_without_s2t_link(s2t_db):
+    rows, report = _merge_catalog(
+        "source_columns",
+        [],
+        [
+            {
+                "file_id": 1,
+                "sheet_name": "Source columns",
+                "row_num": 7,
+                "table_name": "raw.unused",
+                "column_name": "payload",
+                "data_type": "jsonb",
+                "primary_key": 0,
+                "not_null": 0,
+                "description": "Дополнительная колонка",
+            }
+        ],
+    )
+
+    assert len(rows) == 1
+    assert report["source_counts"]["columns_sheet"] == 1
+    assert report["unlinked_rows"] == [
+        {
+            "sheet_name": "Source columns",
+            "row_num": 7,
+            "table_name": "raw.unused",
+            "column_name": "payload",
+        }
+    ]
+
+
+def test_backfill_column_description_embeddings_uses_names_and_descriptions(s2t_db):
+    conn = get_db_connection()
+    conn.executemany(
+        """
+        INSERT INTO source_columns
+        (file_id, sheet_name, row_num, table_name, column_name,
+         description)
+        VALUES (?, 'Source columns', ?, 'raw.orders', ?, ?)
+        """,
+        [
+            (10, 0, "id", "Идентификатор заказа"),
+            (10, 1, "payload", None),
+            (20, 0, "other_id", "Другой идентификатор"),
+        ],
+    )
+    conn.execute(
+        """
+        INSERT INTO target_columns
+        (file_id, sheet_name, row_num, table_name, column_name,
+         description)
+        VALUES (10, 'Target columns', 0, 'mart.orders', 'order_id',
+                'Ключ витрины')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    assert backfill_column_description_embeddings(10) == {
+        "file_id": 10,
+        "candidates": 3,
+        "updated": 3,
+    }
+
+    conn = get_db_connection()
+    rows = [
+        tuple(row)
+        for row in conn.execute(
+            """
+            SELECT file_id, column_name, description_embedding
+            FROM source_columns
+            UNION ALL
+            SELECT file_id, column_name, description_embedding
+            FROM target_columns
+            ORDER BY file_id, column_name
+            """
+        ).fetchall()
+    ]
+    conn.close()
+    assert rows == [
+        (
+            10,
+            "id",
+            "embedding:Название колонки: id\nОписание: Идентификатор заказа".encode(
+                "utf-8"
+            ),
+        ),
+        (
+            10,
+            "order_id",
+            "embedding:Название колонки: order_id\nОписание: Ключ витрины".encode(
+                "utf-8"
+            ),
+        ),
+        (10, "payload", "embedding:Название колонки: payload".encode("utf-8")),
+        (20, "other_id", None),
     ]
 
 
@@ -1586,6 +2646,102 @@ def test_clear_s2t_transformations_deletes_only_current_file(s2t_db):
     conn.close()
 
     assert rows == [{"id": 3, "file_id": 20}]
+    conn = get_db_connection()
+    try:
+        state = conn.execute(
+            """
+            SELECT desired_revision, applied_revision
+            FROM graph_sync_outbox
+            WHERE file_id = 10
+            """
+        ).fetchone()
+        assert tuple(state) == (1, 0)
+    finally:
+        conn.close()
+
+
+def test_insert_s2t_transformations_enqueues_graph_revision(s2t_db):
+    result = insert_s2t_transformations(
+        10,
+        [
+            {
+                "file_id": 10,
+                "sheet_name": "S2T",
+                "row_num": 1,
+                "target_table": "target_a",
+                "source_table": "source_a",
+            }
+        ],
+    )
+
+    assert result == {"file_id": 10, "count": 1}
+    conn = get_db_connection()
+    try:
+        state = conn.execute(
+            """
+            SELECT desired_revision, applied_revision
+            FROM graph_sync_outbox
+            WHERE file_id = 10
+            """
+        ).fetchone()
+        assert tuple(state) == (1, 0)
+    finally:
+        conn.close()
+
+
+def test_insert_s2t_rolls_back_when_outbox_write_fails(s2t_db):
+    with patch(
+        "storage.s2t.enqueue_graph_sync",
+        side_effect=RuntimeError("outbox unavailable"),
+    ), pytest.raises(RuntimeError, match="outbox unavailable"):
+        insert_s2t_transformations(
+            10,
+            [
+                {
+                    "file_id": 10,
+                    "sheet_name": "S2T",
+                    "row_num": 1,
+                    "target_table": "target_a",
+                }
+            ],
+        )
+
+    conn = get_db_connection()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM s2t_transformations"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_clear_s2t_rolls_back_when_outbox_write_fails(s2t_db):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO s2t_transformations
+            (id, file_id, sheet_name, row_num, target_table)
+            VALUES (1, 10, 'S2T', 1, 'target_a')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with patch(
+        "storage.s2t.enqueue_graph_sync",
+        side_effect=RuntimeError("outbox unavailable"),
+    ), pytest.raises(RuntimeError, match="outbox unavailable"):
+        clear_s2t_transformations(10)
+
+    conn = get_db_connection()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM s2t_transformations WHERE file_id = 10"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_list_s2t_transformations_without_file_id_reads_global_table(s2t_db):
@@ -1636,3 +2792,39 @@ def test_list_s2t_transformations_selects_columns(s2t_db):
 
     assert result["columns"] == ["transformation_rule"]
     assert result["rows"] == [{"transformation_rule": "source.value"}]
+
+
+def test_list_s2t_transformations_filters_exact_mapping_fields(s2t_db):
+    conn = get_db_connection()
+    conn.executemany(
+        """
+        INSERT INTO s2t_transformations
+        (id, file_id, sheet_name, row_num, source_table, source_field,
+         target_table, target_field)
+        VALUES (?, 10, 'S2T', ?, ?, ?, ?, ?)
+        """,
+        [
+            (21, 1, "s_exact", "source_id", "t_exact", "target_id"),
+            (22, 2, "s_exact", "other_id", "t_exact", "target_id"),
+            (23, 3, "s_exact", "source_id", "t_exact", "other_id"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = list_s2t_transformations(
+        file_id=None,
+        source_table="s_exact",
+        source_field="source_id",
+        target_table="t_exact",
+        target_field="target_id",
+    )
+
+    assert result["total"] == 1
+    assert result["filters"] == {
+        "target_table": "t_exact",
+        "source_table": "s_exact",
+        "target_field": "target_id",
+        "source_field": "source_id",
+    }
+    assert result["rows"][0]["row_num"] == 1

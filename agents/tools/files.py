@@ -16,16 +16,16 @@ def list_files() -> List[Dict[str, Any]]:
     инструменты. Пустой список означает, что в таблице files сейчас нет
     сохранённых загрузок.
 
-    Возвращает имя файла, сохранённое краткое описание и время загрузки. Внутренний
-    file_id намеренно не показывается в общем каталоге; для последующего обращения
-    к конкретному файлу по точному имени предназначен resolve_file.
+    Возвращает реальный file_id, имя файла, сохранённое краткое описание и время
+    загрузки. Для разрешения одного названного пользователем файла по точному имени
+    без загрузки всего каталога предназначен resolve_file.
     """
     from storage.database import get_db_connection
     conn = get_db_connection()
     try:
         rows = conn.execute(
             """
-            SELECT filename, description, upload_time
+            SELECT file_id, filename, description, upload_time
             FROM files
             ORDER BY upload_time DESC
             """
@@ -97,7 +97,7 @@ def get_file_description(file_id: int) -> Dict[str, Any]:
     отдельно.
 
     Args:
-        file_id: Числовой идентификатор загрузки из UI или resolve_file.
+        file_id: Явный числовой идентификатор загрузки или результат resolve_file.
     """
     from storage.database import get_db_connection
 

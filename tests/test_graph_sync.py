@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from graph_storage.config import Neo4jSettings
 from storage.database import get_db_connection
 
@@ -133,15 +135,67 @@ def test_file_graph_projection_preserves_exact_names_and_duplicate_rows(temp_db)
         (
             row["transformation_id"],
             row["sql_query"],
+            row["rule_status"],
         )
         for row in projection["table_lineage"]
     ] == [
-        (901, "SELECT source_id FROM exact_source"),
+        (901, "SELECT source_id FROM exact_source", "present"),
         (
             902,
             "SELECT source_id FROM exact_source WHERE source_id IS NOT NULL",
+            "present",
         ),
     ]
+
+
+def test_file_graph_projection_keeps_table_lineage_without_rule(temp_db):
+    from services.graph_sync import _build_file_graph_projection
+
+    _insert_graph_source_rows()
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO s2t_transformations
+            (id, file_id, sheet_name, row_num,
+             target_table, target_field, source_table, source_field,
+             transformation_rule, source_layer, target_layer)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                903,
+                501,
+                "S2T",
+                5,
+                "Target Without Rule",
+                "target_value",
+                "Source Without Rule",
+                "source_value",
+                "   ",
+                "B",
+                "T",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    projection = _build_file_graph_projection(501)
+
+    column_edge = next(
+        row
+        for row in projection["lineage"]
+        if row["transformation_id"] == 903
+    )
+    table_edge = next(
+        row
+        for row in projection["table_lineage"]
+        if row["transformation_id"] == 903
+    )
+    assert column_edge["source_column_key"]
+    assert column_edge["target_column_key"]
+    assert table_edge["sql_query"] is None
+    assert table_edge["rule_status"] == "missing"
 
 
 def test_file_graph_projection_adds_table_scoped_wildcard_columns(temp_db):
@@ -254,6 +308,8 @@ def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_d
 
     assert report == {
         "file_id": 501,
+        "desired_revision": 1,
+        "applied_revision": 1,
         "columns": 2,
         "lineage_relationships": 2,
         "wildcard_membership_relationships": 0,
@@ -292,21 +348,24 @@ def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_d
     table_lineage_call = tx.run.call_args_list[5]
     assert "CREATE (source)-[:TABLE_TRANSFORMS_TO" in table_lineage_call.args[0]
     assert "wildcard_passthrough" not in table_lineage_call.args[0]
+    assert "rule_status: row.rule_status" in table_lineage_call.args[0]
     assert [
         (
             row["transformation_id"],
             row["source_layer"],
             row["target_layer"],
             row["sql_query"],
+            row["rule_status"],
         )
         for row in table_lineage_call.kwargs["rows"]
     ] == [
-        (901, "B", "T", "SELECT source_id FROM exact_source"),
+        (901, "B", "T", "SELECT source_id FROM exact_source", "present"),
         (
             902,
             "B",
             "T",
             "SELECT source_id FROM exact_source WHERE source_id IS NOT NULL",
+            "present",
         ),
     ]
 
@@ -329,6 +388,110 @@ def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_d
         "WRITES_TO",
     ):
         assert removed_relationship not in write_queries
+
+
+def test_sync_file_graph_applies_empty_projection_after_s2t_delete(temp_db):
+    from services.graph_sync import sync_file_graph
+    from storage.s2t import clear_s2t_transformations
+
+    _insert_graph_source_rows()
+    assert clear_s2t_transformations(501) == 2
+
+    settings = Neo4jSettings(
+        uri="neo4j://localhost:7687",
+        username="neo4j",
+        password="secret",
+        database="neo4j",
+    )
+    driver = MagicMock()
+    session = driver.session.return_value.__enter__.return_value
+    tx = MagicMock()
+    tx.run.return_value.consume.return_value = None
+    session.execute_write.side_effect = (
+        lambda operation, projection: operation(tx, projection)
+    )
+
+    with patch(
+        "services.graph_sync.load_neo4j_settings",
+        return_value=settings,
+    ), patch(
+        "services.graph_sync.create_neo4j_driver",
+        return_value=driver,
+    ):
+        report = sync_file_graph(501)
+
+    assert report == {
+        "file_id": 501,
+        "desired_revision": 1,
+        "applied_revision": 1,
+        "columns": 0,
+        "lineage_relationships": 0,
+        "wildcard_membership_relationships": 0,
+        "tables": 0,
+        "table_lineage_relationships": 0,
+    }
+    assert "DETACH DELETE node" in tx.run.call_args_list[0].args[0]
+    assert all(
+        call.kwargs.get("rows") == []
+        for call in tx.run.call_args_list[1:]
+    )
+
+
+def test_failed_graph_sync_keeps_revision_pending_for_retry(temp_db):
+    from services.graph_sync import sync_file_graph, sync_pending_graph_projections
+    from storage.graph_outbox import get_graph_sync_state, request_graph_sync
+
+    _insert_graph_source_rows()
+    request_graph_sync(501)
+    settings = Neo4jSettings(
+        uri="neo4j://localhost:7687",
+        username="neo4j",
+        password="secret",
+        database="neo4j",
+    )
+    failed_driver = MagicMock()
+    failed_session = failed_driver.session.return_value.__enter__.return_value
+    failed_session.execute_write.side_effect = RuntimeError("neo4j unavailable")
+
+    with patch(
+        "services.graph_sync.load_neo4j_settings",
+        return_value=settings,
+    ), patch(
+        "services.graph_sync.create_neo4j_driver",
+        return_value=failed_driver,
+    ), pytest.raises(RuntimeError, match="neo4j unavailable"):
+        sync_file_graph(501)
+
+    failed_state = get_graph_sync_state(501)
+    assert failed_state["desired_revision"] == 1
+    assert failed_state["applied_revision"] == 0
+    assert failed_state["attempts"] == 1
+    assert failed_state["last_error"] == "neo4j unavailable"
+
+    retry_driver = MagicMock()
+    retry_session = retry_driver.session.return_value.__enter__.return_value
+    retry_tx = MagicMock()
+    retry_tx.run.return_value.consume.return_value = None
+    retry_session.execute_write.side_effect = (
+        lambda operation, projection: operation(retry_tx, projection)
+    )
+    with patch(
+        "services.graph_sync.load_neo4j_settings",
+        return_value=settings,
+    ), patch(
+        "services.graph_sync.create_neo4j_driver",
+        return_value=retry_driver,
+    ):
+        report = sync_pending_graph_projections()
+
+    assert report["pending"] == 1
+    assert report["errors"] == []
+    assert report["applied"][0]["applied_revision"] == 1
+    applied_state = get_graph_sync_state(501)
+    assert applied_state["desired_revision"] == 1
+    assert applied_state["applied_revision"] == 1
+    assert applied_state["attempts"] == 0
+    assert applied_state["last_error"] is None
 
 
 def test_file_graph_projection_skips_edge_without_source_column(temp_db):

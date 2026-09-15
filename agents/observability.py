@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
+from .env_flags import read_binary_env_flag
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -12,13 +14,13 @@ _langfuse_client = None
 
 
 def is_langfuse_configured() -> bool:
-    enabled = (os.getenv("LANGFUSE_ENABLED") or "true").strip().lower()
-    if enabled in {"0", "false", "no", "off"}:
+    if not read_binary_env_flag("LANGFUSE_ENABLED", default=False):
         return False
     return bool(
         (os.getenv("LANGFUSE_PUBLIC_KEY") or "").strip()
         and (os.getenv("LANGFUSE_SECRET_KEY") or "").strip()
     )
+
 
 def get_langfuse_client():
     global _langfuse_client

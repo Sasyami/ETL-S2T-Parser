@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from config.table_layers import resolve_sheet_layers
 
 from .database import S2T_RECORD_FIELDS, _sql_identifier, get_db_connection
+from .graph_outbox import enqueue_graph_sync
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,8 @@ def insert_s2t_transformations(file_id: int, records: List[Dict[str, Any]]) -> D
                 for row in records
             ],
         )
+        if records:
+            enqueue_graph_sync(cursor, file_id)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -61,14 +64,27 @@ def insert_s2t_transformations(file_id: int, records: List[Dict[str, Any]]) -> D
 
 
 def clear_s2t_transformations(file_id: int) -> int:
-    """Delete generated S2T transformation rows for one workbook."""
+    """Delete one file's S2T rows and enqueue its graph rebuild atomically."""
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) AS n FROM s2t_transformations WHERE file_id = ?", (file_id,))
-    deleted = int(cursor.fetchone()["n"])
-    cursor.execute("DELETE FROM s2t_transformations WHERE file_id = ?", (file_id,))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN")
+        cursor.execute(
+            "SELECT COUNT(*) AS n FROM s2t_transformations WHERE file_id = ?",
+            (int(file_id),),
+        )
+        deleted = int(cursor.fetchone()["n"])
+        cursor.execute(
+            "DELETE FROM s2t_transformations WHERE file_id = ?",
+            (int(file_id),),
+        )
+        enqueue_graph_sync(cursor, int(file_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     logger.info("Cleared %s S2T transformation rows for file %s", deleted, file_id)
     return deleted
 
@@ -77,7 +93,12 @@ def list_s2t_transformations(
     file_id: Optional[int] = None,
     limit: Optional[int] = 200,
     q: Optional[str] = None,
+    q_any: Optional[List[str]] = None,
     columns: Optional[List[str]] = None,
+    target_table: Optional[str] = None,
+    source_table: Optional[str] = None,
+    target_field: Optional[str] = None,
+    source_field: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return minimal stored S2T transformations for UI/API browsing."""
     clean_limit = None if limit is None else max(1, min(int(limit or 200), 1000))
@@ -102,12 +123,36 @@ def list_s2t_transformations(
     if file_id is not None:
         where.insert(0, "file_id = ?")
         params.append(int(file_id))
-    if q:
-        pattern = f"%{q.strip()}%"
-        where.append(
-            "(" + " OR ".join(f"{_sql_identifier(field)} LIKE ?" for field in S2T_RECORD_FIELDS) + ")"
-        )
-        params.extend([pattern] * len(S2T_RECORD_FIELDS))
+    query_terms = [str(q).strip()] if q and str(q).strip() else []
+    query_terms.extend(
+        str(item).strip()
+        for item in (q_any or [])
+        if str(item).strip()
+    )
+    query_terms = list(dict.fromkeys(query_terms))
+    if query_terms:
+        term_conditions = []
+        for term in query_terms:
+            term_conditions.append(
+                "("
+                + " OR ".join(
+                    f"{_sql_identifier(field)} LIKE ?"
+                    for field in S2T_RECORD_FIELDS
+                )
+                + ")"
+            )
+            params.extend([f"%{term}%"] * len(S2T_RECORD_FIELDS))
+        where.append("(" + " OR ".join(term_conditions) + ")")
+    exact_filters = {
+        "target_table": str(target_table or "").strip(),
+        "source_table": str(source_table or "").strip(),
+        "target_field": str(target_field or "").strip(),
+        "source_field": str(source_field or "").strip(),
+    }
+    for field_name, field_value in exact_filters.items():
+        if field_value:
+            where.append(f"TRIM({_sql_identifier(field_name)}) = ? COLLATE NOCASE")
+            params.append(field_value)
     where_sql = " AND ".join(where)
     selected_columns_sql = ", ".join(
         _sql_identifier(column) for column in selected_columns
@@ -139,6 +184,13 @@ def list_s2t_transformations(
     }
     if file_id is not None:
         result["file_id"] = int(file_id)
+    applied_filters = {
+        field_name: field_value
+        for field_name, field_value in exact_filters.items()
+        if field_value
+    }
+    if applied_filters:
+        result["filters"] = applied_filters
     return result
 
 

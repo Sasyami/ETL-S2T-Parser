@@ -49,6 +49,12 @@ SOURCE_TABLE_FIELDS = tuple(
 TARGET_TABLE_FIELDS = tuple(
     get_usefull_col_extraction_target("target_tables")["fields"]
 )
+SOURCE_COLUMN_FIELDS = tuple(
+    get_usefull_col_extraction_target("source_columns")["fields"]
+)
+TARGET_COLUMN_FIELDS = tuple(
+    get_usefull_col_extraction_target("target_columns")["fields"]
+)
 ADDITIONAL_OBJECT_FIELDS = tuple(
     get_usefull_col_extraction_target("additional_objects")["fields"]
 )
@@ -66,9 +72,28 @@ SOURCE_TABLE_COLUMNS = (
 TARGET_TABLE_COLUMNS = (
     EXTRACTION_METADATA_COLUMNS + TARGET_TABLE_FIELDS + ("description_embedding",)
 )
+SOURCE_COLUMN_COLUMNS = (
+    EXTRACTION_METADATA_COLUMNS
+    + SOURCE_COLUMN_FIELDS
+    + ("description_embedding",)
+)
+TARGET_COLUMN_COLUMNS = (
+    EXTRACTION_METADATA_COLUMNS
+    + TARGET_COLUMN_FIELDS
+    + ("description_embedding",)
+)
 ADDITIONAL_OBJECT_COLUMNS = EXTRACTION_METADATA_COLUMNS + ADDITIONAL_OBJECT_FIELDS
 PXF_TO_A_COLUMNS = EXTRACTION_METADATA_COLUMNS + PXF_TO_A_FIELDS
 S2T_TRANSFORMATION_COLUMNS = EXTRACTION_METADATA_COLUMNS + S2T_RECORD_FIELDS
+GRAPH_SYNC_OUTBOX_COLUMNS = (
+    "file_id",
+    "desired_revision",
+    "applied_revision",
+    "attempts",
+    "last_error",
+    "updated_at",
+    "applied_at",
+)
 DATA_COLUMNS = (
     "id",
     "file_id",
@@ -77,38 +102,39 @@ DATA_COLUMNS = (
     "column_id",
     "value",
 )
-CORE_TABLES = (
-    "files",
-    "data",
-    "file_sheet_headers",
-    "source_tables",
-    "target_tables",
-    "additional_objects",
-    "pxf_to_a",
-    "s2t_transformations",
-)
 USER_FACING_TABLES = (
     "files",
     "file_sheet_headers",
     "source_tables",
     "target_tables",
+    "source_columns",
+    "target_columns",
     "additional_objects",
     "pxf_to_a",
     "s2t_transformations",
     "data",
 )
-INTERNAL_TABLES = ()
-STORAGE_SCHEMA_TABLE_ORDER = USER_FACING_TABLES
+INTERNAL_TABLES = ("graph_sync_outbox",)
+CORE_TABLES = USER_FACING_TABLES + INTERNAL_TABLES
+STORAGE_SCHEMA_TABLE_ORDER = CORE_TABLES
 STORAGE_SCHEMA_COLUMNS = {
     "files": FILES_COLUMNS,
     "file_sheet_headers": FILE_SHEET_HEADER_COLUMNS,
     "source_tables": SOURCE_TABLE_COLUMNS,
     "target_tables": TARGET_TABLE_COLUMNS,
+    "source_columns": SOURCE_COLUMN_COLUMNS,
+    "target_columns": TARGET_COLUMN_COLUMNS,
     "additional_objects": ADDITIONAL_OBJECT_COLUMNS,
     "pxf_to_a": PXF_TO_A_COLUMNS,
     "s2t_transformations": S2T_TRANSFORMATION_COLUMNS,
     "data": DATA_COLUMNS,
+    "graph_sync_outbox": GRAPH_SYNC_OUTBOX_COLUMNS,
 }
+PRE_COLUMN_CATALOG_CORE_TABLES = tuple(
+    table_name
+    for table_name in USER_FACING_TABLES
+    if table_name not in {"source_columns", "target_columns"}
+)
 
 
 def _sql_identifier(value: str) -> str:
@@ -120,6 +146,15 @@ def _sql_identifier(value: str) -> str:
 def _text_columns_sql(fields: tuple[str, ...], indent: str) -> str:
     return (",\n" + indent).join(
         f"{_sql_identifier(field)} TEXT" for field in fields
+    )
+
+
+def _column_catalog_fields_sql(fields: tuple[str, ...], indent: str) -> str:
+    integer_fields = {"primary_key", "not_null"}
+    return (",\n" + indent).join(
+        f"{_sql_identifier(field)} "
+        + ("INTEGER" if field in integer_fields else "TEXT")
+        for field in fields
     )
 
 
@@ -252,6 +287,25 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
             )
             """
         )
+    for table_name in ("source_columns", "target_columns"):
+        fields = (
+            SOURCE_COLUMN_FIELDS
+            if table_name == "source_columns"
+            else TARGET_COLUMN_FIELDS
+        )
+        fields_sql = _column_catalog_fields_sql(fields, "                ")
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {names[table_name]} (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER,
+                sheet_name TEXT,
+                row_num INTEGER,
+                {fields_sql},
+                description_embedding BLOB
+            )
+            """
+        )
     for table_name, fields in (
         ("additional_objects", ADDITIONAL_OBJECT_FIELDS),
         ("pxf_to_a", PXF_TO_A_FIELDS),
@@ -279,7 +333,20 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
             {s2t_fields_sql}
         )
         """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {names['graph_sync_outbox']} (
+            file_id INTEGER PRIMARY KEY,
+            desired_revision INTEGER NOT NULL DEFAULT 0,
+            applied_revision INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            applied_at TEXT
         )
+        """
+    )
 
 
 def _legacy_schema_recovery_hint(cursor: sqlite3.Cursor) -> str:
@@ -302,9 +369,15 @@ def _legacy_schema_recovery_hint(cursor: sqlite3.Cursor) -> str:
     )
 
 
-def _schema_mismatches(cursor: sqlite3.Cursor) -> List[str]:
+def _schema_mismatches(
+    cursor: sqlite3.Cursor,
+    table_names: Optional[tuple[str, ...]] = None,
+) -> List[str]:
     mismatches: List[str] = []
+    selected = set(table_names or STORAGE_SCHEMA_COLUMNS)
     for table_name, expected_columns in STORAGE_SCHEMA_COLUMNS.items():
+        if table_name not in selected:
+            continue
         actual_columns = _table_columns(cursor, table_name)
         if actual_columns != list(expected_columns):
             mismatches.append(
@@ -316,35 +389,42 @@ def _schema_mismatches(cursor: sqlite3.Cursor) -> List[str]:
         "data": "id",
         "source_tables": "id",
         "target_tables": "id",
+        "source_columns": "id",
+        "target_columns": "id",
         "additional_objects": "id",
         "pxf_to_a": "id",
         "s2t_transformations": "id",
+        "graph_sync_outbox": "file_id",
     }
     for table_name, key_name in integer_primary_keys.items():
+        if table_name not in selected:
+            continue
         info = {str(row[1]): row for row in _table_info(cursor, table_name)}
         key = info.get(key_name)
         if key is None or str(key[2]).upper() != "INTEGER" or int(key[5]) != 1:
             mismatches.append(
                 f"{table_name}.{key_name}: expected INTEGER PRIMARY KEY"
             )
-    headers_info = {
-        str(row[1]): row for row in _table_info(cursor, "file_sheet_headers")
-    }
-    file_key = headers_info.get("file_id")
-    name_key = headers_info.get("sheet_name")
-    if (
-        file_key is None
-        or name_key is None
-        or int(file_key[5]) != 1
-        or int(name_key[5]) != 2
-    ):
-        mismatches.append(
-            "file_sheet_headers: expected PRIMARY KEY (file_id, sheet_name)"
-        )
-    data_info = {str(row[1]): row for row in _table_info(cursor, "data")}
-    column_id = data_info.get("column_id")
-    if column_id is None or str(column_id[2]).upper() != "INTEGER":
-        mismatches.append("data.column_id: expected INTEGER")
+    if "file_sheet_headers" in selected:
+        headers_info = {
+            str(row[1]): row for row in _table_info(cursor, "file_sheet_headers")
+        }
+        file_key = headers_info.get("file_id")
+        name_key = headers_info.get("sheet_name")
+        if (
+            file_key is None
+            or name_key is None
+            or int(file_key[5]) != 1
+            or int(name_key[5]) != 2
+        ):
+            mismatches.append(
+                "file_sheet_headers: expected PRIMARY KEY (file_id, sheet_name)"
+            )
+    if "data" in selected:
+        data_info = {str(row[1]): row for row in _table_info(cursor, "data")}
+        column_id = data_info.get("column_id")
+        if column_id is None or str(column_id[2]).upper() != "INTEGER":
+            mismatches.append("data.column_id: expected INTEGER")
     return mismatches
 
 
@@ -369,10 +449,22 @@ def _create_indexes(cursor: sqlite3.Cursor) -> None:
     for table_name in ("source_tables", "target_tables"):
         cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_file ON {table_name}(file_id)")
         cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name ON {table_name}(table_name)")
+    for table_name in ("source_columns", "target_columns"):
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table_name}_file ON {table_name}(file_id)"
+        )
+        cursor.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table_name}_identity "
+            f"ON {table_name}(file_id, table_name, column_name)"
+        )
     for table_name in ("additional_objects", "pxf_to_a"):
         cursor.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{table_name}_file ON {table_name}(file_id)"
         )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_graph_sync_outbox_pending "
+        "ON graph_sync_outbox(desired_revision, applied_revision)"
+    )
 
 
 def init_db() -> None:
@@ -385,6 +477,12 @@ def init_db() -> None:
             table_name for table_name in CORE_TABLES if _table_exists(cursor, table_name)
         ]
         if existing_core_tables:
+            legacy_mismatches = _schema_mismatches(
+                cursor, PRE_COLUMN_CATALOG_CORE_TABLES
+            )
+            if not legacy_mismatches:
+                _create_current_tables(cursor)
+                _migrate_column_catalog_schema(cursor)
             mismatches = _schema_mismatches(cursor)
             if mismatches:
                 legacy_hint = _legacy_schema_recovery_hint(cursor)
@@ -407,6 +505,101 @@ def init_db() -> None:
     finally:
         conn.close()
     logger.info("Database initialized with the current schema")
+
+
+def _migrate_column_catalog_schema(cursor: sqlite3.Cursor) -> List[str]:
+    """Remove derived provenance/alias fields while preserving catalog facts."""
+    rebuilt: List[str] = []
+    for table_name, fields in (
+        ("source_columns", SOURCE_COLUMN_FIELDS),
+        ("target_columns", TARGET_COLUMN_FIELDS),
+    ):
+        actual_columns = _table_columns(cursor, table_name)
+        current_columns = list(
+            EXTRACTION_METADATA_COLUMNS + fields + ("description_embedding",)
+        )
+        if actual_columns == current_columns:
+            continue
+        base_columns = list(EXTRACTION_METADATA_COLUMNS + fields)
+        supported_previous = {
+            tuple(base_columns + ["metadata_source"]),
+            tuple(base_columns + ["metadata_source", "description_embedding"]),
+            tuple(
+                base_columns
+                + [
+                    "metadata_source",
+                    "description_embedding",
+                    "description_aliases",
+                ]
+            ),
+        }
+        if tuple(actual_columns) not in supported_previous:
+            continue
+
+        replacement = f"{table_name}__catalog_schema"
+        fields_sql = _column_catalog_fields_sql(fields, "                ")
+        cursor.execute(
+            f"""
+            CREATE TABLE {_sql_identifier(replacement)} (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER,
+                sheet_name TEXT,
+                row_num INTEGER,
+                {fields_sql},
+                description_embedding BLOB
+            )
+            """
+        )
+        copy_columns = base_columns + ["description_embedding"]
+        invalidate_embedding = "description_aliases" in actual_columns
+        select_columns = [
+            (
+                "NULL"
+                if column == "description_embedding" and invalidate_embedding
+                else _sql_identifier(column)
+                if column in actual_columns
+                else "NULL"
+            )
+            for column in copy_columns
+        ]
+        cursor.execute(
+            f"INSERT INTO {_sql_identifier(replacement)} "
+            f"({', '.join(_sql_identifier(column) for column in copy_columns)}) "
+            f"SELECT {', '.join(select_columns)} "
+            f"FROM {_sql_identifier(table_name)}"
+        )
+        cursor.execute(f"DROP TABLE {_sql_identifier(table_name)}")
+        cursor.execute(
+            f"ALTER TABLE {_sql_identifier(replacement)} "
+            f"RENAME TO {_sql_identifier(table_name)}"
+        )
+        rebuilt.append(table_name)
+    return rebuilt
+
+
+def migrate_column_catalog_schema() -> Dict[str, Any]:
+    """Remove obsolete column provenance/alias fields from prior schemas."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN")
+        rebuilt = _migrate_column_catalog_schema(cursor)
+        mismatches = _schema_mismatches(
+            cursor, ("source_columns", "target_columns")
+        )
+        if mismatches:
+            raise DatabaseSchemaError(
+                "Нельзя обновить схему каталогов колонок: "
+                + "; ".join(mismatches)
+            )
+        _create_indexes(cursor)
+        conn.commit()
+        return {"changed": bool(rebuilt), "tables_rebuilt": rebuilt}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def migrate_s2t_layer_columns() -> Dict[str, Any]:
@@ -446,6 +639,17 @@ def clear_all_data() -> Dict[str, int]:
     try:
         cursor = conn.cursor()
         cursor.execute("BEGIN")
+        projection_file_ids: set[int] = set()
+        for table_name in ("files", "s2t_transformations", "graph_sync_outbox"):
+            if not _table_exists(cursor, table_name):
+                continue
+            projection_file_ids.update(
+                int(row[0])
+                for row in cursor.execute(
+                    f"SELECT DISTINCT file_id FROM {_sql_identifier(table_name)} "
+                    "WHERE file_id IS NOT NULL"
+                ).fetchall()
+            )
         deleted = {
             table_name: (
                 int(
@@ -462,6 +666,11 @@ def clear_all_data() -> Dict[str, int]:
             cursor.execute(f"DROP TABLE IF EXISTS {_sql_identifier(table_name)}")
         _create_current_tables(cursor)
         _create_indexes(cursor)
+        if projection_file_ids:
+            from .graph_outbox import enqueue_graph_sync
+
+            for file_id in sorted(projection_file_ids):
+                enqueue_graph_sync(cursor, file_id)
         mismatches = _schema_mismatches(cursor)
         if mismatches:
             raise DatabaseSchemaError(

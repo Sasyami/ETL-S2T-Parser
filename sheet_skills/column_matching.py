@@ -58,6 +58,13 @@ def _best_alias_match(
     return best
 
 
+def best_alias_match(
+    column: Dict[str, Any], aliases: Iterable[str]
+) -> Tuple[float, Optional[str], str, Optional[str]]:
+    """Return the strongest configured alias match for one stored column."""
+    return _best_alias_match(column, aliases)
+
+
 def load_columns(
     file_id: int,
     sheet_name: str,
@@ -227,6 +234,7 @@ def clean_value(value: Any) -> Optional[str]:
 
 
 __all__ = [
+    "best_alias_match",
     "candidate_sheets",
     "clean_value",
     "column_evidence",

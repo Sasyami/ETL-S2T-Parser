@@ -358,50 +358,38 @@ def trace_transformation_path(
 ) -> Dict[str, Any]:
     """Построить многоуровневый объяснимый путь из сохранённых S2T-фактов.
 
-    Используй для вопросов о правилах цепочки, исходном SQL, additional objects,
-    подтверждении Neo4j, «как значение приходит», end-to-end source → target и
-    для явной просьбы показать сохранённый путь схемой: tool сразу возвращает
-    готовую text_diagram; обычный trace_neo4j_lineage этих фактов не возвращает.
-    Инструмент строит многошаговые пути по глобальной
-    s2t_transformations без фильтра file_id, но никогда не склеивает одинаковые
-    имена из разных файлов. Для каждого шага отличает прямую трансформацию
-    (NULL, пусто или ровно "-"), выражение и полный SQL; полный SQL разбирает
-    SQLGlot и связывает с additional_objects.sql того же файла. При включённом
-    include_neo4j добавляет только подтверждающие графовые рёбра. Отсутствие
-    графового ребра не отменяет факты SQLite.
+    Это основной reader для полного, упорядоченного или транзитивного lineage
+    сохранённых S2T-фактов. Один вызов проходит от точного endpoint до всех
+    достижимых конечных endpoint, включая ветви, subquery, правила/SQL,
+    additional objects и готовую схему пути. Для сравнения нескольких известных
+    endpoint вызови tool независимо для каждого со своей точной парой; результат
+    другого endpoint не является входом. Для одной точной пары
+    source_table.source_field → target_table.target_field и её правила используй
+    four-role exact S2T tool; сама стрелка не означает многошаговый путь.
 
-    Используй, когда важны не только соседние source/target, но и порядок
-    нескольких шагов, текст каждого правила и участие additional_objects. Для
-    простой выдачи строк предпочитай list/search_s2t_transformations, для одного
-    прямого графового соседа — Neo4j trace tools. Этот же tool используется при
-    просьбе показать путь схемой: он всегда возвращает готовые text_diagram,
-    Mermaid-код и edges без второго анализа. table_name и column_name сравниваются
-    как точные имена без смысловой подстановки. include_neo4j не превращает
-    Neo4j в fallback и не удаляет SQLite-пути, которых нет в проекции. Пустой
-    paths означает, что из указанной стартовой точки в выбранном направлении не
-    собран путь по сохранённым S2T-рёбрам.
+    Стартовая точка всегда является точной парой одной роли:
+    - downstream: source_table + source_field;
+    - upstream: target_table + target_field;
+    - both: точная пара известной стороны, если нужны оба направления.
+    Копируй пару из task или принятого результата. Не составляй table_name из
+    имени колонки, literal или SQL alias. Если точное имя таблицы неизвестно,
+    сначала разреши его через search_s2t_transformations. Полную ссылку
+    table_name.column_name разделяй по последней точке; tool также нормализует
+    совместимые полные ссылки детерминированно.
 
-    Если пользователь указал колонку в форме table_name.column_name, желательно
-    разделить ссылку: имя таблицы передать в table_name, а в column_name — только
-    имя колонки без префикса. Инструмент также детерминированно исправляет обе
-    совместимые формы: полную ссылку в column_name и полную ссылку в table_name,
-    когда column_name уже содержит совпадающий последний сегмент.
-
-    Для downstream table_name и column_name означают пару source_table + source_field,
-    для upstream — target_table + target_field. Режим both сначала
-    ищет обе точные пары, а при их отсутствии также разрешает комбинации ролей
-    внутри одной S2T-строки: target_table + source_field и source_table +
-    target_field. Для такой комбинации стартом становится фактическая сторона
-    названной колонки, после чего путь обходится в обе стороны. Если пользователь
-    требует только downstream или только upstream, но передал смешанную пару,
-    сначала разреши фактические роли через search_s2t_transformations.
+    Точную пару из task не нужно предварительно искать в каталоге. Tool читает
+    глобальную s2t_transformations без автоматического file_id и не склеивает
+    одноимённые объекты разных файлов. Каждый шаг содержит сохранённое
+    правило, разобранный SQL и связанные additional objects. include_neo4j
+    добавляет необязательное подтверждение, но не заменяет SQLite и не удаляет
+    SQLite-пути при недоступности либо ошибке Neo4j. Результат уже содержит
+    paths, text_diagram, Mermaid-код и edges;
+    не дублируй его отдельными list/Neo4j-вызовами. Пустой paths означает только
+    отсутствие пути от переданной точной стартовой пары в выбранном направлении.
 
     Args:
-        table_name: Точное имя исходной или целевой логической ETL-таблицы;
-            совместимая полная ссылка table_name.column_name нормализуется,
-            если column_name передан отдельно и совпадает с последним сегментом.
-        column_name: Опциональное точное имя колонки без префикса таблицы;
-            null строит путь таблиц.
+        table_name: Точное полное имя исходной или целевой ETL-таблицы.
+        column_name: Точное имя колонки без префикса; null строит путь таблиц.
         direction: upstream, downstream или оба направления both.
         max_depth: Максимальная длина пути, от 1 до 10.
         limit: Максимальное число возвращаемых путей, от 1 до 50.
@@ -490,15 +478,17 @@ def trace_transformation_path(
         "direction": direction,
         "max_depth": clean_depth,
         "returned_paths": len(paths),
+        # Put compact complete lineage before verbose per-step SQL so bounded
+        # model previews still expose every branch and endpoint.
+        "text_diagram": _text_path_diagram(paths),
+        "edges": display_edges,
+        "mermaid": _mermaid_path_diagram(display_edges),
         "paths": paths,
         "neo4j_evidence": (
             _neo4j_evidence(transformation_ids)
             if include_neo4j
             else {"included": False, "rows": []}
         ),
-        "text_diagram": _text_path_diagram(paths),
-        "mermaid": _mermaid_path_diagram(display_edges),
-        "edges": display_edges,
     }
 
 

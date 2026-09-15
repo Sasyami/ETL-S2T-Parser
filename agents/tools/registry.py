@@ -4,6 +4,13 @@ from typing import Dict, Iterable, Tuple
 
 from langchain_core.tools import BaseTool
 
+from ..contracts import WorkerCapability
+from ..experiment_flags import (
+    S2T_NARROW_TOOLS_EXPERIMENT_ENV,
+    experiment_flag_enabled,
+)
+
+from .additional_objects import list_additional_objects, search_additional_objects
 from .files import (
     get_file_description,
     list_files,
@@ -11,12 +18,38 @@ from .files import (
     update_file_description,
     update_table_info_from_user_query,
 )
+from .columns import (
+    filter_column_catalog,
+    get_source_target_column_pair,
+    list_column_catalog,
+    list_column_metadata,
+    list_source_column_catalog,
+    list_target_column_catalog,
+    search_column_catalog,
+)
 from .planning import show_plan
 from .data import get_excel_row, search_excel_values, semantic_search_descriptions
-from .neo4j import run_cypher, trace_neo4j_lineage, trace_neo4j_table_lineage
+from .neo4j import (
+    run_cypher,
+    trace_neo4j_lineage,
+    trace_neo4j_table_lineage,
+    trace_neo4j_table_path,
+)
 from .s2t import (
+    get_s2t_rules_by_ids,
+    list_s2t_occurrences,
+    list_s2t_field_mapping,
+    list_s2t_source_field,
+    list_s2t_source_table,
+    list_s2t_table_mapping,
     list_s2t_table_names,
+    list_s2t_target_field,
+    list_s2t_target_table,
     list_s2t_transformations,
+    read_s2t_by_source_table,
+    read_s2t_by_target_table,
+    read_s2t_mapping,
+    read_s2t_source_to_target,
     search_s2t_transformations,
     summarize_s2t_tables,
     summarize_table_descriptions,
@@ -29,6 +62,7 @@ from .sheets import (
     list_sheets,
 )
 from .sql import run_sql
+from .saved_results import query_saved_result
 from .sql_lineage import (
     parse_sql_column_lineage,
     parse_sql_table_lineage,
@@ -41,18 +75,27 @@ READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
     search_excel_values,
     get_excel_row,
     semantic_search_descriptions,
+    list_additional_objects,
+    search_additional_objects,
+    list_column_catalog,
+    filter_column_catalog,
+    search_column_catalog,
     visualize_s2t_table_graph,
     trace_transformation_path,
     parse_sql_column_lineage,
     parse_sql_table_lineage,
     visualize_sql_lineage,
     run_sql,
+    query_saved_result,
     run_cypher,
     trace_neo4j_lineage,
     trace_neo4j_table_lineage,
+    trace_neo4j_table_path,
     list_files,
     resolve_file,
     get_file_description,
+    get_s2t_rules_by_ids,
+    list_s2t_table_mapping,
     list_s2t_table_names,
     list_s2t_transformations,
     search_s2t_transformations,
@@ -69,9 +112,164 @@ WRITE_TOOLS: Tuple[BaseTool, ...] = (
     update_table_info_from_user_query,
 )
 
-ALL_TOOLS: Tuple[BaseTool, ...] = READ_ONLY_TOOLS + WRITE_TOOLS
+_LEGACY_NARROW_S2T_TOOLS: Tuple[BaseTool, ...] = (
+    list_s2t_field_mapping,
+    list_s2t_source_table,
+    list_s2t_target_table,
+)
+_STRICT_S2T_TOOLS: Tuple[BaseTool, ...] = (
+    read_s2t_source_to_target,
+    read_s2t_by_source_table,
+    read_s2t_by_target_table,
+    list_s2t_source_field,
+    list_s2t_target_field,
+)
+_COMPAT_S2T_TOOLS: Tuple[BaseTool, ...] = (
+    read_s2t_mapping,
+    list_s2t_occurrences,
+)
+_STRICT_COLUMN_TOOLS: Tuple[BaseTool, ...] = (
+    get_source_target_column_pair,
+    list_column_metadata,
+)
+_COMPAT_COLUMN_TOOLS: Tuple[BaseTool, ...] = (
+    list_source_column_catalog,
+    list_target_column_catalog,
+)
+_EXPERIMENT_READ_ONLY_TOOLS: Tuple[BaseTool, ...] = tuple(
+    tool
+    for tool in READ_ONLY_TOOLS
+    if tool.name
+    not in {
+        "get_s2t_rules_by_ids",
+        "list_s2t_table_mapping",
+        "list_s2t_transformations",
+        "list_column_catalog",
+        "filter_column_catalog",
+    }
+) + _STRICT_S2T_TOOLS + _STRICT_COLUMN_TOOLS + _COMPAT_COLUMN_TOOLS
+_REGISTERED_READ_ONLY_TOOLS: Tuple[BaseTool, ...] = (
+    READ_ONLY_TOOLS
+    + _LEGACY_NARROW_S2T_TOOLS
+    + _STRICT_S2T_TOOLS
+    + _COMPAT_S2T_TOOLS
+    + _STRICT_COLUMN_TOOLS
+    + _COMPAT_COLUMN_TOOLS
+)
+
+# Worker routing starts with an unambiguous tool for every common read
+# operation. ``run_sql`` is the sole executor for literal or aggregate SQLite
+# reads, while the field readers keep source/target roles exact in their typed
+# signatures. Compatibility aliases remain executable and are added only for
+# an explicitly requested missing capability.
+_WORKER_SPECIALIZED_TOOL_NAMES = frozenset(
+    {
+        "show_plan",
+        "search_excel_values",
+        "get_excel_row",
+        "semantic_search_descriptions",
+        "list_additional_objects",
+        "search_additional_objects",
+        "search_column_catalog",
+        "visualize_s2t_table_graph",
+        "trace_transformation_path",
+        "parse_sql_column_lineage",
+        "parse_sql_table_lineage",
+        "visualize_sql_lineage",
+        "run_sql",
+        "query_saved_result",
+        "trace_neo4j_lineage",
+        "trace_neo4j_table_lineage",
+        "trace_neo4j_table_path",
+        "list_files",
+        "resolve_file",
+        "get_file_description",
+        "get_s2t_rules_by_ids",
+        "read_s2t_source_to_target",
+        "read_s2t_by_source_table",
+        "read_s2t_by_target_table",
+        "list_s2t_source_field",
+        "list_s2t_target_field",
+        "search_s2t_transformations",
+        "get_source_target_column_pair",
+        "list_column_metadata",
+        "list_source_column_catalog",
+        "list_target_column_catalog",
+        "list_s2t_table_names",
+        "summarize_s2t_tables",
+        "summarize_table_descriptions",
+        "list_sheets",
+        "list_file_sheet_headers",
+        "list_columns",
+    }
+)
+WORKER_GENERAL_FALLBACK_TOOL_NAMES = frozenset(
+    tool.name
+    for tool in _REGISTERED_READ_ONLY_TOOLS
+    if tool.name not in _WORKER_SPECIALIZED_TOOL_NAMES
+)
+WORKER_CAPABILITY_TOOL_NAMES: Dict[WorkerCapability, frozenset[str]] = {
+    "sql_read": frozenset({"run_sql"}),
+    "saved_result_read": frozenset({"query_saved_result"}),
+    "saved_result_aggregate": frozenset({"query_saved_result"}),
+    "semantic_search": frozenset({"semantic_search_descriptions"}),
+    "s2t_search": frozenset({"search_s2t_transformations"}),
+    "s2t_read": frozenset(
+        {
+            "read_s2t_source_to_target",
+            "read_s2t_by_source_table",
+            "read_s2t_by_target_table",
+            "list_s2t_source_field",
+            "list_s2t_target_field",
+            "read_s2t_mapping",
+            "list_s2t_occurrences",
+        }
+    ),
+    "column_catalog_read": frozenset(
+        {
+            "get_source_target_column_pair",
+            "list_column_metadata",
+            "list_source_column_catalog",
+            "list_target_column_catalog",
+            "list_column_catalog",
+            "filter_column_catalog",
+            "search_column_catalog",
+        }
+    ),
+    "graph_read": frozenset(
+        {
+            "run_cypher",
+            "trace_neo4j_lineage",
+            "trace_neo4j_table_lineage",
+            "trace_neo4j_table_path",
+            "trace_transformation_path",
+        }
+    ),
+    "excel_read": frozenset(
+        {
+            "search_excel_values",
+            "get_excel_row",
+            "list_files",
+            "resolve_file",
+            "get_file_description",
+            "list_sheets",
+            "list_file_sheet_headers",
+            "list_columns",
+        }
+    ),
+    "general_read": WORKER_GENERAL_FALLBACK_TOOL_NAMES,
+}
+_WORKER_SPECIALIZED_TOOLS: Tuple[BaseTool, ...] = tuple(
+    tool
+    for tool in _REGISTERED_READ_ONLY_TOOLS
+    if tool.name in _WORKER_SPECIALIZED_TOOL_NAMES
+)
+
+ALL_TOOLS: Tuple[BaseTool, ...] = _REGISTERED_READ_ONLY_TOOLS + WRITE_TOOLS
 TOOLS: Tuple[BaseTool, ...] = READ_ONLY_TOOLS
-TOOLS_BY_NAME: Dict[str, BaseTool] = {tool.name: tool for tool in TOOLS}
+TOOLS_BY_NAME: Dict[str, BaseTool] = {
+    tool.name: tool for tool in TOOLS
+}
 WRITE_TOOLS_BY_NAME: Dict[str, BaseTool] = {
     tool.name: tool for tool in WRITE_TOOLS
 }
@@ -79,9 +277,55 @@ ALL_TOOLS_BY_NAME: Dict[str, BaseTool] = {
     tool.name: tool for tool in ALL_TOOLS
 }
 
+
+def _narrow_s2t_experiment_enabled() -> bool:
+    return experiment_flag_enabled(
+        S2T_NARROW_TOOLS_EXPERIMENT_ENV,
+    )
+
+
 def get_tools() -> Tuple[BaseTool, ...]:
-    """Вернуть неизменяемую коллекцию read-only инструментов."""
-    return TOOLS
+    """Вернуть активную неизменяемую коллекцию read-only инструментов."""
+    return (
+        _EXPERIMENT_READ_ONLY_TOOLS
+        if _narrow_s2t_experiment_enabled()
+        else TOOLS
+    )
+
+
+def get_worker_tool_names_for_capabilities(
+    capabilities: Iterable[WorkerCapability],
+) -> frozenset[str]:
+    """Return the exact registered tool names for requested capabilities."""
+    names: set[str] = set()
+    for capability in dict.fromkeys(capabilities):
+        names.update(WORKER_CAPABILITY_TOOL_NAMES.get(capability, ()))
+    return frozenset(names)
+
+
+def get_worker_tools(
+    *,
+    include_general: bool = False,
+    required_capabilities: Iterable[WorkerCapability] = (),
+) -> Tuple[BaseTool, ...]:
+    """Return the initial or explicitly capability-expanded worker catalog.
+
+    ``include_general`` supports the default counter-based fallback.
+    ``required_capabilities`` supports the opt-in typed reroute experiment.
+    """
+    if include_general:
+        return _REGISTERED_READ_ONLY_TOOLS
+    additional_names = get_worker_tool_names_for_capabilities(
+        required_capabilities
+    )
+    if not additional_names:
+        return _WORKER_SPECIALIZED_TOOLS
+    selected_names = set(_WORKER_SPECIALIZED_TOOL_NAMES) | set(additional_names)
+    return tuple(
+        tool
+        for tool in _REGISTERED_READ_ONLY_TOOLS
+        if tool.name in selected_names
+    )
 
 
 def get_tools_for_names(
@@ -90,19 +334,21 @@ def get_tools_for_names(
     """Вернуть ровно выбранные read-only tools в порядке общего registry."""
     selected = tuple(dict.fromkeys(tool_names))
     if not selected:
-        raise ValueError("Нужно выбрать хотя бы один tool")
+        return ()
 
-    unknown = [name for name in selected if name not in TOOLS_BY_NAME]
+    active_tools = get_tools()
+    active_by_name = {tool.name: tool for tool in active_tools}
+    unknown = [name for name in selected if name not in active_by_name]
     if unknown:
         raise ValueError(f"Неизвестные read-only tools: {', '.join(unknown)}")
 
     selected_set = set(selected)
-    return tuple(tool for tool in TOOLS if tool.name in selected_set)
+    return tuple(tool for tool in active_tools if tool.name in selected_set)
 
 
 def get_tools_by_name() -> Dict[str, BaseTool]:
     """Вернуть копию read-only реестра инструментов по именам."""
-    return dict(TOOLS_BY_NAME)
+    return {tool.name: tool for tool in get_tools()}
 
 
 def get_write_tools() -> Tuple[BaseTool, ...]:

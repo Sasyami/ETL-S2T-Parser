@@ -18,6 +18,8 @@ DEFAULT_MODEL_PATH = (
     / "catboost_header_model.cbm"
 )
 
+HEADER_PAD_EXCLUSION_THRESHOLD = 3
+
 
 def _model_path() -> Path:
     configured = os.getenv("CATBOOST_HEADER_MODEL_PATH", "").strip()
@@ -129,8 +131,23 @@ def predict_header_row(
 ) -> int:
     """Return the zero-based row with the highest header probability."""
     frame = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table)
-    probabilities = _load_model().predict_proba(make_header_features(frame))[:, 1]
-    return int(probabilities.argmax())
+    if frame.empty:
+        raise ValueError("Header preview is empty")
+
+    candidate_indices = [
+        index
+        for index, row in enumerate(frame.itertuples(index=False, name=None))
+        if sum(_is_pad(value) for value in row)
+        < HEADER_PAD_EXCLUSION_THRESHOLD
+    ]
+    if not candidate_indices:
+        candidate_indices = list(range(len(frame)))
+
+    candidate_frame = frame.iloc[candidate_indices]
+    probabilities = _load_model().predict_proba(
+        make_header_features(candidate_frame)
+    )[:, 1]
+    return int(candidate_indices[int(probabilities.argmax())])
 
 
 __all__ = ["make_header_features", "predict_header_row"]

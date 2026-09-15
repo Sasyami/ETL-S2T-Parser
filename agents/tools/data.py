@@ -52,15 +52,18 @@ def search_excel_values(
     или текст внутри загруженных листов. Инструмент читает публичную таблицу
     data и возвращает доказуемое место значения: файл, лист, row_num,
     вычисленный номер строки Excel, column_id и настоящее имя колонки из
-    file_sheet_headers.headers_json. Это не поиск S2T-маппингов и не semantic
-    search по описаниям.
+    file_sheet_headers.headers_json. Это только поиск буквального значения в
+    исходных Excel-ячейках таблицы data: не поиск S2T-маппингов, не semantic
+    search по описаниям и не доступ к физическим строкам логических ETL-таблиц.
 
     Поиск needle выполняется как Unicode-подстрока без учёта регистра по уже
     сохранённым значениям data. Фильтры sheet_name и column_name, напротив,
     требуют точного совпадения без учёта регистра; file_id ограничивает только
     файловый поиск и допустим здесь. Не используй tool для ответа «какие
     трансформации относятся к таблице»: там нужны search_s2t_transformations или
-    run_sql. Если rows пуст, совпадение не найдено среди сохранённых ячеек с
+    read-only SQL по метаданным. Не передавай сюда transformation_rule и не
+    используй найденные в нём имена для проверки строк внешней БД: tool не
+    выполняет SQL. Если rows пуст, совпадение не найдено среди сохранённых ячеек с
     указанными фильтрами; это не доказывает отсутствие значения в исходном файле
     за пределами реально сохранённых данных.
 
@@ -297,16 +300,41 @@ def _cosine_similarity(left: array, right: array) -> float:
 @tool(parse_docstring=True)
 def semantic_search_descriptions(
     query: str,
-    scope: Literal["all", "files", "source_tables", "target_tables"] = "all",
+    scope: Literal[
+        "all",
+        "files",
+        "tables",
+        "source_tables",
+        "target_tables",
+        "columns",
+        "source_columns",
+        "target_columns",
+    ] = "all",
     limit: int = 10,
+    file_id: Optional[int] = None,
+    table_name: Optional[str] = None,
+    column_name: Optional[str] = None,
+    data_type: Optional[str] = None,
+    primary_key: Optional[bool] = None,
+    not_null: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Найти файлы и логические таблицы по смыслу сохранённых описаний.
+    """Найти файлы, логические таблицы и колонки по смысловой близости.
 
-    Используй для вопросов о назначении, предметной области или сущности, когда
-    точное имя файла/таблицы неизвестно. Инструмент эмбеддит запрос той же
+    Используй, когда task требует поиск по смыслу, бизнес-смыслу, назначению,
+    описанию или наиболее вероятному соответствию, а точное имя файла, таблицы
+    или колонки неизвестно. Передавай цельный запрос на естественном языке: не
+    заменяй его поиском буквальной подстроки, набором ключевых слов, синонимов
+    или переводов и не придумывай техническое имя. Поисковый домен scope:
+    files — только файлы, tables — все логические таблицы, source_tables —
+    только исходные таблицы, target_tables — только целевые таблицы, columns —
+    все колонки, source_columns — только исходные колонки, target_columns —
+    только целевые колонки, all — все перечисленные домены. Для колонковых
+    scope можно сначала ограничить подвыборку структурными фильтрами, а затем
+    ранжировать только её по смыслу описания.
+    Инструмент эмбеддит запрос той же
     моделью, которой были записаны description_embedding, и считает cosine
-    similarity по files, source_tables и target_tables. Это не поиск значений
-    ячеек, точных S2T-имён и не lineage.
+    similarity по files, source_tables, target_tables, source_columns и
+    target_columns. Это не поиск значений ячеек, точных S2T-имён и не lineage.
 
     Результат является ранжированием смысловой близости, а не подтверждением
     точного равенства имён. Для известного table_name используй
@@ -314,13 +342,18 @@ def semantic_search_descriptions(
     source → target — S2T/lineage tools. В выборку попадают только записи с уже
     сохранённым embedding. Пустой rows или отсутствие конкретного объекта не
     доказывает, что объекта нет в SQLite: у его описания мог не быть embedding.
-    Не дедуплицируй одинаковые строки каталогов — каждая исходная строка является
-    отдельным фактом и может присутствовать в ранжировании.
 
     Args:
-        query: Смысловой запрос на естественном языке.
-        scope: all либо одна таблица хранения описаний.
+        query: Цельный смысловой запрос на естественном языке.
+        scope: Домен: all, files, tables, source_tables, target_tables, columns,
+            source_columns или target_columns.
         limit: Максимальное число результатов, от 1 до 50.
+        file_id: Опциональный точный идентификатор загрузки для подвыборки.
+        table_name: Точное имя таблицы; допустимо только для колонковых scope.
+        column_name: Точное имя колонки; допустимо только для колонковых scope.
+        data_type: Точный тип данных; допустимо только для колонковых scope.
+        primary_key: Фильтр PK; допустим только для колонковых scope.
+        not_null: Фильтр not-null; допустим только для колонковых scope.
     """
     text = str(query or "").strip()
     if not text:
@@ -328,6 +361,43 @@ def semantic_search_descriptions(
     if len(text) > 1000:
         return {"error": "query too long", "rows": []}
     clean_limit = clamped_int(limit, 10, 1, 50)
+    column_scopes = {"columns", "source_columns", "target_columns"}
+    column_filters = {
+        "table_name": table_name,
+        "column_name": column_name,
+        "data_type": data_type,
+        "primary_key": primary_key,
+        "not_null": not_null,
+    }
+    if scope not in column_scopes and any(
+        value is not None for value in column_filters.values()
+    ):
+        return {
+            "error": "column subset filters require a column scope",
+            "scope": scope,
+            "rows": [],
+        }
+    try:
+        clean_file_id = int(file_id) if file_id is not None else None
+    except (TypeError, ValueError):
+        return {"error": "file_id must be an integer", "rows": []}
+    if clean_file_id is not None and clean_file_id <= 0:
+        return {"error": "file_id must be positive", "rows": []}
+    clean_column_filters: Dict[str, Any] = {}
+    for field in ("table_name", "column_name", "data_type"):
+        value = column_filters[field]
+        if value is None:
+            continue
+        clean_value = str(value).strip()
+        if not clean_value:
+            continue
+        if len(clean_value) > 300:
+            return {"error": f"{field} too long", "rows": []}
+        clean_column_filters[field] = clean_value
+    for field in ("primary_key", "not_null"):
+        value = column_filters[field]
+        if value is not None:
+            clean_column_filters[field] = value
 
     from services.embeddings import embed_description, embedding_model_name
     from storage.database import get_db_connection
@@ -337,33 +407,81 @@ def semantic_search_descriptions(
     try:
         candidates = []
         if scope in ("all", "files"):
-            candidates.extend(
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT 'files' AS scope, file_id AS record_id, file_id,
-                           filename, NULL AS sheet_name,
-                           filename AS name, description, description_embedding
-                    FROM files
-                    WHERE description_embedding IS NOT NULL
-                    """
-                ).fetchall()
-            )
-        for table_name in ("source_tables", "target_tables"):
-            if scope not in ("all", table_name):
-                continue
+            file_where = "WHERE description_embedding IS NOT NULL"
+            file_params: List[Any] = []
+            if clean_file_id is not None:
+                file_where += " AND file_id = ?"
+                file_params.append(clean_file_id)
             candidates.extend(
                 dict(row)
                 for row in conn.execute(
                     f"""
-                    SELECT '{table_name}' AS scope, catalog.id AS record_id,
+                    SELECT 'files' AS scope, file_id AS record_id, file_id,
+                           filename, NULL AS sheet_name,
+                           filename AS name, description, description_embedding
+                    FROM files
+                    {file_where}
+                    """,
+                    file_params,
+                ).fetchall()
+            )
+        for catalog_name in ("source_tables", "target_tables"):
+            if scope not in ("all", "tables", catalog_name):
+                continue
+            table_where = "WHERE catalog.description_embedding IS NOT NULL"
+            table_params: List[Any] = []
+            if clean_file_id is not None:
+                table_where += " AND catalog.file_id = ?"
+                table_params.append(clean_file_id)
+            candidates.extend(
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT '{catalog_name}' AS scope, catalog.id AS record_id,
                            catalog.file_id, files.filename, catalog.sheet_name,
                            catalog.table_name AS name,
                            catalog.description, catalog.description_embedding
-                    FROM {table_name} AS catalog
+                    FROM {catalog_name} AS catalog
                     LEFT JOIN files ON files.file_id = catalog.file_id
-                    WHERE catalog.description_embedding IS NOT NULL
-                    """
+                    {table_where}
+                    """,
+                    table_params,
+                ).fetchall()
+            )
+        for catalog_name in ("source_columns", "target_columns"):
+            if scope not in ("all", "columns", catalog_name):
+                continue
+            conditions = ["catalog.description_embedding IS NOT NULL"]
+            column_params: List[Any] = []
+            if clean_file_id is not None:
+                conditions.append("catalog.file_id = ?")
+                column_params.append(clean_file_id)
+            for field in ("table_name", "column_name", "data_type"):
+                value = clean_column_filters.get(field)
+                if value is None:
+                    continue
+                conditions.append(f"TRIM(catalog.{field}) = ? COLLATE NOCASE")
+                column_params.append(value)
+            for field in ("primary_key", "not_null"):
+                if field not in clean_column_filters:
+                    continue
+                conditions.append(f"catalog.{field} = ?")
+                column_params.append(1 if clean_column_filters[field] else 0)
+            column_where = "WHERE " + " AND ".join(conditions)
+            candidates.extend(
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT '{catalog_name}' AS scope, catalog.id AS record_id,
+                           catalog.file_id, files.filename, catalog.sheet_name,
+                           catalog.column_name AS name, catalog.table_name,
+                           catalog.column_name,
+                           catalog.description, catalog.description_embedding
+                    FROM {catalog_name} AS catalog
+                    LEFT JOIN files ON files.file_id = catalog.file_id
+                    {column_where}
+                    """,
+                    column_params,
                 ).fetchall()
             )
     finally:
@@ -376,12 +494,19 @@ def semantic_search_descriptions(
         ranked.append(candidate)
     ranked.sort(key=lambda item: (-item["score"], item["scope"], item["record_id"]))
     rows = ranked[:clean_limit]
+    truncated = len(ranked) > len(rows)
     return {
         "query": text,
         "scope": scope,
+        "subset": {
+            **({"file_id": clean_file_id} if clean_file_id is not None else {}),
+            **clean_column_filters,
+        },
         "embedding_model": embedding_model_name(),
         "total_candidates": len(ranked),
         "returned_rows": len(rows),
+        "coverage": "truncated" if truncated else "complete",
+        "truncated": truncated,
         "rows": rows,
     }
 

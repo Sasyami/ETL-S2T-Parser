@@ -1,5 +1,6 @@
 import html
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,10 @@ from storage.database import DatabaseSchemaError, get_db_connection, migrate_s2t
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LIVE_DB_PATH = PROJECT_ROOT / "excel_data.db"
+LIVE_DB_PATH = Path(
+    os.getenv("LIVE_AGENT_DB_PATH", "").strip()
+    or PROJECT_ROOT / "excel_data.db"
+).expanduser()
 
 
 @pytest.mark.integration
@@ -29,6 +33,15 @@ def test_live_s2t_graph_builds_html_and_json_from_working_database(
 
     conn = get_db_connection()
     try:
+        has_s2t_schema = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 's2t_transformations'
+            """
+        ).fetchone()
+        if has_s2t_schema is None:
+            pytest.skip("live SQLite database has no s2t_transformations table")
         live_row_count = int(
             conn.execute("SELECT COUNT(*) FROM s2t_transformations").fetchone()[0]
         )

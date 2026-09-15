@@ -34,3 +34,21 @@ def test_predict_header_row_uses_highest_positive_probability():
 
     assert result == 1
     assert model.predict_proba.call_args.args[0].shape == (3, 22)
+
+
+def test_predict_header_row_excludes_rows_with_three_or_more_pad_values():
+    model = MagicMock()
+    model.predict_proba.return_value = np.array(
+        [[0.2, 0.8], [0.7, 0.3]]
+    )
+
+    rows = [
+        ["Report", None, None, "Untitled: 3"],
+        ["Table", "Column", "Type", None],
+        ["value", "field", "text", "description"],
+    ]
+    with patch("agents.header_classifier._load_model", return_value=model):
+        result = predict_header_row(rows)
+
+    assert result == 1
+    assert model.predict_proba.call_args.args[0].shape == (2, 22)

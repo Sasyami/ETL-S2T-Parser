@@ -5,16 +5,24 @@ import datetime
 from threading import Lock
 from typing import List, Any, Dict, Optional
 from flask import Flask, request, jsonify, render_template, send_from_directory
+from agents.env_flags import read_binary_env_flag
 from services.logging_setup import configure_logging
-from agents.agent import get_model_name, agent_chat
+from agents.agent import agent_chat, get_model_name
+from agents.supervisor import supervisor_chat
 from agents.sheet_group_classifier import classify_file_sheet_groups
 from services.analysis import (
     finish_analysis,
     try_generate_description,
     try_generate_summary,
+    try_sync_file_graph,
+    try_sync_pending_graph_projections,
 )
 from services.graph_sync import clear_graph_projection
 from storage.database import clear_all_data, get_file, init_db, store_excel_data
+from storage.graph_outbox import (
+    get_graph_sync_state,
+    mark_all_graph_syncs_applied,
+)
 from processing.excel import (
     allowed_file,
     convert_to_serializable,
@@ -31,6 +39,7 @@ logger.info("File logging enabled: %s", LOG_FILE_PATH)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
+app.config['CHAT_AGENT_MODE'] = os.getenv('CHAT_AGENT_MODE', 'multiagent')
 
 CHAT_HISTORY_MAX_MESSAGES = 12
 CHAT_HISTORY_MAX_MESSAGE_CHARS = 8000
@@ -45,11 +54,18 @@ PROGRESS_EVENT_FIELDS = (
     "sheet_name",
     "sheet_index",
     "sheet_count",
+    "total_data_row_count",
 )
 analysis_progress = {}
 analysis_progress_lock = Lock()
 
 init_db()
+
+
+def _flask_debug_enabled() -> bool:
+    """Return the strict binary debug setting for direct Flask startup."""
+
+    return read_binary_env_flag("FLASK_DEBUG", default=False)
 
 
 def _normalize_chat_history(value: Any) -> List[Dict[str, str]]:
@@ -139,10 +155,6 @@ def _get_analysis_progress(upload_id: str) -> Optional[Dict[str, Any]]:
 
 
 @app.route('/')
-def index():
-    return render_template('index.html')
-
-
 @app.route('/chat_app')
 def chat_app():
     return render_template('chat_app.html')
@@ -303,7 +315,17 @@ def get_transformations(file_id: int):
 def delete_transformations(file_id: int):
     try:
         deleted = clear_s2t_transformations(file_id)
-        return jsonify({"file_id": file_id, "deleted": deleted}), 200
+        graph_sync_report, graph_sync_error = try_sync_file_graph(file_id)
+        return jsonify(
+            {
+                "status": "partial" if graph_sync_error else "ok",
+                "file_id": file_id,
+                "deleted": deleted,
+                "graph_sync_report": graph_sync_report,
+                "graph_sync_error": graph_sync_error,
+                "graph_sync_state": get_graph_sync_state(file_id),
+            }
+        ), 200
     except Exception as e:
         logger.exception("Failed to clear S2T transformations")
         return jsonify({"error": str(e)}), 500
@@ -324,6 +346,8 @@ def delete_all_storage():
     warnings = []
     try:
         graph_deleted = clear_graph_projection()
+        if not graph_deleted.get("skipped"):
+            mark_all_graph_syncs_applied()
     except Exception as e:
         logger.warning("SQLite cleared, but Neo4j cleanup failed: %s", e)
         graph_deleted = {
@@ -407,34 +431,40 @@ def chat():
     if not isinstance(query, str) or not query.strip():
         return jsonify({"error": "Missing query"}), 400
     try:
-        raw_file_id = data.get("file_id")
-        if raw_file_id is None:
-            file_id = None
-        else:
-            try:
-                file_id = int(raw_file_id)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("file_id must be an integer") from exc
-            if file_id <= 0:
-                raise ValueError("file_id must be a positive integer")
         session_id = _normalize_chat_session_id(data.get("session_id"))
         history = _normalize_chat_history(data.get("history"))
         logger.info(
-            "Chat request session_id=%s file_id=%s history_messages=%s query=%s",
+            "Chat request session_id=%s history_messages=%s query=%s",
             session_id,
-            file_id,
             len(history),
             query.strip()[:1000],
         )
-        agent_kwargs: Dict[str, Any] = {}
-        if file_id:
-            agent_kwargs["file_id"] = file_id
+        supervisor_kwargs: Dict[str, Any] = {}
         if history:
-            agent_kwargs["history"] = history
+            supervisor_kwargs["history"] = history
         if session_id:
-            agent_kwargs["session_id"] = session_id
-        answer = agent_chat(query.strip(), **agent_kwargs)
-        return jsonify({"answer": answer}), 200
+            supervisor_kwargs["session_id"] = session_id
+        agent_mode = str(
+            app.config.get("CHAT_AGENT_MODE") or "multiagent"
+        ).strip().lower()
+        if agent_mode == "multiagent":
+            chat_result = supervisor_chat(query.strip(), **supervisor_kwargs)
+        elif agent_mode == "single_agent":
+            chat_result = agent_chat(query.strip(), **supervisor_kwargs)
+        else:
+            raise ValueError(
+                "CHAT_AGENT_MODE must be 'multiagent' or 'single_agent'"
+            )
+        if hasattr(chat_result, "model_dump"):
+            payload = chat_result.model_dump()
+        elif isinstance(chat_result, dict):
+            payload = chat_result
+        else:
+            payload = {
+                "answer": str(chat_result),
+                "display_items": [],
+            }
+        return jsonify(payload), 200
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -442,5 +472,10 @@ def chat():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    recovery_report, recovery_error = try_sync_pending_graph_projections()
+    if recovery_error:
+        logger.warning("Graph outbox recovery incomplete: %s", recovery_error)
+    elif recovery_report and recovery_report.get("pending"):
+        logger.info("Graph outbox recovery: %s", recovery_report)
+    debug = _flask_debug_enabled()
     app.run(debug=debug, use_reloader=debug)

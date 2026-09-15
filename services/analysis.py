@@ -6,7 +6,8 @@ from agents.sheet_group_classifier import classify_file_sheet_groups
 from agents.summarizer_agent import ensure_file_description, summarize_file
 from graph_storage import is_neo4j_configured
 from processing.excel import convert_to_serializable
-from services.graph_sync import sync_file_graph
+from services.graph_sync import sync_file_graph, sync_pending_graph_projections
+from sheet_skills.column_catalog import extract_column_catalogs
 from sheet_skills.s2t import S2TExtractionError, run_s2t_extraction_subagent
 from sheet_skills.structured_metadata import extract_structured_metadata
 from sheet_skills.table_catalog import extract_table_catalogs
@@ -69,7 +70,13 @@ def try_extract_s2t_transformations(
             file_id,
             sheet_group_analysis=sheet_group_analysis,
         )
+        column_catalogs = extract_column_catalogs(
+            file_id,
+            sheet_group_analysis,
+            s2t_sheet_mappings=report.get("sheet_mappings"),
+        )
         report["table_catalogs"] = table_catalogs
+        report["column_catalogs"] = column_catalogs
         report["structured_metadata"] = structured_metadata
         return int(report.get("verification", {}).get("count", 0)), None, report
     except S2TExtractionError as exc:
@@ -98,20 +105,39 @@ def try_sync_file_graph(
         return None, str(exc)
 
 
+def try_sync_pending_graph_projections(
+    limit: int = 100,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Retry durable graph outbox rows without making SQLite writes disappear."""
+    if not is_neo4j_configured():
+        return None, "Neo4j не настроен; graph outbox остаётся в ожидании"
+    try:
+        report = sync_pending_graph_projections(limit=limit)
+        if report["errors"]:
+            return report, f"Не применено ревизий: {len(report['errors'])}"
+        return report, None
+    except Exception as exc:
+        logger.exception("Pending Neo4j synchronization failed")
+        return None, str(exc)
+
+
 def _public_sheets(sheets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Exclude stored workbook rows from the HTTP response."""
     result = []
     for sheet in sheets:
+        data_rows = sheet.get("data_rows", [])
+        data_row_count = len(data_rows) if sheet.get("header") is not None else 0
         item = {
             "sheet_name": sheet["sheet_name"],
             "skip_reason": sheet.get("skip_reason"),
+            "data_row_count": data_row_count,
         }
         if sheet.get("header") is not None:
             item.update(
                 {
                     "header": sheet["header"],
                     "columns": sheet.get("columns", []),
-                    "data_preview": sheet.get("data_rows", [])[:3],
+                    "data_preview": data_rows[:3],
                 }
             )
         result.append(item)
@@ -149,6 +175,9 @@ def finish_analysis(
         file_id,
         sheet_group_analysis=sheet_group_analysis,
     )
+    empty_target_columns_count = int(
+        extraction_report.get("empty_target_columns_count", 0)
+    )
 
     _emit_progress(
         progress_callback,
@@ -165,6 +194,9 @@ def finish_analysis(
     else:
         description, description_error = try_generate_description(file_id)
     response_sheets = _public_sheets(sheets)
+    total_data_row_count = sum(
+        int(sheet["data_row_count"]) for sheet in response_sheets
+    )
     response = convert_to_serializable(
         {
             "filename": filename,
@@ -174,7 +206,9 @@ def finish_analysis(
             "summary_error": summary_error,
             "description": description,
             "description_error": description_error,
+            "total_data_row_count": total_data_row_count,
             "s2t_transformations_count": count,
+            "s2t_empty_target_columns_count": empty_target_columns_count,
             "s2t_transformations_error": extraction_error,
             "s2t_extraction_report": extraction_report,
             "sheet_group_analysis": sheet_group_analysis,
@@ -190,10 +224,16 @@ def finish_analysis(
         phase="done",
         percent=100,
         message="Анализ файла завершен",
-        detail=f"Листов: {len(response_sheets)}, S2T transformations: {count}",
+        detail=(
+            f"Листов: {len(response_sheets)}, строк данных: {total_data_row_count}, "
+            f"S2T transformations: {count}, "
+            f"пустых target columns: {empty_target_columns_count}"
+        ),
         file_id=file_id,
         filename=filename,
+        total_data_row_count=total_data_row_count,
         s2t_transformations_count=count,
+        s2t_empty_target_columns_count=empty_target_columns_count,
         s2t_transformations_error=extraction_error,
         s2t_extraction_report=extraction_report,
     )

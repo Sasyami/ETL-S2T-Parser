@@ -23,6 +23,28 @@
       "description"
     ]
   },
+  "source_columns": {
+    "sheet_group": "source_columns",
+    "fields": [
+      "table_name",
+      "column_name",
+      "data_type",
+      "primary_key",
+      "not_null",
+      "description"
+    ]
+  },
+  "target_columns": {
+    "sheet_group": "target_columns",
+    "fields": [
+      "table_name",
+      "column_name",
+      "data_type",
+      "primary_key",
+      "not_null",
+      "description"
+    ]
+  },
   "additional_objects": {
     "sheet_group": "additional_objects",
     "fields": [

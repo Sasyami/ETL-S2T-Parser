@@ -69,6 +69,9 @@ def test_create_neo4j_driver_only_builds_driver():
     create_driver.assert_called_once_with(
         "neo4j://localhost:7687",
         auth=("neo4j", "secret"),
+        connection_timeout=3.0,
+        connection_acquisition_timeout=3.0,
+        max_transaction_retry_time=0.0,
     )
     driver.execute_query.assert_not_called()
 

@@ -52,6 +52,8 @@ def convert_to_serializable(obj: Any) -> Any:
 def _is_missing(value: Any) -> bool:
     if value is None:
         return True
+    if isinstance(value, str) and not value.strip():
+        return True
     try:
         return bool(pd.isna(value))
     except (TypeError, ValueError):
@@ -233,7 +235,11 @@ def is_empty_or_irrelevant(preview_rows: List[List[Any]]) -> Tuple[bool, str]:
 
 def _rows_empty(frame: pd.DataFrame, num_rows: int = 5) -> bool:
     sample = frame.iloc[:num_rows]
-    return sample.empty or not bool(sample.notna().to_numpy().any())
+    return sample.empty or not any(
+        not _is_missing(cell)
+        for row in sample.itertuples(index=False, name=None)
+        for cell in row
+    )
 
 
 def _resolve_header_decision(
@@ -290,7 +296,13 @@ def _skip_sheet(
     reason: str,
     detail: Optional[str] = None,
 ) -> None:
-    sheets.append({"sheet_name": sheet_name, "skip_reason": reason})
+    sheets.append(
+        {
+            "sheet_name": sheet_name,
+            "skip_reason": reason,
+            "data_row_count": 0,
+        }
+    )
     _report_sheet_progress(
         callback,
         sheet_index,
@@ -364,6 +376,7 @@ def _parse_loaded_sheet(
             },
             "columns": columns,
             "data_rows": rows,
+            "data_row_count": len(rows),
             "data_row_numbers": [
                 position - data_start for position in data_positions
             ],
@@ -421,6 +434,7 @@ def parse_excel_with_decisions(
                 excel_file,
                 sheet_name=sheet_name,
                 header=None,
+                keep_default_na=False,
             )
             parsed = _parse_loaded_sheet(
                 frame,
@@ -440,12 +454,14 @@ def parse_excel_with_decisions(
 
             sheet = parsed["sheet"]
             sheets.append(sheet)
-            data_rows = sheet["data_rows"]
             columns = parsed["sheet"]["columns"]
             _report_sheet_progress(
                 *progress_args,
                 "Лист разобран...",
-                f"{sheet_name}: колонок {len(columns)}, строк {len(data_rows)}",
+                (
+                    f"{sheet_name}: колонок {len(columns)}, "
+                    f"строк {sheet['data_row_count']}"
+                ),
             )
 
     return sheets

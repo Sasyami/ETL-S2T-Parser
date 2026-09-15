@@ -1,9 +1,35 @@
 import logging
+from copy import deepcopy
 
 import pytest
 from unittest.mock import patch
+from openpyxl import Workbook
 from storage.database import init_db, get_db_connection
 import io
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, False), ("0", False), ("1", True)],
+)
+def test_flask_debug_uses_strict_binary_flag(monkeypatch, value, expected):
+    from app import _flask_debug_enabled
+
+    if value is None:
+        monkeypatch.delenv("FLASK_DEBUG", raising=False)
+    else:
+        monkeypatch.setenv("FLASK_DEBUG", value)
+
+    assert _flask_debug_enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["", "true", "false", " 1 ", "2"])
+def test_flask_debug_rejects_non_binary_values(monkeypatch, value):
+    from app import _flask_debug_enabled
+
+    monkeypatch.setenv("FLASK_DEBUG", value)
+    with pytest.raises(ValueError, match="FLASK_DEBUG must be 0 or 1"):
+        _flask_debug_enabled()
 
 
 def test_console_streams_are_reconfigured_to_utf8():
@@ -93,15 +119,23 @@ def use_temp_db(tmp_path):
 def test_index(client):
     response = client.get('/')
     assert response.status_code == 200
-    assert b'AI Excel Parser' in response.data
+    assert b'ETL S2T Agent' in response.data
     body = response.data.decode("utf-8")
-    assert "void loadTransformations();" in body
+    assert "Чат с данными" in body
+    assert 'id="chatInput"' in body
+    assert 'rows="2" autofocus' in body
+    assert "Классический интерфейс" not in body
+    assert "setCurrentFile" not in body
     assert 'id="clearAllDataBtn"' in body
     assert "fetch('/storage', { method: 'DELETE' })" in body
     assert "clearTransformationsBtn" not in body
     assert 'id="includeHiddenRows"' in body
     assert "Учитывать скрытые строки" in body
     assert "formData.append('include_hidden_rows', String(includeHiddenRows.checked))" in body
+    assert "s2t_empty_target_columns_count" in body
+    assert "empty_target_columns_count" in body
+    assert "total_data_row_count" in body
+    assert "data_row_count" in body
 
 
 def test_chat_app_single_user_no_session_cookie(client):
@@ -109,6 +143,7 @@ def test_chat_app_single_user_no_session_cookie(client):
     assert response.status_code == 200
     assert b'ETL S2T Agent' in response.data
     assert 'Set-Cookie' not in response.headers
+    assert response.get_data(as_text=True) == client.get('/').get_data(as_text=True)
 
 
 def test_chat_app_has_loading_indicators(client):
@@ -142,7 +177,9 @@ def test_chat_app_has_loading_indicators(client):
     assert 'aria-label="Полная таблица трансформаций с прокруткой"' in body
     assert 'aria-label="Таблица с прокруткой"' in body
     assert "sessionStorage.getItem(CHAT_SESSION_ID_STORAGE_KEY)" in body
-    assert "JSON.stringify({ query, file_id: currentFileId, history, session_id: currentSessionId })" in body
+    assert "JSON.stringify({ query, history, session_id: currentSessionId })" in body
+    assert "currentFileId" not in body
+    assert "Листы текущего файла" not in body
     assert 'id="clearAllDataBtn"' in body
     assert "Очистить все данные" in body
     assert "fetch('/storage', { method: 'DELETE' })" in body
@@ -151,6 +188,17 @@ def test_chat_app_has_loading_indicators(client):
     assert "Учитывать скрытые строки" in body
     assert "includeHiddenRows.disabled = value" in body
     assert "formData.append('include_hidden_rows', String(includeHiddenRows.checked))" in body
+
+
+def test_chat_app_renders_worker_results_in_scrollable_elements(client):
+    response = client.get("/chat_app")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "addDisplayItems(data.display_items)" in body
+    assert "tool-result-scroll" in body
+    assert "Полный результат:" in body
+    assert "toolResultTable" in body
 
 
 def test_sql_lineage_export_route(client, tmp_path, monkeypatch):
@@ -205,8 +253,8 @@ def test_upload(mock_generate_description, mock_summarize, mock_store, mock_pars
         "sheet_name": "Sheet1",
         "skip_reason": None,
         "header": {"start_row": 0, "row_count": 1, "nested": False},
-        "columns": ["Name"],
-        "data_rows": [],
+        "columns": ["Name", "Age"],
+        "data_rows": [["Alice", 30], ["Bob", 25]],
     }]
     mock_store.return_value = 101
     mock_summarize.return_value = "Test summary"
@@ -224,11 +272,17 @@ def test_upload(mock_generate_description, mock_summarize, mock_store, mock_pars
     assert json_data['summary_error'] is None
     assert json_data['description'] == 'Test description'
     assert json_data['description_error'] is None
+    assert json_data['total_data_row_count'] == 2
     assert json_data['s2t_transformations_count'] == 0
+    assert json_data['s2t_empty_target_columns_count'] == 0
     assert json_data['s2t_transformations_error'] is None
     assert json_data['s2t_extraction_report']['status'] == 'ok'
     assert json_data["sheets"][0]["header"]["row_count"] == 1
-    assert json_data["sheets"][0]["data_preview"] == []
+    assert json_data["sheets"][0]["data_row_count"] == 2
+    assert json_data["sheets"][0]["data_preview"] == [
+        ["Alice", 30],
+        ["Bob", 25],
+    ]
     assert "data_rows" not in json_data["sheets"][0]
     assert json_data["graph_sync_report"] == {"file_id": 101}
     assert json_data["graph_sync_error"] is None
@@ -246,7 +300,7 @@ def test_upload_records_analysis_progress(mock_generate_description, mock_summar
         "skip_reason": None,
         "header": {"start_row": 0, "row_count": 1, "nested": False},
         "columns": ["Name"],
-        "data_rows": [],
+        "data_rows": [["Alice"], ["Bob"]],
     }]
     mock_store.return_value = 102
     mock_summarize.return_value = "Test summary"
@@ -267,8 +321,110 @@ def test_upload_records_analysis_progress(mock_generate_description, mock_summar
     assert progress["percent"] == 100
     assert progress["file_id"] == 102
     assert progress["filename"] == "test.xlsx"
+    assert progress["total_data_row_count"] == 2
+    assert progress["history"][-1]["total_data_row_count"] == 2
     assert progress["s2t_transformations_error"] is None
+    assert progress["s2t_empty_target_columns_count"] == 0
     assert progress["history"]
+
+
+@pytest.mark.parametrize(
+    ("include_hidden_rows", "expected_main_rows", "expected_total_rows"),
+    ((False, 2, 4), (True, 3, 5)),
+)
+def test_upload_counts_parsed_rows_in_real_multicolumn_workbook(
+    client,
+    include_hidden_rows,
+    expected_main_rows,
+    expected_total_rows,
+):
+    workbook = Workbook()
+    main = workbook.active
+    main.title = "Main"
+    main.append(["Name", "Age"])
+    main.append(["same", 1])
+    main.append(["hidden", 2])
+    main.append(["same", 1])
+    main.row_dimensions[3].hidden = True
+
+    second = workbook.create_sheet("Second")
+    second.append(["Code", "Value"])
+    second.append(["A", 10])
+    second.append(["B", 20])
+    workbook.create_sheet("Empty")
+
+    output = io.BytesIO()
+    workbook.save(output)
+    upload = {
+        "file": (io.BytesIO(output.getvalue()), "row-counts.xlsx"),
+        "include_hidden_rows": str(include_hidden_rows).lower(),
+    }
+    extraction_report = {
+        "status": "ok",
+        "verification": {"count": 0},
+        "empty_target_columns_count": 0,
+        "sheets": [],
+    }
+
+    with (
+        patch(
+            "processing.excel.get_header_decision",
+            return_value=(0, 1, False),
+        ),
+        patch(
+            "services.analysis.classify_file_sheet_groups",
+            return_value={"status": "ok", "sheets": []},
+        ),
+        patch(
+            "services.analysis.try_extract_s2t_transformations",
+            return_value=(0, None, extraction_report),
+        ),
+        patch(
+            "services.analysis.try_generate_summary",
+            return_value=(None, None),
+        ),
+    ):
+        response = client.post(
+            "/upload",
+            data=upload,
+            content_type="multipart/form-data",
+        )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["total_data_row_count"] == expected_total_rows
+    counts = {
+        sheet["sheet_name"]: sheet["data_row_count"]
+        for sheet in payload["sheets"]
+    }
+    assert counts == {
+        "Main": expected_main_rows,
+        "Second": 2,
+        "Empty": 0,
+    }
+    assert all("data_rows" not in sheet for sheet in payload["sheets"])
+
+    conn = get_db_connection()
+    try:
+        stored = conn.execute(
+            """
+            SELECT table_name, COUNT(DISTINCT row_num), COUNT(*)
+            FROM data
+            WHERE file_id = ?
+            GROUP BY table_name
+            """,
+            (payload["file_id"],),
+        ).fetchall()
+    finally:
+        conn.close()
+    stored_counts = {
+        str(sheet_name): (int(row_count), int(cell_count))
+        for sheet_name, row_count, cell_count in stored
+    }
+    assert stored_counts == {
+        "Main": (expected_main_rows, expected_main_rows * 2),
+        "Second": (2, 4),
+    }
 
 
 def test_analysis_progress_missing(client):
@@ -306,18 +462,54 @@ def test_upload_returns_summary_error(mock_generate_description, mock_summarize,
     assert json_data['s2t_transformations_count'] == 0
     assert json_data['s2t_transformations_error'] is None
 
-@patch("app.agent_chat")
+@patch("app.supervisor_chat")
 def test_chat_success(mock_agent, client):
     mock_agent.return_value = "Answer text"
     response = client.post("/chat", json={"query": "List files"})
     assert response.status_code == 200
-    assert response.get_json() == {"answer": "Answer text"}
+    assert response.get_json() == {
+        "answer": "Answer text",
+        "display_items": [],
+    }
     mock_agent.assert_called_once_with("List files")
 
 
+@patch("app.supervisor_chat")
 @patch("app.agent_chat")
-def test_chat_passes_active_file_id_to_agent(mock_agent, client):
-    mock_agent.return_value = "Scoped answer"
+def test_chat_can_run_single_agent_baseline(
+    mock_single_agent,
+    mock_supervisor,
+    app,
+    client,
+):
+    app.config["CHAT_AGENT_MODE"] = "single_agent"
+    mock_single_agent.return_value = "Single-agent answer"
+
+    response = client.post(
+        "/chat",
+        json={
+            "query": "List files",
+            "history": [{"role": "user", "content": "Use SQLite"}],
+            "session_id": "baseline-session",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "answer": "Single-agent answer",
+        "display_items": [],
+    }
+    mock_single_agent.assert_called_once_with(
+        "List files",
+        history=[{"role": "user", "content": "Use SQLite"}],
+        session_id="baseline-session",
+    )
+    mock_supervisor.assert_not_called()
+
+
+@patch("app.supervisor_chat")
+def test_chat_does_not_pass_legacy_file_id_to_supervisor(mock_agent, client):
+    mock_agent.return_value = "Global answer"
 
     response = client.post(
         "/chat",
@@ -325,15 +517,17 @@ def test_chat_passes_active_file_id_to_agent(mock_agent, client):
     )
 
     assert response.status_code == 200
-    assert response.get_json() == {"answer": "Scoped answer"}
+    assert response.get_json() == {
+        "answer": "Global answer",
+        "display_items": [],
+    }
     mock_agent.assert_called_once_with(
         "Покажи таблицу трансформаций",
-        file_id=106,
     )
 
 
-@patch("app.agent_chat")
-def test_chat_passes_browser_session_history_to_agent(mock_agent, client):
+@patch("app.supervisor_chat")
+def test_chat_passes_browser_history_to_supervisor(mock_agent, client):
     mock_agent.return_value = "Follow-up answer"
     history = [
         {"role": "user", "content": "Какие файлы загружены?"},
@@ -352,8 +546,48 @@ def test_chat_passes_browser_session_history_to_agent(mock_agent, client):
     )
 
 
-@patch("app.agent_chat")
-def test_chat_passes_session_id_to_agent(mock_agent, client):
+@patch("app.supervisor_chat")
+def test_chat_bounds_history_before_passing_it_to_supervisor(mock_agent, client):
+    mock_agent.return_value = "Bounded answer"
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"  message-{index}  ",
+            "ui_only": True,
+        }
+        for index in range(12)
+    ]
+    history.extend(
+        [
+            {"role": "user", "content": "  " + "x" * 9000 + "  "},
+            {"role": "assistant", "content": "  " + "y" * 9000 + "  "},
+        ]
+    )
+    original_history = deepcopy(history)
+
+    response = client.post(
+        "/chat",
+        json={
+            "query": "  Follow up  ",
+            "history": history,
+            "session_id": "  bounded-session  ",
+        },
+    )
+
+    assert response.status_code == 200
+    mock_agent.assert_called_once_with(
+        "Follow up",
+        history=[
+            {"role": "user", "content": ("x" * 8000)},
+            {"role": "assistant", "content": ("y" * 8000)},
+        ],
+        session_id="bounded-session",
+    )
+    assert history == original_history
+
+
+@patch("app.supervisor_chat")
+def test_chat_passes_session_id_to_supervisor(mock_agent, client):
     mock_agent.return_value = "Scoped answer"
 
     response = client.post(
@@ -362,14 +596,35 @@ def test_chat_passes_session_id_to_agent(mock_agent, client):
     )
 
     assert response.status_code == 200
-    assert response.get_json() == {"answer": "Scoped answer"}
+    assert response.get_json() == {
+        "answer": "Scoped answer",
+        "display_items": [],
+    }
     mock_agent.assert_called_once_with(
         "List files",
         session_id="chat-session-1",
     )
 
 
-@patch("app.agent_chat")
+@patch("app.supervisor_chat")
+def test_chat_returns_worker_display_items(mock_agent, client):
+    mock_agent.return_value = {
+        "answer": "Найдены строки.",
+        "display_items": [
+            {
+                "name": "run_sql",
+                "content": '{"rows":[{"value":1}]}',
+            }
+        ],
+    }
+
+    response = client.post("/chat", json={"query": "Покажи строки"})
+
+    assert response.status_code == 200
+    assert response.get_json() == mock_agent.return_value
+
+
+@patch("app.supervisor_chat")
 def test_chat_rejects_invalid_history(mock_agent, client):
     response = client.post(
         "/chat",
@@ -381,6 +636,32 @@ def test_chat_rejects_invalid_history(mock_agent, client):
 
     assert response.status_code == 400
     assert "role" in response.get_json()["error"]
+    mock_agent.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("invalid_payload", "error_fragment"),
+    [
+        ({"history": {}}, "history must be an array"),
+        ({"history": [1]}, "history[0] must be an object"),
+        (
+            {"history": [{"role": "user", "content": 1}]},
+            "history[0].content must be a string",
+        ),
+        ({"session_id": 7}, "session_id must be a string"),
+    ],
+)
+@patch("app.supervisor_chat")
+def test_chat_rejects_invalid_history_transport(
+    mock_agent,
+    client,
+    invalid_payload,
+    error_fragment,
+):
+    response = client.post("/chat", json={"query": "q", **invalid_payload})
+
+    assert response.status_code == 400
+    assert error_fragment in response.get_json()["error"]
     mock_agent.assert_not_called()
 
 
@@ -554,6 +835,8 @@ def test_get_transformations_filter(client):
 
 
 def test_delete_transformations(client):
+    from storage.graph_outbox import mark_graph_sync_applied
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.executemany(
@@ -571,10 +854,41 @@ def test_delete_transformations(client):
     conn.commit()
     conn.close()
 
-    response = client.delete("/transformations/207")
+    def apply_projection(file_id):
+        mark_graph_sync_applied(file_id, 1)
+        return (
+            {
+                "file_id": file_id,
+                "desired_revision": 1,
+                "applied_revision": 1,
+            },
+            None,
+        )
+
+    with patch("app.try_sync_file_graph", side_effect=apply_projection):
+        response = client.delete("/transformations/207")
 
     assert response.status_code == 200
-    assert response.get_json()["deleted"] == 2
+    body = response.get_json()
+    state = body.pop("graph_sync_state")
+    assert body == {
+        "status": "ok",
+        "file_id": 207,
+        "deleted": 2,
+        "graph_sync_report": {
+            "file_id": 207,
+            "desired_revision": 1,
+            "applied_revision": 1,
+        },
+        "graph_sync_error": None,
+    }
+    assert state["file_id"] == 207
+    assert state["desired_revision"] == 1
+    assert state["applied_revision"] == 1
+    assert state["attempts"] == 0
+    assert state["last_error"] is None
+    assert state["updated_at"]
+    assert state["applied_at"]
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -663,6 +977,8 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
             "file_sheet_headers": 1,
             "source_tables": 1,
             "target_tables": 1,
+            "source_columns": 0,
+            "target_columns": 0,
             "additional_objects": 1,
             "pxf_to_a": 1,
             "s2t_transformations": 1,
@@ -682,6 +998,8 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
             "file_sheet_headers",
             "source_tables",
             "target_tables",
+            "source_columns",
+            "target_columns",
             "additional_objects",
             "pxf_to_a",
             "s2t_transformations",
@@ -721,6 +1039,8 @@ def test_delete_all_storage_clears_sqlite_when_neo4j_fails(
             "file_sheet_headers": 0,
             "source_tables": 0,
             "target_tables": 0,
+            "source_columns": 0,
+            "target_columns": 0,
             "additional_objects": 0,
             "pxf_to_a": 0,
             "s2t_transformations": 0,
