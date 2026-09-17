@@ -122,6 +122,7 @@ def test_ollama_factory_passes_configured_context_window(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "ollama")
     monkeypatch.setenv("OLLAMA_MODEL", "qwen3.5:9b")
     monkeypatch.setenv("OLLAMA_NUM_CTX", "16384")
+    monkeypatch.delenv("OLLAMA_REASONING", raising=False)
 
     model = create_chat_model()
 

@@ -47,8 +47,8 @@ from .contracts import (
     Observation,
     RerouteReason,
     WorkerCapability,
+    WorkerRequestParts,
     WorkerStopReason,
-    WORKER_PREVIOUS_RESULTS_MARKER,
     parse_worker_request,
 )
 from .observability import get_callback_handler, langfuse_trace_context
@@ -319,6 +319,7 @@ class AgentGraphState(TypedDict):
     original_task: str
     planner_operation_context: str
     observer_operation_context: str
+    previous_results: Optional[List[Dict[str, Any]]]
     planner_message: Optional[AIMessage]
     observations: List[Observation]
     cycle_history: List[WorkerCycleTrace]
@@ -569,26 +570,6 @@ def _with_structured_output(model: Any, schema: Any) -> Any:
     return _NormalizedStructuredOutput()
 
 
-def _split_worker_request(
-    value: Any,
-) -> tuple[str, Optional[List[Dict[str, Any]]], str]:
-    """Expose only the current task and minimal previous result refs."""
-    parts = parse_worker_request(value)
-    previous_results = (
-        [
-            item.model_dump(mode="json", exclude_none=True)
-            for item in parts.previous_results
-        ]
-        if parts.previous_results is not None
-        else None
-    )
-    return (
-        parts.current_task,
-        previous_results,
-        parts.operation_completeness_context,
-    )
-
-
 def _history_messages(
     history: Optional[List[ChatHistoryMessage]],
 ) -> List[BaseMessage]:
@@ -831,6 +812,21 @@ def _original_task_message(
     )
 
 
+def _previous_results_message(
+    state: AgentGraphState,
+) -> Optional[HumanMessage]:
+    """Expose typed lazy references separately from the literal worker task."""
+    previous_results = state.get("previous_results")
+    if not previous_results:
+        return None
+    return HumanMessage(
+        content=json.dumps(
+            {"previous_results": previous_results},
+            ensure_ascii=False,
+        )
+    )
+
+
 def _planner_messages(
     state: AgentGraphState,
     available_tool_names: Sequence[str] = (),
@@ -880,29 +876,13 @@ def _planner_messages(
         ),
         None,
     )
-    task_parts = (
-        parse_worker_request(task_message.content)
-        if task_message is not None
-        else None
-    )
-    if task_parts is not None and task_parts.previous_results is not None:
-        messages.append(
-            HumanMessage(
-                content=json.dumps(
-                    {
-                        "previous_results": [
-                            item.model_dump(mode="json", exclude_none=True)
-                            for item in task_parts.previous_results
-                        ]
-                    },
-                    ensure_ascii=False,
-                )
-            )
-        )
+    previous_results_message = _previous_results_message(state)
+    if previous_results_message is not None:
+        messages.append(previous_results_message)
 
     if worker_finish:
-        if task_parts is not None:
-            messages.append(HumanMessage(content=task_parts.current_task))
+        if task_message is not None:
+            messages.append(HumanMessage(content=task_message.content))
         try:
             latest_call, latest_results = _latest_tool_exchange(
                 state["messages"]
@@ -914,14 +894,7 @@ def _planner_messages(
             messages.append(latest_call)
             messages.extend(latest_results)
     else:
-        for message in state["messages"]:
-            if message is task_message and task_parts is not None:
-                # Keep lazy references visible as compact context while the
-                # authoritative current task remains the last user message
-                # before its tool exchange.
-                messages.append(HumanMessage(content=task_parts.current_task))
-            else:
-                messages.append(message)
+        messages.extend(state["messages"])
     return messages
 
 
@@ -975,6 +948,9 @@ def _worker_tool_selector_messages(
     messages: List[BaseMessage] = [
         SystemMessage(content="\n\n".join(system_parts))
     ]
+    previous_results_message = _previous_results_message(state)
+    if previous_results_message is not None:
+        messages.append(previous_results_message)
     task_message = next(
         (
             message
@@ -1085,7 +1061,10 @@ def _tool_result_truncated(message: ToolMessage) -> bool:
         or payload.get("input_truncated")
         or (
             isinstance(saved_result, dict)
-            and saved_result.get("truncated")
+            and (
+                saved_result.get("truncated")
+                or saved_result.get("input_truncated")
+            )
         )
     )
 
@@ -1532,6 +1511,14 @@ def build_agent_graph(
         if planner_message is None or not planner_message.tool_calls:
             raise RuntimeError("Planner не выбрал инструмент.")
 
+        remaining_steps = state["max_steps"] - state["tool_steps"]
+        requested_steps = len(planner_message.tool_calls)
+        if requested_steps > remaining_steps:
+            raise WorkerResponseError(
+                "Пакет tool calls превышает оставшийся лимит: "
+                f"запрошено {requested_steps}, доступно {remaining_steps}."
+            )
+
         return {
             "messages": [planner_message],
             "planner_message": None,
@@ -1694,14 +1681,10 @@ def build_agent_graph(
             if tool_call_id in retained_tool_results
         ]
 
-        (
-            current_user_request,
-            previous_results,
-            legacy_observer_context,
-        ) = _split_worker_request(_last_user_query(state["messages"]))
+        current_user_request = _last_user_query(state["messages"])
+        previous_results = state.get("previous_results")
         operation_observer_context = str(
             state.get("observer_operation_context")
-            or legacy_observer_context
             or ""
         ).strip()
         payload = {
@@ -2041,6 +2024,7 @@ def run_agent_graph(
         "original_task": "",
         "planner_operation_context": "",
         "observer_operation_context": "",
+        "previous_results": None,
         "planner_message": None,
         "observations": [],
         "cycle_history": [],
@@ -2099,7 +2083,7 @@ def run_agent_graph(
 
 
 def run_worker_graph(
-    task: str,
+    task: str | WorkerRequestParts,
     system_prompt: str,
     model: Any,
     tools: Mapping[str, BaseTool] | Sequence[BaseTool],
@@ -2110,26 +2094,10 @@ def run_worker_graph(
     split_tool_call_planning: bool = False,
 ) -> WorkerRunResult:
     """Run the internal worker graph and retain its selected UI results locally."""
-    raw_task = str(task or "").strip()
-    if not raw_task:
+    request_parts = parse_worker_request(task)
+    clean_task = request_parts.current_task.strip()
+    if not clean_task:
         raise WorkerResponseError("Worker получил пустую task.")
-
-    request_parts = parse_worker_request(raw_task)
-    clean_task = request_parts.current_task
-    if request_parts.previous_results is not None:
-        clean_task += (
-            WORKER_PREVIOUS_RESULTS_MARKER
-            + "\n"
-            + json.dumps(
-                {
-                    "previous_results": [
-                        item.model_dump(mode="json", exclude_none=True)
-                        for item in request_parts.previous_results
-                    ]
-                },
-                ensure_ascii=False,
-            )
-        )
 
     bounded_steps = max(1, int(max_steps))
     preview_chars = max(1, int(tool_message_preview_chars))
@@ -2155,6 +2123,14 @@ def run_worker_graph(
         ),
         "observer_operation_context": (
             request_parts.operation_completeness_context
+        ),
+        "previous_results": (
+            [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in request_parts.previous_results
+            ]
+            if request_parts.previous_results is not None
+            else None
         ),
         "planner_message": None,
         "observations": [],
@@ -2233,6 +2209,26 @@ def run_worker_graph(
             )
         )
 
+    def partial_contract_result(
+        gap: str,
+        stop_reason: WorkerStopReason,
+    ) -> WorkerRunResult:
+        return WorkerRunResult(
+            answer=gap,
+            display_items=display_items,
+            cycle_history=list(final_state.get("cycle_history") or []),
+            status="complete",
+            gap=gap,
+            stop_reason=stop_reason,
+            unmet_requirements=[gap],
+            facts=(
+                list(latest_observation.facts)
+                if latest_observation is not None
+                else []
+            ),
+            accepted_tool_call_ids=accepted_tool_call_ids,
+        )
+
     if latest_observation is not None and latest_observation.status == "reroute":
         reroute_gap = str(latest_observation.gap or "").strip()
         logger.info(
@@ -2272,38 +2268,47 @@ def run_worker_graph(
             # earlier valid cumulative observation already accepted.  Return
             # the normal internal result shape with a typed gap so the public
             # worker can expose a partial outcome and retain those artifacts.
-            return WorkerRunResult(
-                answer=terminal_gap,
-                display_items=display_items,
-                cycle_history=list(final_state.get("cycle_history") or []),
-                status="complete",
-                gap=terminal_gap,
-                stop_reason="observer_error",
-                unmet_requirements=[terminal_gap],
-                facts=(
-                    list(latest_observation.facts)
-                    if latest_observation is not None
-                    else []
-                ),
-                accepted_tool_call_ids=accepted_tool_call_ids,
+            return partial_contract_result(
+                terminal_gap,
+                "observer_error",
             )
         raise WorkerResponseError(terminal_gap)
 
     planner_message = final_state.get("planner_message")
     if planner_message is None:
-        raise WorkerResponseError("Воркер завершился без finish_worker.")
+        planner_contract_gap = "Воркер завершился без finish_worker."
+        if accepted_tool_call_ids:
+            return partial_contract_result(
+                planner_contract_gap,
+                "tool_error",
+            )
+        raise WorkerResponseError(planner_contract_gap)
     finish_calls = [
         call
         for call in planner_message.tool_calls
         if call.get("name") == _FINISH_WORKER_TOOL_NAME
     ]
     if len(finish_calls) == 1 and len(planner_message.tool_calls) == 1:
-        payload = _worker_finish_payload(finish_calls[0])
+        try:
+            payload = _worker_finish_payload(finish_calls[0])
+        except WorkerResponseError as exc:
+            planner_contract_gap = str(exc)
+            if accepted_tool_call_ids:
+                return partial_contract_result(
+                    planner_contract_gap,
+                    "tool_error",
+                )
+            raise
     else:
         planner_contract_gap = (
             _message_text(planner_message).strip()
             or "Воркер должен завершиться ровно одним вызовом finish_worker."
         )
+        if accepted_tool_call_ids:
+            return partial_contract_result(
+                planner_contract_gap,
+                "tool_error",
+            )
         raise WorkerResponseError(planner_contract_gap)
     gap = (
         latest_observation.gap

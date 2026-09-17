@@ -14,6 +14,7 @@ from sheet_skills.column_matching import (
     persist_mapping_aliases,
 )
 from storage.database import _sql_identifier, get_db_connection
+from storage.embedding_index import register_embedding_blobs
 
 
 RecordPreparer = Callable[[str, List[Dict[str, Any]]], None]
@@ -98,6 +99,15 @@ def extract_configured_rows(
     try:
         cursor = conn.cursor()
         cursor.execute("BEGIN")
+        register_embedding_blobs(
+            cursor,
+            [
+                row["description_embedding"]
+                for rows in records_by_target.values()
+                for row in rows
+                if row.get("description_embedding") is not None
+            ],
+        )
         for target_name in target_names:
             fields = tuple(configs[target_name]["fields"])
             insert_columns = (

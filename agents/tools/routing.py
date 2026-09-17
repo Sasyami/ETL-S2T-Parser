@@ -10,7 +10,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from ..contracts import parse_worker_request
+from ..contracts import WorkerRequestParts, parse_worker_request
 from ..run_metrics import llm_stage
 from .context import SCHEMA_CATALOG
 from .registry import (
@@ -668,7 +668,7 @@ def _general_fallback_route(
 
 
 def select_chat_route(
-    user_query: str,
+    user_query: str | WorkerRequestParts,
     history: Optional[List[Dict[str, str]]] = None,
     *,
     model: Any,
@@ -678,8 +678,8 @@ def select_chat_route(
     catalog_stage: str = "unrestricted",
 ) -> ToolRoute:
     """Select exact tools, skills, and schemas via structured output."""
-    clean_query = str(user_query or "").strip()
-    if not clean_query:
+    request_parts = parse_worker_request(user_query)
+    if not request_parts.current_task:
         raise ToolRoutingError("Tool-router получил пустой запрос")
     if not available_tools:
         raise ToolRoutingError("Tool-router не получил каталог tools")
@@ -693,10 +693,6 @@ def select_chat_route(
         raise ToolRoutingError(
             f"Tool-router получил неизвестный catalog_stage: {catalog_stage}"
         )
-
-    request_parts = parse_worker_request(clean_query)
-    if not request_parts.current_task:
-        raise ToolRoutingError("Tool-router получил пустую текущую task")
 
     payload = {
         "current_task": request_parts.current_task,

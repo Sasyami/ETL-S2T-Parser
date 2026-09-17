@@ -10,9 +10,9 @@ from agents.contracts import (
     EvidenceArtifact,
     EvidenceFact,
     PreviousResultReference,
-    WORKER_PREVIOUS_RESULTS_MARKER,
     WorkerOutcome,
     WorkerPlan,
+    WorkerRequestParts,
     parse_worker_request,
 )
 from agents.coordinator import CoordinatorAnswer
@@ -492,15 +492,16 @@ def test_sql_risk_router_propagates_only_requested_aspect(monkeypatch):
         "enum"
     ]
     assert 'pipeline="sql_risk_scope"' not in _operation_skill_prompt()
+    worker_parts = parse_worker_request(worker.call_args.args[0])
     for forbidden_aspect in (
         "row_filtering",
         "constraint_rejection",
         "value_changes",
         "write_semantics",
     ):
-        assert forbidden_aspect not in worker.call_args.args[0]
+        assert forbidden_aspect not in worker_parts.operation_execution_context
+        assert forbidden_aspect not in worker_parts.operation_completeness_context
 
-    worker_parts = parse_worker_request(worker.call_args.args[0])
     assert "`cardinality`" in worker_parts.operation_execution_context
     assert "`cardinality`" in worker_parts.operation_completeness_context
     for tool_name in (
@@ -3126,12 +3127,12 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
         "подтверждённые имена."
     )
     assert first_parts.previous_results is None
-    assert "Структурированные ограничения шага" not in first_task
+    assert "Структурированные ограничения шага" not in first_parts.current_task
     second_task = worker.call_args_list[1].args[0]
     second_parts = parse_worker_request(second_task)
     assert second_parts.current_task == "Проверь найденное имя."
-    assert "Общий фон" not in first_task
-    assert "Общий фон" not in second_task
+    assert "Общий фон" not in first_parts.current_task
+    assert "Общий фон" not in second_parts.current_task
     operation_payload = _payload(model, "select_operation_skills")
     assert operation_payload == {
         "original_task": "Найди имя для file_id=7 и проверь его.",
@@ -3148,7 +3149,7 @@ def test_coordinator_keeps_workers_isolated_and_combines_upstream_output(caplog)
             "description": "lookup: точное имя t_example.",
         }
     ]
-    assert WORKER_PREVIOUS_RESULTS_MARKER in second_task
+    assert isinstance(second_task, WorkerRequestParts)
     discard.assert_not_called()
 
     upstream = _payload(model, "submit_upstream_answer")
@@ -4221,7 +4222,9 @@ def test_upstream_restarts_cleanly_with_only_problem():
         "problem": "Отсутствуют три метрики source_table.",
     }
     second_worker_task = worker.call_args_list[1].args[0]
-    assert "target_table=t_example; строк=42" not in second_worker_task
+    assert "target_table=t_example; строк=42" not in parse_worker_request(
+        second_worker_task
+    ).current_task
     final_upstream_payload = _payload(model, "submit_upstream_answer")
     assert set(final_upstream_payload) == {
         "original_task",
@@ -4580,7 +4583,9 @@ def test_coordinator_does_not_semantically_reparse_agentic_reroute_plan():
 
     assert result.answer == "Риск размножения строк условный."
     assert worker.call_count == 2
-    assert "metadata src_orders и tgt_orders" in worker.call_args_list[1].args[0]
+    assert "metadata src_orders и tgt_orders" in parse_worker_request(
+        worker.call_args_list[1].args[0]
+    ).current_task
     plan_messages = [
         messages
         for name, messages in model.messages

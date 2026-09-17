@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .database import get_db_connection
 
@@ -13,21 +13,55 @@ def _now() -> str:
     return datetime.now().isoformat()
 
 
+def _current_generation(cursor: sqlite3.Cursor) -> int:
+    row = cursor.execute(
+        """
+        SELECT generation
+        FROM graph_sync_generation
+        WHERE singleton_id = 1
+        """
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Graph sync generation is not initialized")
+    return int(row[0])
+
+
 def enqueue_graph_sync(cursor: sqlite3.Cursor, file_id: int) -> int:
     """Increment the desired projection revision inside the caller transaction."""
     clean_file_id = int(file_id)
+    generation = _current_generation(cursor)
     cursor.execute(
         """
         INSERT INTO graph_sync_outbox
-        (file_id, desired_revision, applied_revision, attempts,
+        (file_id, generation, desired_revision, applied_revision, attempts,
          last_error, updated_at, applied_at)
-        VALUES (?, 1, 0, 0, NULL, ?, NULL)
+        VALUES (?, ?, 1, 0, 0, NULL, ?, NULL)
         ON CONFLICT(file_id) DO UPDATE SET
-            desired_revision = graph_sync_outbox.desired_revision + 1,
+            generation = excluded.generation,
+            desired_revision = CASE
+                WHEN graph_sync_outbox.generation = excluded.generation
+                THEN graph_sync_outbox.desired_revision + 1
+                ELSE 1
+            END,
+            applied_revision = CASE
+                WHEN graph_sync_outbox.generation = excluded.generation
+                THEN graph_sync_outbox.applied_revision
+                ELSE 0
+            END,
+            attempts = CASE
+                WHEN graph_sync_outbox.generation = excluded.generation
+                THEN graph_sync_outbox.attempts
+                ELSE 0
+            END,
             last_error = NULL,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            applied_at = CASE
+                WHEN graph_sync_outbox.generation = excluded.generation
+                THEN graph_sync_outbox.applied_at
+                ELSE NULL
+            END
         """,
-        (clean_file_id, _now()),
+        (clean_file_id, generation, _now()),
     )
     row = cursor.execute(
         """
@@ -64,7 +98,7 @@ def get_graph_sync_state(file_id: int) -> Optional[Dict[str, Any]]:
     try:
         row = conn.execute(
             """
-            SELECT file_id, desired_revision, applied_revision, attempts,
+            SELECT file_id, generation, desired_revision, applied_revision, attempts,
                    last_error, updated_at, applied_at
             FROM graph_sync_outbox
             WHERE file_id = ?
@@ -83,7 +117,7 @@ def list_pending_graph_syncs(limit: int = 100) -> List[Dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT file_id, desired_revision, applied_revision, attempts,
+            SELECT file_id, generation, desired_revision, applied_revision, attempts,
                    last_error, updated_at, applied_at
             FROM graph_sync_outbox
             WHERE desired_revision > applied_revision
@@ -97,65 +131,152 @@ def list_pending_graph_syncs(limit: int = 100) -> List[Dict[str, Any]]:
         conn.close()
 
 
-def mark_graph_sync_applied(file_id: int, revision: int) -> None:
+def _resolve_generation(
+    conn: sqlite3.Connection,
+    file_id: int,
+    generation: Optional[int],
+) -> Optional[int]:
+    if generation is not None:
+        return int(generation)
+    row = conn.execute(
+        "SELECT generation FROM graph_sync_outbox WHERE file_id = ?",
+        (int(file_id),),
+    ).fetchone()
+    return int(row[0]) if row is not None else None
+
+
+def mark_graph_sync_applied(
+    file_id: int,
+    revision: int,
+    generation: Optional[int] = None,
+) -> bool:
     """Confirm a revision only after the Neo4j transaction succeeded."""
     conn = get_db_connection()
     try:
-        conn.execute(
+        clean_generation = _resolve_generation(conn, file_id, generation)
+        if clean_generation is None:
+            return False
+        cursor = conn.execute(
             """
             UPDATE graph_sync_outbox
             SET applied_revision = CASE
                     WHEN applied_revision < ? THEN ?
                     ELSE applied_revision
                 END,
-                attempts = 0,
-                last_error = NULL,
+                attempts = CASE
+                    WHEN desired_revision = ? THEN 0
+                    ELSE attempts
+                END,
+                last_error = CASE
+                    WHEN desired_revision = ? THEN NULL
+                    ELSE last_error
+                END,
                 applied_at = ?
             WHERE file_id = ?
+              AND generation = ?
+              AND desired_revision >= ?
             """,
-            (int(revision), int(revision), _now(), int(file_id)),
+            (
+                int(revision),
+                int(revision),
+                int(revision),
+                int(revision),
+                _now(),
+                int(file_id),
+                clean_generation,
+                int(revision),
+            ),
         )
         conn.commit()
+        return cursor.rowcount == 1
     finally:
         conn.close()
 
 
-def mark_graph_sync_failed(file_id: int, revision: int, error: str) -> None:
+def mark_graph_sync_failed(
+    file_id: int,
+    revision: int,
+    error: str,
+    generation: Optional[int] = None,
+) -> bool:
     """Record a failed delivery without advancing applied_revision."""
     conn = get_db_connection()
     try:
-        conn.execute(
+        clean_generation = _resolve_generation(conn, file_id, generation)
+        if clean_generation is None:
+            return False
+        cursor = conn.execute(
             """
             UPDATE graph_sync_outbox
             SET attempts = attempts + 1,
                 last_error = ?,
                 updated_at = ?
-            WHERE file_id = ? AND desired_revision >= ?
+            WHERE file_id = ?
+              AND generation = ?
+              AND desired_revision = ?
+              AND applied_revision < ?
             """,
-            (str(error), _now(), int(file_id), int(revision)),
+            (
+                str(error),
+                _now(),
+                int(file_id),
+                clean_generation,
+                int(revision),
+                int(revision),
+            ),
         )
         conn.commit()
+        return cursor.rowcount == 1
     finally:
         conn.close()
 
 
-def mark_all_graph_syncs_applied() -> None:
-    """Confirm all pending empty projections after a successful global clear."""
+def mark_graph_syncs_applied(
+    requests: Sequence[Mapping[str, Any]],
+) -> int:
+    """Confirm only the generation/revisions included in one clear snapshot."""
     conn = get_db_connection()
     try:
         now = _now()
-        conn.execute(
-            """
-            UPDATE graph_sync_outbox
-            SET applied_revision = desired_revision,
-                attempts = 0,
-                last_error = NULL,
-                applied_at = ?
-            WHERE desired_revision > applied_revision
-            """,
-            (now,),
-        )
+        updated = 0
+        for request in requests:
+            file_id = int(request["file_id"])
+            generation = int(request["generation"])
+            revision = int(request["revision"])
+            cursor = conn.execute(
+                """
+                UPDATE graph_sync_outbox
+                SET applied_revision = CASE
+                        WHEN applied_revision < ? THEN ?
+                        ELSE applied_revision
+                    END,
+                    attempts = CASE
+                        WHEN desired_revision = ? THEN 0
+                        ELSE attempts
+                    END,
+                    last_error = CASE
+                        WHEN desired_revision = ? THEN NULL
+                        ELSE last_error
+                    END,
+                    applied_at = ?
+                WHERE file_id = ?
+                  AND generation = ?
+                  AND desired_revision >= ?
+                """,
+                (
+                    revision,
+                    revision,
+                    revision,
+                    revision,
+                    now,
+                    file_id,
+                    generation,
+                    revision,
+                ),
+            )
+            updated += int(cursor.rowcount == 1)
         conn.commit()
+        return updated
     finally:
         conn.close()
 
@@ -164,8 +285,8 @@ __all__ = [
     "enqueue_graph_sync",
     "get_graph_sync_state",
     "list_pending_graph_syncs",
-    "mark_all_graph_syncs_applied",
     "mark_graph_sync_applied",
     "mark_graph_sync_failed",
+    "mark_graph_syncs_applied",
     "request_graph_sync",
 ]

@@ -248,11 +248,11 @@ def _evenly_spaced_items(items: List[Any], limit: int) -> List[Any]:
     if limit <= 1:
         return items[:1]
     last_index = len(items) - 1
-    picked = {
-        items[round(index * last_index / (limit - 1))]
+    picked_indexes = {
+        round(index * last_index / (limit - 1))
         for index in range(limit)
     }
-    return [item for item in items if item in picked]
+    return [item for index, item in enumerate(items) if index in picked_indexes]
 
 
 def _dedupe_records(

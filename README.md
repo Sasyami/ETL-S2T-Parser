@@ -231,6 +231,26 @@ CHAT_AGENT_MODE=single_agent
 
 `source_layer` и `target_layer` определяются по группе листа правилами из `config/table_layers.json`, а не по имени таблицы и не через LLM.
 
+### Профиль embedding-индекса
+
+Семантический поиск хранит внутренние метаданные индекса: модель, optional
+revision, явный query/document-профиль, нормализацию и размерность. Для модели
+по умолчанию используется профиль `multilingual-e5-v1` (`query: ` для запроса,
+`passage: ` для документов). Для любой явно заданной `EMBEDDING_MODEL` нужно
+также явно задать `EMBEDDING_PROFILE`; доступен нейтральный
+`plain-normalized-v1`, который не добавляет префиксы.
+
+Старые embedding blobs без этих метаданных и векторы от другой конфигурации не
+смешиваются с новым запросом. После смены модели, revision или профиля выполните
+явную переиндексацию из корня проекта:
+
+```bash
+uv run python scripts/reindex_description_embeddings.py
+```
+
+Команда атомарно перестраивает descriptions для `files`, каталогов таблиц и
+каталогов колонок. Read-only chat эту миграцию не запускает.
+
 ### Neo4j
 
 При настроенном подключении `services/graph_sync.py` пересобирает проекцию одного файла:
@@ -272,6 +292,12 @@ uv run python app.py
 конфигурации. Это относится к live/judge, metrics, Langfuse, SSL/reasoning и
 всем бинарным флагам с суффиксом `_EXPERIMENT`. Многовариантный
 `OPERATION_SQL_RISK_PROTOCOL_EXPERIMENT` остаётся enum-selector.
+
+При обновлении старого `.env` замените сохранённые boolean aliases явно:
+`false` → `0`, `true` → `1`. В частности, прежнее
+`GIGACHAT_VERIFY_SSL=false` должно стать `GIGACHAT_VERIFY_SSL=0`. Приложение
+намеренно не переписывает пользовательский `.env` и завершает запуск с именем
+ошибочной переменной до сетевого запроса.
 
 ### GigaChat
 
@@ -514,6 +540,13 @@ uv run python scripts/run_operation_protocol_experiments.py \
   --db-path .test_runs/synthetic_live.db \
   --output-dir .test_runs/operation-protocol-experiments
 ```
+
+Изолированные arms по умолчанию запускаются тем же Python, которым запущен
+runner; другой интерпретатор можно передать через `--python-executable`.
+Версионируемый pytest-plugin с guard неизменности synthetic fixture находится в
+`tests/support/synthetic_live_support.py`; пустая локальная заглушка preflight не
+проходит. Завершение по timeout или interrupt останавливает всё дерево процессов
+платформенным способом на Windows и POSIX до удаления временного clone.
 
 Перед первым вызовом runner фиксирует committed HEAD, SHA протокольного bundle,
 SQLite и synthetic plugin. Каждый эксперимент выполняется в отдельном локальном

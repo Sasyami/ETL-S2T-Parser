@@ -32,12 +32,9 @@ from .contracts import (
     SqlRiskAspect,
     UpstreamDecision,
     UpstreamOutput,
-    WORKER_OPERATION_COMPLETENESS_MARKER,
-    WORKER_OPERATION_EXECUTION_MARKER,
-    WORKER_ORIGINAL_TASK_MARKER,
-    WORKER_PREVIOUS_RESULTS_MARKER,
     WorkerOutcome,
     WorkerPlan,
+    WorkerRequestParts,
 )
 from .experiment_flags import experiment_flag_enabled
 from .chat_graph import WorkerDisplayItem
@@ -2084,14 +2081,6 @@ def build_coordinator_graph(
             raise CoordinatorResponseError(
                 "Coordinator вызвал worker с пустой task из плана."
             )
-        worker_task = planned_task
-        worker_task += (
-            WORKER_ORIGINAL_TASK_MARKER
-            + json.dumps(
-                {"original_task": state["task"]},
-                ensure_ascii=False,
-            )
-        )
         selected_operation_skills = state.get("operation_skills") or []
         selected_sql_risk_aspects = (
             state.get("operation_sql_risk_aspects") or []
@@ -2106,41 +2095,26 @@ def build_coordinator_graph(
             stage="observer",
             sql_risk_aspects=selected_sql_risk_aspects,
         )
-        if planner_context:
-            worker_task += (
-                WORKER_OPERATION_EXECUTION_MARKER + planner_context
-            )
-        if observer_context:
-            worker_task += (
-                WORKER_OPERATION_COMPLETENESS_MARKER
-                + observer_context
-            )
         previous_results = [
             reference
             for run in state["worker_runs"]
             if run["cycle"] == state["cycle"]
             for reference in run["outcome"].previous_results
         ]
-        if previous_results:
-            worker_task += (
-                WORKER_PREVIOUS_RESULTS_MARKER
-                + "\n"
-                + json.dumps(
-                    {
-                        "previous_results": [
-                            item.model_dump(mode="json", exclude_none=True)
-                            for item in previous_results
-                        ]
-                    },
-                    ensure_ascii=False,
-                )
-            )
-        logger.info(
-            "Coordinator dispatches planned worker step=%s task=%s",
-            step_index + 1,
-            worker_task[:1000],
+        worker_request = WorkerRequestParts(
+            current_task=planned_task,
+            original_task=state["task"],
+            operation_execution_context=planner_context,
+            operation_completeness_context=observer_context,
+            previous_results=(previous_results or None),
         )
-        outcome = worker_chat(worker_task)
+        logger.info(
+            "Coordinator dispatches planned worker step=%s task=%s previous_results=%s",
+            step_index + 1,
+            worker_request.current_task[:1000],
+            len(previous_results),
+        )
+        outcome = worker_chat(worker_request)
         record_worker_outcome(
             cycle=state["cycle"],
             step=step_index + 1,

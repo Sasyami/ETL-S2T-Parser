@@ -27,19 +27,20 @@ def allowed_file(filename: str) -> bool:
 def convert_to_serializable(obj: Any) -> Any:
     if obj is None:
         return None
-    if isinstance(obj, (datetime.datetime, datetime.date, pd.Timestamp)):
-        return obj.isoformat()
-    if isinstance(obj, np.datetime64):
-        return None if pd.isna(obj) else str(obj)
     if isinstance(obj, dict):
         return {key: convert_to_serializable(value) for key, value in obj.items()}
     if isinstance(obj, (list, tuple, np.ndarray, pd.Series)):
         return [convert_to_serializable(value) for value in list(obj)]
     try:
-        if pd.isna(obj):
+        missing = pd.isna(obj)
+        if isinstance(missing, (bool, np.bool_)) and bool(missing):
             return None
     except (TypeError, ValueError):
         pass
+    if isinstance(obj, (datetime.datetime, datetime.date, pd.Timestamp)):
+        return obj.isoformat()
+    if isinstance(obj, np.datetime64):
+        return str(obj)
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, np.floating):
@@ -224,7 +225,7 @@ def is_empty_or_irrelevant(preview_rows: List[List[Any]]) -> Tuple[bool, str]:
         return True, "Sheet contains no data (all cells empty)"
     meaningful = sum(
         bool(cell.strip()) if isinstance(cell, str) else cell is not None
-        for row in preview_rows[:5]
+        for row in preview_rows
         for cell in row
     )
     return (False, "") if meaningful else (
@@ -233,11 +234,10 @@ def is_empty_or_irrelevant(preview_rows: List[List[Any]]) -> Tuple[bool, str]:
     )
 
 
-def _rows_empty(frame: pd.DataFrame, num_rows: int = 5) -> bool:
-    sample = frame.iloc[:num_rows]
-    return sample.empty or not any(
+def _rows_empty(frame: pd.DataFrame) -> bool:
+    return frame.empty or not any(
         not _is_missing(cell)
-        for row in sample.itertuples(index=False, name=None)
+        for row in frame.itertuples(index=False, name=None)
         for cell in row
     )
 
@@ -342,6 +342,17 @@ def _parse_loaded_sheet(
     preview = _frame_rows(frame.iloc[:PREVIEW_ROWS])
     irrelevant, reason = is_empty_or_irrelevant(preview)
     if irrelevant:
+        if not _rows_empty(frame):
+            return {
+                "skip_reason": (
+                    f"No data in the first {PREVIEW_ROWS} rows used for "
+                    "header detection"
+                ),
+                "detail": (
+                    f"{sheet_name}: данные есть ниже поддерживаемого окна "
+                    "поиска заголовка"
+                ),
+            }
         return {"skip_reason": reason}
 
     start, header_rows, nested = _resolve_header_decision(sheet_name, preview)
@@ -358,9 +369,9 @@ def _parse_loaded_sheet(
         hidden = hidden_rows or set()
         data_positions = [position for position in data_positions if position not in hidden]
     selected_data = data_frame.iloc[data_positions]
-    if _rows_empty(selected_data, 5):
+    if _rows_empty(selected_data):
         return {
-            "skip_reason": "No data rows after headers (first 5 rows empty)",
+            "skip_reason": "No data rows after headers",
             "detail": f"{sheet_name}: нет строк данных после заголовков",
         }
 

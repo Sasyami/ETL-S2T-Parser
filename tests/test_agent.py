@@ -743,7 +743,7 @@ def test_chat_tool_rerouter_requires_a_tool_for_each_required_capability():
 
 
 def test_chat_tool_router_separates_current_task_from_previous_results():
-    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
+    from agents.contracts import PreviousResultReference, WorkerRequestParts
 
     previous = {
         "previous_results": [
@@ -758,10 +758,16 @@ def test_chat_tool_router_separates_current_task_from_previous_results():
     )
 
     route = _select_chat_route(
-        "Прочитай новый срез основной базы с filter_value прошлого шага."
-        + WORKER_PREVIOUS_RESULTS_MARKER
-        + " Служебный handoff:\n"
-        + json.dumps(previous, ensure_ascii=False),
+        WorkerRequestParts(
+            current_task=(
+                "Прочитай новый срез основной базы с filter_value прошлого шага."
+            ),
+            previous_results=[
+                PreviousResultReference.model_validate(
+                    previous["previous_results"][0]
+                )
+            ],
+        ),
         model=model,
         available_tools=get_tools(),
     )
@@ -776,7 +782,7 @@ def test_chat_tool_router_separates_current_task_from_previous_results():
 
 
 def test_chat_tool_router_routes_only_current_task_not_original_task():
-    from agents.contracts import WORKER_ORIGINAL_TASK_MARKER
+    from agents.contracts import WorkerRequestParts
 
     current_task = "Прочитай назначенный S2T-срез."
     original_task = (
@@ -792,11 +798,9 @@ def test_chat_tool_router_routes_only_current_task_not_original_task():
     )
 
     route = _select_chat_route(
-        current_task
-        + WORKER_ORIGINAL_TASK_MARKER
-        + json.dumps(
-            {"original_task": original_task},
-            ensure_ascii=False,
+        WorkerRequestParts(
+            current_task=current_task,
+            original_task=original_task,
         ),
         model=model,
         available_tools=get_tools(),
@@ -812,25 +816,29 @@ def test_chat_tool_router_routes_only_current_task_not_original_task():
     )
 
 
-def test_chat_tool_router_discards_legacy_stable_context_suffix():
+def test_chat_tool_router_treats_legacy_marker_text_as_literal_task():
     model = _ToolRouterModel(
         ToolRoute(tools=["list_files"], skills=[], schemas=[])
     )
     leaked_context = "RAW_CONVERSATION_CONTEXT_MUST_NOT_REACH_ROUTER"
 
-    route = _select_chat_route(
+    literal_task = (
         "Покажи файлы."
         "\n\nУстойчивые правила контекста:\n"
-        + leaked_context,
+        + leaked_context
+    )
+    route = _select_chat_route(
+        literal_task,
         model=model,
         available_tools=get_tools(),
     )
 
     assert route.tools == ["list_files"]
     payload = json.loads(model.messages[-1].content)
-    assert payload["current_task"] == "Покажи файлы."
+    assert payload["current_task"] == literal_task
     assert "stable_context" not in payload
-    assert leaked_context not in json.dumps(payload, ensure_ascii=False)
+    assert leaked_context in payload["current_task"]
+    assert leaked_context not in str(model.messages[0].content)
 
 
 def test_chat_tool_rerouter_repairs_unchanged_palette_by_adding_tool():
@@ -2257,6 +2265,53 @@ def test_run_agent_graph_enforces_max_steps_in_router():
 
     assert out == "Готово без дополнительных инструментов."
     assert calls == [True]
+
+
+def test_run_agent_graph_rejects_parallel_batch_over_remaining_limit():
+    from agents.chat_graph import WorkerResponseError, run_agent_graph
+
+    calls = []
+
+    def ping():
+        calls.append("ping")
+        return {"ok": True}
+
+    def pong():
+        calls.append("pong")
+        return {"ok": True}
+
+    model = _ScriptedNativeModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ping",
+                        "args": {},
+                        "id": "call-ping-over-limit",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "pong",
+                        "args": {},
+                        "id": "call-pong-over-limit",
+                        "type": "tool_call",
+                    },
+                ],
+            )
+        ]
+    )
+
+    with pytest.raises(WorkerResponseError, match="запрошено 2, доступно 1"):
+        run_agent_graph(
+            "Проверь обе операции",
+            "Системный контекст",
+            model,
+            (_as_tool(ping), _as_tool(pong)),
+            max_steps=1,
+        )
+
+    assert calls == []
 
 
 def test_run_agent_graph_can_use_show_plan_as_native_tool():

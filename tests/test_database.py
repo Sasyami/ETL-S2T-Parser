@@ -10,6 +10,7 @@ from storage.database import (
     FILES_COLUMNS,
     FILE_SHEET_HEADER_COLUMNS,
     GRAPH_SYNC_OUTBOX_COLUMNS,
+    GRAPH_SYNC_GENERATION_COLUMNS,
     INTERNAL_TABLES,
     PXF_TO_A_COLUMNS,
     S2T_TRANSFORMATION_COLUMNS,
@@ -23,6 +24,7 @@ from storage.database import (
     TARGET_COLUMN_COLUMNS,
     USER_FACING_TABLES,
     clear_all_data,
+    clear_all_data_with_graph_snapshot,
     get_file,
     init_db,
     store_excel_data,
@@ -67,6 +69,9 @@ def test_init_db(temp_db):
     cursor.execute("PRAGMA table_info(graph_sync_outbox)")
     outbox_columns = [row[1] for row in cursor.fetchall()]
     assert outbox_columns == list(GRAPH_SYNC_OUTBOX_COLUMNS)
+    cursor.execute("PRAGMA table_info(graph_sync_generation)")
+    generation_columns = [row[1] for row in cursor.fetchall()]
+    assert generation_columns == list(GRAPH_SYNC_GENERATION_COLUMNS)
 
 
 def test_store_excel_data_preserves_long_cell_values(temp_db):
@@ -112,7 +117,11 @@ def test_storage_schema_constants_cover_current_tables():
         "s2t_transformations",
         "data",
     )
-    assert INTERNAL_TABLES == ("graph_sync_outbox",)
+    assert INTERNAL_TABLES == (
+        "graph_sync_generation",
+        "graph_sync_outbox",
+        "embedding_index_metadata",
+    )
     assert tuple(get_usefull_col_extraction_target("source_tables")["fields"]) == tuple(
         SOURCE_TABLE_COLUMNS[4:-1]
     )
@@ -269,7 +278,11 @@ def test_clear_all_data_deletes_every_row_and_keeps_schema(temp_db):
     }
     assert tables == set(CORE_TABLES)
     for table_name, expected_columns in STORAGE_SCHEMA_COLUMNS.items():
-        expected_count = 1 if table_name == "graph_sync_outbox" else 0
+        expected_count = (
+            1
+            if table_name in {"graph_sync_generation", "graph_sync_outbox"}
+            else 0
+        )
         assert temp_db.execute(
             f'SELECT COUNT(*) FROM "{table_name}"'
         ).fetchone()[0] == expected_count
@@ -282,11 +295,110 @@ def test_clear_all_data_deletes_every_row_and_keeps_schema(temp_db):
         assert actual_columns == tuple(expected_columns)
     outbox = temp_db.execute(
         """
-        SELECT file_id, desired_revision, applied_revision
+        SELECT file_id, generation, desired_revision, applied_revision
         FROM graph_sync_outbox
         """
     ).fetchone()
-    assert tuple(outbox) == (10, 1, 0)
+    assert tuple(outbox) == (10, 1, 1, 0)
+    assert temp_db.execute(
+        "SELECT generation FROM graph_sync_generation WHERE singleton_id = 1"
+    ).fetchone()[0] == 1
+
+
+def test_clear_snapshot_does_not_acknowledge_later_upload(temp_db):
+    from storage.graph_outbox import (
+        get_graph_sync_state,
+        mark_graph_syncs_applied,
+        request_graph_sync,
+    )
+
+    temp_db.execute(
+        "INSERT INTO files (file_id, filename, upload_time) VALUES (10, 'old.xlsx', 'now')"
+    )
+    temp_db.commit()
+
+    _deleted, snapshot = clear_all_data_with_graph_snapshot()
+    assert snapshot == {
+        "generation": 1,
+        "requests": [{"file_id": 10, "generation": 1, "revision": 1}],
+    }
+
+    request_graph_sync(10)
+    assert mark_graph_syncs_applied(snapshot["requests"]) == 1
+    state = get_graph_sync_state(10)
+    assert state["generation"] == 1
+    assert state["desired_revision"] == 2
+    assert state["applied_revision"] == 1
+
+
+def test_new_clear_generation_rejects_stale_ack_and_failure(temp_db):
+    from storage.graph_outbox import (
+        get_graph_sync_state,
+        mark_graph_sync_applied,
+        mark_graph_sync_failed,
+    )
+
+    temp_db.execute(
+        "INSERT INTO files (file_id, filename, upload_time) VALUES (10, 'old.xlsx', 'now')"
+    )
+    temp_db.commit()
+    _deleted, first = clear_all_data_with_graph_snapshot()
+    _deleted, second = clear_all_data_with_graph_snapshot()
+
+    assert first["generation"] == 1
+    assert second["generation"] == 2
+    assert mark_graph_sync_applied(10, 1, generation=1) is False
+    assert mark_graph_sync_failed(10, 1, "stale", generation=1) is False
+    state = get_graph_sync_state(10)
+    assert state["generation"] == 2
+    assert state["desired_revision"] == 1
+    assert state["applied_revision"] == 0
+    assert state["last_error"] is None
+
+
+def test_init_db_migrates_pre_generation_graph_outbox(temp_db):
+    temp_db.execute("DROP TABLE graph_sync_generation")
+    temp_db.execute("ALTER TABLE graph_sync_outbox RENAME TO graph_sync_outbox_new")
+    temp_db.execute(
+        """
+        CREATE TABLE graph_sync_outbox (
+            file_id INTEGER PRIMARY KEY,
+            desired_revision INTEGER NOT NULL DEFAULT 0,
+            applied_revision INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            applied_at TEXT
+        )
+        """
+    )
+    temp_db.execute(
+        """
+        INSERT INTO graph_sync_outbox
+        (file_id, desired_revision, applied_revision, attempts, updated_at)
+        VALUES (12, 3, 2, 1, 'now')
+        """
+    )
+    temp_db.execute("DROP TABLE graph_sync_outbox_new")
+    temp_db.commit()
+
+    init_db()
+
+    columns = [
+        row[1]
+        for row in temp_db.execute("PRAGMA table_info(graph_sync_outbox)").fetchall()
+    ]
+    assert columns == list(GRAPH_SYNC_OUTBOX_COLUMNS)
+    row = temp_db.execute(
+        """
+        SELECT file_id, generation, desired_revision, applied_revision, attempts
+        FROM graph_sync_outbox
+        """
+    ).fetchone()
+    assert tuple(row) == (12, 0, 3, 2, 1)
+    assert temp_db.execute(
+        "SELECT generation FROM graph_sync_generation WHERE singleton_id = 1"
+    ).fetchone()[0] == 0
 
 
 def test_init_db_rejects_old_table_catalog_schema_without_mutating_data(temp_db):

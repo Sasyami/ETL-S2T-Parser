@@ -17,6 +17,25 @@ SQL_EXPORT_URL_PREFIX = "/exports/sql"
 MAX_INLINE_SQL_ROWS = 100
 SQL_FETCH_BATCH_SIZE = 1000
 
+
+def _result_column_error(columns: List[str]) -> Optional[str]:
+    """Return an explicit error for names sqlite3.Row cannot represent safely."""
+    seen: Dict[str, str] = {}
+    for column in columns:
+        folded = column.casefold()
+        if folded in seen:
+            return (
+                "SQL result contains ambiguous column names: "
+                f"{seen[folded]!r} and {column!r}; assign unique aliases"
+            )
+        seen[folded] = column
+    return None
+
+
+def _row_dict(row: Any, columns: List[str]) -> Dict[str, Any]:
+    return {column: row[index] for index, column in enumerate(columns)}
+
+
 def _write_sql_export_cursor(
     query: str,
     cursor: Any,
@@ -28,22 +47,28 @@ def _write_sql_export_cursor(
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     filename = f"sql_result_{stamp}.csv"
     path = SQL_EXPORT_DIR / filename
+    temporary_path = path.with_name(f".{filename}.tmp")
 
     row_count = 0
     preview_rows: List[Dict[str, Any]] = []
-    with path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=columns, extrasaction="ignore")
-        writer.writeheader()
-        while True:
-            batch = cursor.fetchmany(SQL_FETCH_BATCH_SIZE)
-            if not batch:
-                break
-            for row in batch:
-                item = dict(row)
-                writer.writerow({column: item.get(column) for column in columns})
-                row_count += 1
-                if len(preview_rows) < preview_limit:
-                    preview_rows.append(item)
+    try:
+        with temporary_path.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            while True:
+                batch = cursor.fetchmany(SQL_FETCH_BATCH_SIZE)
+                if not batch:
+                    break
+                for row in batch:
+                    item = _row_dict(row, columns)
+                    writer.writerow(item)
+                    row_count += 1
+                    if len(preview_rows) < preview_limit:
+                        preview_rows.append(item)
+        temporary_path.replace(path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
     return {
         "query": query,
@@ -102,9 +127,6 @@ def _validate_readonly_sql(query: str) -> Optional[str]:
         return "query must be non-empty"
     if not re.match(r"(?is)^(select|with|explain(?:\s+query\s+plan)?)\b", text):
         return "Only SELECT, WITH and EXPLAIN QUERY PLAN are allowed"
-    statements = [part.strip() for part in text.rstrip(";").split(";") if part.strip()]
-    if len(statements) != 1:
-        return "Exactly one SQL statement is allowed"
     return None
 
 
@@ -175,6 +197,13 @@ def run_sql(
         cursor = conn.cursor()
         cursor.execute(text)
         columns = [item[0] for item in (cursor.description or [])]
+        column_error = _result_column_error(columns)
+        if column_error:
+            return {
+                "error": column_error,
+                "query": text,
+                "columns": columns,
+            }
 
         if export_csv:
             preview_count = clamped_int(preview_limit, 20, 0, 100)
@@ -186,15 +215,20 @@ def run_sql(
         return {
             "query": text,
             "columns": columns,
-            "rows": [dict(row) for row in visible_rows],
+            "rows": [_row_dict(row, columns) for row in visible_rows],
             "returned_rows": len(visible_rows),
             "truncated": truncated,
             "max_inline_rows": MAX_INLINE_SQL_ROWS,
         }
     except sqlite3.Error as exc:
         logger.exception("SQL execution failed")
+        error = (
+            "Exactly one SQL statement is allowed"
+            if "one statement at a time" in str(exc).casefold()
+            else "SQL query failed"
+        )
         return {
-            "error": "SQL query failed",
+            "error": error,
             "error_message": str(exc),
             "query": text,
         }

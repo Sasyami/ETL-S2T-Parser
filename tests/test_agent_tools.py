@@ -48,6 +48,40 @@ def test_run_sql_select():
     assert result["truncated"] is False
 
 
+def test_run_sql_accepts_semicolons_inside_literals_and_comments():
+    from agents.tools import run_sql
+
+    literal = run_sql.invoke({"query": "SELECT ';' AS value"})
+    commented = run_sql.invoke({"query": "SELECT 1 AS n /* ; comment */"})
+
+    assert literal["rows"] == [{"value": ";"}]
+    assert commented["rows"] == [{"n": 1}]
+
+
+def test_run_sql_rejects_multiple_statements_without_executing_them():
+    from agents.tools import run_sql
+
+    out = run_sql.invoke({"query": "SELECT 1 AS first; SELECT 2 AS second"})
+
+    assert out["error"] == "Exactly one SQL statement is allowed"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT 1 AS x, 2 AS x",
+        'SELECT 1 AS "Value", 2 AS "value"',
+    ],
+)
+def test_run_sql_rejects_ambiguous_result_columns(query):
+    from agents.tools import run_sql
+
+    out = run_sql.invoke({"query": query})
+
+    assert "ambiguous column names" in out["error"]
+    assert out["columns"] in (["x", "x"], ["Value", "value:1"], ["Value", "value"])
+
+
 def test_run_sql_export_csv_writes_full_result(tmp_path, monkeypatch):
     import agents.tools.sql as sql_tools
     from agents.tools import run_sql
@@ -85,12 +119,52 @@ def test_run_sql_export_csv_writes_full_result(tmp_path, monkeypatch):
     assert "12,two.xlsx" in csv_text
 
 
+def test_sql_export_does_not_publish_partial_file(tmp_path, monkeypatch):
+    import agents.tools.sql as sql_tools
+
+    class FailingCursor:
+        calls = 0
+
+        def fetchmany(self, _size):
+            self.calls += 1
+            if self.calls == 1:
+                return [(1,)]
+            raise RuntimeError("fetch failed")
+
+    export_dir = tmp_path / "exports"
+    monkeypatch.setattr(sql_tools, "SQL_EXPORT_DIR", export_dir)
+
+    with pytest.raises(RuntimeError, match="fetch failed"):
+        sql_tools._write_sql_export_cursor(
+            "SELECT value",
+            FailingCursor(),
+            ["value"],
+            1,
+        )
+
+    assert export_dir.exists()
+    assert list(export_dir.iterdir()) == []
+
+
 def test_run_sql_invalid_returns_error_dict():
     from agents.tools import run_sql
 
     out = run_sql.invoke({"query": "NOT A VALID STMT"})
     assert isinstance(out, dict)
     assert "error" in out
+
+
+def test_embedding_vector_validation_rejects_non_finite_and_malformed_values():
+    from array import array
+
+    from agents.tools.data import _cosine_similarity, _float_vector
+
+    with pytest.raises(ValueError, match="multiple of float size"):
+        _float_vector(b"bad")
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        _float_vector(array("f", [float("nan")]).tobytes())
+    with pytest.raises(ValueError, match="finite and non-zero"):
+        _cosine_similarity(array("f", [0.0]), array("f", [1.0]))
 
 
 def test_run_sql_returns_sqlite_error_message():
@@ -354,6 +428,109 @@ def test_packed_tool_result_materializes_decoded_rows_losslessly():
         ]
 
 
+def test_saved_result_preserves_exact_column_names_with_spaces_and_unicode():
+    from agents.tools.saved_results import saved_result_store_scope
+
+    with saved_result_store_scope() as store:
+        descriptor = store.save_payload(
+            source_tool="run_sql",
+            payload={
+                "columns": [" amount ", "имя"],
+                "rows": [{" amount ": 17, "имя": "значение"}],
+            },
+        )
+        assert descriptor is not None
+        assert [column.name for column in descriptor.columns] == [
+            " amount ",
+            "имя",
+        ]
+
+        queried = store.query(
+            result_ref=descriptor.result_ref,
+            query='SELECT " amount ", "имя" FROM result',
+            preview_limit=20,
+        )
+
+    assert queried["columns"] == [" amount ", "имя"]
+    assert queried["rows"] == [{" amount ": 17, "имя": "значение"}]
+
+
+def test_saved_result_rejects_ambiguous_columns_explicitly():
+    from agents.tools.saved_results import saved_result_store_scope
+
+    with saved_result_store_scope() as store:
+        with pytest.raises(ValueError, match="ambiguous declared column names"):
+            store.save_payload(
+                source_tool="run_sql",
+                payload={
+                    "columns": ["value", "VALUE"],
+                    "rows": [],
+                },
+            )
+
+
+def test_saved_result_query_rejects_duplicate_aliases():
+    from agents.tools.saved_results import saved_result_store_scope
+
+    with saved_result_store_scope() as store:
+        descriptor = store.save_payload(
+            source_tool="run_sql",
+            payload={"columns": ["value"], "rows": [{"value": 1}]},
+        )
+        assert descriptor is not None
+
+        queried = store.query(
+            result_ref=descriptor.result_ref,
+            query="SELECT value AS x, value AS x FROM result",
+            preview_limit=20,
+        )
+
+    assert "ambiguous column names" in queried["error"]
+
+
+def test_saved_result_propagates_incomplete_input_through_aggregate():
+    from agents.tools.saved_results import saved_result_store_scope
+
+    with saved_result_store_scope() as store:
+        source = store.save_payload(
+            source_tool="run_sql",
+            payload={
+                "columns": ["value"],
+                "rows": [{"value": index} for index in range(100)],
+                "row_count": 101,
+                "truncated": True,
+            },
+        )
+        assert source is not None
+
+        aggregate = store.query(
+            result_ref=source.result_ref,
+            query="SELECT COUNT(*) AS stored_count FROM result",
+            preview_limit=20,
+        )
+        assert aggregate["rows"] == [{"stored_count": 100}]
+        assert aggregate["truncated"] is False
+        assert aggregate["input_truncated"] is True
+
+        derived = store.save_payload(
+            source_tool="query_saved_result",
+            payload=aggregate,
+        )
+        assert derived is not None
+        assert derived.truncated is False
+        assert derived.input_truncated is True
+
+        reread = store.query(
+            result_ref=derived.result_ref,
+            query="SELECT stored_count FROM result",
+            preview_limit=20,
+        )
+
+    assert reread["rows"] == [{"stored_count": 100}]
+    assert reread["truncated"] is False
+    assert reread["input_truncated"] is True
+
+
 @pytest.mark.parametrize(
     "invalid_payload",
     [
@@ -446,7 +623,7 @@ def test_query_saved_result_is_scoped_and_read_only():
 
 
 def test_previous_result_is_lazy_and_scoped_to_coordinator_run():
-    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
+    from agents.contracts import WorkerRequestParts
     from agents.tools import get_tools
     from agents.tools.saved_results import (
         bind_saved_result_schemas,
@@ -484,14 +661,9 @@ def test_previous_result_is_lazy_and_scoped_to_coordinator_run():
             ("target_table", "TEXT"),
             ("row_count", "INTEGER"),
         ]
-        handoff = {
-            "previous_results": [reference.model_dump(mode="json")]
-        }
-        task = (
-            "Проверь точный прошлый результат."
-            + WORKER_PREVIOUS_RESULTS_MARKER
-            + "\n"
-            + json.dumps(handoff, ensure_ascii=False)
+        task = WorkerRequestParts(
+            current_task="Проверь точный прошлый результат.",
+            previous_results=[reference],
         )
 
         resolved = read_previous_result.invoke(
@@ -665,12 +837,15 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
 
     from agents.tools import semantic_search_descriptions
     from services import embeddings
+    from storage.embedding_index import register_embedding_blobs
 
     vector = lambda values: array("f", values).tobytes()
-    monkeypatch.setattr(embeddings, "embed_description", lambda text: vector([1.0, 0.0]))
-    monkeypatch.setattr(embeddings, "embedding_model_name", lambda: "test-model")
+    monkeypatch.setenv("EMBEDDING_MODEL", "test-model")
+    monkeypatch.setenv("EMBEDDING_PROFILE", "plain-normalized-v1")
+    monkeypatch.setattr(embeddings, "embed_query", lambda text: vector([1.0, 0.0]))
 
     conn = get_db_connection()
+    register_embedding_blobs(conn.cursor(), [vector([1.0, 0.0])])
     conn.execute(
         """
         INSERT INTO files
@@ -746,6 +921,9 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
         {"query": "кредитные договоры", "limit": 3}
     )
     assert result["embedding_model"] == "test-model"
+    assert result["embedding_profile"] == "plain-normalized-v1"
+    assert result["embedding_dimension"] == 2
+    assert result["embedding_index_registered"] is True
     assert result["total_candidates"] == 5
     assert result["returned_rows"] == 3
     assert result["coverage"] == "truncated"
@@ -803,6 +981,41 @@ def test_semantic_search_descriptions_ranks_stored_embeddings(monkeypatch):
     assert invalid_subset["error"] == (
         "column subset filters require a column scope"
     )
+
+
+def test_semantic_search_rejects_unregistered_legacy_embeddings(monkeypatch):
+    from array import array
+
+    from agents.tools import semantic_search_descriptions
+    from services import embeddings
+    from storage.embedding_index import get_embedding_index_metadata
+
+    vector = array("f", [1.0, 0.0]).tobytes()
+    monkeypatch.setenv("EMBEDDING_MODEL", "test-model")
+    monkeypatch.setenv("EMBEDDING_PROFILE", "plain-normalized-v1")
+    monkeypatch.setattr(embeddings, "embed_query", lambda text: vector)
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO files
+        (file_id, filename, upload_time, description, description_embedding)
+        VALUES (10, 'legacy.xlsx', '2026-01-01', 'legacy', ?)
+        """,
+        (vector,),
+    )
+    conn.commit()
+    conn.close()
+
+    result = semantic_search_descriptions.invoke({"query": "legacy"})
+
+    assert result["error_code"] == "embedding_index_unregistered"
+    assert "explicit embedding reindex" in result["error"]
+    assert result["rows"] == []
+    conn = get_db_connection()
+    try:
+        assert get_embedding_index_metadata(conn.cursor()) is None
+    finally:
+        conn.close()
 
 
 def test_column_catalog_tools_support_exact_and_substring_subsets():

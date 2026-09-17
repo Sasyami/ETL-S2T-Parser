@@ -87,12 +87,28 @@ PXF_TO_A_COLUMNS = EXTRACTION_METADATA_COLUMNS + PXF_TO_A_FIELDS
 S2T_TRANSFORMATION_COLUMNS = EXTRACTION_METADATA_COLUMNS + S2T_RECORD_FIELDS
 GRAPH_SYNC_OUTBOX_COLUMNS = (
     "file_id",
+    "generation",
     "desired_revision",
     "applied_revision",
     "attempts",
     "last_error",
     "updated_at",
     "applied_at",
+)
+GRAPH_SYNC_GENERATION_COLUMNS = (
+    "singleton_id",
+    "generation",
+)
+EMBEDDING_INDEX_METADATA_COLUMNS = (
+    "index_name",
+    "model_name",
+    "model_revision",
+    "profile_id",
+    "query_prefix",
+    "document_prefix",
+    "normalize_embeddings",
+    "dimension",
+    "updated_at",
 )
 DATA_COLUMNS = (
     "id",
@@ -114,7 +130,11 @@ USER_FACING_TABLES = (
     "s2t_transformations",
     "data",
 )
-INTERNAL_TABLES = ("graph_sync_outbox",)
+INTERNAL_TABLES = (
+    "graph_sync_generation",
+    "graph_sync_outbox",
+    "embedding_index_metadata",
+)
 CORE_TABLES = USER_FACING_TABLES + INTERNAL_TABLES
 STORAGE_SCHEMA_TABLE_ORDER = CORE_TABLES
 STORAGE_SCHEMA_COLUMNS = {
@@ -128,7 +148,9 @@ STORAGE_SCHEMA_COLUMNS = {
     "pxf_to_a": PXF_TO_A_COLUMNS,
     "s2t_transformations": S2T_TRANSFORMATION_COLUMNS,
     "data": DATA_COLUMNS,
+    "graph_sync_generation": GRAPH_SYNC_GENERATION_COLUMNS,
     "graph_sync_outbox": GRAPH_SYNC_OUTBOX_COLUMNS,
+    "embedding_index_metadata": EMBEDDING_INDEX_METADATA_COLUMNS,
 }
 PRE_COLUMN_CATALOG_CORE_TABLES = tuple(
     table_name
@@ -336,14 +358,40 @@ def _create_current_tables(cursor: sqlite3.Cursor, suffix: str = "") -> None:
     )
     cursor.execute(
         f"""
+        CREATE TABLE IF NOT EXISTS {names['graph_sync_generation']} (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            generation INTEGER NOT NULL CHECK (generation >= 0)
+        )
+        """
+    )
+    cursor.execute(
+        f"""
         CREATE TABLE IF NOT EXISTS {names['graph_sync_outbox']} (
             file_id INTEGER PRIMARY KEY,
+            generation INTEGER NOT NULL DEFAULT 0,
             desired_revision INTEGER NOT NULL DEFAULT 0,
             applied_revision INTEGER NOT NULL DEFAULT 0,
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             updated_at TEXT NOT NULL,
             applied_at TEXT
+        )
+        """
+    )
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {names['embedding_index_metadata']} (
+            index_name TEXT PRIMARY KEY,
+            model_name TEXT NOT NULL,
+            model_revision TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            query_prefix TEXT NOT NULL,
+            document_prefix TEXT NOT NULL,
+            normalize_embeddings INTEGER NOT NULL,
+            dimension INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (normalize_embeddings IN (0, 1)),
+            CHECK (dimension > 0)
         )
         """
     )
@@ -394,6 +442,7 @@ def _schema_mismatches(
         "additional_objects": "id",
         "pxf_to_a": "id",
         "s2t_transformations": "id",
+        "graph_sync_generation": "singleton_id",
         "graph_sync_outbox": "file_id",
     }
     for table_name, key_name in integer_primary_keys.items():
@@ -404,6 +453,20 @@ def _schema_mismatches(
         if key is None or str(key[2]).upper() != "INTEGER" or int(key[5]) != 1:
             mismatches.append(
                 f"{table_name}.{key_name}: expected INTEGER PRIMARY KEY"
+            )
+    if "embedding_index_metadata" in selected:
+        metadata_info = {
+            str(row[1]): row
+            for row in _table_info(cursor, "embedding_index_metadata")
+        }
+        index_key = metadata_info.get("index_name")
+        if (
+            index_key is None
+            or str(index_key[2]).upper() != "TEXT"
+            or int(index_key[5]) != 1
+        ):
+            mismatches.append(
+                "embedding_index_metadata.index_name: expected TEXT PRIMARY KEY"
             )
     if "file_sheet_headers" in selected:
         headers_info = {
@@ -483,6 +546,7 @@ def init_db() -> None:
             if not legacy_mismatches:
                 _create_current_tables(cursor)
                 _migrate_column_catalog_schema(cursor)
+                _migrate_graph_sync_schema(cursor)
             mismatches = _schema_mismatches(cursor)
             if mismatches:
                 legacy_hint = _legacy_schema_recovery_hint(cursor)
@@ -497,6 +561,7 @@ def init_db() -> None:
                 )
         else:
             _create_current_tables(cursor)
+            _migrate_graph_sync_schema(cursor)
         _create_indexes(cursor)
         conn.commit()
     except Exception:
@@ -505,6 +570,71 @@ def init_db() -> None:
     finally:
         conn.close()
     logger.info("Database initialized with the current schema")
+
+
+def _migrate_graph_sync_schema(cursor: sqlite3.Cursor) -> None:
+    """Upgrade the supported pre-generation outbox without losing requests."""
+    previous_columns = [
+        "file_id",
+        "desired_revision",
+        "applied_revision",
+        "attempts",
+        "last_error",
+        "updated_at",
+        "applied_at",
+    ]
+    actual_columns = _table_columns(cursor, "graph_sync_outbox")
+    if actual_columns == previous_columns:
+        cursor.execute(
+            "ALTER TABLE graph_sync_outbox "
+            "ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE graph_sync_outbox_current (
+                file_id INTEGER PRIMARY KEY,
+                generation INTEGER NOT NULL DEFAULT 0,
+                desired_revision INTEGER NOT NULL DEFAULT 0,
+                applied_revision INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TEXT NOT NULL,
+                applied_at TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO graph_sync_outbox_current
+            (file_id, generation, desired_revision, applied_revision, attempts,
+             last_error, updated_at, applied_at)
+            SELECT file_id, generation, desired_revision, applied_revision,
+                   attempts, last_error, updated_at, applied_at
+            FROM graph_sync_outbox
+            """
+        )
+        cursor.execute("DROP TABLE graph_sync_outbox")
+        cursor.execute(
+            "ALTER TABLE graph_sync_outbox_current RENAME TO graph_sync_outbox"
+        )
+    elif actual_columns != list(GRAPH_SYNC_OUTBOX_COLUMNS):
+        return
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS graph_sync_generation (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            generation INTEGER NOT NULL CHECK (generation >= 0)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        INSERT INTO graph_sync_generation (singleton_id, generation)
+        VALUES (1, COALESCE((SELECT MAX(generation) FROM graph_sync_outbox), 0))
+        ON CONFLICT(singleton_id) DO NOTHING
+        """
+    )
 
 
 def _migrate_column_catalog_schema(cursor: sqlite3.Cursor) -> List[str]:
@@ -632,13 +762,25 @@ def migrate_s2t_layer_columns() -> Dict[str, Any]:
         conn.close()
 
 
-def clear_all_data() -> Dict[str, int]:
-    """Drop all application tables and recreate the current empty schema."""
+def clear_all_data_with_graph_snapshot() -> tuple[Dict[str, int], Dict[str, Any]]:
+    """Clear SQLite and return the exact graph-clear generation to acknowledge."""
     deletion_order = tuple(reversed(STORAGE_SCHEMA_TABLE_ORDER))
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("BEGIN")
+        current_generation = 0
+        if _table_exists(cursor, "graph_sync_generation"):
+            generation_row = cursor.execute(
+                """
+                SELECT generation
+                FROM graph_sync_generation
+                WHERE singleton_id = 1
+                """
+            ).fetchone()
+            if generation_row is not None:
+                current_generation = int(generation_row[0])
+        next_generation = current_generation + 1
         projection_file_ids: set[int] = set()
         for table_name in ("files", "s2t_transformations", "graph_sync_outbox"):
             if not _table_exists(cursor, table_name):
@@ -665,6 +807,13 @@ def clear_all_data() -> Dict[str, int]:
         for table_name in deletion_order:
             cursor.execute(f"DROP TABLE IF EXISTS {_sql_identifier(table_name)}")
         _create_current_tables(cursor)
+        cursor.execute(
+            """
+            INSERT INTO graph_sync_generation (singleton_id, generation)
+            VALUES (1, ?)
+            """,
+            (next_generation,),
+        )
         _create_indexes(cursor)
         if projection_file_ids:
             from .graph_outbox import enqueue_graph_sync
@@ -677,13 +826,36 @@ def clear_all_data() -> Dict[str, int]:
                 "Failed to recreate the current SQLite schema: "
                 + "; ".join(mismatches)
             )
+        requests = [
+            {
+                "file_id": int(row[0]),
+                "generation": int(row[1]),
+                "revision": int(row[2]),
+            }
+            for row in cursor.execute(
+                """
+                SELECT file_id, generation, desired_revision
+                FROM graph_sync_outbox
+                ORDER BY file_id
+                """
+            ).fetchall()
+        ]
         conn.commit()
-        return deleted
+        return deleted, {
+            "generation": next_generation,
+            "requests": requests,
+        }
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def clear_all_data() -> Dict[str, int]:
+    """Drop all application tables and recreate the current empty schema."""
+    deleted, _graph_snapshot = clear_all_data_with_graph_snapshot()
+    return deleted
 
 
 def store_excel_data(
@@ -821,12 +993,16 @@ def update_file_summary(file_id: int, summary: str) -> None:
 
 
 def update_file_description(file_id: int, description: str) -> None:
-    from services.embeddings import embed_description
+    from services.embeddings import embed_document
+    from storage.embedding_index import register_embedding_blobs
 
-    description_embedding = embed_description(description)
+    description_embedding = embed_document(description)
     conn = get_db_connection()
     try:
-        conn.execute(
+        cursor = conn.cursor()
+        cursor.execute("BEGIN")
+        register_embedding_blobs(cursor, [description_embedding])
+        cursor.execute(
             """
             UPDATE files
             SET description = ?, description_embedding = ?

@@ -54,6 +54,20 @@ def test_convert_to_serializable_nested():
     assert out == {"nums": [1.0], "nested": [7, None]}
 
 
+def test_convert_to_serializable_preserves_real_nat_string_and_nulls_missing_dates():
+    timestamp = pd.Timestamp("2026-09-17T12:30:00")
+
+    assert convert_to_serializable(pd.NaT) is None
+    assert convert_to_serializable(np.datetime64("NaT")) is None
+    assert convert_to_serializable(np.nan) is None
+    assert convert_to_serializable(None) is None
+    assert convert_to_serializable(timestamp) == timestamp.isoformat()
+    assert convert_to_serializable("NaT") == "NaT"
+    assert convert_to_serializable({"dates": [pd.NaT, timestamp]}) == {
+        "dates": [None, timestamp.isoformat()]
+    }
+
+
 def test_build_nested_columns_merges_forward_fill():
     df = pd.DataFrame(
         [
@@ -134,6 +148,93 @@ def test_parser_reads_each_sheet_once(sample_excel_bytes):
     }
     assert sheets[0]["data_rows"] == [["Alice", 30], ["Bob", 25]]
     assert sheets[0]["data_row_count"] == 2
+
+
+def test_parser_accepts_five_blank_rows_before_header():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Offset header"
+    for _ in range(5):
+        sheet.append([None, None])
+    sheet.append(["Name", "Value"])
+    sheet.append(["kept", 17])
+    output = io.BytesIO()
+    workbook.save(output)
+
+    with patch(
+        "processing.excel.get_header_decision",
+        return_value=(5, 1, False),
+    ):
+        sheets = parse_excel_with_decisions(output.getvalue())
+
+    assert sheets[0]["header"]["start_row"] == 5
+    assert sheets[0]["data_rows"] == [["kept", 17]]
+    assert sheets[0]["data_row_numbers"] == [0]
+
+
+def test_parser_accepts_data_after_five_blank_rows_below_header():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Offset data"
+    sheet.append(["Name", "Value"])
+    for _ in range(5):
+        sheet.append([None, None])
+    sheet.append(["kept", 23])
+    output = io.BytesIO()
+    workbook.save(output)
+
+    with patch(
+        "processing.excel.get_header_decision",
+        return_value=(0, 1, False),
+    ):
+        sheets = parse_excel_with_decisions(output.getvalue())
+
+    assert sheets[0]["data_rows"][-1] == ["kept", 23]
+    assert sheets[0]["data_row_numbers"][-1] == 5
+    assert sheets[0]["data_row_count"] == 6
+
+
+def test_parser_reports_header_window_limit_instead_of_false_empty_sheet():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Beyond preview"
+    for _ in range(10):
+        sheet.append([None, None])
+    sheet.append(["Name", "Value"])
+    sheet.append(["present", 1])
+    output = io.BytesIO()
+    workbook.save(output)
+
+    with patch("processing.excel.get_header_decision") as get_decision:
+        sheets = parse_excel_with_decisions(output.getvalue())
+
+    get_decision.assert_not_called()
+    assert "first 10 rows" in sheets[0]["skip_reason"]
+    assert "empty" not in sheets[0]["skip_reason"].lower()
+
+
+def test_parser_respects_hidden_only_data_when_checking_emptiness():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Hidden data"
+    sheet.append(["Name", "Value"])
+    sheet.append(["hidden", 9])
+    sheet.row_dimensions[2].hidden = True
+    output = io.BytesIO()
+    workbook.save(output)
+
+    with patch(
+        "processing.excel.get_header_decision",
+        return_value=(0, 1, False),
+    ):
+        visible = parse_excel_with_decisions(output.getvalue())
+        all_rows = parse_excel_with_decisions(
+            output.getvalue(),
+            include_hidden_rows=True,
+        )
+
+    assert visible[0]["skip_reason"] == "No data rows after headers"
+    assert all_rows[0]["data_rows"] == [["hidden", 9]]
 
 
 def test_parser_preserves_excel_strings_that_pandas_treats_as_na_by_default():

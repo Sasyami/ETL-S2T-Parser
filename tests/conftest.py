@@ -79,20 +79,36 @@ def _disable_langfuse_in_tests(monkeypatch):
 @pytest.fixture
 def mock_embeddings(monkeypatch):
     monkeypatch.setenv("EMBEDDING_MODEL", "test-embedding-model")
+    monkeypatch.setenv("EMBEDDING_PROFILE", "plain-normalized-v1")
     from services import embeddings
 
+    identity = embeddings.EmbeddingIndexIdentity(
+        model_name="test-embedding-model",
+        model_revision="",
+        profile_id="plain-normalized-v1",
+        query_prefix="",
+        document_prefix="",
+        normalize_embeddings=True,
+        dimension=2,
+    )
+    encode_one = lambda text: f"embedding:{text}".encode("utf-8")
+    encode_many = lambda texts: [encode_one(text) for text in texts]
     monkeypatch.setattr(
         embeddings,
         "embed_description",
-        lambda text: f"embedding:{text}".encode("utf-8"),
+        encode_one,
     )
     monkeypatch.setattr(
         embeddings,
         "embed_descriptions",
-        lambda texts: [
-            f"embedding:{text}".encode("utf-8")
-            for text in texts
-        ],
+        encode_many,
+    )
+    monkeypatch.setattr(embeddings, "embed_document", encode_one)
+    monkeypatch.setattr(embeddings, "embed_documents", encode_many)
+    monkeypatch.setattr(
+        embeddings,
+        "embedding_index_identity_for_blobs",
+        lambda blobs: identity,
     )
 
 

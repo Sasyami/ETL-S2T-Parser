@@ -320,19 +320,29 @@ def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_d
     session.execute_write.assert_called_once()
     driver.close.assert_called_once_with()
 
-    delete_query = tx.run.call_args_list[0].args[0]
+    fence_query = tx.run.call_args_list[0].args[0]
+    assert "ETLProjectionFence" in fence_query
+    assert "generation" in fence_query
+    assert "revision" in fence_query
+    delete_query = tx.run.call_args_list[1].args[0]
     assert "MATCH (node:ETLProjection {file_id: $file_id})" in delete_query
-    assert len(tx.run.call_args_list) == 6
-    columns_call = tx.run.call_args_list[1]
+    assert len(tx.run.call_args_list) == 7
+    columns_call = tx.run.call_args_list[2]
     assert "CREATE (:ETLProjection:ETLColumn" in columns_call.args[0]
+    assert "projection_generation: $generation" in columns_call.args[0]
+    assert "projection_revision: $revision" in columns_call.args[0]
+    assert columns_call.kwargs["generation"] == 0
+    assert columns_call.kwargs["revision"] == 1
     assert len(columns_call.kwargs["rows"]) == 2
 
-    tables_call = tx.run.call_args_list[2]
+    tables_call = tx.run.call_args_list[3]
     assert "CREATE (:ETLProjection:ETLTable" in tables_call.args[0]
+    assert "projection_generation: $generation" in tables_call.args[0]
+    assert "projection_revision: $revision" in tables_call.args[0]
     assert len(tables_call.kwargs["rows"]) == 2
     assert "layers: row.layers" in tables_call.args[0]
 
-    lineage_call = tx.run.call_args_list[3]
+    lineage_call = tx.run.call_args_list[4]
     assert "CREATE (source)-[:TRANSFORMS_TO" in lineage_call.args[0]
     assert "source_layer: row.source_layer" in lineage_call.args[0]
     assert [
@@ -340,12 +350,12 @@ def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_d
         for row in lineage_call.kwargs["rows"]
     ] == [(901, "B", "T"), (902, "B", "T")]
 
-    wildcard_membership_call = tx.run.call_args_list[4]
+    wildcard_membership_call = tx.run.call_args_list[5]
     assert "[:COVERED_BY" in wildcard_membership_call.args[0]
     assert "[:EXPANDS_TO" in wildcard_membership_call.args[0]
     assert wildcard_membership_call.kwargs["rows"] == []
 
-    table_lineage_call = tx.run.call_args_list[5]
+    table_lineage_call = tx.run.call_args_list[6]
     assert "CREATE (source)-[:TABLE_TRANSFORMS_TO" in table_lineage_call.args[0]
     assert "wildcard_passthrough" not in table_lineage_call.args[0]
     assert "rule_status: row.rule_status" in table_lineage_call.args[0]
@@ -370,7 +380,7 @@ def test_sync_file_graph_replaces_only_file_projection_in_one_transaction(temp_d
     ]
 
     write_queries = "\n".join(
-        call.args[0] for call in tx.run.call_args_list[1:]
+        call.args[0] for call in tx.run.call_args_list[2:]
     )
     for removed_label in (
         "ETLFile",
@@ -430,11 +440,83 @@ def test_sync_file_graph_applies_empty_projection_after_s2t_delete(temp_db):
         "tables": 0,
         "table_lineage_relationships": 0,
     }
-    assert "DETACH DELETE node" in tx.run.call_args_list[0].args[0]
+    assert "ETLProjectionFence" in tx.run.call_args_list[0].args[0]
+    assert "DETACH DELETE node" in tx.run.call_args_list[1].args[0]
     assert all(
         call.kwargs.get("rows") == []
-        for call in tx.run.call_args_list[1:]
+        for call in tx.run.call_args_list[2:]
     )
+
+
+def test_replace_file_graph_rejects_stale_fence_before_deleting_projection():
+    from services.graph_sync import _replace_file_graph
+
+    tx = MagicMock()
+    tx.run.return_value.single.return_value = {"accepted": False}
+    projection = {
+        "file_id": 501,
+        "generation": 1,
+        "revision": 1,
+        "columns": [],
+        "lineage": [],
+        "wildcard_memberships": [],
+        "tables": [],
+        "table_lineage": [],
+    }
+
+    assert _replace_file_graph(tx, projection) is False
+    assert len(tx.run.call_args_list) == 1
+    fence_call = tx.run.call_args_list[0]
+    assert "generation" in fence_call.args[0]
+    assert "revision" in fence_call.args[0]
+    assert fence_call.kwargs == {
+        "file_id": 501,
+        "generation": 1,
+        "revision": 1,
+    }
+
+
+def test_projection_snapshot_rejects_revision_superseded_before_read(temp_db):
+    from services.graph_sync import StaleGraphSyncError, _build_file_graph_projection
+    from storage.graph_outbox import get_graph_sync_state, request_graph_sync
+
+    _insert_graph_source_rows()
+    request_graph_sync(501)
+    old_state = get_graph_sync_state(501)
+    request_graph_sync(501)
+
+    with pytest.raises(StaleGraphSyncError, match="changed before its snapshot"):
+        _build_file_graph_projection(
+            501,
+            generation=old_state["generation"],
+            revision=old_state["desired_revision"],
+        )
+
+
+def test_old_failure_does_not_overwrite_newer_applied_revision(temp_db):
+    from storage.graph_outbox import (
+        get_graph_sync_state,
+        mark_graph_sync_applied,
+        mark_graph_sync_failed,
+        request_graph_sync,
+    )
+
+    request_graph_sync(501)
+    request_graph_sync(501)
+    state = get_graph_sync_state(501)
+    generation = state["generation"]
+    assert mark_graph_sync_applied(501, 2, generation=generation) is True
+    assert mark_graph_sync_failed(
+        501,
+        1,
+        "late old failure",
+        generation=generation,
+    ) is False
+
+    state = get_graph_sync_state(501)
+    assert state["applied_revision"] == 2
+    assert state["attempts"] == 0
+    assert state["last_error"] is None
 
 
 def test_failed_graph_sync_keeps_revision_pending_for_retry(temp_db):
@@ -492,6 +574,25 @@ def test_failed_graph_sync_keeps_revision_pending_for_retry(temp_db):
     assert applied_state["applied_revision"] == 1
     assert applied_state["attempts"] == 0
     assert applied_state["last_error"] is None
+
+
+def test_projection_build_failure_is_recorded_in_outbox(temp_db):
+    from services.graph_sync import sync_file_graph
+    from storage.graph_outbox import get_graph_sync_state, request_graph_sync
+
+    request_graph_sync(777)
+
+    with patch(
+        "services.graph_sync._build_file_graph_projection",
+        side_effect=RuntimeError("projection failed"),
+    ), pytest.raises(RuntimeError, match="projection failed"):
+        sync_file_graph(777)
+
+    state = get_graph_sync_state(777)
+    assert state["desired_revision"] == 1
+    assert state["applied_revision"] == 0
+    assert state["attempts"] == 1
+    assert state["last_error"] == "projection failed"
 
 
 def test_file_graph_projection_skips_edge_without_source_column(temp_db):
@@ -559,7 +660,7 @@ def test_clear_graph_projection_deletes_all_application_nodes():
     tx = MagicMock()
     summary = tx.run.return_value.consume.return_value
     summary.counters.nodes_deleted = 17
-    session.execute_write.side_effect = lambda operation: operation(tx)
+    session.execute_write.side_effect = lambda operation, *args: operation(tx, *args)
 
     with patch(
         "services.graph_sync.is_neo4j_configured",
@@ -571,11 +672,23 @@ def test_clear_graph_projection_deletes_all_application_nodes():
         "services.graph_sync.create_neo4j_driver",
         return_value=driver,
     ):
-        report = clear_graph_projection()
+        report = clear_graph_projection(
+            generation=4,
+            requests=[{"file_id": 501, "generation": 4, "revision": 1}],
+        )
 
     assert report == {"nodes": 17}
-    query = tx.run.call_args.args[0]
+    assert "ETLProjectionFence" in tx.run.call_args_list[0].args[0]
+    assert tx.run.call_args_list[1].kwargs["rows"] == [
+        {"file_id": 501, "generation": 4, "revision": 1}
+    ]
+    query = tx.run.call_args_list[2].args[0]
     assert "MATCH (node:ETLProjection)" in query
     assert "DETACH DELETE node" in query
+    assert "node.projection_generation < $generation" in query
+    assert "node.projection_revision <= row.revision" in query
+    assert tx.run.call_args_list[2].kwargs["rows"] == [
+        {"file_id": 501, "generation": 4, "revision": 1}
+    ]
     driver.session.assert_called_once_with(database="neo4j")
     driver.close.assert_called_once_with()

@@ -292,8 +292,7 @@ class _WorkerModel:
 
 def test_worker_operation_contexts_are_isolated_by_role():
     from agents.contracts import (
-        WORKER_OPERATION_COMPLETENESS_MARKER,
-        WORKER_OPERATION_EXECUTION_MARKER,
+        WorkerRequestParts,
     )
 
     def lookup():
@@ -315,12 +314,10 @@ def test_worker_operation_contexts_are_isolated_by_role():
     observer_rule = "OBSERVER_ONLY_ACCEPTANCE"
 
     run_worker_graph(
-        task=(
-            "Прочитай значение."
-            + WORKER_OPERATION_EXECUTION_MARKER
-            + planner_rule
-            + WORKER_OPERATION_COMPLETENESS_MARKER
-            + observer_rule
+        task=WorkerRequestParts(
+            current_task="Прочитай значение.",
+            operation_execution_context=planner_rule,
+            operation_completeness_context=observer_rule,
         ),
         system_prompt="Базовый prompt.",
         model=model,
@@ -338,7 +335,6 @@ def test_worker_operation_contexts_are_isolated_by_role():
         if message.__class__.__name__ == "HumanMessage"
     )
     assert observer_rule not in planner_human_text
-    assert WORKER_OPERATION_COMPLETENESS_MARKER not in planner_human_text
 
     observer_system = str(model.observer.messages[0][0].content)
     assert observer_rule in observer_system
@@ -347,9 +343,7 @@ def test_worker_operation_contexts_are_isolated_by_role():
 
 def test_worker_original_task_is_exact_and_separate_from_current_task():
     from agents.contracts import (
-        WORKER_OPERATION_COMPLETENESS_MARKER,
-        WORKER_OPERATION_EXECUTION_MARKER,
-        WORKER_ORIGINAL_TASK_MARKER,
+        WorkerRequestParts,
         parse_worker_request,
     )
 
@@ -363,17 +357,11 @@ def test_worker_original_task_is_exact_and_separate_from_current_task():
     )
     planner_rule = "PLANNER_ONLY_RULE_917"
     observer_rule = "OBSERVER_ONLY_RULE_842"
-    raw_task = (
-        current_task
-        + WORKER_ORIGINAL_TASK_MARKER
-        + json.dumps(
-            {"original_task": original_task},
-            ensure_ascii=False,
-        )
-        + WORKER_OPERATION_EXECUTION_MARKER
-        + planner_rule
-        + WORKER_OPERATION_COMPLETENESS_MARKER
-        + observer_rule
+    request = WorkerRequestParts(
+        current_task=current_task,
+        original_task=original_task,
+        operation_execution_context=planner_rule,
+        operation_completeness_context=observer_rule,
     )
     model = _WorkerModel(
         [
@@ -392,9 +380,9 @@ def test_worker_original_task_is_exact_and_separate_from_current_task():
         ]
     )
 
-    parts = parse_worker_request(raw_task)
+    parts = parse_worker_request(request)
     result = run_worker_graph(
-        task=raw_task,
+        task=request,
         system_prompt="Системный контекст",
         model=model,
         tools={"lookup": _as_tool(lookup)},
@@ -427,7 +415,7 @@ def test_worker_original_task_is_exact_and_separate_from_current_task():
 
 
 def test_worker_presents_independent_endpoint_after_lazy_result_context():
-    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
+    from agents.contracts import PreviousResultReference, WorkerRequestParts
 
     calls = []
     previous_table = "mart_alpha_731"
@@ -472,32 +460,25 @@ def test_worker_presents_independent_endpoint_after_lazy_result_context():
             _finish_message("Текущий lineage прочитан."),
         ]
     )
-    task = (
-        current_task
-        + WORKER_PREVIOUS_RESULTS_MARKER
-        + "\n"
-        + json.dumps(
-            {
-                "previous_results": [
-                    {
-                        "result_id": "result_previous_lineage",
-                        "description": (
-                            "trace_transformation_path: args="
-                            + json.dumps(
-                                {
-                                    "table_name": previous_table,
-                                    "column_name": column_name,
-                                    "direction": "upstream",
-                                },
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            )
-                        ),
-                    }
-                ]
-            },
-            ensure_ascii=False,
-        )
+    task = WorkerRequestParts(
+        current_task=current_task,
+        previous_results=[
+            PreviousResultReference(
+                result_id="result_previous_lineage",
+                description=(
+                    "trace_transformation_path: args="
+                    + json.dumps(
+                        {
+                            "table_name": previous_table,
+                            "column_name": column_name,
+                            "direction": "upstream",
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                ),
+            )
+        ],
     )
 
     result = run_worker_graph(
@@ -519,7 +500,7 @@ def test_worker_presents_independent_endpoint_after_lazy_result_context():
     ] == "result_previous_lineage"
     assert first_planner_humans[-1].content == current_task
     assert previous_table not in first_planner_humans[-1].content
-    assert WORKER_PREVIOUS_RESULTS_MARKER not in first_planner_humans[-1].content
+    assert "Результаты прошлых workers" not in first_planner_humans[-1].content
     planner_system = str(model.messages[0][0].content)
     assert "Сами ссылки не делают текущую task зависимой" in planner_system
     assert "другого объекта" in planner_system
@@ -533,34 +514,32 @@ def test_worker_presents_independent_endpoint_after_lazy_result_context():
         json.dumps({"original_task": "Исходная.", "extra": "forbidden"}),
     ],
 )
-def test_worker_original_task_envelope_rejects_non_exact_json(encoded):
+def test_explicit_legacy_worker_adapter_rejects_non_exact_json(encoded):
     from agents.contracts import (
         WORKER_ORIGINAL_TASK_MARKER,
-        parse_worker_request,
+        parse_legacy_worker_request,
     )
 
-    parts = parse_worker_request(
-        "Прочитай назначенный срез."
-        + WORKER_ORIGINAL_TASK_MARKER
-        + encoded
-    )
-
-    assert parts.current_task == "Прочитай назначенный срез."
-    assert parts.original_task == ""
+    with pytest.raises(ValueError, match="Legacy worker envelope"):
+        parse_legacy_worker_request(
+            "Прочитай назначенный срез."
+            + WORKER_ORIGINAL_TASK_MARKER
+            + encoded
+        )
 
 
-def test_worker_original_task_composes_with_all_coordinator_suffixes():
+def test_explicit_legacy_worker_adapter_composes_all_suffixes():
     from agents.contracts import (
         WORKER_OPERATION_COMPLETENESS_MARKER,
         WORKER_OPERATION_EXECUTION_MARKER,
         WORKER_ORIGINAL_TASK_MARKER,
         WORKER_PREVIOUS_RESULTS_MARKER,
-        parse_worker_request,
+        parse_legacy_worker_request,
     )
 
     current_task = "Прочитай следующий зависимый срез."
     original_task = "Сопоставь `source_611.id` → `target_722.id`."
-    parts = parse_worker_request(
+    parts = parse_legacy_worker_request(
         current_task
         + WORKER_ORIGINAL_TASK_MARKER
         + json.dumps({"original_task": original_task}, ensure_ascii=False)
@@ -591,7 +570,43 @@ def test_worker_original_task_composes_with_all_coordinator_suffixes():
     assert [item.result_id for item in parts.previous_results] == ["result_611"]
 
 
-def test_direct_worker_discards_legacy_stable_context_before_planner():
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "\n\nУстойчивые правила контекста:\n",
+        "\n\nРезультаты прошлых workers.",
+        "\n\nИсходная задача coordinator (immutable):\n",
+        "\n\nOperation-skill текущей задачи:\n",
+        "\n\nOperation-skill проверки полноты:\n",
+    ],
+)
+def test_literal_worker_request_preserves_reserved_marker_phrases(marker):
+    from agents.contracts import parse_worker_request
+
+    literal_task = f"Проверь точный текст `{marker}literal_value` без разбора."
+    parts = parse_worker_request(literal_task)
+
+    assert parts.current_task == literal_task
+    assert parts.original_task == ""
+    assert parts.operation_execution_context == ""
+    assert parts.operation_completeness_context == ""
+    assert parts.previous_results is None
+
+
+def test_typed_worker_request_round_trip_preserves_empty_references():
+    from agents.contracts import WorkerRequestParts, parse_worker_request
+
+    request = WorkerRequestParts(
+        current_task="Прочитай буквальную task.",
+        original_task="Исходная task.",
+        previous_results=[],
+    )
+
+    assert parse_worker_request(request) is request
+    assert request.previous_results == []
+
+
+def test_direct_worker_treats_legacy_marker_text_as_literal_task():
     from agents.contracts import parse_worker_request
 
     leaked_context = "RAW_CONVERSATION_CONTEXT_MUST_NOT_REACH_PLANNER"
@@ -629,11 +644,16 @@ def test_direct_worker_discards_legacy_stable_context_before_planner():
         tools={"lookup": _as_tool(lookup)},
     )
 
-    assert parts.current_task == "Прочитай значение."
+    assert parts.current_task == raw_task
     assert not hasattr(parts, "stable_context")
     assert result.status == "complete"
-    assert leaked_context not in str(model.messages)
-    assert leaked_context not in str(model.observer.messages)
+    assert leaked_context in str(model.messages)
+    assert leaked_context in str(model.observer.messages)
+    assert all(
+        leaked_context not in str(messages[0].content)
+        for messages in model.messages
+    )
+    assert leaked_context not in str(model.observer.messages[0][0].content)
 
 
 class _BoundToolChoiceModel:
@@ -739,7 +759,7 @@ class _SplitToolCallModel:
 
 
 def test_worker_can_select_tool_and_build_arguments_in_separate_calls():
-    from agents.contracts import WORKER_ORIGINAL_TASK_MARKER
+    from agents.contracts import WorkerRequestParts
 
     executed_arguments = []
 
@@ -751,13 +771,9 @@ def test_worker_can_select_tool_and_build_arguments_in_separate_calls():
     current_task = "Прочитай назначенную таблицу."
     original_task = "Прочитай таблицу `orders` для проверки нового ID 731."
     result = run_worker_graph(
-        task=(
-            current_task
-            + WORKER_ORIGINAL_TASK_MARKER
-            + json.dumps(
-                {"original_task": original_task},
-                ensure_ascii=False,
-            )
+        task=WorkerRequestParts(
+            current_task=current_task,
+            original_task=original_task,
         ),
         system_prompt="Системный контекст",
         model=model,
@@ -1076,6 +1092,51 @@ def test_worker_raises_after_five_observer_retries_without_repeating_tool():
     assert len(model.observer.messages) == 6
 
 
+def test_worker_rejects_tool_batch_larger_than_remaining_budget():
+    calls = []
+
+    def first_lookup():
+        calls.append("first")
+        return {"value": 1}
+
+    def second_lookup():
+        calls.append("second")
+        return {"value": 2}
+
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "first_lookup",
+                        "args": {},
+                        "id": "call-first",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "second_lookup",
+                        "args": {},
+                        "id": "call-second",
+                        "type": "tool_call",
+                    },
+                ],
+            )
+        ]
+    )
+
+    with pytest.raises(WorkerResponseError, match="запрошено 2, доступно 1"):
+        run_worker_graph(
+            task="Получи два значения.",
+            system_prompt="Системный контекст",
+            model=model,
+            tools=(_as_tool(first_lookup), _as_tool(second_lookup)),
+            max_steps=1,
+        )
+
+    assert calls == []
+
+
 def test_public_worker_keeps_prior_evidence_after_observer_exhaustion():
     from agents.worker import resolve_worker_display_refs, worker_chat
 
@@ -1165,6 +1226,68 @@ def test_public_worker_keeps_prior_evidence_after_observer_exhaustion():
     assert evidence.display_ref is not None
     retained = resolve_worker_display_refs([evidence.display_ref])
     assert [item.tool_call_id for item in retained] == ["call-accepted"]
+
+
+def test_public_worker_keeps_accepted_evidence_after_invalid_finish():
+    from agents.worker import resolve_worker_display_refs, worker_chat
+
+    calls = []
+
+    def accepted_lookup():
+        calls.append("accepted")
+        return {"rows": [{"value": 42}]}
+
+    tools = (_as_tool(accepted_lookup),)
+    model = _WorkerModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "accepted_lookup",
+                        "args": {},
+                        "id": "call-accepted-finish",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "finish_worker",
+                        "args": {},
+                        "id": "finish-invalid",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        ]
+    )
+    route = ToolRoute(tools=["accepted_lookup"], skills=[], schemas=[])
+
+    with (
+        patch("agents.worker.chat_model", model),
+        patch("agents.worker.get_worker_tools", return_value=tools),
+        patch("agents.worker.select_chat_route", return_value=route),
+    ):
+        outcome = worker_chat("Получи значение.")
+
+    assert calls == ["accepted"]
+    assert outcome.status == "partial"
+    assert outcome.stop_reason == "tool_error"
+    assert outcome.unmet_requirements == [
+        "finish_worker вернул невалидные аргументы"
+    ]
+    assert len(outcome.evidence) == 1
+    evidence = outcome.evidence[0]
+    assert evidence.tool_name == "accepted_lookup"
+    assert '"value": 42' in evidence.preview
+    assert evidence.display_ref is not None
+    retained = resolve_worker_display_refs([evidence.display_ref])
+    assert [item.tool_call_id for item in retained] == [
+        "call-accepted-finish"
+    ]
 
 
 def test_worker_rejects_complete_when_exact_lineage_scope_was_shortened():
@@ -1754,7 +1877,8 @@ def test_worker_requires_target_roles_for_exact_loaded_field():
 
 def test_worker_requires_dependent_value_in_current_tool_filter():
     from agents.contracts import (
-        WORKER_PREVIOUS_RESULTS_MARKER,
+        PreviousResultReference,
+        WorkerRequestParts,
         parse_worker_request,
     )
 
@@ -1819,31 +1943,26 @@ def test_worker_requires_dependent_value_in_current_tool_filter():
             ),
         ],
     )
-    previous_payload = {
-        "previous_results": [
-            {
-                "result_id": "result-first",
-                "description": (
-                    "run_sql: "
-                    "target_table с максимальным числом строк: "
-                    f"{selected_target}: 110"
-                ),
-            }
-        ]
-    }
-    task = (
-        "Используя target_table, полученную на предыдущем шаге, посчитай "
-        "число различных непустых source_table в s2t_transformations."
-        + WORKER_PREVIOUS_RESULTS_MARKER
-        + " Используй краткие описания прошлых результатов:\n"
-        + json.dumps(previous_payload, ensure_ascii=False)
+    reference = PreviousResultReference(
+        result_id="result-first",
+        description=(
+            "run_sql: target_table с максимальным числом строк: "
+            f"{selected_target}: 110"
+        ),
+    )
+    task = WorkerRequestParts(
+        current_task=(
+            "Используя target_table, полученную на предыдущем шаге, посчитай "
+            "число различных непустых source_table в s2t_transformations."
+        ),
+        previous_results=[reference],
     )
     request_parts = parse_worker_request(task)
     assert request_parts.current_task.startswith("Используя target_table")
     assert [
         item.model_dump(mode="json", exclude_none=True)
         for item in (request_parts.previous_results or [])
-    ] == previous_payload["previous_results"]
+    ] == [reference.model_dump(mode="json", exclude_none=True)]
 
     result = run_worker_graph(
         task=task,
@@ -2490,7 +2609,7 @@ def test_worker_repairs_plain_planner_finish_to_native_finish_call():
     )
 
 
-def test_worker_raises_when_plain_text_repair_still_has_no_native_call():
+def test_worker_keeps_evidence_when_plain_text_repair_has_no_native_call():
     def lookup():
         return {"value": "confirmed"}
 
@@ -2512,14 +2631,21 @@ def test_worker_raises_when_plain_text_repair_still_has_no_native_call():
         ]
     )
 
-    with pytest.raises(WorkerResponseError, match="native data-tool call"):
-        run_worker_graph(
-            task="Получи значение",
-            system_prompt="Системный контекст",
-            model=model,
-            tools=(_as_tool(lookup),),
-            max_steps=2,
-        )
+    result = run_worker_graph(
+        task="Получи значение",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+    )
+
+    assert result.gap is not None
+    assert "native data-tool call" in result.gap
+    assert result.stop_reason == "tool_error"
+    assert result.accepted_tool_call_ids == ["call-lookup"]
+    assert [item.tool_call_id for item in result.display_items] == [
+        "call-lookup"
+    ]
 
 
 def test_worker_repairs_plain_text_before_first_data_tool_call():
@@ -2818,7 +2944,7 @@ def test_worker_observer_evaluates_current_result_with_prior_state():
     assert "не требуй их повторно" in observer_system_prompt
 
 
-def test_worker_rejects_legacy_display_selection_field():
+def test_worker_rejects_legacy_display_selection_but_keeps_evidence():
     def lookup():
         return {"rows": [{"value": 1}]}
 
@@ -2842,14 +2968,18 @@ def test_worker_rejects_legacy_display_selection_field():
         ]
     )
 
-    with pytest.raises(WorkerResponseError, match="невалидные аргументы"):
-        run_worker_graph(
-            task="Получи значение",
-            system_prompt="Системный контекст",
-            model=model,
-            tools=(_as_tool(lookup),),
-            max_steps=2,
-        )
+    result = run_worker_graph(
+        task="Получи значение",
+        system_prompt="Системный контекст",
+        model=model,
+        tools=(_as_tool(lookup),),
+        max_steps=2,
+    )
+
+    assert result.gap == "finish_worker вернул невалидные аргументы"
+    assert result.stop_reason == "tool_error"
+    assert result.accepted_tool_call_ids == ["call-real"]
+    assert [item.tool_call_id for item in result.display_items] == ["call-real"]
 
 
 def test_worker_asks_llm_to_finish_after_step_limit():
@@ -3384,6 +3514,7 @@ def test_worker_loop_does_not_rewrite_llm_tool_arguments_in_python():
 def test_public_worker_contract_exposes_evidence_and_opaque_runtime_refs(
     caplog,
 ):
+    from agents.contracts import parse_worker_request
     from agents.worker import (
         WorkerOutcome,
         resolve_worker_display_refs,
@@ -3474,7 +3605,8 @@ def test_public_worker_contract_exposes_evidence_and_opaque_runtime_refs(
     ]
     assert resolve_worker_display_refs(refs) == graph_result.display_items
     assert resolve_worker_display_refs(refs) == []
-    assert router.call_args.args == ("Покажи файлы",)
+    routed_request = parse_worker_request(router.call_args.args[0])
+    assert routed_request.current_task == "Покажи файлы"
     assert "history" not in router.call_args.kwargs
     assert router.call_args.kwargs["available_tools"] == tuple(
         tool
@@ -3482,7 +3614,8 @@ def test_public_worker_contract_exposes_evidence_and_opaque_runtime_refs(
         if tool.name not in {"read_previous_result", "query_saved_result"}
     )
     assert result.previous_results == []
-    assert run_graph.call_args.kwargs["task"] == "Покажи файлы"
+    graph_request = parse_worker_request(run_graph.call_args.kwargs["task"])
+    assert graph_request.current_task == "Покажи файлы"
     assert "## Актуальная схема SQLite" not in run_graph.call_args.kwargs[
         "system_prompt"
     ]
@@ -3550,7 +3683,7 @@ def test_public_worker_allows_empty_palette_and_returns_observation():
 
 
 def test_public_worker_adds_previous_result_reader_outside_router():
-    from agents.contracts import WORKER_PREVIOUS_RESULTS_MARKER
+    from agents.contracts import WorkerRequestParts
     from agents.tools.saved_results import saved_result_store_scope
     from agents.worker import worker_chat
 
@@ -3572,14 +3705,9 @@ def test_public_worker_adds_previous_result_reader_outside_router():
             content=json.dumps({"rows": [{"column_name": "c_debtlimit"}]}),
             description="semantic_search_descriptions: найден кандидат колонки",
         )
-        task = (
-            "Получи S2T для найденной колонки."
-            + WORKER_PREVIOUS_RESULTS_MARKER
-            + "\n"
-            + json.dumps(
-                {"previous_results": [reference.model_dump(mode="json")]},
-                ensure_ascii=False,
-            )
+        task = WorkerRequestParts(
+            current_task="Получи S2T для найденной колонки.",
+            previous_results=[reference],
         )
         with (
             patch("agents.worker.select_chat_route", return_value=route) as router,
@@ -3602,6 +3730,7 @@ def test_public_worker_adds_previous_result_reader_outside_router():
 def test_public_worker_reroutes_original_task_after_observer_request(
     monkeypatch,
 ):
+    from agents.contracts import parse_worker_request
     from agents.worker import (
         WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
         worker_chat,
@@ -3681,13 +3810,13 @@ def test_public_worker_reroutes_original_task_after_observer_request(
 
     assert result.summary == "Максимум: t_example, 55 строк."
     assert router.call_count == 2
-    assert router.call_args_list[0].args == (
-        "Найди target_table с максимумом строк",
-    )
+    assert parse_worker_request(
+        router.call_args_list[0].args[0]
+    ).current_task == "Найди target_table с максимумом строк"
     assert "reroute_context" not in router.call_args_list[0].kwargs
-    assert router.call_args_list[1].args == (
-        "Найди target_table с максимумом строк",
-    )
+    assert parse_worker_request(
+        router.call_args_list[1].args[0]
+    ).current_task == "Найди target_table с максимумом строк"
     reroute_context = router.call_args_list[1].kwargs["reroute_context"]
     assert reroute_context == {
         "gap": "Текущий tool не строит многошаговый путь с rules.",

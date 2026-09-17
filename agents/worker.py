@@ -31,6 +31,8 @@ from .contracts import (
     SavedResultDescriptor,
     WorkerCapability,
     WorkerOutcome,
+    WorkerRequestParts,
+    parse_worker_request,
 )
 from .experiment_flags import (
     WORKER_CAPABILITY_REROUTE_EXPERIMENT_ENV,
@@ -264,9 +266,10 @@ def _final_outcome_summary(
     return f"{clean_answer}\nПричина незавершённости: {clean_gap}"
 
 
-def worker_chat(task: str) -> WorkerOutcome:
+def worker_chat(task: str | WorkerRequestParts) -> WorkerOutcome:
     """Execute one self-contained task in an isolated generic worker."""
-    clean_task = str(task or "").strip()
+    request_parts = parse_worker_request(task)
+    clean_task = request_parts.current_task.strip()
     if not clean_task:
         return WorkerOutcome(
             summary="Worker получил пустую task.",
@@ -274,9 +277,7 @@ def worker_chat(task: str) -> WorkerOutcome:
             stop_reason="missing_input",
             unmet_requirements=["Непустая worker task не передана."],
         )
-    worker_request = clean_task
-
-    record_worker_task(worker_request)
+    record_worker_task(clean_task)
 
     callback = get_callback_handler()
     callbacks = [callback] if callback is not None else []
@@ -316,7 +317,7 @@ def worker_chat(task: str) -> WorkerOutcome:
     while True:
         available_tools = bind_saved_result_schemas(
             get_worker_tools(include_general=True),
-            worker_request,
+            request_parts,
         )
         if capability_reroute_enabled:
             required_capabilities = tuple(
@@ -372,7 +373,7 @@ def worker_chat(task: str) -> WorkerOutcome:
         }
         if reroute_context is not None:
             route_kwargs["reroute_context"] = reroute_context
-        route = select_chat_route(worker_request, **route_kwargs)
+        route = select_chat_route(request_parts, **route_kwargs)
         selected_names = set(route.tools)
         if any(
             item.name == _READ_PREVIOUS_RESULT_TOOL_NAME
@@ -405,7 +406,7 @@ def worker_chat(task: str) -> WorkerOutcome:
             "Worker route: %s",
             json.dumps(
                 {
-                    "task": worker_request,
+                    "task": clean_task,
                     "routing_attempt": reroute_count + 1,
                     "tools": [tool.name for tool in selected_tools],
                     "worker_tools": [tool.name for tool in worker_tools],
@@ -432,7 +433,7 @@ def worker_chat(task: str) -> WorkerOutcome:
 
         try:
             graph_result = run_worker_graph(
-                task=worker_request,
+                task=request_parts,
                 system_prompt=system_prompt,
                 model=chat_model,
                 tools=worker_tools,
@@ -470,7 +471,7 @@ def worker_chat(task: str) -> WorkerOutcome:
         for cycle in new_cycles:
             observation_payload = cycle.observation.model_dump()
             record_worker_observation(
-                worker_task=worker_request,
+                worker_task=clean_task,
                 cycle=cycle.cycle,
                 routing_attempt=cycle.routing_attempt,
                 observation=observation_payload,
@@ -479,7 +480,7 @@ def worker_chat(task: str) -> WorkerOutcome:
                 "Worker observation: %s",
                 json.dumps(
                     {
-                        "task": worker_request,
+                        "task": clean_task,
                         "cycle": cycle.cycle,
                         "routing_attempt": cycle.routing_attempt,
                         "observation": observation_payload,

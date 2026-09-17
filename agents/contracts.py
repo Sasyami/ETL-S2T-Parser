@@ -91,6 +91,7 @@ class PreviousResultSchema(BaseModel):
     result_ref: str = Field(min_length=1)
     row_count: int = Field(ge=0)
     truncated: bool = False
+    input_truncated: bool = False
     columns: List[SavedResultColumn] = Field(default_factory=list)
 
 
@@ -124,7 +125,14 @@ class WorkerRequestParts:
 
 
 def parse_worker_request(value: Any) -> WorkerRequestParts:
-    """Separate coordinator-owned context from the worker's current task."""
+    """Coerce a typed request or treat an ordinary string as a literal task."""
+    if isinstance(value, WorkerRequestParts):
+        return value
+    return WorkerRequestParts(current_task=str(value or "").strip())
+
+
+def parse_legacy_worker_request(value: Any) -> WorkerRequestParts:
+    """Explicitly decode the retired marker-delimited worker envelope."""
     full_text = str(value or "").strip()
     # Older direct worker ingress accepted an arbitrary conversation-context
     # suffix and forwarded it to both router and planner.  Keep recognizing the
@@ -142,21 +150,29 @@ def parse_worker_request(value: Any) -> WorkerRequestParts:
             1,
         )
         json_start = handoff_text.find("{")
-        if json_start >= 0:
-            try:
-                decoded = json.loads(handoff_text[json_start:])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                decoded = None
-            if isinstance(decoded, Mapping):
-                raw_results = decoded.get("previous_results")
-                if isinstance(raw_results, list):
-                    try:
-                        previous_results = [
-                            PreviousResultReference.model_validate(item)
-                            for item in raw_results
-                        ]
-                    except (TypeError, ValueError):
-                        previous_results = None
+        if json_start < 0:
+            raise ValueError("Legacy worker envelope has no previous-results JSON")
+        try:
+            decoded = json.loads(handoff_text[json_start:])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("Legacy worker envelope has invalid JSON") from exc
+        if (
+            not isinstance(decoded, Mapping)
+            or set(decoded) != {"previous_results"}
+            or not isinstance(decoded["previous_results"], list)
+        ):
+            raise ValueError(
+                "Legacy worker envelope has invalid previous_results payload"
+            )
+        try:
+            previous_results = [
+                PreviousResultReference.model_validate(item)
+                for item in decoded["previous_results"]
+            ]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Legacy worker envelope has invalid previous-result reference"
+            ) from exc
 
     current_task = task_and_context
     operation_completeness_context = ""
@@ -181,14 +197,17 @@ def parse_worker_request(value: Any) -> WorkerRequestParts:
         )
         try:
             decoded_original_task = json.loads(original_task_text.strip())
-        except (TypeError, ValueError, json.JSONDecodeError):
-            decoded_original_task = None
-        if (
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("Legacy worker envelope has invalid JSON") from exc
+        if not (
             isinstance(decoded_original_task, Mapping)
             and set(decoded_original_task) == {"original_task"}
             and isinstance(decoded_original_task["original_task"], str)
         ):
-            original_task = decoded_original_task["original_task"]
+            raise ValueError(
+                "Legacy worker envelope has invalid original_task payload"
+            )
+        original_task = decoded_original_task["original_task"]
 
     return WorkerRequestParts(
         current_task=current_task.strip(),
@@ -401,6 +420,7 @@ class SavedResultDescriptor(BaseModel):
     row_count: int = Field(ge=0)
     source_total: Optional[int] = Field(default=None, ge=0)
     truncated: bool = False
+    input_truncated: bool = False
     columns: List[SavedResultColumn] = Field(default_factory=list)
 
 
@@ -674,5 +694,6 @@ __all__ = [
     "WORKER_PREVIOUS_RESULTS_MARKER",
     "WORKER_OPERATION_COMPLETENESS_MARKER",
     "WORKER_OPERATION_EXECUTION_MARKER",
+    "parse_legacy_worker_request",
     "parse_worker_request",
 ]

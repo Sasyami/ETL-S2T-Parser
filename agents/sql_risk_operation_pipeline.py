@@ -874,6 +874,7 @@ def _execute_read(
         descriptor.source_tool == read_spec.tool_name
         and descriptor.source_tool_call_id == call_id
         and not descriptor.truncated
+        and not descriptor.input_truncated
         and descriptor.source_total is not None
         and descriptor.source_total == descriptor.row_count
         and not missing_columns

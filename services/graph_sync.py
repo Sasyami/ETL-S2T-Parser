@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from graph_storage import (
     close_neo4j_driver,
@@ -48,10 +48,40 @@ def _table_key(file_id: int, table_name: str) -> str:
     )
 
 
-def _build_file_graph_projection(file_id: int) -> Dict[str, Any]:
+class StaleGraphSyncError(RuntimeError):
+    """Raised when a projection snapshot no longer matches its outbox request."""
+
+
+def _build_file_graph_projection(
+    file_id: int,
+    *,
+    generation: Optional[int] = None,
+    revision: Optional[int] = None,
+) -> Dict[str, Any]:
     clean_file_id = int(file_id)
     conn = get_db_connection()
     try:
+        conn.execute("BEGIN")
+        if generation is not None or revision is not None:
+            if generation is None or revision is None:
+                raise ValueError("generation and revision must be provided together")
+            state = conn.execute(
+                """
+                SELECT generation, desired_revision
+                FROM graph_sync_outbox
+                WHERE file_id = ?
+                """,
+                (clean_file_id,),
+            ).fetchone()
+            if (
+                state is None
+                or int(state["generation"]) != int(generation)
+                or int(state["desired_revision"]) != int(revision)
+            ):
+                raise StaleGraphSyncError(
+                    "graph projection request changed before its snapshot "
+                    f"for file_id={clean_file_id}"
+                )
         transformations = [
             dict(row)
             for row in conn.execute(
@@ -256,6 +286,8 @@ def _build_file_graph_projection(file_id: int) -> Dict[str, Any]:
     ]
     return {
         "file_id": clean_file_id,
+        "generation": int(generation or 0),
+        "revision": int(revision or 0),
         "columns": columns,
         "lineage": lineage,
         "wildcard_memberships": list(wildcard_memberships_by_key.values()),
@@ -264,8 +296,34 @@ def _build_file_graph_projection(file_id: int) -> Dict[str, Any]:
     }
 
 
-def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
+def _replace_file_graph(tx, projection: Dict[str, Any]) -> bool:
     file_id = int(projection["file_id"])
+    generation = int(projection.get("generation") or 0)
+    revision = int(projection.get("revision") or 0)
+
+    fence_record = tx.run(
+        """
+        MERGE (fence:ETLProjectionFence {file_id: $file_id})
+        ON CREATE SET fence.generation = -1,
+                      fence.revision = -1,
+                      fence._lock = 0
+        SET fence._lock = coalesce(fence._lock, 0) + 1
+        WITH fence,
+             ($generation > fence.generation OR
+              ($generation = fence.generation AND
+               $revision >= fence.revision)) AS accepted
+        FOREACH (_ IN CASE WHEN accepted THEN [1] ELSE [] END |
+            SET fence.generation = $generation,
+                fence.revision = $revision
+        )
+        RETURN accepted
+        """,
+        file_id=file_id,
+        generation=generation,
+        revision=revision,
+    ).single()
+    if fence_record is None or not bool(fence_record.get("accepted", False)):
+        return False
 
     tx.run(
         "MATCH (node:ETLProjection {file_id: $file_id}) DETACH DELETE node",
@@ -276,6 +334,8 @@ def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
         UNWIND $rows AS row
         CREATE (:ETLProjection:ETLColumn {
             file_id: $file_id,
+            projection_generation: $generation,
+            projection_revision: $revision,
             key: row.key,
             table_name: row.table_name,
             name: row.name,
@@ -283,6 +343,8 @@ def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
         })
         """,
         file_id=file_id,
+        generation=generation,
+        revision=revision,
         rows=projection["columns"],
     ).consume()
     tx.run(
@@ -290,6 +352,8 @@ def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
         UNWIND $rows AS row
         CREATE (:ETLProjection:ETLTable {
             file_id: $file_id,
+            projection_generation: $generation,
+            projection_revision: $revision,
             key: row.key,
             name: row.name,
             roles: row.roles,
@@ -297,6 +361,8 @@ def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
         })
         """,
         file_id=file_id,
+        generation=generation,
+        revision=revision,
         rows=projection["tables"],
     ).consume()
     tx.run(
@@ -360,24 +426,53 @@ def _replace_file_graph(tx, projection: Dict[str, Any]) -> None:
         file_id=file_id,
         rows=projection["table_lineage"],
     ).consume()
+    return True
 
 
-def _sync_file_graph_revision(file_id: int, revision: int) -> Dict[str, Any]:
+def _sync_file_graph_revision(
+    file_id: int,
+    revision: int,
+    generation: Optional[int] = None,
+) -> Dict[str, Any]:
     """Apply one requested revision and confirm it only after Neo4j commits."""
     clean_file_id = int(file_id)
     clean_revision = int(revision)
-    projection = _build_file_graph_projection(file_id)
+    if generation is None:
+        state = get_graph_sync_state(clean_file_id)
+        if state is None:
+            raise StaleGraphSyncError(
+                f"graph outbox row is missing for file_id={clean_file_id}"
+            )
+        clean_generation = int(state["generation"])
+    else:
+        clean_generation = int(generation)
     try:
+        projection = _build_file_graph_projection(
+            clean_file_id,
+            generation=clean_generation,
+            revision=clean_revision,
+        )
         settings = load_neo4j_settings()
         driver = create_neo4j_driver(settings)
         try:
             with driver.session(database=settings.database) as session:
-                session.execute_write(_replace_file_graph, projection)
+                accepted = session.execute_write(_replace_file_graph, projection)
+                if not accepted:
+                    raise StaleGraphSyncError(
+                        "Neo4j rejected a stale graph projection "
+                        f"for file_id={clean_file_id} generation="
+                        f"{clean_generation} revision={clean_revision}"
+                    )
         finally:
             close_neo4j_driver(driver)
     except Exception as exc:
         try:
-            mark_graph_sync_failed(clean_file_id, clean_revision, str(exc))
+            mark_graph_sync_failed(
+                clean_file_id,
+                clean_revision,
+                str(exc),
+                generation=clean_generation,
+            )
         except Exception:
             logger.exception(
                 "Failed to record graph outbox error for file_id=%s revision=%s",
@@ -386,7 +481,11 @@ def _sync_file_graph_revision(file_id: int, revision: int) -> Dict[str, Any]:
             )
         raise
 
-    mark_graph_sync_applied(clean_file_id, clean_revision)
+    mark_graph_sync_applied(
+        clean_file_id,
+        clean_revision,
+        generation=clean_generation,
+    )
     state = get_graph_sync_state(clean_file_id) or {}
 
     return {
@@ -414,10 +513,15 @@ def sync_file_graph(file_id: int) -> Dict[str, Any]:
     if state is None or int(state["desired_revision"]) <= int(
         state["applied_revision"]
     ):
-        revision = request_graph_sync(clean_file_id)
-    else:
-        revision = int(state["desired_revision"])
-    return _sync_file_graph_revision(clean_file_id, revision)
+        request_graph_sync(clean_file_id)
+        state = get_graph_sync_state(clean_file_id)
+    if state is None:
+        raise RuntimeError(f"Graph outbox row is missing for file_id={clean_file_id}")
+    return _sync_file_graph_revision(
+        clean_file_id,
+        int(state["desired_revision"]),
+        int(state["generation"]),
+    )
 
 
 def sync_pending_graph_projections(limit: int = 100) -> Dict[str, Any]:
@@ -428,8 +532,11 @@ def sync_pending_graph_projections(limit: int = 100) -> Dict[str, Any]:
     for row in rows:
         file_id = int(row["file_id"])
         revision = int(row["desired_revision"])
+        generation = int(row["generation"])
         try:
-            applied.append(_sync_file_graph_revision(file_id, revision))
+            applied.append(
+                _sync_file_graph_revision(file_id, revision, generation)
+            )
         except Exception as exc:
             logger.exception(
                 "Pending Neo4j projection failed for file_id=%s revision=%s",
@@ -450,14 +557,79 @@ def sync_pending_graph_projections(limit: int = 100) -> Dict[str, Any]:
     }
 
 
-def _clear_graph_projection(tx) -> int:
+def _clear_graph_projection(
+    tx,
+    generation: int,
+    requests: Sequence[Mapping[str, Any]],
+) -> int:
+    tx.run(
+        """
+        MATCH (fence:ETLProjectionFence)
+        SET fence._lock = coalesce(fence._lock, 0) + 1
+        WITH fence, fence.generation AS old_generation
+        SET
+            fence.generation = CASE
+                WHEN old_generation < $generation
+                THEN $generation
+                ELSE old_generation
+            END,
+            fence.revision = CASE
+                WHEN old_generation < $generation
+                THEN 0
+                ELSE fence.revision
+            END
+        """,
+        generation=int(generation),
+    ).consume()
+    tx.run(
+        """
+        UNWIND $rows AS row
+        MERGE (fence:ETLProjectionFence {file_id: row.file_id})
+        ON CREATE SET fence.generation = row.generation,
+                      fence.revision = row.revision,
+                      fence._lock = 0
+        SET fence._lock = coalesce(fence._lock, 0) + 1
+        WITH fence, row, fence.generation AS old_generation,
+             fence.revision AS old_revision
+        SET
+            fence.generation = CASE
+                WHEN old_generation < row.generation
+                THEN row.generation
+                ELSE old_generation
+            END,
+            fence.revision = CASE
+                WHEN old_generation < row.generation
+                THEN row.revision
+                WHEN old_generation = row.generation AND
+                     old_revision < row.revision
+                THEN row.revision
+                ELSE old_revision
+            END
+        """,
+        rows=[dict(request) for request in requests],
+    ).consume()
     summary = tx.run(
-        "MATCH (node:ETLProjection) DETACH DELETE node"
+        """
+        MATCH (node:ETLProjection)
+        WHERE node.projection_generation IS NULL
+           OR node.projection_generation < $generation
+           OR any(row IN $rows WHERE
+                row.file_id = node.file_id AND
+                row.generation = node.projection_generation AND
+                node.projection_revision <= row.revision)
+        DETACH DELETE node
+        """,
+        generation=int(generation),
+        rows=[dict(request) for request in requests],
     ).consume()
     return int(summary.counters.nodes_deleted)
 
 
-def clear_graph_projection() -> Dict[str, Any]:
+def clear_graph_projection(
+    *,
+    generation: int,
+    requests: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
     """Delete the complete application-owned Neo4j projection."""
     if not is_neo4j_configured():
         return {
@@ -469,7 +641,11 @@ def clear_graph_projection() -> Dict[str, Any]:
     driver = create_neo4j_driver(settings)
     try:
         with driver.session(database=settings.database) as session:
-            deleted = session.execute_write(_clear_graph_projection)
+            deleted = session.execute_write(
+                _clear_graph_projection,
+                int(generation),
+                tuple(requests),
+            )
     finally:
         close_neo4j_driver(driver)
     return {"nodes": int(deleted)}

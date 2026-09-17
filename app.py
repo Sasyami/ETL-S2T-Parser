@@ -18,10 +18,15 @@ from services.analysis import (
     try_sync_pending_graph_projections,
 )
 from services.graph_sync import clear_graph_projection
-from storage.database import clear_all_data, get_file, init_db, store_excel_data
+from storage.database import (
+    clear_all_data_with_graph_snapshot,
+    get_file,
+    init_db,
+    store_excel_data,
+)
 from storage.graph_outbox import (
     get_graph_sync_state,
-    mark_all_graph_syncs_applied,
+    mark_graph_syncs_applied,
 )
 from processing.excel import (
     allowed_file,
@@ -334,7 +339,7 @@ def delete_transformations(file_id: int):
 @app.route('/storage', methods=['DELETE'])
 def delete_all_storage():
     try:
-        sqlite_deleted = clear_all_data()
+        sqlite_deleted, graph_clear_snapshot = clear_all_data_with_graph_snapshot()
     except Exception as e:
         logger.exception("Failed to clear SQLite application storage")
         return jsonify({"error": str(e), "storage": "sqlite"}), 500
@@ -345,9 +350,12 @@ def delete_all_storage():
 
     warnings = []
     try:
-        graph_deleted = clear_graph_projection()
+        graph_deleted = clear_graph_projection(
+            generation=int(graph_clear_snapshot["generation"]),
+            requests=graph_clear_snapshot["requests"],
+        )
         if not graph_deleted.get("skipped"):
-            mark_all_graph_syncs_applied()
+            mark_graph_syncs_applied(graph_clear_snapshot["requests"])
     except Exception as e:
         logger.warning("SQLite cleared, but Neo4j cleanup failed: %s", e)
         graph_deleted = {
@@ -426,7 +434,13 @@ def show_s2t_table_graph_export(filename):
 @app.route('/chat', methods=['POST'])
 def chat():
     """Natural language query endpoint."""
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if data is None:
+        if request.is_json:
+            return jsonify({"error": "JSON body must be an object"}), 400
+        data = {}
+    elif not isinstance(data, dict):
+        return jsonify({"error": "JSON body must be an object"}), 400
     query = data.get("query")
     if not isinstance(query, str) or not query.strip():
         return jsonify({"error": "Missing query"}), 400

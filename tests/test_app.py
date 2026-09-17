@@ -198,6 +198,8 @@ def test_chat_app_renders_worker_results_in_scrollable_elements(client):
     assert "addDisplayItems(data.display_items)" in body
     assert "tool-result-scroll" in body
     assert "Полный результат:" in body
+    assert "if (value === null) return '∅ NULL'" in body
+    assert "escapeHtml(toolResultValue(row[key]))" in body
     assert "toolResultTable" in body
 
 
@@ -671,6 +673,29 @@ def test_chat_missing_query(client):
     assert "error" in response.get_json()
 
 
+@pytest.mark.parametrize("payload", [[], "query", 7, True])
+@patch("app.supervisor_chat")
+def test_chat_rejects_non_object_json_root(mock_agent, client, payload):
+    response = client.post("/chat", json=payload)
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "JSON body must be an object"}
+    mock_agent.assert_not_called()
+
+
+@patch("app.supervisor_chat")
+def test_chat_rejects_json_null_root(mock_agent, client):
+    response = client.post(
+        "/chat",
+        data="null",
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "JSON body must be an object"}
+    mock_agent.assert_not_called()
+
+
 def test_get_description_returns_cached_value(client):
     conn = get_db_connection()
     conn.execute(
@@ -990,7 +1015,16 @@ def test_delete_all_storage_clears_sqlite_neo4j_and_memory(
         },
         "warnings": [],
     }
-    mock_clear_graph.assert_called_once_with()
+    mock_clear_graph.assert_called_once_with(
+        generation=1,
+        requests=[
+            {
+                "file_id": 401,
+                "generation": 1,
+                "revision": 1,
+            }
+        ],
+    )
     conn = get_db_connection()
     try:
         for table_name in (
@@ -1059,7 +1093,16 @@ def test_delete_all_storage_clears_sqlite_when_neo4j_fails(
             }
         ],
     }
-    mock_clear_graph.assert_called_once_with()
+    mock_clear_graph.assert_called_once_with(
+        generation=1,
+        requests=[
+            {
+                "file_id": 410,
+                "generation": 1,
+                "revision": 1,
+            }
+        ],
+    )
     conn = get_db_connection()
     try:
         assert conn.execute(

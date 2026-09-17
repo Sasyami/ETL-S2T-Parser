@@ -183,6 +183,19 @@ def test_evenly_spaced_items_picks_edges_and_middle():
     assert _evenly_spaced_items([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 5) == [1, 3, 5, 8, 10]
 
 
+def test_evenly_spaced_items_supports_record_values_and_boundaries():
+    records = [{"index": index} for index in range(21)]
+
+    assert _evenly_spaced_items([], 20) == []
+    assert _evenly_spaced_items(records[:19], 20) == records[:19]
+    assert _evenly_spaced_items(records[:20], 20) == records[:20]
+    assert [item["index"] for item in _evenly_spaced_items(records, 20)] == [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    ]
+    assert _evenly_spaced_items(records, 1) == records[:1]
+
+
 @patch("agents.summarizer_agent.call_gigachat")
 def test_description_prompts_focus_on_domain_descriptions(mock_call_gigachat):
     mock_call_gigachat.return_value = "Описание"

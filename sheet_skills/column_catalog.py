@@ -795,6 +795,17 @@ def _replace_catalog_rows(
     try:
         cursor = conn.cursor()
         cursor.execute("BEGIN")
+        from storage.embedding_index import register_embedding_blobs
+
+        register_embedding_blobs(
+            cursor,
+            [
+                row["description_embedding"]
+                for rows in rows_by_target.values()
+                for row in rows
+                if row.get("description_embedding") is not None
+            ],
+        )
         for target_name in COLUMN_CATALOG_TARGETS:
             cursor.execute(
                 f"DELETE FROM {_sql_identifier(target_name)} WHERE file_id = ?",
@@ -830,7 +841,7 @@ def _embed_catalog_descriptions(
     rows_by_target: Dict[str, Sequence[Dict[str, Any]]],
 ) -> int:
     """Embed each column's technical name and optional description in one batch."""
-    from services.embeddings import embed_descriptions
+    from services.embeddings import embed_documents
 
     pending: List[Tuple[Dict[str, Any], str]] = []
     for target_name in COLUMN_CATALOG_TARGETS:
@@ -841,7 +852,7 @@ def _embed_catalog_descriptions(
                 pending.append((row, semantic_text))
     if not pending:
         return 0
-    embeddings = embed_descriptions([description for _, description in pending])
+    embeddings = embed_documents([description for _, description in pending])
     for (row, _), embedding in zip(pending, embeddings):
         row["description_embedding"] = embedding
     return len(pending)
@@ -849,21 +860,20 @@ def _embed_catalog_descriptions(
 
 def _column_semantic_text(row: Dict[str, Any]) -> str:
     """Build stable semantic text without source-sheet header aliases."""
-    column_name = clean_value(row.get("column_name"))
-    description = clean_value(row.get("description"))
-    parts = []
-    if column_name:
-        parts.append(f"Название колонки: {column_name}")
-    if description:
-        parts.append(f"Описание: {description}")
-    return "\n".join(parts)
+    from storage.embedding_index import column_embedding_document
+
+    return column_embedding_document(
+        clean_value(row.get("column_name")),
+        clean_value(row.get("description")),
+    )
 
 
 def backfill_column_description_embeddings(
     file_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Embed stored column names/descriptions missing a semantic embedding."""
-    from services.embeddings import embed_descriptions
+    from services.embeddings import embed_documents
+    from storage.embedding_index import register_embedding_blobs
 
     conn = get_db_connection()
     try:
@@ -893,11 +903,12 @@ def backfill_column_description_embeddings(
         if not candidates:
             return {"file_id": file_id, "candidates": 0, "updated": 0}
 
-        embeddings = embed_descriptions(
+        embeddings = embed_documents(
             [candidate["description"] for candidate in candidates]
         )
         cursor = conn.cursor()
         cursor.execute("BEGIN")
+        register_embedding_blobs(cursor, embeddings)
         for candidate, embedding in zip(candidates, embeddings):
             cursor.execute(
                 f"UPDATE {_sql_identifier(candidate['table_name'])} "

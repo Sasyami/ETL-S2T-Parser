@@ -21,10 +21,16 @@ from ..contracts import (
     PreviousResultSchema,
     SavedResultColumn,
     SavedResultDescriptor,
+    WorkerRequestParts,
     parse_worker_request,
 )
 from .common import clamped_int
-from .sql import _readonly_sql_authorizer, _validate_readonly_sql
+from .sql import (
+    _readonly_sql_authorizer,
+    _result_column_error,
+    _row_dict,
+    _validate_readonly_sql,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,15 +117,37 @@ def _normalized_columns(
     declared_columns: Sequence[Any],
 ) -> List[str]:
     columns: List[str] = []
+    seen: Dict[str, str] = {}
+    declared_seen: set[str] = set()
     for value in declared_columns:
-        name = str(value or "").strip()
-        if name and name not in columns:
-            columns.append(name)
+        name = "" if value is None else str(value)
+        if not name:
+            raise ValueError("Saved result contains an empty column name")
+        folded = name.casefold()
+        if folded in declared_seen:
+            raise ValueError(
+                "Saved result contains ambiguous declared column names: "
+                f"{seen[folded]!r} and {name!r}"
+            )
+        declared_seen.add(folded)
+        seen[folded] = name
+        columns.append(name)
     for row in rows:
         for value in row:
-            name = str(value or "").strip()
-            if name and name not in columns:
-                columns.append(name)
+            name = "" if value is None else str(value)
+            if not name:
+                raise ValueError("Saved result contains an empty column name")
+            folded = name.casefold()
+            existing = seen.get(folded)
+            if existing is not None:
+                if existing != name:
+                    raise ValueError(
+                        "Saved result contains ambiguous column names: "
+                        f"{existing!r} and {name!r}"
+                    )
+                continue
+            seen[folded] = name
+            columns.append(name)
     return columns
 
 
@@ -150,19 +178,15 @@ def _tabular_payload(payload: Any) -> Optional[Dict[str, Any]]:
         and metadata.get("row_format") == "arrays_in_column_order"
     )
     if packed_format:
-        packed_columns = [str(value or "").strip() for value in declared_columns]
-        if (
-            not packed_columns
-            or any(not value for value in packed_columns)
-            or len(set(packed_columns)) != len(packed_columns)
-        ):
+        if not declared_columns:
             return None
+        packed_columns = _normalized_columns([], declared_columns)
         raw_dictionaries = metadata.get("dictionaries", {})
         if not isinstance(raw_dictionaries, Mapping):
             return None
         dictionaries: Dict[str, List[Any]] = {}
         for key, values in raw_dictionaries.items():
-            column = str(key or "").strip()
+            column = "" if key is None else str(key)
             if column not in packed_columns or not isinstance(values, list):
                 return None
             dictionaries[column] = values
@@ -204,6 +228,7 @@ def _tabular_payload(payload: Any) -> Optional[Dict[str, Any]]:
             source_total = value
             break
     truncated = bool(metadata.get("truncated"))
+    input_truncated = bool(metadata.get("input_truncated"))
     if source_total is not None and source_total > len(rows):
         truncated = True
     return {
@@ -211,6 +236,7 @@ def _tabular_payload(payload: Any) -> Optional[Dict[str, Any]]:
         "rows": rows,
         "source_total": source_total,
         "truncated": truncated,
+        "input_truncated": input_truncated,
     }
 
 
@@ -289,6 +315,7 @@ class SavedResultStore:
                         result_ref=descriptor.result_ref,
                         row_count=descriptor.row_count,
                         truncated=descriptor.truncated,
+                        input_truncated=descriptor.input_truncated,
                         columns=[
                             column.model_copy(deep=True)
                             for column in descriptor.columns
@@ -399,6 +426,7 @@ class SavedResultStore:
                 row_count=len(rows),
                 source_total=tabular["source_total"],
                 truncated=bool(tabular["truncated"]),
+                input_truncated=bool(tabular["input_truncated"]),
                 columns=[
                     SavedResultColumn(name=name, sqlite_type=sqlite_type)
                     for name, sqlite_type in zip(column_names, column_types)
@@ -483,9 +511,17 @@ class SavedResultStore:
 
             cursor = conn.execute(text)
             columns = [item[0] for item in (cursor.description or [])]
+            column_error = _result_column_error(columns)
+            if column_error:
+                return {
+                    "error": column_error,
+                    "result_ref": clean_ref,
+                    "query": text,
+                    "columns": columns,
+                }
             fetched = cursor.fetchmany(limit + 1)
             truncated = len(fetched) > limit
-            rows = [dict(row) for row in fetched[:limit]]
+            rows = [_row_dict(row, columns) for row in fetched[:limit]]
             logger.info(
                 "Queried saved SQLite result: ref=%s returned_rows=%s "
                 "truncated=%s",
@@ -497,7 +533,9 @@ class SavedResultStore:
                 "result_ref": clean_ref,
                 "query": text,
                 "input_row_count": descriptor.row_count,
-                "input_truncated": descriptor.truncated,
+                "input_truncated": (
+                    descriptor.truncated or descriptor.input_truncated
+                ),
                 "columns": columns,
                 "rows": rows,
                 "returned_rows": len(rows),
@@ -554,11 +592,28 @@ def persist_sqlite_tool_message(message: ToolMessage) -> ToolMessage:
     if isinstance(payload, dict) and isinstance(payload.get("saved_result"), dict):
         return message
 
-    descriptor = store.save_payload(
-        source_tool=str(message.name or "unknown_tool"),
-        source_tool_call_id=str(message.tool_call_id or "").strip() or None,
-        payload=payload,
-    )
+    try:
+        descriptor = store.save_payload(
+            source_tool=str(message.name or "unknown_tool"),
+            source_tool_call_id=str(message.tool_call_id or "").strip() or None,
+            payload=payload,
+        )
+    except ValueError as exc:
+        logger.warning("Tool result could not be materialized safely: %s", exc)
+        if not isinstance(payload, dict):
+            return message
+        enriched = dict(payload)
+        enriched["saved_result_error"] = str(exc)
+        return message.model_copy(
+            update={
+                "content": json.dumps(
+                    enriched,
+                    ensure_ascii=False,
+                    default=str,
+                    separators=(",", ":"),
+                )
+            }
+        )
     if descriptor is None:
         return message
 
@@ -598,6 +653,7 @@ def _descriptor_catalog(
             f"source_tool={descriptor.source_tool}; "
             f"stored_rows={descriptor.row_count}{total}; "
             f"truncated={str(descriptor.truncated).lower()}; "
+            f"input_truncated={str(descriptor.input_truncated).lower()}; "
             f"schema: CREATE TABLE result ({columns})"
         )
     return "\n".join(items)
@@ -605,7 +661,7 @@ def _descriptor_catalog(
 
 def bind_saved_result_schemas(
     tools: Sequence[BaseTool],
-    task: str,
+    task: str | WorkerRequestParts,
 ) -> tuple[BaseTool, ...]:
     """Expose only applicable lazy-result tools and bind tabular schemas."""
     available_tools = list(tools)
@@ -627,7 +683,7 @@ def bind_saved_result_schemas(
         descriptors = [
             item
             for item in store.descriptors()
-            if item.result_ref in str(task or "")
+            if item.result_ref in request_parts.current_task
         ]
     catalog = _descriptor_catalog(descriptors) if descriptors else ""
     bound: List[BaseTool] = []

@@ -4,6 +4,7 @@ import argparse
 import json
 import signal
 import sqlite3
+import stat
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -71,6 +72,10 @@ def _result(
 
 
 def _patch_outer_preflight(monkeypatch, db_path: Path) -> runner.RepositorySnapshot:
+    plugin_dir = db_path.parent / "synthetic_live_support"
+    plugin_path = plugin_dir / runner.PLUGIN_PATH.name
+    monkeypatch.setattr(runner, "PLUGIN_DIR", plugin_dir)
+    monkeypatch.setattr(runner, "PLUGIN_PATH", plugin_path)
     runner.PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
     if not runner.PLUGIN_PATH.is_file():
         runner.PLUGIN_PATH.write_text(
@@ -93,6 +98,7 @@ def _patch_outer_preflight(monkeypatch, db_path: Path) -> runner.RepositorySnaps
             base_sha=snapshot.head,
             runtime_bundle_sha256=bundle_sha256,
             plugin_sha256=plugin_sha256,
+            python_executable=runner.DEFAULT_PYTHON_EXECUTABLE,
         ),
     )
     monkeypatch.setattr(
@@ -259,12 +265,12 @@ def test_arm_launcher_uses_clone_runner_main_venv_and_explicit_plugin_path(
     class FakeProcess:
         pid = 12345
 
-        def __init__(self, command, *, cwd, env, start_new_session):
+        def __init__(self, command, *, cwd, env, **process_options):
             seen.update(
                 command=command,
                 cwd=cwd,
                 env=env,
-                start_new_session=start_new_session,
+                process_options=process_options,
             )
             result_path = Path(command[command.index("--arm-result-json") + 1])
             result = _result(output, case.scenario)
@@ -302,7 +308,7 @@ def test_arm_launcher_uses_clone_runner_main_venv_and_explicit_plugin_path(
     assert seen["cwd"] == clone
     assert seen["env"]["PYTHONPATH"] == f"{clone}{runner.os.pathsep}{plugin_dir}"
     assert seen["env"]["PYTEST_PLUGINS"] == runner.PLUGIN_MODULE
-    assert seen["start_new_session"] is True
+    assert seen["process_options"] == runner._process_group_options()
     assert seen["timeout"] == runner.ARM_SUBPROCESS_TIMEOUT_SECONDS
 
 
@@ -343,6 +349,121 @@ def test_arm_launcher_rejects_missing_clone_runtime_attestation(
             output_dir=output,
             run_label="run-01",
         )
+
+
+def test_synthetic_plugin_contract_is_versioned_and_rejects_a_stub(tmp_path):
+    runner._validate_plugin_contract(runner.PLUGIN_PATH)
+
+    stub = tmp_path / "synthetic_live_support.py"
+    stub.write_text("# not a fixture plugin\n", encoding="utf-8")
+    with pytest.raises(runner.InfrastructureError, match="API version differs"):
+        runner._validate_plugin_contract(stub)
+
+    wrong_version = tmp_path / "wrong_version.py"
+    wrong_version.write_text(
+        "PLUGIN_API_VERSION = 2\n"
+        "def pytest_configure(config): pass\n"
+        "def synthetic_live_database_guard(): pass\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(runner.InfrastructureError, match="expected 1, found 2"):
+        runner._validate_plugin_contract(wrong_version)
+
+
+def test_process_group_options_are_native_to_windows_and_posix():
+    assert runner._process_group_options("nt") == {
+        "creationflags": int(
+            getattr(runner.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+    }
+    assert runner._process_group_options("posix") == {"start_new_session": True}
+
+
+def test_terminate_child_escalates_the_entire_process_tree(monkeypatch):
+    events: list[tuple[str, object]] = []
+
+    class FakeProcess:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            events.append(("wait", timeout))
+            if sum(name == "wait" for name, _value in events) == 1:
+                raise subprocess.TimeoutExpired("worker", timeout)
+            return 0
+
+    monkeypatch.setattr(
+        runner,
+        "_request_child_shutdown",
+        lambda _process, platform: events.append(("request", platform)),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_force_child_shutdown",
+        lambda _process, platform: events.append(("force", platform)),
+    )
+
+    runner._terminate_child(FakeProcess(), "nt")
+
+    assert events == [
+        ("request", "nt"),
+        ("wait", 10),
+        ("force", "nt"),
+        ("wait", 10),
+    ]
+
+
+def test_windows_tree_shutdown_uses_taskkill_when_break_is_unavailable(monkeypatch):
+    events: list[tuple[int, bool]] = []
+
+    class FakeProcess:
+        pid = 9876
+
+        def poll(self):
+            return None
+
+        def send_signal(self, _signal):
+            raise OSError("no console")
+
+    monkeypatch.setattr(
+        runner,
+        "_taskkill_tree",
+        lambda process_id, *, force: events.append((process_id, force)),
+    )
+
+    process = FakeProcess()
+    runner._request_child_shutdown(process, "nt")
+    runner._force_child_shutdown(process, "nt")
+
+    assert events == [(9876, False), (9876, True)]
+
+
+def test_posix_tree_shutdown_targets_the_process_group(monkeypatch):
+    events: list[tuple[int, int]] = []
+
+    class FakeProcess:
+        pid = 2468
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        runner.os,
+        "killpg",
+        lambda process_id, signum: events.append((process_id, signum)),
+        raising=False,
+    )
+
+    process = FakeProcess()
+    runner._request_child_shutdown(process, "posix")
+    runner._force_child_shutdown(process, "posix")
+
+    assert events == [
+        (2468, signal.SIGTERM),
+        (2468, getattr(signal, "SIGKILL", 9)),
+    ]
 
 
 def test_prepare_clone_uses_local_no_hardlinks_and_detached_fixed_sha(
@@ -562,8 +683,9 @@ def test_env_integrity_snapshot_contains_metadata_not_secret(
     tmp_path,
 ):
     secret = "private-token-that-must-never-be-read-into-report"
-    (tmp_path / ".env").write_text(f"TOKEN={secret}\n", encoding="utf-8")
-    (tmp_path / ".env").chmod(0o600)
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"TOKEN={secret}\n", encoding="utf-8")
+    env_path.chmod(0o600)
     monkeypatch.setattr(
         runner,
         "_run_git",
@@ -575,7 +697,7 @@ def test_env_integrity_snapshot_contains_metadata_not_secret(
     serialized = json.dumps(metadata)
     assert metadata["exists"] is True
     assert metadata["ignored"] is True
-    assert metadata["mode"] == 0o600
+    assert metadata["mode"] == stat.S_IMODE(env_path.stat().st_mode)
     assert secret not in serialized
     assert set(metadata) == {"exists", "ignored", "mode", "size", "mtime_ns"}
 

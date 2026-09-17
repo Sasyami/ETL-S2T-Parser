@@ -282,8 +282,15 @@ def get_excel_row(
 
 
 def _float_vector(blob: Any) -> array:
+    raw = bytes(blob)
     vector = array("f")
-    vector.frombytes(bytes(blob))
+    if len(raw) % vector.itemsize:
+        raise ValueError("Embedding blob length is not a multiple of float size")
+    vector.frombytes(raw)
+    if not vector:
+        raise ValueError("Embedding vector must not be empty")
+    if any(not math.isfinite(value) for value in vector):
+        raise ValueError("Embedding vector contains NaN or infinity")
     return vector
 
 
@@ -292,9 +299,17 @@ def _cosine_similarity(left: array, right: array) -> float:
         raise ValueError("Embedding dimensions do not match")
     left_norm = math.sqrt(sum(value * value for value in left))
     right_norm = math.sqrt(sum(value * value for value in right))
-    if not left_norm or not right_norm:
-        raise ValueError("Embedding vector must be non-zero")
-    return sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
+    if (
+        not math.isfinite(left_norm)
+        or not math.isfinite(right_norm)
+        or not left_norm
+        or not right_norm
+    ):
+        raise ValueError("Embedding vector must be finite and non-zero")
+    score = sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
+    if not math.isfinite(score):
+        raise ValueError("Embedding similarity score must be finite")
+    return score
 
 
 @tool(parse_docstring=True)
@@ -331,10 +346,11 @@ def semantic_search_descriptions(
     только целевые колонки, all — все перечисленные домены. Для колонковых
     scope можно сначала ограничить подвыборку структурными фильтрами, а затем
     ранжировать только её по смыслу описания.
-    Инструмент эмбеддит запрос той же
-    моделью, которой были записаны description_embedding, и считает cosine
-    similarity по files, source_tables, target_tables, source_columns и
-    target_columns. Это не поиск значений ячеек, точных S2T-имён и не lineage.
+    Инструмент кодирует запрос query-стороной подтверждённого embedding-профиля
+    и до сравнения проверяет сохранённые model, revision, query/document
+    encoding, нормализацию и размерность индекса. Затем считает cosine similarity
+    по files, source_tables, target_tables, source_columns и target_columns. Это
+    не поиск значений ячеек, точных S2T-имён и не lineage.
 
     Результат является ранжированием смысловой близости, а не подтверждением
     точного равенства имён. Для известного table_name используй
@@ -399,12 +415,38 @@ def semantic_search_descriptions(
         if value is not None:
             clean_column_filters[field] = value
 
-    from services.embeddings import embed_description, embedding_model_name
+    from services.embeddings import (
+        embed_query,
+        embedding_index_identity_for_blobs,
+    )
     from storage.database import get_db_connection
+    from storage.embedding_index import (
+        EmbeddingIndexCompatibilityError,
+        validate_embedding_index,
+    )
 
-    query_vector = _float_vector(embed_description(text))
+    try:
+        query_blob = embed_query(text)
+        query_vector = _float_vector(query_blob)
+        runtime_identity = embedding_index_identity_for_blobs([query_blob])
+    except (TypeError, ValueError, OverflowError) as exc:
+        return {
+            "error": "Query embedding is invalid",
+            "error_message": str(exc),
+            "rows": [],
+        }
     conn = get_db_connection()
     try:
+        try:
+            stored_identity = validate_embedding_index(
+                conn.cursor(), runtime_identity
+            )
+        except EmbeddingIndexCompatibilityError as exc:
+            return {
+                "error": str(exc),
+                "error_code": exc.error_code,
+                "rows": [],
+            }
         candidates = []
         if scope in ("all", "files"):
             file_where = "WHERE description_embedding IS NOT NULL"
@@ -489,8 +531,19 @@ def semantic_search_descriptions(
 
     ranked = []
     for candidate in candidates:
-        vector = _float_vector(candidate.pop("description_embedding"))
-        candidate["score"] = round(_cosine_similarity(query_vector, vector), 6)
+        blob = candidate.pop("description_embedding")
+        try:
+            vector = _float_vector(blob)
+            score = _cosine_similarity(query_vector, vector)
+        except (TypeError, ValueError, OverflowError) as exc:
+            return {
+                "error": "Stored embedding index is corrupted or incompatible",
+                "error_message": str(exc),
+                "scope": candidate.get("scope"),
+                "record_id": candidate.get("record_id"),
+                "rows": [],
+            }
+        candidate["score"] = round(score, 6)
         ranked.append(candidate)
     ranked.sort(key=lambda item: (-item["score"], item["scope"], item["record_id"]))
     rows = ranked[:clean_limit]
@@ -502,7 +555,11 @@ def semantic_search_descriptions(
             **({"file_id": clean_file_id} if clean_file_id is not None else {}),
             **clean_column_filters,
         },
-        "embedding_model": embedding_model_name(),
+        "embedding_model": runtime_identity.model_name,
+        "embedding_model_revision": runtime_identity.model_revision or None,
+        "embedding_profile": runtime_identity.profile_id,
+        "embedding_dimension": runtime_identity.dimension,
+        "embedding_index_registered": stored_identity is not None,
         "total_candidates": len(ranked),
         "returned_rows": len(rows),
         "coverage": "truncated" if truncated else "complete",

@@ -10,6 +10,7 @@ artifacts, a sanitized journal and rollback certificates survive the run.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib
 import json
@@ -77,10 +78,15 @@ DEFAULT_DB_PATH = PROJECT_ROOT / ".test_runs" / "synthetic_live.db"
 DEFAULT_OUTPUT_DIR = (
     PROJECT_ROOT / ".test_runs" / "operation-protocol-experiments"
 )
-MAIN_VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
-PLUGIN_DIR = PROJECT_ROOT / ".test_runs"
+DEFAULT_PYTHON_EXECUTABLE = Path(sys.executable).resolve()
+PLUGIN_DIR = PROJECT_ROOT / "tests" / "support"
 PLUGIN_MODULE = "synthetic_live_support"
 PLUGIN_PATH = PLUGIN_DIR / f"{PLUGIN_MODULE}.py"
+PLUGIN_API_VERSION = 1
+PLUGIN_REQUIRED_CALLABLES = (
+    "pytest_configure",
+    "synthetic_live_database_guard",
+)
 
 COMMITTED_RUNTIME_PATHS = (
     "agents/operation_protocols.py",
@@ -93,6 +99,7 @@ COMMITTED_RUNTIME_PATHS = (
     "tests/test_live_agent_scenarios.py",
     "tests/test_operation_protocol_experiments.py",
     "tests/test_operation_protocols.py",
+    "tests/support/synthetic_live_support.py",
 )
 SQLITE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 QUALITY_TOKEN_GUARD_RATIO = 1.10
@@ -222,6 +229,7 @@ class PreflightState:
     base_sha: str
     runtime_bundle_sha256: str
     plugin_sha256: str
+    python_executable: Path
 
 
 class InfrastructureError(RuntimeError):
@@ -303,6 +311,43 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_plugin_contract(path: Path) -> None:
+    """Validate the committed plugin's declared version and hook interface."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError) as exc:
+        raise InfrastructureError(
+            f"cannot parse synthetic fixture plugin: {_safe_error(exc)}"
+        ) from exc
+
+    version: int | None = None
+    callables: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            callables.add(node.name)
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "PLUGIN_API_VERSION"
+            for target in node.targets
+        ):
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, int):
+            version = int(node.value.value)
+
+    if version != PLUGIN_API_VERSION:
+        raise InfrastructureError(
+            "synthetic fixture plugin API version differs: "
+            f"expected {PLUGIN_API_VERSION}, found {version!r}"
+        )
+    missing = sorted(set(PLUGIN_REQUIRED_CALLABLES) - callables)
+    if missing:
+        raise InfrastructureError(
+            "synthetic fixture plugin misses required callables: "
+            + ", ".join(missing)
+        )
 
 
 def _tracked_runtime_paths(root: Path) -> set[str]:
@@ -607,21 +652,82 @@ def _run_arm_worker(args: argparse.Namespace) -> int:
     return 0
 
 
-def _terminate_child(process: subprocess.Popen[Any]) -> None:
-    """Bound shutdown of an isolated worker before its clone is removed."""
+def _process_group_options(platform_name: str | None = None) -> dict[str, Any]:
+    """Return platform-native options for an independently terminable tree."""
+    platform = os.name if platform_name is None else platform_name
+    if platform == "nt":
+        return {
+            "creationflags": int(
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            )
+        }
+    return {"start_new_session": True}
+
+
+def _taskkill_tree(process_id: int, *, force: bool) -> None:
+    command = ["taskkill", "/PID", str(int(process_id)), "/T"]
+    if force:
+        command.append("/F")
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if completed.returncode not in {0, 128, 255}:
+        raise InfrastructureError(
+            f"taskkill failed for process tree {int(process_id)} "
+            f"with code {completed.returncode}"
+        )
+
+
+def _request_child_shutdown(
+    process: subprocess.Popen[Any],
+    platform_name: str | None = None,
+) -> None:
     if process.poll() is not None:
+        return
+    platform = os.name if platform_name is None else platform_name
+    if platform == "nt":
+        try:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        except (AttributeError, OSError, ValueError):
+            _taskkill_tree(process.pid, force=False)
         return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+
+
+def _force_child_shutdown(
+    process: subprocess.Popen[Any],
+    platform_name: str | None = None,
+) -> None:
+    if process.poll() is not None:
+        return
+    platform = os.name if platform_name is None else platform_name
+    if platform == "nt":
+        _taskkill_tree(process.pid, force=True)
+        return
+    try:
+        os.killpg(process.pid, getattr(signal, "SIGKILL", 9))
+    except ProcessLookupError:
+        return
+
+
+def _terminate_child(
+    process: subprocess.Popen[Any],
+    platform_name: str | None = None,
+) -> None:
+    """Bound shutdown of an isolated worker before its clone is removed."""
+    if process.poll() is not None:
+        return
+    _request_child_shutdown(process, platform_name)
     try:
         process.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        _force_child_shutdown(process, platform_name)
         process.wait(timeout=10)
 
 
@@ -630,10 +736,7 @@ def _experiment_signal_handler(signum: int, _frame: Any) -> None:
     global _SIGNAL_ALREADY_RAISED
     process = _ACTIVE_CHILD_PROCESS
     if process is not None and process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        _request_child_shutdown(process)
     if _SIGNAL_ALREADY_RAISED:
         return
     _SIGNAL_ALREADY_RAISED = True
@@ -699,7 +802,7 @@ def _run_arm_subprocess(
         command,
         cwd=clone,
         env=environment,
-        start_new_session=True,
+        **_process_group_options(),
     )
     _ACTIVE_CHILD_PROCESS = process
     try:
@@ -1184,6 +1287,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db-path", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
+        "--python-executable",
+        type=Path,
+        default=DEFAULT_PYTHON_EXECUTABLE,
+        help=(
+            "Python executable used for isolated arms; defaults to the "
+            "interpreter running this command."
+        ),
+    )
+    parser.add_argument(
         "--base-sha",
         default="",
         help="Committed base for every fresh clone; defaults to current HEAD.",
@@ -1259,12 +1371,18 @@ def _preflight(
             raise InfrastructureError("; ".join(errors))
         db_sha256 = sqlite_sha256(db_path)
         db_file_state = _sqlite_file_state(db_path)
-        if not MAIN_VENV_PYTHON.is_file():
-            raise InfrastructureError(f"main venv Python is missing: {MAIN_VENV_PYTHON}")
+        python_executable = Path(
+            getattr(args, "python_executable", DEFAULT_PYTHON_EXECUTABLE)
+        ).expanduser().resolve()
+        if not python_executable.is_file():
+            raise InfrastructureError(
+                f"Python executable is missing: {python_executable}"
+            )
         if not PLUGIN_PATH.is_file():
             raise InfrastructureError(
                 f"live fixture plugin is missing: {PLUGIN_MODULE}"
             )
+        _validate_plugin_contract(PLUGIN_PATH)
         plugin_sha256 = _file_sha256(PLUGIN_PATH)
     except (InfrastructureError, OSError, ValueError) as exc:
         parser.error(_safe_error(exc))
@@ -1276,6 +1394,7 @@ def _preflight(
         base_sha=base_sha,
         runtime_bundle_sha256=runtime_bundle_sha256,
         plugin_sha256=plugin_sha256,
+        python_executable=python_executable,
     )
 
 
@@ -1513,7 +1632,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 result = _run_arm_subprocess(
                     clone=clone,
-                    python=MAIN_VENV_PYTHON,
+                    python=preflight.python_executable,
                     plugin_dir=frozen_plugin_dir,
                     case=case,
                     arm=arm,

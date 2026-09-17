@@ -817,7 +817,8 @@
     }
 
     function toolResultValue(value) {
-        if (value === null || value === undefined) return '';
+        if (value === null) return '∅ NULL';
+        if (value === undefined) return '';
         if (typeof value === 'object') return JSON.stringify(value);
         return String(value);
     }
@@ -844,7 +845,7 @@
             ['transformation_rule', 'Правило трансформации']
         ];
         const header = columns.map(([, label]) => `<th>${escapeHtml(label)}</th>`).join('');
-        const body = rows.map((row) => `<tr>${columns.map(([key]) => `<td>${escapeHtml(row[key] ?? '')}</td>`).join('')}</tr>`).join('');
+        const body = rows.map((row) => `<tr>${columns.map(([key]) => `<td>${escapeHtml(toolResultValue(row[key]))}</td>`).join('')}</tr>`).join('');
         return `<div class="table-responsive" tabindex="0" role="region" aria-label="Полная таблица трансформаций с прокруткой"><table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table></div>`;
     }
 

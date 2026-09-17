@@ -13,14 +13,14 @@ def extract_table_catalogs(
     sheet_group_analysis: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Extract table catalogs, embed descriptions and preserve equal rows."""
-    from services.embeddings import embed_descriptions
+    from services.embeddings import embed_documents
 
     def prepare_records(
         target_name: str,
         records: List[Dict[str, Any]],
     ) -> None:
         del target_name
-        embeddings = embed_descriptions([row["description"] for row in records])
+        embeddings = embed_documents([row["description"] for row in records])
         for row, embedding in zip(records, embeddings):
             row["description_embedding"] = embedding
 
